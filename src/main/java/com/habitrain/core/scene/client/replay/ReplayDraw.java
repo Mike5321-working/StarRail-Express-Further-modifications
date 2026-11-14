@@ -174,9 +174,10 @@ final class ReplayDraw {
     /** Camera-facing star burst (muzzle flash, sparkles) around a camera-relative centre. */
     static void star(VertexConsumer vc, Vector3f c, Vector3f right, Vector3f up, float radius, int rays,
                      float spin, int core, int tip) {
+        double baseSpin = Double.isFinite(spin) ? Math.IEEEremainder(spin, Math.PI * 2.0) : 0.0;
         for (int i = 0; i < rays; i++) {
-            float a = spin + Mth.TWO_PI * i / rays;
-            float dx = Mth.cos(a), dy = Mth.sin(a);
+            double a = baseSpin + (Math.PI * 2.0) * i / rays;
+            float dx = (float) Math.cos(a), dy = (float) Math.sin(a);
             float len = (i % 2 == 0 ? 1f : 0.55f) * radius;
             Vector3f tipPos = new Vector3f(c).add(right.x * dx * len + up.x * dy * len,
                     right.y * dx * len + up.y * dy * len, right.z * dx * len + up.z * dy * len);

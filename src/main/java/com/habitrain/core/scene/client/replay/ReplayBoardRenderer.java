@@ -68,6 +68,9 @@ public final class ReplayBoardRenderer {
     private static @Nullable ReplayBoardModel model;
     private static @Nullable LastMatchReplay modelSource;
     private static @Nullable ClientLevel observedLevel;
+    private static @Nullable ClientLevel animOriginLevel;
+    private static long animOriginTick;
+    private static long lastAnimGameTime;
     private static boolean registered;
     private static boolean failed;
 
@@ -82,6 +85,7 @@ public final class ReplayBoardRenderer {
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.level != observedLevel) {
                 observedLevel = client.level;
+                animOriginLevel = null;
                 ReplayDioramaMesh.reset();
                 model = null;
                 modelSource = null;
@@ -103,6 +107,7 @@ public final class ReplayBoardRenderer {
     /** Disconnect / session reset: drop GPU mesh, cached skins, models and local toggles. */
     public static void reset() {
         failed = false;
+        animOriginLevel = null;
         ReplayDioramaMesh.reset();
         ReplayHeadSkins.clear();
         ReplayBoardLocalState.reset();
@@ -180,7 +185,18 @@ public final class ReplayBoardRenderer {
         long gameTime = level.getGameTime();
         ReplayTimeline.Frame frame = current == null ? null
                 : current.timeline.at(ReplayBoardLocalState.tick(gameTime), ReplayBoardLocalState.partial(partial));
-        double anim = (gameTime + partial) / 20.0;
+        if (level != animOriginLevel) {
+            animOriginLevel = level;
+            animOriginTick = gameTime;
+            lastAnimGameTime = gameTime;
+        } else if (Math.abs(gameTime - lastAnimGameTime) > 200L) {
+            // Re-anchor smoothly when the initial server time packet arrives on pre-aged lobby saves
+            animOriginTick += (gameTime - lastAnimGameTime);
+            lastAnimGameTime = gameTime;
+        } else {
+            lastAnimGameTime = gameTime;
+        }
+        double anim = ((double) (gameTime - animOriginTick) + (double) partial) / 20.0;
 
         SceneMeshSet mesh = null;
         if (current != null && current.layout != null && view.asset() != null) {
@@ -324,7 +340,7 @@ public final class ReplayBoardRenderer {
             trayType = RenderType.entityCutoutNoCull(InventoryMenu.BLOCK_ATLAS);
             SequencedMap<RenderType, ByteBufferBuilder> fixed = new LinkedHashMap<>();
             fixed.put(trayType, own(1 << 17));
-            fixed.put(ReplayDraw.FILL, own(1 << 16));
+            fixed.put(ReplayDraw.FILL, own(1 << 18));
             fixed.put(ReplayDraw.GLOW, own(1 << 18));
             buffers = MultiBufferSource.immediateWithBuffers(fixed, own(1 << 17));
         }

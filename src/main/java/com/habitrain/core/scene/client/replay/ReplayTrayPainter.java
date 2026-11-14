@@ -19,7 +19,7 @@ import static com.habitrain.core.scene.client.replay.ReplayBoardSite.*;
 /**
  * The wooden, brass-trimmed diorama tray one block above the marker, its Art Deco flip-board
  * plaque, the faint holographic support beams and the stage-wide overlays (scan-in, settlement
- * wave, blackout glow). Also draws the idle "waiting for departure" wire train.
+ * wave, blackout glow). Delegates the idle / loading sculpture to {@link ReplayIdleCubes}.
  */
 final class ReplayTrayPainter {
     private ReplayTrayPainter() {}
@@ -322,136 +322,7 @@ final class ReplayTrayPainter {
 
     // ------------------------------------------------------------------ idle / loading
 
-    private static float[] train;
-
     static void idle(ReplayFrame f, ReplayBoardSite s) {
-        if (train == null) train = WireTrain.build();
-        VertexConsumer glow = f.glow();
-        float scale = Math.min(1f, (s.hw() * 2 - 0.6f) / 3.4f);
-        float bob = (float) Math.sin(f.anim * 1.3) * 0.03f;
-        Matrix4f m = new Matrix4f(s.board()).translate(0, FRAME_TOP + 0.55f + bob, 0).scale(scale);
-        double pulse = f.hasRound ? 0.55 + 0.45 * Math.sin(f.anim * 4) : 1;
-        int gold = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.75 * s.fade() * pulse);
-        int dim = ReplayPalette.alpha(ReplayPalette.BRASS, 0.25 * s.fade() * pulse);
-        Vector3f a = new Vector3f(), b = new Vector3f();
-        for (int i = 0; i + 5 < train.length; i += 6) {
-            m.transformPosition(train[i], train[i + 1], train[i + 2], a);
-            m.transformPosition(train[i + 3], train[i + 4], train[i + 5], b);
-            ReplayDraw.segment(glow, a, b, 0.024f * scale, dim, dim);
-            ReplayDraw.segment(glow, a, b, 0.009f * scale, gold, gold);
-        }
-        Matrix4f sign = new Matrix4f(s.board()).translate(0, FRAME_TOP + 1.35f, 0);
-        Component text = f.hasRound ? ReplayBoardTexts.tr("loading") : ReplayBoardTexts.tr("idle");
-        float width = Minecraft.getInstance().font.width(text) * 0.008f + 0.3f;
-        VertexConsumer fill = f.fill();
-        ReplayDraw.rectXY(fill, sign, -width / 2, -0.09f, width / 2, 0.09f, 0, ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.85 * s.fade()),
-                ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.85 * s.fade()));
-        ReplayDraw.segment(glow, sign, -width / 2, 0.09f, 0.002f, width / 2, 0.09f, 0.002f, 0.008f, gold, gold);
-        ReplayDraw.segment(glow, sign, -width / 2, -0.09f, 0.002f, width / 2, -0.09f, 0.002f, 0.008f, gold, gold);
-        f.text(sign, text, 0, 0, 0.004f, 0.008f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, s.fade()), 0, true, 0);
-    }
-
-    /** Golden wireframe steam train (segments, x0 y0 z0 x1 y1 z1), centred on the origin. */
-    static final class WireTrain {
-        private float[] seg = new float[6 * 256];
-        private int n;
-
-        static float[] build() {
-            WireTrain t = new WireTrain();
-            float off = -1.6f;
-            // locomotive frame, cab, boiler, chimney, dome, wheels, cowcatcher
-            t.box(off, 0.08f, -0.17f, off + 1.25f, 0.15f, 0.17f);
-            t.box(off, 0.15f, -0.19f, off + 0.38f, 0.62f, 0.19f);
-            t.box(off - 0.04f, 0.62f, -0.22f, off + 0.42f, 0.66f, 0.22f);
-            t.cylinderX(off + 0.38f, off + 1.18f, 0.33f, 0, 0.16f, 14, 6);
-            t.circleX(off + 0.62f, 0.33f, 0, 0.165f, 14);
-            t.circleX(off + 0.9f, 0.33f, 0, 0.165f, 14);
-            t.cylinderY(0.48f, 0.68f, off + 1.02f, 0, 0.05f, 8);
-            t.cylinderY(0.47f, 0.56f, off + 0.72f, 0, 0.06f, 8);
-            for (float wx : new float[]{0.22f, 0.58f, 0.92f}) {
-                t.circleZ(off + wx, 0.12f, 0.19f, 0.11f, 12);
-                t.circleZ(off + wx, 0.12f, -0.19f, 0.11f, 12);
-            }
-            t.line(off + 0.22f, 0.12f, 0.2f, off + 0.92f, 0.12f, 0.2f);
-            t.line(off + 1.25f, 0.08f, -0.17f, off + 1.42f, 0.02f, 0);
-            t.line(off + 1.25f, 0.08f, 0.17f, off + 1.42f, 0.02f, 0);
-            t.line(off + 1.25f, 0.15f, 0, off + 1.42f, 0.02f, 0);
-            // two coaches behind the locomotive
-            for (int c = 0; c < 2; c++) {
-                float x0 = off - 0.08f - 0.98f * (c + 1), x1 = x0 + 0.9f;
-                t.box(x0, 0.1f, -0.18f, x1, 0.52f, 0.18f);
-                t.line(x0 - 0.02f, 0.56f, 0, x1 + 0.02f, 0.56f, 0);
-                t.line(x0, 0.52f, -0.18f, x0 - 0.02f, 0.56f, 0);
-                t.line(x1, 0.52f, -0.18f, x1 + 0.02f, 0.56f, 0);
-                t.line(x0, 0.52f, 0.18f, x0 - 0.02f, 0.56f, 0);
-                t.line(x1, 0.52f, 0.18f, x1 + 0.02f, 0.56f, 0);
-                for (int wdw = 0; wdw < 4; wdw++) {
-                    float wx = x0 + 0.08f + wdw * 0.2f;
-                    t.rectZ(0.18f, wx, 0.27f, wx + 0.13f, 0.43f);
-                    t.rectZ(-0.18f, wx, 0.27f, wx + 0.13f, 0.43f);
-                }
-                t.circleZ(x0 + 0.18f, 0.08f, 0.18f, 0.07f, 10);
-                t.circleZ(x1 - 0.18f, 0.08f, 0.18f, 0.07f, 10);
-                t.circleZ(x0 + 0.18f, 0.08f, -0.18f, 0.07f, 10);
-                t.circleZ(x1 - 0.18f, 0.08f, -0.18f, 0.07f, 10);
-                t.line(x1, 0.2f, 0, x1 + 0.08f, 0.2f, 0);
-            }
-            // rails
-            t.line(-3.3f, 0.005f, 0.19f, 1.7f, 0.005f, 0.19f);
-            t.line(-3.3f, 0.005f, -0.19f, 1.7f, 0.005f, -0.19f);
-            float[] out = java.util.Arrays.copyOf(t.seg, t.n * 6);
-            // centre on x
-            for (int i = 0; i < out.length; i += 3) out[i] += 0.8f;
-            return out;
-        }
-
-        void line(float x0, float y0, float z0, float x1, float y1, float z1) {
-            if ((n + 1) * 6 > seg.length) seg = java.util.Arrays.copyOf(seg, seg.length * 2);
-            int o = n * 6;
-            seg[o] = x0; seg[o + 1] = y0; seg[o + 2] = z0; seg[o + 3] = x1; seg[o + 4] = y1; seg[o + 5] = z1;
-            n++;
-        }
-
-        void box(float x0, float y0, float z0, float x1, float y1, float z1) {
-            line(x0, y0, z0, x1, y0, z0); line(x1, y0, z0, x1, y0, z1); line(x1, y0, z1, x0, y0, z1); line(x0, y0, z1, x0, y0, z0);
-            line(x0, y1, z0, x1, y1, z0); line(x1, y1, z0, x1, y1, z1); line(x1, y1, z1, x0, y1, z1); line(x0, y1, z1, x0, y1, z0);
-            line(x0, y0, z0, x0, y1, z0); line(x1, y0, z0, x1, y1, z0); line(x1, y0, z1, x1, y1, z1); line(x0, y0, z1, x0, y1, z1);
-        }
-
-        void rectZ(float z, float x0, float y0, float x1, float y1) {
-            line(x0, y0, z, x1, y0, z); line(x1, y0, z, x1, y1, z); line(x1, y1, z, x0, y1, z); line(x0, y1, z, x0, y0, z);
-        }
-
-        void circleX(float cx, float cy, float cz, float r, int sides) {
-            for (int i = 0; i < sides; i++) {
-                float a0 = Mth.TWO_PI * i / sides, a1 = Mth.TWO_PI * (i + 1) / sides;
-                line(cx, cy + Mth.cos(a0) * r, cz + Mth.sin(a0) * r, cx, cy + Mth.cos(a1) * r, cz + Mth.sin(a1) * r);
-            }
-        }
-
-        void circleZ(float cx, float cy, float cz, float r, int sides) {
-            for (int i = 0; i < sides; i++) {
-                float a0 = Mth.TWO_PI * i / sides, a1 = Mth.TWO_PI * (i + 1) / sides;
-                line(cx + Mth.cos(a0) * r, cy + Mth.sin(a0) * r, cz, cx + Mth.cos(a1) * r, cy + Mth.sin(a1) * r, cz);
-            }
-        }
-
-        void cylinderX(float x0, float x1, float cy, float cz, float r, int sides, int generators) {
-            circleX(x0, cy, cz, r, sides);
-            circleX(x1, cy, cz, r, sides);
-            for (int i = 0; i < generators; i++) {
-                float a = Mth.TWO_PI * i / generators + 0.3f;
-                line(x0, cy + Mth.cos(a) * r, cz + Mth.sin(a) * r, x1, cy + Mth.cos(a) * r, cz + Mth.sin(a) * r);
-            }
-        }
-
-        void cylinderY(float y0, float y1, float cx, float cz, float r, int sides) {
-            for (int i = 0; i < sides; i++) {
-                float a0 = Mth.TWO_PI * i / sides, a1 = Mth.TWO_PI * (i + 1) / sides;
-                line(cx + Mth.cos(a0) * r, y0, cz + Mth.sin(a0) * r, cx + Mth.cos(a1) * r, y0, cz + Mth.sin(a1) * r);
-                line(cx + Mth.cos(a0) * r, y1, cz + Mth.sin(a0) * r, cx + Mth.cos(a1) * r, y1, cz + Mth.sin(a1) * r);
-                if (i % 2 == 0) line(cx + Mth.cos(a0) * r, y0, cz + Mth.sin(a0) * r, cx + Mth.cos(a0) * r, y1, cz + Mth.sin(a0) * r);
-            }
-        }
+        ReplayIdleCubes.paint(f, s);
     }
 }
