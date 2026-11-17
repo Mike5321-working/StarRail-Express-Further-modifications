@@ -11,6 +11,7 @@ import com.habitrain.core.api.role.v2.behavior.RoleCombatHooks;
 import com.habitrain.core.api.role.v2.behavior.RoleHookContext;
 import com.habitrain.core.api.role.v2.behavior.RoleHooks;
 import com.habitrain.core.api.role.v2.behavior.RoleLifecycleHooks;
+import com.habitrain.core.api.role.v2.behavior.RoleMeetingHooks;
 import com.habitrain.core.api.role.v2.behavior.RoleInteractionHooks;
 import com.habitrain.core.game.sre.role.shop.SnakeFruitService;
 import net.minecraft.world.InteractionHand;
@@ -74,6 +75,29 @@ public final class HabiRoleHooks {
                         com.habitrain.core.game.sre.role.tailor.DollTailorService.releasePlayer(dead);
                     }
                 }).build());
+        registrar.hooks(RoleKey.of(HabiRoles.DRONE_OPERATOR_ID), RoleHooks.builder()
+                .lifecycle(new RoleLifecycleHooks() {
+                    @Override public void onAssigned(ServerPlayer player, RoleHookContext ctx) {
+                        com.habitrain.core.game.sre.role.drone.DroneOperatorService.onRoleAssigned(player);
+                    }
+                    @Override public void onLost(ServerPlayer player, RoleHookContext ctx) {
+                        com.habitrain.core.game.sre.role.drone.DroneOperatorService.onRoleLost(player);
+                    }
+                    @Override public void onGameEnd(ServerLevel level, RoleHookContext ctx) {
+                        com.habitrain.core.game.sre.role.drone.DroneOperatorService.onGameEnd(level);
+                    }
+                })
+                .meeting(new RoleMeetingHooks() {
+                    @Override public void onMeetingStart(ServerLevel level, ServerPlayer reporter, RoleHookContext ctx) {
+                        com.habitrain.core.game.sre.role.drone.DroneOperatorService.onMeetingStart(level);
+                    }
+                })
+                .combat(new RoleCombatHooks() {
+                    @Override public void onDeath(ServerPlayer player, ResourceLocation deathReason, RoleHookContext ctx) {
+                        com.habitrain.core.game.sre.role.drone.DroneOperatorService.onOperatorDeath(player);
+                    }
+                })
+                .build());
     }
 
     static RoleHooks snakeFruit() {

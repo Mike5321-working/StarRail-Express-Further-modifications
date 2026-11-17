@@ -42,6 +42,8 @@ final class ReplayBoardModel {
     final boolean rotated;
     final float scale, mapW, mapD, mapH;
     final Actor[] actors;
+    final List<Drone> drones;
+    final List<LastMatchReplay.Span> sortedSpans;
     final Map<UUID, Actor> byId = new HashMap<>();
     final EventMark[] events;
     final double rate, comet;
@@ -90,6 +92,8 @@ final class ReplayBoardModel {
             survival = Math.max(survival, p.survivalSeconds());
         }
         maxSurvival = survival;
+        drones = replay.drones().stream().map(d -> new Drone(new ReplayTrackSampler(d.track()), byId.get(d.owner()))).toList();
+        sortedSpans = replay.spans().stream().sorted(Comparator.comparingInt(LastMatchReplay.Span::startTick)).toList();
 
         List<EventMark> marks = new ArrayList<>();
         for (LastMatchReplay.Node node : replay.events()) {
@@ -140,19 +144,23 @@ final class ReplayBoardModel {
     }
 
     boolean blackoutAt(double tick) {
-        for (LastMatchReplay.Span span : replay.spans()) {
-            if (span.kind() == LastMatchReplay.SpanKind.BLACKOUT && span.startTick() <= tick && tick < span.endTick()) return true;
+        for (LastMatchReplay.Span span : sortedSpans) {
+            if (span.startTick() > tick) break;
+            if (span.kind() == LastMatchReplay.SpanKind.BLACKOUT && tick < span.endTick()) return true;
         }
         return false;
     }
 
     boolean psychoAt(UUID actor, double tick) {
-        for (LastMatchReplay.Span span : replay.spans()) {
+        for (LastMatchReplay.Span span : sortedSpans) {
+            if (span.startTick() > tick) break;
             if (span.kind() == LastMatchReplay.SpanKind.PSYCHO && actor.equals(span.actor())
-                    && span.startTick() <= tick && tick < span.endTick()) return true;
+                    && tick < span.endTick()) return true;
         }
         return false;
     }
+
+    record Drone(ReplayTrackSampler track, @Nullable Actor owner) {}
 
     static final class Actor {
         final int index;

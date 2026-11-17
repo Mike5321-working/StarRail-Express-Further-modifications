@@ -83,9 +83,19 @@ public final class ReplayTracks {
                     return new Encoding(result, thinned);
                 }
             } finally { buf.release(); }
+            int prevTotalSamples = totalSamples(work);
             thinned = true;
             for (var track : work) thin(track);
+            if (totalSamples(work) >= prevTotalSamples) {
+                throw new IllegalArgumentException("Replay tracks exceed MAX_BYTES (" + MAX_BYTES + ") after maximum thinning");
+            }
         }
+    }
+
+    private static int totalSamples(List<List<Sample>> tracks) {
+        int sum = 0;
+        for (var track : tracks) sum += track.size();
+        return sum;
     }
 
     private static void thin(List<Sample> track) {
@@ -106,7 +116,7 @@ public final class ReplayTracks {
     }
 
     public static List<List<Sample>> decode(byte[] bytes, int players, int duration) {
-        if (bytes.length > MAX_BYTES || players < 0 || players > MAX_PLAYERS) throw new IllegalArgumentException("Tracks exceed limits");
+        if (bytes.length > MAX_BYTES || players < 0 || players > MAX_PLAYERS + MAX_DRONES) throw new IllegalArgumentException("Tracks exceed limits");
         var buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(bytes));
         try {
             List<List<Sample>> result = new ArrayList<>(players);

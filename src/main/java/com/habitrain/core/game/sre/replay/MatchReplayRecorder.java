@@ -12,6 +12,7 @@ import com.habitrain.core.game.sre.match.MvpScoreTracker;
 import com.habitrain.core.game.sre.mode.RepairModeManager;
 import com.habitrain.core.game.sre.role.sins.component.SlothComponent;
 import com.habitrain.core.network.replay.ReplayTracks;
+import com.habitrain.core.game.sre.role.drone.ReconDroneEntity;
 import com.habitrain.core.role.snapshot.RoleSnapshotManager;
 import com.habitrain.core.scene.replay.ReplayMapCapture;
 import com.habitrain.core.scene.replay.ReplaySectionGeometry;
@@ -63,7 +64,16 @@ public final class MatchReplayRecorder {
         });
         MatchEventBridge.WINNERS_FINALIZED.register(MatchReplayRecorder::finish);
         ServerTickEvents.END_WORLD_TICK.register(MatchReplayRecorder::tick);
+        ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
+            Round r = current;
+            if (r != null && r.level == level && entity instanceof ReconDroneEntity drone) r.removeDrone(drone);
+        });
         ServerEntityEvents.ENTITY_LOAD.register((entity, level) -> {
+            if (entity instanceof ReconDroneEntity drone) {
+                Round r = running(level);
+                if (r != null) r.addDrone(drone);
+                return;
+            }
             if (entity.tickCount != 0 || !(entity instanceof Projectile projectile)
                     || !(projectile.getOwner() instanceof ServerPlayer thrower)) return;
             var type = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
@@ -203,7 +213,7 @@ public final class MatchReplayRecorder {
         ReplayBoardService.publish(new LastMatchReplay(UUID.randomUUID(), anchor, at, r.label, bounded(settlement.modeId(), 128),
                 win == null ? "NONE" : win.name(), settlement.winKind(),
                 bounded(cca.CustomWinnerID, 128), title(cca.CustomWinnerTitle, level), title(cca.CustomWinnerSubtitle, level),
-                cca.CustomWinnerColor, r.bounds, null, people, r.events, r.spans, mvp, r.kills, r.limited), r.map);
+                cca.CustomWinnerColor, r.bounds, null, people, r.events, r.spans, mvp, r.kills, r.limited, r.droneTracks(ids)), r.map);
     }
 
     private static String title(Component c, ServerLevel level) {
@@ -340,7 +350,7 @@ public final class MatchReplayRecorder {
     }
 
     private static @Nullable UUID id(@Nullable Entity entity) { return entity == null ? null : entity.getUUID(); }
-    private static byte yaw(Player player) { return (byte) Math.round(player.getYRot() * 256.0f / 360); }
+    private static byte yaw(Entity entity) { return (byte) Math.round(entity.getYRot() * 256.0f / 360); }
     private static boolean excluded(SRERole role) {
         return role == null || TMMRoles.DISCOVERY_CIVILIAN.identifier().equals(role.identifier());
     }
@@ -367,6 +377,7 @@ public final class MatchReplayRecorder {
         Person(String name, Role role) { this.name = name; this.startRole = role; this.lastRole = role; }
     }
     private record SpanKey(SpanKind kind, @Nullable UUID actor) {}
+    private record DroneTrack(UUID id, UUID owner, List<Sample> track) {}
     private record Shot(int tick, int index, boolean authoritative) {}
     private record Backfire(int tick, @Nullable Position impact) {}
 
@@ -382,6 +393,8 @@ public final class MatchReplayRecorder {
         final String label;
         final ReplayMapCapture capture;
         final Map<UUID, Person> people = new LinkedHashMap<>();
+        final Map<UUID, DroneTrack> drones = new LinkedHashMap<>();
+        final Map<UUID, ReconDroneEntity> deployed = new LinkedHashMap<>();
         final Map<UUID, Integer> deaths = new HashMap<>();
         final Map<UUID, Shot> shots = new HashMap<>();
         final Map<UUID, Backfire> backfires = new HashMap<>();
@@ -418,7 +431,52 @@ public final class MatchReplayRecorder {
             return id != null && !RepairModeManager.isRepairer(id)
                     && (people.containsKey(id) || !excluded(SREGameWorldComponent.KEY.get(level).getRole(id)));
         }
+        void addDrone(ReconDroneEntity entity) {
+            UUID drone = entity.getUUID(), owner = entity.ownerId();
+            if (owner == null || !eligible(owner)) return;
+            if (!drones.containsKey(drone) && drones.size() >= MAX_DRONES) { limited = true; return; }
+            drones.computeIfAbsent(drone, id -> new DroneTrack(id, owner, new ArrayList<>()));
+            deployed.put(drone, entity);
+            sampleDrone(entity, now());
+        }
+        void removeDrone(ReconDroneEntity entity) {
+            UUID id = entity.getUUID();
+            if (!deployed.remove(id, entity)) return;
+            var points = drones.get(id).track();
+            if (points.isEmpty()) return;
+            Sample last = points.getLast();
+            ReplayTracks.append(points, new Sample(now(), last.position(), last.yaw(), BREAK));
+        }
+        void sampleDrone(ReconDroneEntity entity, int tick) {
+            var points = drones.get(entity.getUUID()).track();
+            Position position = pos(entity.position());
+            if (position == null) {
+                if (!points.isEmpty() && (points.getLast().flags() & ALIVE) != 0) {
+                    var last = points.getLast();
+                    ReplayTracks.append(points, new Sample(tick, last.position(), last.yaw(), BREAK));
+                }
+                return;
+            }
+            int flags = ALIVE;
+            if (entity.isCrashed()) flags |= Drone.CRASHED;
+            if (entity.isScrapped()) flags |= Drone.SCRAPPED;
+            if (entity.isOperatorPiloting()) flags |= Drone.PILOTED;
+            if (entity.isDroneSprinting()) flags |= SPRINT;
+            if (!points.isEmpty()) {
+                var last = points.getLast();
+                var prior = last.position();
+                if ((last.flags() & ALIVE) == 0 || Math.abs(prior.x() - position.x()) > 128
+                        || Math.abs(prior.y() - position.y()) > 128 || Math.abs(prior.z() - position.z()) > 128) flags |= BREAK;
+            }
+            if (points.size() >= ReplayTracks.MAX_TRACK) limited = true;
+            ReplayTracks.append(points, new Sample(tick, position, yaw(entity), (byte) flags));
+        }
+        List<Drone> droneTracks(List<UUID> participants) {
+            return drones.values().stream().filter(d -> !d.track().isEmpty() && participants.contains(d.owner()))
+                    .map(d -> new Drone(d.id(), d.owner(), d.track())).toList();
+        }
         void sample(SREGameWorldComponent game, int tick) {
+            deployed.values().forEach(entity -> sampleDrone(entity, tick));
             lastSample = tick;
             var seen = new HashSet<UUID>();
             for (ServerPlayer player : level.players()) {

@@ -59,6 +59,7 @@ public final class HabiRoleShops {
         ShopContent.customEntries.put(HabiRoles.FLOWER_GIRL_ID, flowerGirlShop());
         ShopContent.customEntries.put(HabiRoles.SWIFT_WIND_ID, swiftWindShop());
         ShopContent.customEntries.put(HabiRoles.MIME_KILLER_ID, mimeKillerShop());
+        ShopContent.customEntries.put(HabiRoles.DRONE_OPERATOR_ID, droneOperatorShop());
         // Also pin seven-sin shops in customEntries as a secondary path
         // (role getShopEntries remains authoritative).
         if (SevenSins.ENVY_ID != null) {
@@ -186,6 +187,105 @@ public final class HabiRoleShops {
             }
         });
         shop.add(new ShopEntry(TMMItems.LOCKPICK.getDefaultInstance(), MIME_KILLER_LOCKPICK_PRICE, ShopEntry.Type.TOOL));
+        return shop;
+    }
+
+    /**
+     * 无人机操控者专属商店（狼中立）：绝不出售致命杀伤武器，仅出售整机补给、备用电池及欺诈/破拆/掩护配件。
+     */
+    public static List<ShopEntry> droneOperatorShop() {
+        List<ShopEntry> shop = new ArrayList<>();
+
+        // 1. 侦察无人机整机补给：150 金币（开局默认无无人机；即使有无人机在线也可随时购买新机，旧机直接报废且不可回收）
+        shop.add(new ShopEntry(HabiRoleItems.createDroneResupplyIcon(),
+                com.habitrain.core.game.sre.role.drone.DroneRules.REPLACEMENT_DRONE_PRICE, ShopEntry.Type.TOOL) {
+            @Override
+            public boolean canBuy(@NotNull Player player) {
+                if (!super.canBuy(player)) return false;
+                if (com.habitrain.core.game.sre.role.drone.DroneOperatorService.canBuyReplacementDrone(player)) {
+                    return true;
+                }
+                setFailedMessage(net.minecraft.network.chat.Component.translatable(
+                        "message.habitrain_core.drone.shop_resupply_busy"));
+                return false;
+            }
+
+            @Override
+            public boolean onBuy(@NotNull Player player) {
+                return com.habitrain.core.game.sre.role.drone.DroneOperatorService.grantReplacementDrone(player);
+            }
+        });
+
+        // 2. 高能备用电池：100 金币 / 块（背包上限 3 块）
+        shop.add(new ShopEntry(HabiRoleItems.createDroneBattery(1),
+                com.habitrain.core.game.sre.role.drone.DroneRules.SPARE_BATTERY_PRICE, ShopEntry.Type.TOOL) {
+            @Override
+            public boolean canBuy(@NotNull Player player) {
+                if (!super.canBuy(player)) return false;
+                int count = HabiRoleItems.countDroneBatteries(player);
+                if (com.habitrain.core.game.sre.role.drone.DroneRules.canBuySpareBattery(count)) {
+                    return true;
+                }
+                setFailedMessage(net.minecraft.network.chat.Component.translatable(
+                        "message.habitrain_core.drone.shop_battery_full"));
+                return false;
+            }
+
+            @Override
+            public boolean onBuy(@NotNull Player player) {
+                if (!canBuy(player)) return false;
+                ItemStack battery = HabiRoleItems.createDroneBattery(1);
+                if (!player.getInventory().add(battery)) {
+                    player.drop(battery, false);
+                }
+                return true;
+            }
+        });
+
+        // 3. 声学鞭炮：50 金币
+        shop.add(new ShopEntry(TMMItems.FIRECRACKER.getDefaultInstance(),
+                com.habitrain.core.game.sre.role.drone.DroneRules.FIRECRACKER_PRICE, ShopEntry.Type.TOOL));
+
+        // 4. 全息拟真假刀：60 金币
+        ItemStack fakeKnife = HabiRoleItems.createDroneFakeKnife();
+        if (!fakeKnife.isEmpty()) {
+            shop.add(new ShopEntry(fakeKnife,
+                    com.habitrain.core.game.sre.role.drone.DroneRules.FAKE_KNIFE_PRICE, ShopEntry.Type.TOOL) {
+                @Override
+                public boolean onBuy(@NotNull Player player) {
+                    ItemStack stack = HabiRoleItems.createDroneFakeKnife();
+                    if (!player.getInventory().add(stack)) {
+                        player.drop(stack, false);
+                    }
+                    return true;
+                }
+            });
+        }
+
+        // 5. 电子开锁器：90 金币
+        shop.add(new ShopEntry(TMMItems.LOCKPICK.getDefaultInstance(),
+                com.habitrain.core.game.sre.role.drone.DroneRules.LOCKPICK_PRICE, ShopEntry.Type.TOOL));
+
+        // 6. 战术烟雾弹：100 金币（若存在）
+        ItemStack smoke = HabiRoleItems.lookupItem(HabiRoleItems.SMOKE_GRENADE_ID, 1);
+        if (!smoke.isEmpty()) {
+            shop.add(new ShopEntry(smoke,
+                    com.habitrain.core.game.sre.role.drone.DroneRules.SMOKE_GRENADE_PRICE, ShopEntry.Type.TOOL));
+        }
+
+        // 7. 防狼喷雾：120 金币
+        shop.add(new ShopEntry(HabiRoleItems.createPepperSpray(),
+                com.habitrain.core.game.sre.role.drone.DroneRules.PEPPER_SPRAY_PRICE, ShopEntry.Type.TOOL) {
+            @Override
+            public boolean onBuy(@NotNull Player player) {
+                ItemStack stack = HabiRoleItems.createPepperSpray();
+                if (!player.getInventory().add(stack)) {
+                    player.drop(stack, false);
+                }
+                return true;
+            }
+        });
+
         return shop;
     }
 }

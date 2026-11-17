@@ -1,5 +1,7 @@
 package com.habitrain.core.game.sre.role;
 
+import com.habitrain.core.game.sre.role.drone.DroneMessages;
+import com.habitrain.core.game.sre.role.drone.DroneRules;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
@@ -27,6 +29,10 @@ public final class HabiRoleItems {
     public static final String TAG_MELEE_IMMUNE_UNTIL = "habitrain_melee_immune_until";
     /** 凶案替罪羊被动发放的假刀标记，回收时只删带此 tag 的刀。 */
     public static final String TAG_SCAPEGOAT_KNIFE = "habitrain_scapegoat_knife";
+    public static final String TAG_DRONE_TERMINAL = "habitrain_drone_terminal";
+    public static final String TAG_DRONE_BATTERY = "habitrain_drone_battery";
+    public static final String TAG_DRONE_RESUPPLY = "habitrain_drone_resupply";
+    public static final String TAG_DRONE_FAKE_KNIFE = "habitrain_drone_fake_knife";
 
     public static final ResourceLocation ONCE_REVOLVER_ID = ResourceLocation.parse("noellesroles:once_revolver");
     public static final ResourceLocation THROWING_KNIFE_ID = ResourceLocation.parse("noellesroles:throwing_knife");
@@ -87,6 +93,157 @@ public final class HabiRoleItems {
         return hasFlag(stack, TAG_SCAPEGOAT_KNIFE);
     }
 
+    /** 无人机操控者初始绑定装备：战术图传终端（不可丢弃）。 */
+    public static ItemStack createDroneTerminal() {
+        ItemStack stack = new ItemStack(Items.RECOVERY_COMPASS, 1);
+        stack.set(DataComponents.MAX_STACK_SIZE, 1);
+        stack.set(DataComponents.CUSTOM_NAME, Component.translatable("item.habitrain_core.drone_terminal"));
+        stack.set(DataComponents.LORE, new ItemLore(List.of(
+                Component.translatable("item.habitrain_core.drone_terminal.desc"),
+                Component.translatable("item.habitrain_core.drone_terminal.bound")
+        )));
+        putFlag(stack, TAG_DRONE_TERMINAL, true);
+        return stack;
+    }
+
+    /** 无人机操控者消耗品：高能备用电池（堆叠与携带上限 3 块）。 */
+    public static ItemStack createDroneBattery(int count) {
+        int clamped = Math.max(1, Math.min(DroneRules.MAX_SPARE_BATTERIES, count));
+        ItemStack stack = new ItemStack(Items.ECHO_SHARD, clamped);
+        stack.set(DataComponents.MAX_STACK_SIZE, DroneRules.MAX_SPARE_BATTERIES);
+        stack.set(DataComponents.CUSTOM_NAME, Component.translatable("item.habitrain_core.drone_battery"));
+        stack.set(DataComponents.LORE, new ItemLore(List.of(
+                Component.translatable("item.habitrain_core.drone_battery.desc"),
+                Component.translatable("item.habitrain_core.drone_battery.limit")
+        )));
+        putFlag(stack, TAG_DRONE_BATTERY, true);
+        return stack;
+    }
+
+    /** 专属商店展示图标：侦察无人机整机补给（150 金币，可随时购买，旧机直接报废不可回收）。 */
+    public static ItemStack createDroneResupplyIcon() {
+        ItemStack stack = new ItemStack(Items.RECOVERY_COMPASS, 1);
+        stack.set(DataComponents.MAX_STACK_SIZE, 1);
+        stack.set(DataComponents.ENCHANTMENT_GLINT_OVERRIDE, true);
+        stack.set(DataComponents.CUSTOM_NAME, Component.translatable("item.habitrain_core.drone_resupply"));
+        stack.set(DataComponents.LORE, new ItemLore(List.of(
+                Component.translatable("item.habitrain_core.drone_resupply.desc"),
+                Component.translatable("item.habitrain_core.drone_resupply.rule")
+        )));
+        putFlag(stack, TAG_DRONE_RESUPPLY, true);
+        return stack;
+    }
+
+    /** 专属商店欺诈道具：全息拟真假刀（带回收标记的 noellesroles:fake_knife）。 */
+    public static ItemStack createDroneFakeKnife() {
+        ItemStack stack = lookupItem(FAKE_KNIFE_ID, 1);
+        if (stack.isEmpty()) {
+            stack = new ItemStack(Items.IRON_SWORD, 1);
+        }
+        stack.set(DataComponents.CUSTOM_NAME, Component.translatable("item.habitrain_core.drone_fake_knife"));
+        stack.set(DataComponents.LORE, new ItemLore(List.of(
+                Component.translatable("item.habitrain_core.drone_fake_knife.desc")
+        )));
+        putFlag(stack, TAG_DRONE_FAKE_KNIFE, true);
+        return stack;
+    }
+
+    public static boolean isDroneTerminal(ItemStack stack) {
+        return stack != null && stack.is(Items.RECOVERY_COMPASS) && hasFlag(stack, TAG_DRONE_TERMINAL);
+    }
+
+    public static boolean isDroneBattery(ItemStack stack) {
+        return stack != null && stack.is(Items.ECHO_SHARD) && hasFlag(stack, TAG_DRONE_BATTERY);
+    }
+
+    public static boolean isDroneFakeKnife(ItemStack stack) {
+        return hasFlag(stack, TAG_DRONE_FAKE_KNIFE);
+    }
+
+    public static int countDroneBatteries(Player player) {
+        if (player == null) return 0;
+        int total = 0;
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (isDroneBattery(stack)) {
+                total += stack.getCount();
+            }
+        }
+        if (player.containerMenu != null && isDroneBattery(player.containerMenu.getCarried())) {
+            total += player.containerMenu.getCarried().getCount();
+        }
+        return total;
+    }
+
+    /** Reconciles menu and modded transfers that don't use Inventory.add. Excess bound batteries are trimmed directly. */
+    public static boolean enforceDroneBatteryCap(net.minecraft.server.level.ServerPlayer player) {
+        int excess = countDroneBatteries(player) - DroneRules.MAX_SPARE_BATTERIES;
+        if (excess <= 0) return false;
+        ItemStack carried = player.containerMenu.getCarried();
+        if (isDroneBattery(carried)) excess -= trimExcessBatteries(carried, excess);
+        for (int i = player.getInventory().getContainerSize() - 1; i >= 0 && excess > 0; i--) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (isDroneBattery(stack)) excess -= trimExcessBatteries(stack, excess);
+        }
+        player.getInventory().setChanged();
+        player.containerMenu.broadcastFullState();
+        player.displayClientMessage(DroneMessages.create("message.habitrain_core.drone.shop_battery_full"), true);
+        return true;
+    }
+
+    private static int trimExcessBatteries(ItemStack stack, int excess) {
+        int count = Math.min(stack.getCount(), excess);
+        stack.shrink(count);
+        return count;
+    }
+
+    public static boolean consumeDroneBattery(Player player) {
+        if (player == null) return false;
+        if (isDroneBattery(player.getMainHandItem())) {
+            player.getMainHandItem().shrink(1);
+            return true;
+        }
+        if (isDroneBattery(player.getOffhandItem())) {
+            player.getOffhandItem().shrink(1);
+            return true;
+        }
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (isDroneBattery(stack)) {
+                stack.shrink(1);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public static boolean ensureDroneTerminal(Player player) {
+        if (player == null) return false;
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            if (isDroneTerminal(player.getInventory().getItem(i))) {
+                return true;
+            }
+        }
+        return player.getInventory().add(createDroneTerminal());
+    }
+
+    /** 清理操控者绑定终端、备用电池与专属拟真假刀。 */
+    public static void reclaimDroneItems(Player player) {
+        if (player == null) return;
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (isDroneTerminal(stack) || isDroneBattery(stack) || isDroneFakeKnife(stack)) {
+                player.getInventory().setItem(i, ItemStack.EMPTY);
+            }
+        }
+        if (player.containerMenu != null) {
+            ItemStack carried = player.containerMenu.getCarried();
+            if (isDroneTerminal(carried) || isDroneBattery(carried) || isDroneFakeKnife(carried)) {
+                player.containerMenu.setCarried(ItemStack.EMPTY);
+            }
+        }
+    }
+
     /** 收回替罪羊被动发放的假刀（只删带 tag 的，含背包与鼠标游标）。 */
     public static void reclaimScapegoatKnives(Player player) {
         if (player == null) return;
@@ -102,11 +259,11 @@ public final class HabiRoleItems {
     }
 
     public static boolean isBouquet(ItemStack stack) {
-        return hasFlag(stack, TAG_BOUQUET);
+        return stack != null && stack.is(Items.POPPY) && hasFlag(stack, TAG_BOUQUET);
     }
 
     public static boolean isPepperSpray(ItemStack stack) {
-        return hasFlag(stack, TAG_PEPPER_SPRAY);
+        return stack != null && stack.is(Items.HONEY_BOTTLE) && hasFlag(stack, TAG_PEPPER_SPRAY);
     }
 
     public static boolean playerHasBouquet(net.minecraft.world.entity.player.Player player) {
@@ -147,7 +304,7 @@ public final class HabiRoleItems {
     public static boolean hasFlag(ItemStack stack, String key) {
         if (stack == null || stack.isEmpty()) return false;
         CustomData data = stack.get(DataComponents.CUSTOM_DATA);
-        if (data == null) return false;
+        if (data == null || !data.contains(key)) return false;
         return data.copyTag().getBoolean(key);
     }
 }

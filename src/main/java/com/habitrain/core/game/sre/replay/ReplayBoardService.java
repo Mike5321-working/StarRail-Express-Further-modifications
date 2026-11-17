@@ -1,6 +1,7 @@
 package com.habitrain.core.game.sre.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.network.replay.ReplayTracks;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.replay.ReplayMapCapture;
@@ -34,7 +35,7 @@ public final class ReplayBoardService {
     private static ThreadPoolExecutor worker;
     private static MinecraftServer server;
     private static Published latest;
-    private record Published(LastMatchSummaryS2C packet, int bytes, ReplayMapCapture.Result map) {}
+    private record Published(LastMatchSummaryS2C packet, int bytes, ReplayMapCapture.Result map, int cycleTicks) {}
 
     private ReplayBoardService() {}
 
@@ -99,7 +100,9 @@ public final class ReplayBoardService {
     public static void publish(LastMatchReplay summary, CompletableFuture<ReplayMapCapture.Result> map) {
         MinecraftServer owner = server;
         if (owner == null) return;
-        var data = summary.participants().stream().map(LastMatchReplay.Participant::track).toList();
+        var data = new ArrayList<List<LastMatchReplay.Sample>>(summary.participants().size() + summary.drones().size());
+        summary.participants().forEach(p -> data.add(p.track()));
+        summary.drones().forEach(drone -> data.add(drone.track()));
         var encoded = ReplayTracks.encodeWithStatus(data);
         byte[] tracks = encoded.bytes();
         var resolved = map == null ? null : map.getNow(null);
@@ -126,12 +129,13 @@ public final class ReplayBoardService {
         var replay = new LastMatchReplay(s.roundId(), s.playbackAnchorTick(), s.durationTicks(), s.mapName(), s.modeId(),
                 s.winStatus(), s.winKind(), s.customWinId(), s.customTitleJson(), s.customSubtitleJson(), s.customColor(),
                 s.origin(), map == null ? null : map.manifest(), people, s.events(), s.spans(),
-                s.mvp(), s.killCount(), s.limited() || tracksThinned);
+                s.mvp(), s.killCount(), s.limited() || tracksThinned, s.drones().stream()
+                        .map(d -> new LastMatchReplay.Drone(d.id(), d.owner(), List.of())).toList());
         var packet = new LastMatchSummaryS2C(replay, tracks);
         var buffer = new FriendlyByteBuf(Unpooled.buffer());
         try {
             LastMatchSummaryS2C.CODEC.encode(buffer, packet);
-            latest = new Published(packet, buffer.readableBytes(), map);
+            latest = new Published(packet, buffer.readableBytes(), map, new ReplayTimeline(replay).cycleTicks());
         } finally {
             buffer.release();
         }
@@ -142,6 +146,18 @@ public final class ReplayBoardService {
         if (ServerPlayNetworking.canSend(player, Available.TYPE)) {
             ServerPlayNetworking.send(player, new Available(latest == null ? EMPTY : latest.packet.replay().roundId(),
                     latest != null && latest.map != null));
+        }
+    }
+
+    public static void start(ServerPlayer player, StartPlayback packet) {
+        Published source = latest;
+        BlockPos pos = packet.board();
+        if (server == null || server != player.getServer() || player.isSpectator()
+                || player.distanceToSqr(pos.getX() + .5, pos.getY() + .5, pos.getZ() + .5) > 64
+                || !accessible(player, pos) || source == null
+                || !source.packet.replay().roundId().equals(packet.roundId())) return;
+        if (player.serverLevel().getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker) {
+            marker.startPlayback(packet.roundId(), source.cycleTicks());
         }
     }
 

@@ -813,10 +813,9 @@ final class ReplayIdleCubes {
         float halfW = (Minecraft.getInstance().font.width(text) * 0.0082f * localScale + 0.38f * localScale) * 0.5f * s.scale();
         float halfH = 0.098f * localScale * s.scale();
 
-        // Anchor in camera-relative world space and yaw-face the viewer horizontally so text is legible 360°
+        // Anchor in camera-relative world space and face the viewer so text is legible from any angle
         s.board().transformPosition(0f, bannerY, 0f, TMP_A);
-        float yawToCam = (float) Math.atan2(-TMP_A.x, -TMP_A.z);
-        Matrix4f sign = new Matrix4f().translate(TMP_A.x, TMP_A.y, TMP_A.z).rotateY(yawToCam);
+        Matrix4f sign = new Matrix4f().translate(TMP_A.x, TMP_A.y, TMP_A.z).rotate(f.rotation);
 
         int bgTop = ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.90 * fade);
         int bgBot = ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.92 * fade);

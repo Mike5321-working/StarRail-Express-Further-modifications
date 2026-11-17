@@ -87,6 +87,12 @@ public final class SceneMeshSet implements AutoCloseable {
     }
     private volatile boolean closed = false;
     private long estimatedBytes;
+    private double replayCeiling = Double.NEGATIVE_INFINITY;
+
+    void includeReplayCeiling(double y) { replayCeiling = Math.max(replayCeiling, y); }
+
+    /** Highest emitted vertex in the replay snapshot's source coordinates, including mod models. */
+    public double replayCeiling() { return replayCeiling; }
 
     public void setBuffer(Layer layer, VertexBuffer buffer) {
         VertexBuffer old = buffers.put(layer, buffer);

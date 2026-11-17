@@ -27,6 +27,9 @@ public final class ClientVisualPreferences {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final boolean DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED = true;
     private static final String SCENE_PERFORMANCE = "scenePerformance";
+    private static final String REPLAY_VIDEO = "replayVideo";
+    private static final String DEFAULT_REPLAY_RESOLUTION = "720p";
+    private static final boolean DEFAULT_REPLAY_COMPRESS = true;
 
     private static boolean loaded;
     private static boolean customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
@@ -35,6 +38,8 @@ public final class ClientVisualPreferences {
     private static boolean idiotFaceOverlay = true;
     private static boolean idiotLargeJackpot = true;
     private static int idiotParticles = 2;
+    private static String replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
+    private static boolean replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
     private static int requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
     private static int maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
     private static int diskCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB;
@@ -111,6 +116,12 @@ public final class ClientVisualPreferences {
         meshBatchMinSections = readInt(performance, "meshBatchMinSections",
                 SceneClientPerformanceRules.DEFAULT_MESH_BATCH_MIN_SECTIONS,
                 SceneClientPerformanceRules::clampMeshBatchMinSections);
+
+        JsonObject replayVideo = root.has(REPLAY_VIDEO) && root.get(REPLAY_VIDEO).isJsonObject()
+                ? root.getAsJsonObject(REPLAY_VIDEO)
+                : new JsonObject();
+        replayVideoResolution = normalizeReplayResolution(readString(replayVideo, "resolution", DEFAULT_REPLAY_RESOLUTION));
+        replayVideoCompress = readBoolean(replayVideo, "compress", DEFAULT_REPLAY_COMPRESS);
     }
 
     private static void applyDefaults() {
@@ -119,6 +130,8 @@ public final class ClientVisualPreferences {
         idiotFaceOverlay = idiotLargeJackpot = true;
         idiotParticles = 2;
         customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
+        replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
+        replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
         requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
         maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
         diskCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB;
@@ -130,6 +143,24 @@ public final class ClientVisualPreferences {
         memoryCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_MEMORY_CACHE_QUOTA_MIB;
         meshCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_MESH_CACHE_QUOTA_MIB;
         meshBatchMinSections = SceneClientPerformanceRules.DEFAULT_MESH_BATCH_MIN_SECTIONS;
+    }
+
+    private static String readString(JsonObject root, String key, String fallback) {
+        if (!root.has(key) || !root.get(key).isJsonPrimitive()) return fallback;
+        try {
+            String value = root.get(key).getAsString();
+            return value == null || value.isBlank() ? fallback : value;
+        } catch (RuntimeException e) {
+            return fallback;
+        }
+    }
+
+    private static String normalizeReplayResolution(String raw) {
+        if (raw == null) return DEFAULT_REPLAY_RESOLUTION;
+        return switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "480p", "720p", "1080p", "1440p", "2160p" -> raw.trim().toLowerCase(java.util.Locale.ROOT);
+            default -> DEFAULT_REPLAY_RESOLUTION;
+        };
     }
 
     private static int readInt(JsonObject root, String key, int fallback,
@@ -376,6 +407,10 @@ public final class ClientVisualPreferences {
         performance.addProperty("memoryCacheQuotaMiB", memoryCacheQuotaMiB);
         performance.addProperty("meshCacheQuotaMiB", meshCacheQuotaMiB);
         root.add(SCENE_PERFORMANCE, performance);
+        JsonObject replayVideo = new JsonObject();
+        replayVideo.addProperty("resolution", replayVideoResolution);
+        replayVideo.addProperty("compress", replayVideoCompress);
+        root.add(REPLAY_VIDEO, replayVideo);
         boolean saved = AtomicJsonFiles.writeJson(file(), root, GSON, true);
         if (!saved) {
             HabiTrainCore.LOGGER.error("无法保存客户端视觉配置 {}", file());
@@ -401,5 +436,33 @@ public final class ClientVisualPreferences {
     public static synchronized boolean setIdiotParticles(int value) {
         load(); int previous = idiotParticles; idiotParticles = Math.clamp(value, 0, 2);
         if (save()) return true; idiotParticles = previous; return false;
+    }
+
+    public static synchronized String getReplayVideoResolution() {
+        load();
+        return replayVideoResolution;
+    }
+
+    public static synchronized boolean setReplayVideoResolution(String resolutionId) {
+        load();
+        String previous = replayVideoResolution;
+        replayVideoResolution = normalizeReplayResolution(resolutionId);
+        if (save()) return true;
+        replayVideoResolution = previous;
+        return false;
+    }
+
+    public static synchronized boolean isReplayVideoCompress() {
+        load();
+        return replayVideoCompress;
+    }
+
+    public static synchronized boolean setReplayVideoCompress(boolean compress) {
+        load();
+        boolean previous = replayVideoCompress;
+        replayVideoCompress = compress;
+        if (save()) return true;
+        replayVideoCompress = previous;
+        return false;
     }
 }

@@ -14,8 +14,9 @@ public record LastMatchReplay(UUID roundId, long playbackAnchorTick, int duratio
                               String customWinId, String customTitleJson, String customSubtitleJson, int customColor,
                               SceneBounds origin, @Nullable ReplayMapManifest manifest,
                               List<Participant> participants, List<Node> events, List<Span> spans,
-                              @Nullable UUID mvp, int killCount, boolean limited) {
+                              @Nullable UUID mvp, int killCount, boolean limited, List<Drone> drones) {
     public static final int MAX_PLAYERS = 128;
+    public static final int MAX_DRONES = 64;
     public static final int MAX_EVENTS = 768;
     public static final int MAX_SPANS = 384;
     public static final int MAX_TICKS = 24 * 60 * 60 * 20;
@@ -24,6 +25,25 @@ public record LastMatchReplay(UUID roundId, long playbackAnchorTick, int duratio
         participants = List.copyOf(participants);
         events = List.copyOf(events);
         spans = List.copyOf(spans);
+        drones = List.copyOf(drones);
+    }
+
+    /** Compatibility constructor for producers that only have player tracks. */
+    public LastMatchReplay(UUID roundId, long playbackAnchorTick, int durationTicks,
+                           String mapName, String modeId, String winStatus, MatchWinKind winKind,
+                           String customWinId, String customTitleJson, String customSubtitleJson, int customColor,
+                           SceneBounds origin, @Nullable ReplayMapManifest manifest,
+                           List<Participant> participants, List<Node> events, List<Span> spans,
+                           @Nullable UUID mvp, int killCount, boolean limited) {
+        this(roundId, playbackAnchorTick, durationTicks, mapName, modeId, winStatus, winKind, customWinId,
+                customTitleJson, customSubtitleJson, customColor, origin, manifest, participants, events, spans,
+                mvp, killCount, limited, List.of());
+    }
+
+    /** One deployed chassis; it never occupies the operator's player track or settlement ranking. */
+    public record Drone(UUID id, UUID owner, List<Sample> track) {
+        public static final byte CRASHED = SNEAK, SCRAPPED = DISGUISED, PILOTED = PSYCHO;
+        public Drone { track = List.copyOf(track); }
     }
 
     public record Participant(UUID id, String name, String startRole, int startColor, String endRole, int endColor,

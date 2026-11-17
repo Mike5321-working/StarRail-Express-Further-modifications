@@ -62,17 +62,17 @@ public final class GreedPouchItem {
     }
 
     public static boolean isGreedPouch(@Nullable ItemStack stack) {
-        if (stack == null || stack.isEmpty()) return false;
-        if (HabiRoleItems.hasFlag(stack, TAG_GREED_POUCH)) return true;
-        CustomData data = stack.get(DataComponents.CUSTOM_DATA);
-        if (data != null && data.copyTag().getBoolean(TAG_GREED_POUCH)) return true;
-        return false;
+        return stack != null && stack.is(Items.BUNDLE) && HabiRoleItems.hasFlag(stack, TAG_GREED_POUCH);
     }
 
     /** Shared by hand absorption, vanilla bundle clicks and collection accounting. */
     public static boolean canStore(@Nullable ItemStack stack) {
         if (stack == null || stack.isEmpty() || isGreedPouch(stack)) return false;
         if (stack.getItem() instanceof com.habitrain.core.game.sre.role.idiot.IdiotEggItem) return false;
+        if (HabiRoleItems.isDroneTerminal(stack)
+                || HabiRoleItems.isDroneBattery(stack)
+                || HabiRoleItems.isDroneFakeKnife(stack)
+                || HabiRoleItems.isScapegoatKnife(stack)) return false;
         String itemId = net.minecraft.core.registries.BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
         // Explicit exclusions also apply to items carrying the thief provenance marker.
         if (itemId.equals("supplementaries:bubble_blower") || itemId.equals("supplementaries:flute")) return false;
@@ -91,9 +91,7 @@ public final class GreedPouchItem {
     }
 
     public static boolean isStolenByThief(@Nullable ItemStack stack) {
-        if (stack == null || stack.isEmpty()) return false;
-        CustomData data = stack.get(DataComponents.CUSTOM_DATA);
-        return data != null && data.copyTag().getBoolean(TAG_STOLEN_BY_THIEF);
+        return HabiRoleItems.hasFlag(stack, TAG_STOLEN_BY_THIEF);
     }
 
     public static void markStolenByThief(ItemStack stack) {

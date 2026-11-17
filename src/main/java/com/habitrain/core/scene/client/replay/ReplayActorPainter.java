@@ -34,11 +34,11 @@ final class ReplayActorPainter {
         double t = f.replayTick;
         double alpha = stage.actors() * s.fade();
         boolean review = f.frame != null && (f.frame.phase() == ReplayTimeline.Phase.REVIEW || f.frame.phase() == ReplayTimeline.Phase.HONORS);
+        float elemScale = s.scale() * (float) f.focus.zoom();
         VertexConsumer glow = f.glow();
         float[] tmp = new float[3];
-        Vector3f cam = new Vector3f();
         for (ReplayBoardModel.Actor actor : model.actors) {
-            trails(f, d, actor, t, alpha, stage.history(), review);
+            trails(f, d, actor, t, alpha, stage.history(), review, elemScale);
             ReplayTrackSampler.Pose pose = actor.track.sample(t);
             if (!pose.visible()) continue;
             model.project(pose.x(), pose.y(), pose.z(), tmp);
@@ -51,13 +51,13 @@ final class ReplayActorPainter {
                     ReplayPalette.alpha(ringColor, ringA * 0.25 * alpha));
             ReplayDraw.disc(glow, d, x, y - 0.001f, z, 0.06f, 16, ReplayPalette.alpha(ringColor, 0.18 * alpha),
                     ReplayPalette.alpha(ringColor, 0));
-            if (alive) aliveActor(f, s, d, actor, pose, x, y, z, alpha, cam);
-            else deadActor(f, s, d, actor, pose, x, y, z, alpha);
+            if (alive) aliveActor(f, s, d, actor, pose, x, y, z, alpha, elemScale);
+            else deadActor(f, s, d, actor, pose, x, y, z, alpha, elemScale);
         }
     }
 
     private static void aliveActor(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayBoardModel.Actor actor,
-                                   ReplayTrackSampler.Pose pose, float x, float y, float z, double alpha, Vector3f cam) {
+                                   ReplayTrackSampler.Pose pose, float x, float y, float z, double alpha, float elemScale) {
         ReplayBoardModel model = f.model;
         VertexConsumer glow = f.glow();
         double moving = Math.min(1, pose.speed() / 0.12);
@@ -81,7 +81,7 @@ final class ReplayActorPainter {
             ReplayDraw.ring(glow, d, x, y + 0.003f, z, 0.095f, 0.01f, 20, ReplayPalette.alpha(ReplayPalette.DISGUISE, 0.7 * alpha),
                     ReplayPalette.alpha(ReplayPalette.DISGUISE, 0.1 * alpha));
             Vector3f badge = d.transformPosition(x + HEAD * 0.6f, hy + HEAD * 0.75f, z, new Vector3f());
-            ReplayDraw.billboard(glow, badge, f.right, f.up, 0.02f, 0.02f, ReplayPalette.alpha(ReplayPalette.DISGUISE, 0.9 * alpha));
+            ReplayDraw.billboard(glow, badge, f.right, f.up, 0.02f * elemScale, 0.02f * elemScale, ReplayPalette.alpha(ReplayPalette.DISGUISE, 0.9 * alpha));
         }
         boolean psycho = pose.has(LastMatchReplay.PSYCHO) || model.psychoAt(actor.p.id(), f.replayTick);
         if (psycho) {
@@ -92,25 +92,26 @@ final class ReplayActorPainter {
                 float oz = (float) Math.sin(i * 1.05 + f.anim) * HEAD * 0.55f;
                 float h = (float) (0.05 + 0.04 * Math.abs(Math.sin(ph)));
                 Vector3f p = d.transformPosition(x + ox, hy - HEAD * 0.3f + h * 0.5f, z + oz, new Vector3f());
-                ReplayDraw.billboard(glow, p, f.right, f.up, 0.018f, h, ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.45 * alpha));
+                ReplayDraw.billboard(glow, p, f.right, f.up, 0.018f * elemScale, h * elemScale, ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.45 * alpha));
             }
-            ReplayDraw.billboard(glow, c, f.right, f.up, HEAD * 0.95f, HEAD * 0.95f, ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.18 * alpha));
+            ReplayDraw.billboard(glow, c, f.right, f.up, HEAD * 0.95f * elemScale, HEAD * 0.95f * elemScale, ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.18 * alpha));
         }
         if (s.detail()) {
             Vector3f top = d.transformPosition(x, hy + HEAD * 0.9f, z, new Vector3f());
             float dist = top.length();
+            float distScale = Math.max(1f, s.scale());
             if (pose.has(LastMatchReplay.ASLEEP)) {
-                f.billboardText(new Vector3f(top).add(0, 0.03f, 0), Component.literal("z Z"), 0.0035f,
+                f.billboardText(new Vector3f(top).add(0, 0.03f * elemScale, 0), Component.literal("z Z"), 0.0035f * elemScale,
                         ReplayPalette.alpha(ReplayPalette.PASSENGER, alpha));
-            } else if (dist < 6.5f && f.stage.history() < 0.5) {
-                double near = 1 - ReplayStagePlan.smoothstep(4.5, 6.5, dist);
-                f.billboardText(top, actor.name, 0.0032f, ReplayPalette.alpha(actor.color, near * alpha));
+            } else if (dist < 6.5f * distScale && f.stage.history() < 0.5) {
+                double near = 1 - ReplayStagePlan.smoothstep(4.5 * distScale, 6.5 * distScale, dist);
+                f.billboardText(top, actor.name, 0.0032f * elemScale, ReplayPalette.alpha(actor.color, near * alpha));
             }
         }
     }
 
     private static void deadActor(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayBoardModel.Actor actor,
-                                  ReplayTrackSampler.Pose pose, float x, float y, float z, double alpha) {
+                                  ReplayTrackSampler.Pose pose, float x, float y, float z, double alpha, float elemScale) {
         ReplayBoardModel model = f.model;
         double window = ReplayStagePlan.effectWindow(0.9, model.rate);
         double age = f.replayTick - pose.stateSince();
@@ -123,7 +124,7 @@ final class ReplayActorPainter {
             head(f, d, actor, x, y + HEAD * 0.5f + 0.02f - drop, z, yaw + (float) (k * 70), size, 0xFFFF8080, alpha * (1 - 0.6 * k));
             Vector3f c = d.transformPosition(x, y + HEAD * 0.5f, z, new Vector3f());
             if (s.detail()) {
-                ReplayDraw.star(glow, c, f.right, f.up, (float) (0.05 + 0.12 * k), 8, (float) (k * 2),
+                ReplayDraw.star(glow, c, f.right, f.up, (float) (0.05 + 0.12 * k) * elemScale, 8, (float) (k * 2),
                         ReplayPalette.alpha(ReplayPalette.RUBY, (1 - k) * alpha), ReplayPalette.alpha(ReplayPalette.RUBY, 0));
             }
             return;
@@ -193,7 +194,7 @@ final class ReplayActorPainter {
     // ------------------------------------------------------------------ trails
 
     private static void trails(ReplayFrame f, Matrix4f d, ReplayBoardModel.Actor actor, double t, double alpha,
-                               double history, boolean review) {
+                               double history, boolean review, float elemScale) {
         ReplayTrackSampler track = actor.track;
         int last = track.indexAt(t);
         if (last < 0) return;
@@ -223,24 +224,24 @@ final class ReplayActorPainter {
                 n = 1;
             }
             d.transformPosition(actor.xs[i], actor.ys[i] + 0.012f, actor.zs[i], tmp);
-            put(n++, tmp, track.tick(i), cometStart, t, baseA, base, alpha);
+            put(n++, tmp, track.tick(i), cometStart, t, baseA, base, alpha, elemScale);
         }
         if (appendLive && n >= 1) {
             d.transformPosition(lp[0], lp[1] + 0.012f, lp[2], tmp);
-            put(n++, tmp, t, cometStart, t, baseA, base, alpha);
+            put(n++, tmp, t, cometStart, t, baseA, base, alpha, elemScale);
         }
         if (n >= 2) emit(glow, n);
     }
 
     private static void put(int index, Vector3f p, double tick, double cometStart, double t, double baseA, int color,
-                            double alpha) {
+                            double alpha, float elemScale) {
         int o = index * 3;
         points[o] = p.x; points[o + 1] = p.y; points[o + 2] = p.z;
         double comet = tick >= cometStart ? (tick - cometStart) / Math.max(1, t - cometStart) : 0;
         double a = baseA + comet * comet * 0.85 * alpha;
         int c = ReplayPalette.lerp(ReplayPalette.scale(color, 0.85), ReplayPalette.lerp(color, 0xFFFFFFFF, 0.35), comet);
         colors[index] = ReplayPalette.alpha(c, a);
-        widths[index] = (float) (0.010 + 0.022 * comet);
+        widths[index] = (float) (0.010 + 0.022 * comet) * elemScale;
     }
 
     private static void emit(VertexConsumer glow, int n) {

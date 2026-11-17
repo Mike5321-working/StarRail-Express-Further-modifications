@@ -22,6 +22,8 @@ final class SceneVertexBounds {
         }
     }
 
+    double maxY() { return maxY; }
+
     SceneMeshSet.Batch batch(SceneMeshSet mesh) {
         // A tiny margin also keeps planar geometry from producing a zero-volume box.
         double margin = 0.001;

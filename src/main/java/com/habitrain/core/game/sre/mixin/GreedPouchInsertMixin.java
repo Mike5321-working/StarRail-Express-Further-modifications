@@ -1,5 +1,6 @@
 package com.habitrain.core.game.sre.mixin;
 
+import com.habitrain.core.game.sre.role.HabiBoundItems;
 import com.habitrain.core.game.sre.role.sins.item.GreedPouchItem;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.SlotAccess;
@@ -24,7 +25,11 @@ public abstract class GreedPouchInsertMixin {
     @Inject(method = "overrideStackedOnOther", at = @At("HEAD"), cancellable = true)
     private void habitrain$checkSlot(ItemStack pouch, Slot slot, ClickAction action, Player player,
                                      CallbackInfoReturnable<Boolean> cir) {
-        if (action != ClickAction.SECONDARY || !GreedPouchItem.isGreedPouch(pouch)) return;
+        if (action != ClickAction.SECONDARY) return;
+        if (!GreedPouchItem.isGreedPouch(pouch)) {
+            if (habitrain$rejectBoundInVanillaBundle(slot.getItem(), player, cir)) return;
+            return;
+        }
         if (!GreedPouchItem.isBoundPouchOf(player, pouch)) {
             cir.setReturnValue(true);
             return;
@@ -71,7 +76,11 @@ public abstract class GreedPouchInsertMixin {
     @Inject(method = "overrideOtherStackedOnMe", at = @At("HEAD"), cancellable = true)
     private void habitrain$checkCursor(ItemStack pouch, ItemStack other, Slot slot, ClickAction action,
                                        Player player, SlotAccess cursor, CallbackInfoReturnable<Boolean> cir) {
-        if (action != ClickAction.SECONDARY || !GreedPouchItem.isGreedPouch(pouch)) return;
+        if (action != ClickAction.SECONDARY) return;
+        if (!GreedPouchItem.isGreedPouch(pouch)) {
+            if (habitrain$rejectBoundInVanillaBundle(other, player, cir)) return;
+            return;
+        }
         if (!GreedPouchItem.isBoundPouchOf(player, pouch)) {
             cir.setReturnValue(true);
             return;
@@ -97,6 +106,19 @@ public abstract class GreedPouchInsertMixin {
                 || other.isEmpty() || GreedPouchItem.canStore(other)) return false;
         if (!player.level().isClientSide) {
             player.displayClientMessage(Component.translatable("message.habitrain_core.sin_greed.forbidden_item"), true);
+        }
+        cir.setReturnValue(true);
+        return true;
+    }
+
+    @org.spongepowered.asm.mixin.Unique
+    private static boolean habitrain$rejectBoundInVanillaBundle(ItemStack candidate, Player player,
+                                                                CallbackInfoReturnable<Boolean> cir) {
+        if (!HabiBoundItems.isForbiddenInBundle(candidate)) return false;
+        if (!player.level().isClientSide) {
+            String key = HabiBoundItems.boundMessageKey(candidate);
+            player.displayClientMessage(Component.translatable(
+                    key != null ? key : "item.habitrain_core.drone_terminal.bound"), true);
         }
         cir.setReturnValue(true);
         return true;

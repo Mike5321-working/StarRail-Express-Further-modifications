@@ -35,6 +35,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
+import org.joml.Quaternionf;
 import org.joml.Vector3f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -100,12 +101,15 @@ public final class ReplayBoardRenderer {
 
     /** Resource reload: atlas sprites and baked models changed, so the diorama mesh must be rebuilt. */
     public static void onResourceReload() {
+        ReplayBoardControlsScreen.cancelExport();
         ReplayTrayPainter.invalidateSprites();
+        ReplayVideoCanvas.invalidate();
         ReplayDioramaMesh.reset();
     }
 
     /** Disconnect / session reset: drop GPU mesh, cached skins, models and local toggles. */
     public static void reset() {
+        ReplayBoardControlsScreen.cancelExport();
         failed = false;
         animOriginLevel = null;
         ReplayDioramaMesh.reset();
@@ -131,9 +135,10 @@ public final class ReplayBoardRenderer {
         }
     }
 
-    private record Candidate(BlockPos pos, Direction facing, double distance, ReplayBoardSettings settings) {}
+    private record Candidate(BlockPos pos, Direction facing, double distance, ReplayBoardSettings settings,
+                             @Nullable SettlementSummaryBoard.Marker.Playback playback) {}
 
-    private static float trayHalfSize(@Nullable ReplayBoardModel current) {
+    static float trayHalfSize(@Nullable ReplayBoardModel current) {
         if (current == null || current.layout == null) return DEFAULT_TRAY_HALF_SIZE;
         // Fit the longer map axis without changing the diorama's scale or aspect ratio.
         return Math.max(1.3f, Math.max(current.mapW, current.mapD) / 2 + 0.3f);
@@ -149,21 +154,30 @@ public final class ReplayBoardRenderer {
             if (!(level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) continue;
             ReplayBoardSettings preview = ReplayBoardSettingsScreen.previewAt(pos);
             ReplayBoardSettings settings = preview == null ? marker.settings() : preview;
-            double dx = pos.getX() + 0.5 - cam.x, dy = pos.getY() + 1.4 - cam.y, dz = pos.getZ() + 0.5 - cam.z;
-            double distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            if (distance > ReplayStagePlan.FADE_END) continue;
             Direction facing = state.getValue(SettlementSummaryBoard.FACING);
             Matrix4f worldTable = ReplayFrame.boardMatrix(pos, facing, 0, 0, 0);
             Vector3f center = worldTable.transformPosition(settings.offsetX(), settings.height(), settings.offsetZ(), new Vector3f());
-            // Rotation can point the square tray's diagonal at the camera. Include all overlays and
-            // the real table even when the floating display is moved far above/to one side of it.
-            float reach = (trayHalfSize(model) + 0.6f) * settings.scale() * 1.415f;
-            float visualHeight = Math.max(3.8f, model == null ? 0 : (model.mapH + 0.8f) * (float) (ReplayFocusPlan.MAX_ZOOM * 1.15)) * settings.scale();
+            double dx = pos.getX() + 0.5 - cam.x, dy = pos.getY() + 1.4 - cam.y, dz = pos.getZ() + 0.5 - cam.z;
+            double blockDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            double cx = center.x - cam.x, cy = center.y - cam.y, cz = center.z - cam.z;
+            double displayDist = Math.sqrt(cx * cx + cy * cy + cz * cz);
+            double distance = Math.min(blockDist, displayDist);
+            double distScale = Math.max(1.0, settings.scale());
+            if (distance > ReplayStagePlan.FADE_END * distScale) continue;
+            float trayHalf = trayHalfSize(model);
+            // Rotation can point the square tray's diagonal at the camera. Include all 4 plaques,
+            // the floating honors screen, and the real table even when offset from the marker.
+            float honorsRadius = ReplayHonorsPainter.PANEL_RADIUS * ReplayHonorsPainter.honorsWorldScale(1, trayHalf);
+            float honorsCenter = ReplayHonorsPainter.anchorHeight(trayHalf) - ReplayBoardSite.MAP_BASE;
+            float reach = Math.max((trayHalf + 0.65f) * 1.415f, honorsRadius) * settings.scale();
+            float visualBottom = Math.min(-0.7f, honorsCenter - honorsRadius) * settings.scale();
+            float visualTop = Math.max(Math.max(3.8f, honorsCenter + honorsRadius),
+                    model == null ? 0 : (model.mapH + 0.8f) * (float) (ReplayFocusPlan.MAX_ZOOM * 1.15)) * settings.scale();
             if (frustum != null && !((FrustumAccessor) frustum).habitrain$cubeInFrustum(
-                    Math.min(pos.getX(), center.x - reach), Math.min(pos.getY(), center.y - 0.7f * settings.scale()),
+                    Math.min(pos.getX(), center.x - reach), Math.min(pos.getY(), center.y + visualBottom),
                     Math.min(pos.getZ(), center.z - reach), Math.max(pos.getX() + 1, center.x + reach),
-                    Math.max(pos.getY() + 1, center.y + visualHeight), Math.max(pos.getZ() + 1, center.z + reach))) continue;
-            candidates.add(new Candidate(pos, facing, distance, settings));
+                    Math.max(pos.getY() + 1, center.y + visualTop), Math.max(pos.getZ() + 1, center.z + reach))) continue;
+            candidates.add(new Candidate(pos, facing, distance, settings, marker.playback()));
         }
         if (candidates.isEmpty()) return;
         candidates.sort(Comparator.comparingDouble(Candidate::distance));
@@ -183,8 +197,6 @@ public final class ReplayBoardRenderer {
         ReplayBoardModel current = view.hasRound() && replay != null ? model : null;
         float partial = context.tickCounter().getGameTimeDeltaPartialTick(true);
         long gameTime = level.getGameTime();
-        ReplayTimeline.Frame frame = current == null ? null
-                : current.timeline.at(ReplayBoardLocalState.tick(gameTime), ReplayBoardLocalState.partial(partial));
         if (level != animOriginLevel) {
             animOriginLevel = level;
             animOriginTick = gameTime;
@@ -198,64 +210,114 @@ public final class ReplayBoardRenderer {
         }
         double anim = ((double) (gameTime - animOriginTick) + (double) partial) / 20.0;
 
+        var round = ClientReplayBoard.availableRound();
+        boolean needsMap = current != null && current.layout != null && candidates.stream().anyMatch(c ->
+                c.playback() != null && c.playback().roundId().equals(round) && c.playback().pendingOrPlaying(gameTime));
         SceneMeshSet mesh = null;
-        if (current != null && current.layout != null && view.asset() != null) {
+        if (needsMap && view.asset() != null) {
             ReplayDioramaMesh.update(view.asset(), view.presentSections(), view.totalSections());
             if (ReplayDioramaMesh.matches(view.asset())) mesh = ReplayDioramaMesh.current();
         }
 
-        float halfSize = trayHalfSize(current);
-
         MultiBufferSource.BufferSource source = buffers();
-        ReplayFrame f = new ReplayFrame(mc, level, context.camera(), source, trayType, anim, current, frame,
-                view.hasRound(), view.presentSections(), view.totalSections());
-        List<ReplayBoardSite> sites = new ArrayList<>(candidates.size());
-        for (Candidate c : candidates) {
-            float fade = (float) ReplayStagePlan.distanceFade(c.distance());
-            if (fade <= 0.01f) continue;
-            int raw = LevelRenderer.getLightColor(level, c.pos().above());
-            int light = LightTexture.pack(Math.max(7, LightTexture.block(raw)), LightTexture.sky(raw));
-            Matrix4f table = ReplayFrame.boardMatrix(c.pos(), c.facing(), cam.x, cam.y, cam.z);
-            Matrix4f display = ReplayBoardPlacement.displayMatrix(table, c.settings(), ReplayBoardSite.MAP_BASE);
-            sites.add(new ReplayBoardSite(c.pos(), c.facing(), c.distance(), display, table, c.settings().scale(), halfSize, halfSize, fade,
-                    c.distance() < ReplayStagePlan.DETAIL_DISTANCE, light));
-        }
-        if (sites.isEmpty()) return;
-
+        var camera = context.camera();
         try (var guard = ClientRenderState.capture()) {
-            // 1. textured tray and its plaque body
-            for (ReplayBoardSite s : sites) ReplayTrayPainter.tray(f, s);
-            source.endBatch(trayType);
-            // 2. the diorama map itself (shared VBO, one model matrix per board)
-            if (mesh != null && f.stage != null) {
-                for (ReplayBoardSite s : sites) drawMap(context, f, s, mesh);
+            for (Candidate c : candidates) {
+                double distScale = Math.max(1.0, c.settings().scale());
+                float fade = (float) ReplayStagePlan.distanceFade(c.distance() / distScale);
+                if (fade <= 0.01f) continue;
+                var playing = c.playback();
+                boolean active = playing != null && playing.roundId().equals(round) && playing.playing(gameTime);
+                ReplayBoardModel shown = active ? current : null;
+                double elapsed = active ? gameTime - playing.startTick() + partial : 0;
+                ReplayTimeline.Frame frame = shown == null ? null : shown.timeline.atElapsed(elapsed);
+                float halfSize = trayHalfSize(shown);
+                int raw = LevelRenderer.getLightColor(level, c.pos().above());
+                int light = LightTexture.pack(Math.max(7, LightTexture.block(raw)), LightTexture.sky(raw));
+                Matrix4f table = ReplayFrame.boardMatrix(c.pos(), c.facing(), cam.x, cam.y, cam.z);
+                Matrix4f display = ReplayBoardPlacement.displayMatrix(table, c.settings(), ReplayBoardSite.MAP_BASE);
+                var site = new ReplayBoardSite(c.pos(), c.facing(), c.distance(), display, table, c.settings().scale(),
+                        halfSize, halfSize, fade, c.distance() < ReplayStagePlan.DETAIL_DISTANCE * distScale, light);
+                var f = new ReplayFrame(mc, level, camera.rotation(), source, trayType,
+                        active ? elapsed / 20.0 : anim, shown, frame, active,
+                        active ? view.presentSections() : 0, active ? view.totalSections() : 0,
+                        new Vector3f(camera.getLeftVector()).negate(), new Vector3f(camera.getUpVector()),
+                        new Vector3f(camera.getLookVector()));
+                drawFrame(context.positionMatrix(), context.projectionMatrix(), f, site, mesh, ReplayBoardLocalState.fullBody());
             }
-            // 3. collect fills / glow / deferred models and text
-            for (ReplayBoardSite s : sites) {
-                ReplayTrayPainter.lights(f, s);
-                ReplayTrayPainter.plaque(f, s);
-                if (current == null || current.layout == null) {
-                    ReplayTrayPainter.idle(f, s);
-                    continue;
-                }
-                float sink = f.stage == null ? 0 : (float) f.stage.mapSink() * 0.2f;
-                Matrix4f d = f.focus.apply(new Matrix4f(s.board()).translate(0, ReplayBoardSite.MAP_BASE - sink, 0));
-                try (var mapScope = f.mapScope(s)) {
-                    if (mesh == null) loadingOutline(f, s, d, current);
-                    ReplayTrayPainter.overlays(f, s, d, sink);
-                    ReplayActorPainter.paint(f, s, d);
-                    ReplayEventPainter.paint(f, s, d);
-                }
-                ReplayEventPainter.briefing(f, s);
-                ReplayHonorsPainter.paint(f, s);
-            }
-            source.endBatch(ReplayDraw.FILL);
-            f.flushModels();
-            source.endLastBatch();
-            source.endBatch(ReplayDraw.GLOW);
-            f.flushTexts();
-            source.endBatch();
         }
+    }
+
+    static void drawVideoFrame(Minecraft mc, ReplayBoardModel current, ReplayTimeline.Frame frame, ReplayStagePlan.Stage stage,
+                               double anim, ReplayVideoCamera.Shot shot, SceneMeshSet mesh, boolean fullBody, ReplayVideoFx fx) {
+        var buffers = buffers();
+        var eye = shot.eye();
+        var board = new Matrix4f().translation(-eye.x, -eye.y, -eye.z);
+        float halfSize = trayHalfSize(current);
+        var site = new ReplayBoardSite(BlockPos.ZERO, Direction.SOUTH, 0, board, board, 1,
+                halfSize, halfSize, 1, true, LightTexture.FULL_BRIGHT);
+        Quaternionf rotation = shot.rotation();
+        var f = new ReplayFrame(mc, mc.level, rotation, buffers, trayType, anim, current,
+                frame, true, 0, 0, rotation.transform(new Vector3f(1, 0, 0)),
+                rotation.transform(new Vector3f(0, 1, 0)), shot.look(), stage, ReplayFocusPlan.WIDE);
+        // Same pass order as the board, minus the in-world briefing and honors panel: the video draws
+        // those as designed 2D motion graphics instead.
+        var source = f.buffers;
+        ReplayTrayPainter.tray(f, site);
+        source.endBatch(trayType);
+        drawMap(shot.view(), shot.projection(), f, site, mesh, fullBody);
+        ReplayTrayPainter.lights(f, site);
+        ReplayTrayPainter.plaque(f, site);
+        fx.environment(f, site);
+        if (current.layout != null) {
+            float sink = (float) stage.mapSink() * 0.2f;
+            Matrix4f d = f.focus.apply(new Matrix4f(site.board()).translate(0, ReplayBoardSite.MAP_BASE - sink, 0));
+            try (var mapScope = f.mapScope(site)) {
+                ReplayTrayPainter.overlays(f, site, d, sink);
+                ReplayActorPainter.paint(f, site, d);
+                ReplayDronePainter.paint(f, site, d);
+                ReplayEventPainter.paint(f, site, d);
+                fx.map(f, site, d);
+            }
+        }
+        source.endBatch(ReplayDraw.FILL);
+        f.flushModels();
+        source.endLastBatch();
+        source.endBatch(ReplayDraw.GLOW);
+        f.flushTexts();
+        source.endBatch();
+    }
+
+    private static void drawFrame(Matrix4f view, Matrix4f projection, ReplayFrame f, ReplayBoardSite site,
+                                  @Nullable SceneMeshSet mesh, boolean fullBody) {
+        var source = f.buffers;
+        ReplayTrayPainter.tray(f, site);
+        source.endBatch(trayType);
+        if (mesh != null && f.stage != null) drawMap(view, projection, f, site, mesh, fullBody);
+        ReplayTrayPainter.lights(f, site);
+        ReplayTrayPainter.plaque(f, site);
+        if (f.model == null || f.model.layout == null) {
+            if (f.stage != null && f.stage.honors() > 0.01) ReplayHonorsPainter.paint(f, site);
+            else ReplayTrayPainter.idle(f, site);
+        } else {
+            float sink = f.stage == null ? 0 : (float) f.stage.mapSink() * 0.2f;
+            Matrix4f d = f.focus.apply(new Matrix4f(site.board()).translate(0, ReplayBoardSite.MAP_BASE - sink, 0));
+            try (var mapScope = f.mapScope(site)) {
+                if (mesh == null) loadingOutline(f, site, d, f.model);
+                ReplayTrayPainter.overlays(f, site, d, sink);
+                ReplayActorPainter.paint(f, site, d);
+                ReplayDronePainter.paint(f, site, d);
+                ReplayEventPainter.paint(f, site, d);
+            }
+            ReplayEventPainter.briefing(f, site);
+            ReplayHonorsPainter.paint(f, site);
+        }
+        source.endBatch(ReplayDraw.FILL);
+        f.flushModels();
+        source.endLastBatch();
+        source.endBatch(ReplayDraw.GLOW);
+        f.flushTexts();
+        source.endBatch();
     }
 
     private static void loadingOutline(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayBoardModel current) {
@@ -269,7 +331,8 @@ public final class ReplayBoardRenderer {
                 ReplayPalette.fade(c, 0), ReplayPalette.fade(c, 0));
     }
 
-    private static void drawMap(WorldRenderContext context, ReplayFrame f, ReplayBoardSite s, SceneMeshSet mesh) {
+    private static void drawMap(Matrix4f view, Matrix4f projection, ReplayFrame f, ReplayBoardSite s,
+                                SceneMeshSet mesh, boolean fullBody) {
         ReplayBoardModel current = f.model;
         ReplayStagePlan.Stage stage = f.stage;
         if (current == null || current.layout == null || stage == null || stage.scan() <= 0.001) return;
@@ -282,8 +345,7 @@ public final class ReplayBoardRenderer {
         Matrix4f model = new Matrix4f(s.board()).translate(0, ReplayBoardSite.MAP_BASE - sink, 0).mul(sourceToTray);
         var bounds = ReplayMapViewport.sourceBounds(sourceToTray, s.hw() - ReplayBoardSite.FRAME - 0.04f,
                 s.hd() - ReplayBoardSite.FRAME - 0.04f);
-        Matrix4f modelView = new Matrix4f(context.positionMatrix()).mul(model);
-        Matrix4f projection = context.projectionMatrix();
+        Matrix4f modelView = new Matrix4f(view).mul(model);
         double dim = (0.55 + 0.45 * s.fade()) * (1 - stage.mapSink() * 0.6);
         float r = (float) dim, g = (float) dim, b = (float) dim;
         if (f.blackout) {
@@ -296,7 +358,7 @@ public final class ReplayBoardRenderer {
         boolean clip = stage.scan() < 0.999;
         int axisLength = current.rotated ? src.sizeZ() : src.sizeX();
         float threshold = (float) (stage.scan() * (axisLength + 1.0)) - 0.5f;
-        updateFans(f, current, model);
+        updateFans(f, current, model, fullBody);
         // The tray already has a local fill light. Give the train the same minimum so
         // the lobby's night lightmap cannot leave the train dark on a lit tray.
         try (var scope = SceneShaders.model(model, s.light());
@@ -314,17 +376,21 @@ public final class ReplayBoardRenderer {
         }
     }
 
-    private static void updateFans(ReplayFrame f, ReplayBoardModel current, Matrix4f model) {
+    private static void updateFans(ReplayFrame f, ReplayBoardModel current, Matrix4f model, boolean fullBody) {
         FAN_CUTAWAY.clear();
-        if (ReplayBoardLocalState.fullBody() || f.stage == null || f.stage.actors() <= 0.01) return;
+        if (fullBody || f.stage == null || f.stage.actors() <= 0.01) return;
         // Use a direction (w=0), not a position: offsets, table rotation and display size must
         // not reverse the opening. A quarter-turn source map is accounted for by this matrix too.
-        FAN_CUTAWAY.faceViewer(model, new Vector3f(f.camera.getLookVector()), current.source);
+        FAN_CUTAWAY.faceViewer(model, new Vector3f(f.look), current.source);
         // Avatars have a fixed diorama size, independent of map dimensions. Keep the rounded
         // apex wide enough for the head and hat even on a very long train.
         double radius = Math.max(1.25, ReplayActorPainter.HEAD * 0.75 / current.scale);
         for (ReplayBoardModel.Actor actor : current.actors) {
             FAN_CUTAWAY.add(actor.track.sample(f.replayTick), current.layout.origin(), current.source, radius);
+        }
+        for (var drone : current.drones) {
+            FAN_CUTAWAY.add(drone.track().sample(f.replayTick), current.layout.origin(), current.source,
+                    Math.max(1, 0.19 / current.scale));
         }
     }
 

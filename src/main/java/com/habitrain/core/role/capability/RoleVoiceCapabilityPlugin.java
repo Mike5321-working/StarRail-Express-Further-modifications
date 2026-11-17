@@ -47,7 +47,8 @@ public final class RoleVoiceCapabilityPlugin implements VoicechatPlugin {
         try {
             java.util.UUID speaker = idOf(event.getSenderConnection());
             if (speaker == null) return;
-            if (ServerVoicePermissions.current().evaluate(speaker, null, null, null) == VoiceDecision.BLOCK) {
+            if (com.habitrain.core.game.sre.role.drone.DroneOperatorService.isVoiceMuted(speaker)
+                    || ServerVoicePermissions.current().evaluate(speaker, null, null, null) == VoiceDecision.BLOCK) {
                 event.cancel();
             }
         } catch (Throwable t) {
@@ -77,7 +78,8 @@ public final class RoleVoiceCapabilityPlugin implements VoicechatPlugin {
         try {
             java.util.UUID from = idOf(sender), to = idOf(receiver);
             if (from == null || to == null) return false; // server-generated audio has no player policy
-            return ServerVoicePermissions.current().evaluate(from, to, groupIdOf(sender), groupIdOf(receiver))
+            return com.habitrain.core.game.sre.role.drone.DroneOperatorService.isVoiceMuted(from)
+                    || ServerVoicePermissions.current().evaluate(from, to, groupIdOf(sender), groupIdOf(receiver))
                     == VoiceDecision.BLOCK;
         } catch (Throwable t) {
             return true;

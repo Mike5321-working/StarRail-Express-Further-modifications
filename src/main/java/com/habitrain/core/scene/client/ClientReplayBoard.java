@@ -91,6 +91,10 @@ public final class ClientReplayBoard {
                 !available.roundId().equals(EMPTY));
     }
 
+    public static UUID availableRound() { return available.roundId(); }
+
+    public static boolean mapAvailable() { return available.mapReady(); }
+
     public static void accept(Available update) {
         if (!update.roundId().equals(available.roundId())) clearView();
         if (!available.equals(update)) nextSummary = 0;
@@ -102,16 +106,22 @@ public final class ClientReplayBoard {
         if (!available.roundId().equals(s.roundId()) || !looking(Minecraft.getInstance())) return;
         if (replay != null && replay.roundId().equals(s.roundId()) && replay.manifest() != null && s.manifest() == null) return;
         try {
-            var tracks = ReplayTracks.decode(payload.tracks(), s.participants().size(), s.durationTicks());
+            int playerCount = s.participants().size();
+            var tracks = ReplayTracks.decode(payload.tracks(), playerCount + s.drones().size(), s.durationTicks());
             var players = new ArrayList<Participant>();
-            for (int i = 0; i < tracks.size(); i++) {
+            for (int i = 0; i < playerCount; i++) {
                 var p = s.participants().get(i);
                 players.add(new Participant(p.id(), p.name(), p.startRole(), p.startColor(), p.endRole(), p.endColor(),
                         p.faction(), p.winner(), p.survivalSeconds(), p.kills(), p.score(), p.itemUses(), tracks.get(i)));
             }
+            List<LastMatchReplay.Drone> drones = new ArrayList<>(s.drones().size());
+            for (int i = 0; i < s.drones().size(); i++) {
+                var meta = s.drones().get(i);
+                drones.add(new LastMatchReplay.Drone(meta.id(), meta.owner(), tracks.get(playerCount + i)));
+            }
             replay = new LastMatchReplay(s.roundId(), s.playbackAnchorTick(), s.durationTicks(), s.mapName(), s.modeId(),
                     s.winStatus(), s.winKind(), s.customWinId(), s.customTitleJson(), s.customSubtitleJson(), s.customColor(),
-                    s.origin(), s.manifest(), players, s.events(), s.spans(), s.mvp(), s.killCount(), s.limited());
+                    s.origin(), s.manifest(), players, s.events(), s.spans(), s.mvp(), s.killCount(), s.limited(), drones);
             timeline = new ReplayTimeline(replay);
             if (s.manifest() != null && (map == null || !map.manifest.hash().equals(s.manifest().hash()))) {
                 MapData state = new MapData(s.manifest());

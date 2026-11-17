@@ -75,7 +75,9 @@ public final class IdiotService {
         }).build();
     }
 
-    public static boolean isEgg(ItemStack stack) { return stack != null && stack.is(IdiotContent.EGG); }
+    public static boolean isEgg(ItemStack stack) {
+        return stack != null && !stack.isEmpty() && stack.getItem() instanceof IdiotEggItem;
+    }
     public static boolean boundTo(ItemStack stack, Player player) {
         if (!isEgg(stack)) return false;
         CompoundTag tag = stack.getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY).copyTag();

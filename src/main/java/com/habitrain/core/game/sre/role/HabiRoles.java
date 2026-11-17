@@ -28,6 +28,7 @@ public final class HabiRoles {
     public static final ResourceLocation SNAKE_FRUIT_ID = HabiTrainCore.id("snake_fruit");
     public static final ResourceLocation DOLL_TAILOR_ID = HabiTrainCore.id("doll_tailor");
     public static final ResourceLocation IDIOT_ID = HabiTrainCore.id("idiot");
+    public static final ResourceLocation DRONE_OPERATOR_ID = HabiTrainCore.id("drone_operator");
 
     public static SRERole CRIME_SCAPEGOAT;
     public static SRERole FLOWER_GIRL;
@@ -37,6 +38,7 @@ public final class HabiRoles {
     public static SRERole SNAKE_FRUIT;
     public static SRERole DOLL_TAILOR;
     public static SRERole IDIOT;
+    public static SRERole DRONE_OPERATOR;
 
     public static void init() {
         // 投稿职业已由 CoreRoleExtensionProvider 经 v2 ADD 注册并回填字段
@@ -46,7 +48,8 @@ public final class HabiRoles {
         HabiRoleEvents.init();
         com.habitrain.core.game.sre.role.tailor.DollTailorService.init();
         com.habitrain.core.game.sre.role.idiot.IdiotService.init();
-        HabiTrainCore.LOGGER.info("[HabiRoles] v2 ADD fields ready: crime_scapegoat, flower_girl, swift_wind, mime_killer, mike, snake_fruit, doll_tailor, idiot");
+        com.habitrain.core.game.sre.role.drone.DroneOperatorService.init();
+        HabiTrainCore.LOGGER.info("[HabiRoles] v2 ADD fields ready: crime_scapegoat, flower_girl, swift_wind, mime_killer, mike, snake_fruit, doll_tailor, idiot, drone_operator");
     }
 
     /**

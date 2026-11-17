@@ -241,6 +241,7 @@ public final class SceneMeshBuilder {
         /** 批次下标 → 该批的网格集合（惰性创建，只有真的产出几何才会有）。 */
         private final Map<Integer, SceneMeshSet> batchTargets = new LinkedHashMap<>();
         private final Map<Integer, SceneVertexBounds> batchBounds = new LinkedHashMap<>();
+        private final SceneVertexBounds replayUnbatchedBounds = new SceneVertexBounds();
 
         private BuildState(SceneAssetCodec.AssetData asset, CompletableFuture<MeshBuildResult> result,
                            boolean detailedDiagnostics, boolean retainHiddenFaces) {
@@ -1094,10 +1095,12 @@ public final class SceneMeshBuilder {
                                 sort = SceneTransparencySort.capture(data, upload.byteBuilder(),
                                         com.mojang.blaze3d.vertex.VertexSorting.byDistance(sortX, sortY, sortZ));
                             }
-                            if (batched) {
-                                batchBounds.computeIfAbsent(upload.batch(), ignored -> new SceneVertexBounds())
-                                        .include(data.vertexBuffer(), data.drawState().vertexCount(),
-                                                DefaultVertexFormat.BLOCK.getVertexSize());
+                            if (batched || retainHiddenFaces) {
+                                var bounds = batched ? batchBounds.computeIfAbsent(upload.batch(), ignored -> new SceneVertexBounds())
+                                        : replayUnbatchedBounds;
+                                bounds.include(data.vertexBuffer(), data.drawState().vertexCount(),
+                                        DefaultVertexFormat.BLOCK.getVertexSize());
+                                if (retainHiddenFaces) uploadTarget.includeReplayCeiling(bounds.maxY());
                             }
                             long bytes = (long) data.drawState().vertexCount()
                                     * DefaultVertexFormat.BLOCK.getVertexSize();

@@ -12,7 +12,7 @@ public final class NetworkRegistrar {
 
     public static void init() {
         int count = 0;
-        com.habitrain.core.network.replay.ReplayPackets.register(); count += 5;
+        com.habitrain.core.network.replay.ReplayPackets.register(); count += 6;
         com.habitrain.core.network.replay.ReplayBoardSettingsPackets.register(); count += 2;
         TaskConfigPayload.register(); count++;
         ActiveTaskPayload.register(); count++;
@@ -47,6 +47,11 @@ public final class NetworkRegistrar {
         RoleConfigUpdatePayload.register(); count++;
         RoleSnapshotPayload.register(); count++;
         RoleHandshakeReportPayload.register(); count++;
+        DroneInputPayload.register(); count++;
+        DroneCommandPayload.register(); count++;
+        DroneStatePayload.register(); count++;
+        DroneScanHighlightPayload.register(); count++;
+        DroneFxPayload.register(); count++;
         com.habitrain.core.scene.network.SceneEditorOpenS2C.register(); count++;
         com.habitrain.core.scene.network.SceneSelectionStateS2C.register(); count++;
         com.habitrain.core.scene.network.SceneToolTargetStateS2C.register(); count++;

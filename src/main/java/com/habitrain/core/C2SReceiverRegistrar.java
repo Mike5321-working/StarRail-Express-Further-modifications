@@ -35,6 +35,10 @@ public final class C2SReceiverRegistrar {
                         runOnServer(context.server(), () ->
                                 com.habitrain.core.scene.block.ReplayBoardSettingsService.save(context.player(), payload)));
         ServerPlayNetworking.registerGlobalReceiver(
+                com.habitrain.core.network.replay.ReplayPackets.StartPlayback.TYPE, (payload, context) ->
+                        context.server().execute(() ->
+                                com.habitrain.core.game.sre.replay.ReplayBoardService.start(context.player(), payload)));
+        ServerPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.RequestSummary.TYPE, (payload, context) ->
                         runOnServer(context.server(), () ->
                                 com.habitrain.core.game.sre.replay.ReplayBoardService.request(context.player(), payload)));
@@ -134,6 +138,26 @@ public final class C2SReceiverRegistrar {
                     com.habitrain.core.game.sre.role.sins.component.SlothComponent
                             .tryInduceSleep(sloth, payload.targetId());
                     sendSlothSleepRoster(sloth);
+                }));
+        ServerPlayNetworking.registerGlobalReceiver(DroneInputPayload.TYPE, (payload, context) ->
+                runOnServer(context.server(), () -> {
+                    ServerPlayer player = context.player();
+                    if (player == null || payload == null) return;
+                    if (!C2SRateLimiter.tryAcquire(player.getUUID(), "drone_input", 15)) return;
+                    com.habitrain.core.game.sre.role.drone.DroneOperatorService.handleInput(player, payload);
+                }));
+        ServerPlayNetworking.registerGlobalReceiver(DroneCommandPayload.TYPE, (payload, context) ->
+                runOnServer(context.server(), () -> {
+                    ServerPlayer player = context.player();
+                    if (player == null || payload == null || payload.action() == null) return;
+                    long windowMs = payload.action() == DroneCommandPayload.Action.EXIT_FPV ? 25L : 50L;
+                    if (!C2SRateLimiter.tryAcquire(
+                            player.getUUID(),
+                            "drone_cmd_" + payload.action().ordinal(),
+                            windowMs)) {
+                        return;
+                    }
+                    com.habitrain.core.game.sre.role.drone.DroneOperatorService.handleCommand(player, payload);
                 }));
         ServerPlayNetworking.registerGlobalReceiver(RoleActionC2SPayload.TYPE, (payload, context) ->
                 runOnServer(context.server(), () -> {

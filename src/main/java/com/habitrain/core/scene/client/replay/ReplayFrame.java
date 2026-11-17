@@ -5,7 +5,6 @@ import com.habitrain.core.scene.replay.ReplayStagePlan;
 import com.habitrain.core.scene.replay.ReplayFocusPlan;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
-import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -17,6 +16,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
+import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.util.ArrayList;
@@ -34,7 +34,8 @@ import java.util.function.Consumer;
 final class ReplayFrame {
     final Minecraft mc;
     final ClientLevel level;
-    final Camera camera;
+    final Quaternionf rotation;
+    final Vector3f look;
     final Vector3f right, up;
     final MultiBufferSource.BufferSource buffers;
     final RenderType trayType;
@@ -42,6 +43,8 @@ final class ReplayFrame {
     final @Nullable ReplayBoardModel model;
     final @Nullable ReplayTimeline.Frame frame;
     final @Nullable ReplayStagePlan.Stage stage;
+    /** Directed video export frame (its own effects replace some board-only decorations). */
+    final boolean video;
     final double replayTick;
     final ReplayFocusPlan.Pose focus;
     final boolean blackout;
@@ -52,22 +55,35 @@ final class ReplayFrame {
     private MapScope mapScope;
     private MultiBufferSource drawingBuffers;
 
-    ReplayFrame(Minecraft mc, ClientLevel level, Camera camera, MultiBufferSource.BufferSource buffers, RenderType trayType,
+    ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
                 double anim, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
-                boolean hasRound, int presentSections, int totalSections) {
+                boolean hasRound, int presentSections, int totalSections,
+                Vector3f right, Vector3f up, Vector3f look) {
+        this(mc, level, rotation, buffers, trayType, anim, model, frame, hasRound, presentSections, totalSections,
+                right, up, look, null, null);
+    }
+
+    /** Video export: the director supplies its own act choreography and keeps the map at its natural scale. */
+    ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
+                double anim, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
+                boolean hasRound, int presentSections, int totalSections,
+                Vector3f right, Vector3f up, Vector3f look,
+                @Nullable ReplayStagePlan.Stage stageOverride, @Nullable ReplayFocusPlan.Pose focusOverride) {
         this.mc = mc;
         this.level = level;
-        this.camera = camera;
-        this.right = new Vector3f(camera.getLeftVector()).negate();
-        this.up = new Vector3f(camera.getUpVector());
+        this.rotation = rotation;
+        this.right = right;
+        this.up = up;
+        this.look = look;
         this.buffers = buffers;
         this.trayType = trayType;
         this.anim = anim;
         this.model = model;
         this.frame = frame;
-        this.stage = frame == null ? null : ReplayStagePlan.stage(frame);
+        this.stage = stageOverride != null ? stageOverride : frame == null ? null : ReplayStagePlan.stage(frame);
+        this.video = stageOverride != null;
         this.replayTick = frame == null ? 0 : frame.replayTick();
-        this.focus = model == null ? ReplayFocusPlan.WIDE : model.focus.at(frame);
+        this.focus = focusOverride != null ? focusOverride : model == null ? ReplayFocusPlan.WIDE : model.focus.at(frame);
         this.drawingBuffers = buffers;
         this.blackout = model != null && frame != null && frame.phase() == ReplayTimeline.Phase.PLAY && model.blackoutAt(replayTick);
         this.hasRound = hasRound;
@@ -162,7 +178,7 @@ final class ReplayFrame {
 
     /** Camera-facing text at a camera-relative point. */
     void billboardText(Vector3f at, Component text, float scale, int color) {
-        Matrix4f m = new Matrix4f().translate(at).rotate(camera.rotation());
+        Matrix4f m = new Matrix4f().translate(at).rotate(rotation);
         text(m, text, 0, 0, 0, scale, color, 0, false, 0);
     }
 

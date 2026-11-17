@@ -1,5 +1,8 @@
 package com.habitrain.core.client.mixin;
 
+import com.habitrain.core.client.drone.DroneOperatorClient;
+import io.wifi.utils.client.betterrender.FakeGuiGraphics;
+import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
@@ -8,7 +11,9 @@ import org.agmas.noellesroles.client.NoellesrolesClient;
 import org.agmas.noellesroles.client.hud.UnifiedSkillHud;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 
 /**
@@ -26,6 +31,17 @@ import org.spongepowered.asm.mixin.injection.Redirect;
  */
 @Mixin(value = UnifiedSkillHud.class, remap = false)
 public class UnifiedSkillHudReadyShiftMixin {
+    @Inject(method = "lambda$register$1", at = @At("HEAD"), cancellable = true, require = 0)
+    private static void habitrain$hideSkillHudInDroneFpv(
+            FakeGuiGraphics graphics,
+            DeltaTracker deltaTracker,
+            CallbackInfo ci
+    ) {
+        if (DroneOperatorClient.isCameraControlledByDrone()) {
+            ci.cancel();
+        }
+    }
+
     @Redirect(
             method = "lambda$register$1",
             at = @At(

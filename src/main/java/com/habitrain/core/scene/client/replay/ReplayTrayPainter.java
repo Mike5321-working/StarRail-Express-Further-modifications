@@ -111,7 +111,7 @@ final class ReplayTrayPainter {
             box(vc, pose, -hw + 0.12f, TRAY_BOTTOM - 0.03f, z - 0.022f, hw - 0.12f, TRAY_BOTTOM, z + 0.022f,
                     brass, brass, l, 0.5f);
         }
-        plaqueBody(f, s, vc);
+        plaqueBody(s, vc);
     }
 
     private static void rivet(VertexConsumer vc, PoseStack.Pose pose, float x, float y, float z, int light) {
@@ -126,114 +126,193 @@ final class ReplayTrayPainter {
 
     // ------------------------------------------------------------------ plaque
 
-    static float plaqueWidth(ReplayBoardSite s) { return Math.min(2.9f, Math.max(1.6f, s.hw() * 2 - 0.5f)); }
+    static final float REF_TRAY_HALF = 2.3f;
+    static final float BASE_PLAQUE_W = 2.6f;
     static final float PLAQUE_H = 0.36f;
+    static final float PLAQUE_STANDOFF = 0.07f;
 
-    static Matrix4f plaqueMatrix(ReplayBoardSite s) {
-        return new Matrix4f(s.board()).translate(0, 0.14f, s.hd() + 0.035f).rotateX((float) Math.toRadians(-20));
+    static float plaqueScale(float edgeHalf) {
+        return Mth.clamp(edgeHalf / REF_TRAY_HALF, 0.55f, 2.0f);
     }
 
-    private static void plaqueBody(ReplayFrame f, ReplayBoardSite s, VertexConsumer vc) {
-        PoseStack stack = new PoseStack();
-        stack.mulPose(plaqueMatrix(s));
-        PoseStack.Pose pose = stack.last();
-        float pw = plaqueWidth(s), ph = PLAQUE_H;
-        box(vc, pose, -pw / 2 - 0.035f, -ph / 2 - 0.035f, -0.045f, pw / 2 + 0.035f, ph / 2 + 0.035f, -0.02f,
-                ebonyWall, ebony, s.light(), 0.5f);
-        box(vc, pose, -pw / 2, -ph / 2, -0.02f, pw / 2, ph / 2, 0f, brass, brass, s.light(), 0.5f);
-        // fan ornaments at both ends
-        for (int side = -1; side <= 1; side += 2) {
-            float x = side * (pw / 2 + 0.06f);
-            box(vc, pose, x - 0.05f, -0.06f, -0.04f, x + 0.05f, 0.06f, -0.005f, corner, corner, s.light(), 0.25f);
+    static Matrix4f plaqueFrameMatrix(Matrix4f board, float hw, float hd, int side) {
+        boolean alongX = (side & 1) == 0;
+        float edgeHalf = alongX ? hw : hd;
+        float outward = alongX ? hd : hw;
+        float pScale = plaqueScale(edgeHalf);
+        float yCenter = FRAME_TOP + 0.03f - (PLAQUE_H * 0.5f + 0.01f) * pScale;
+        return new Matrix4f(board)
+                .rotateY(side * Mth.HALF_PI)
+                .translate(0f, yCenter, outward + PLAQUE_STANDOFF * pScale)
+                .rotateX((float) Math.toRadians(-20));
+    }
+
+    static Matrix4f plaqueMatrix(ReplayBoardSite s, int side) {
+        float pScale = plaqueScale((side & 1) == 0 ? s.hw() : s.hd());
+        return plaqueFrameMatrix(s.board(), s.hw(), s.hd(), side).scale(pScale);
+    }
+
+    /** The camera is at the origin of the render pass. Only draw the readable side of the plaque. */
+    static boolean plaqueFacesCamera(Matrix4f m) {
+        return m.m20() * m.m30() + m.m21() * m.m31() + m.m22() * m.m32() < 0f;
+    }
+
+    private static void plaqueBody(ReplayBoardSite s, VertexConsumer vc) {
+        float pw = BASE_PLAQUE_W, ph = PLAQUE_H;
+        for (int side = 0; side < 4; side++) {
+            PoseStack stack = new PoseStack();
+            stack.mulPose(plaqueMatrix(s, side));
+            PoseStack.Pose pose = stack.last();
+            box(vc, pose, -pw / 2 - 0.035f, -ph / 2 - 0.035f, -0.045f, pw / 2 + 0.035f, ph / 2 + 0.035f, -0.02f,
+                    ebonyWall, ebony, s.light(), 0.5f);
+            box(vc, pose, -pw / 2, -ph / 2, -0.02f, pw / 2, ph / 2, 0f, brass, brass, s.light(), 0.5f);
+            // fan ornaments at both ends
+            for (int endSide = -1; endSide <= 1; endSide += 2) {
+                float x = endSide * (pw / 2 + 0.06f);
+                box(vc, pose, x - 0.05f, -0.06f, -0.04f, x + 0.05f, 0.06f, -0.005f, corner, corner, s.light(), 0.25f);
+            }
         }
     }
 
-    private static final char[] LAST_CLOCK = new char[16];
-    private static final long[] CLOCK_CHANGED = new long[16];
+    private static final int MAX_CLOCK_CHARS = 16;
 
     static void plaque(ReplayFrame f, ReplayBoardSite s) {
-        Matrix4f m = plaqueMatrix(s);
-        float pw = plaqueWidth(s), ph = PLAQUE_H;
+        float pw = BASE_PLAQUE_W, ph = PLAQUE_H;
         float alpha = s.fade();
         VertexConsumer fill = f.fill();
-        // engraved night inset
-        ReplayDraw.rectXY(fill, m, -pw / 2 + 0.035f, -ph / 2 + 0.035f, pw / 2 - 0.035f, ph / 2 - 0.035f, 0.002f,
-                ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.96 * alpha), ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.96 * alpha));
-        ReplayDraw.rectXY(fill, m, -pw / 2 + 0.05f, 0.005f, pw / 2 - 0.05f, 0.009f, 0.003f,
-                ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha), ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha));
         float left = -pw / 2 + 0.07f, rightEdge = pw / 2 - 0.07f, z = 0.006f;
         var model = f.model;
         if (model == null) {
             Component line = f.hasRound ? ReplayBoardTexts.tr("loading") : ReplayBoardTexts.tr("idle");
-            f.text(m, line, 0, 0.075f, z, 0.0052f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, alpha), 0, false, pw - 0.16f);
             int dots = (int) (f.anim * 3) % 4;
             Component sub = ReplayBoardTexts.tr("brand").copy().append(".".repeat(f.hasRound ? dots : 0));
-            f.text(m, sub, 0, -0.07f, z, 0.0042f, ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, alpha), 0, false, pw - 0.16f);
+            for (int side = 0; side < 4; side++) {
+                Matrix4f m = plaqueMatrix(s, side);
+                if (!plaqueFacesCamera(m)) continue;
+                ReplayDraw.rectXY(fill, m, -pw / 2 + 0.035f, -ph / 2 + 0.035f, pw / 2 - 0.035f, ph / 2 - 0.035f, 0.002f,
+                        ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.96 * alpha), ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.96 * alpha));
+                ReplayDraw.rectXY(fill, m, -pw / 2 + 0.05f, 0.005f, pw / 2 - 0.05f, 0.009f, 0.003f,
+                        ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha), ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha));
+                f.text(m, line, 0, 0.075f, z, 0.0052f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, alpha), 0, false, pw - 0.16f);
+                f.text(m, sub, 0, -0.07f, z, 0.0042f, ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, alpha), 0, false, pw - 0.16f);
+            }
             return;
         }
         var stage = f.stage;
         double flip = stage == null ? 1 : stage.plaqueFlip();
         float flipScale = (float) Math.max(0.05, flip);
-        Matrix4f titleM = new Matrix4f(m).translate(0, 0.075f, 0).scale(1, flipScale, 1);
-        f.text(titleM, Component.literal(model.replay.mapName()), left, 0, z, 0.0054f,
-                ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, alpha * flip), -1, false, pw * 0.58f);
-        f.text(titleM, model.modeLabel, rightEdge, 0, z, 0.0042f,
-                ReplayPalette.alpha(ReplayPalette.TEXT_MUTED, alpha * flip), 1, false, pw * 0.36f);
-        // flip-board clock "mm:ss / mm:ss"
+        // Pure stateless flip-clock animation derived directly from f.replayTick so multiple
+        // boards on screen and offline video exports never clobber shared static state.
         String clock = ReplayStagePlan.clock(f.replayTick) + "/" + ReplayStagePlan.clock(model.replay.durationTicks());
-        long now = System.nanoTime();
-        float tileW = 0.046f, tileH = 0.072f, gap = 0.006f, cy = -0.065f;
-        float x = left + tileW / 2;
-        VertexConsumer glow = f.glow();
-        for (int i = 0; i < clock.length() && i < LAST_CLOCK.length; i++) {
-            char c = clock.charAt(i);
-            if (LAST_CLOCK[i] != c) {
-                LAST_CLOCK[i] = c;
-                CLOCK_CHANGED[i] = now;
-            }
-            double p = Math.min(1, (now - CLOCK_CHANGED[i]) / 160_000_000.0);
-            float squash = (float) Math.max(0.08, Math.abs(Math.cos(p * Math.PI)));
-            boolean digit = Character.isDigit(c);
-            float w = digit ? tileW : tileW * 0.55f;
-            float cx = x + (w - tileW) / 2;
-            if (digit) {
-                ReplayDraw.rectXY(fill, m, cx - w / 2, cy - tileH / 2, cx + w / 2, cy, 0.004f,
-                        ReplayPalette.alpha(0xFF0B0F1C, alpha), ReplayPalette.alpha(0xFF070A14, alpha));
-                ReplayDraw.rectXY(fill, m, cx - w / 2, cy, cx + w / 2, cy + tileH / 2, 0.004f,
-                        ReplayPalette.alpha(0xFF1A2440, alpha), ReplayPalette.alpha(0xFF101830, alpha));
-                ReplayDraw.rectXY(fill, m, cx - w / 2, cy - 0.0015f, cx + w / 2, cy + 0.0015f, 0.005f,
-                        ReplayPalette.alpha(0xFF000000, 0.9 * alpha), ReplayPalette.alpha(0xFF000000, 0.9 * alpha));
-                if (p < 1) {
-                    ReplayDraw.rectXY(glow, m, cx - w / 2, cy - 0.003f, cx + w / 2, cy + 0.003f, 0.006f,
-                            ReplayPalette.alpha(ReplayPalette.LAMP, (1 - p) * 0.8 * alpha), ReplayPalette.alpha(ReplayPalette.LAMP, (1 - p) * 0.8 * alpha));
-                }
-            }
-            Matrix4f cm = new Matrix4f(m).translate(cx, cy, 0).scale(1, squash, 1);
-            f.text(cm, Component.literal(String.valueOf(c)), 0, 0, z, 0.0058f,
-                    ReplayPalette.alpha(digit ? ReplayPalette.BRASS_LIGHT : ReplayPalette.TEXT_MUTED, alpha), 0, false, 0);
-            x += w + gap;
-        }
-        // phase label
+        int clockLen = Math.min(clock.length(), MAX_CLOCK_CHARS);
+        double[] clockFlipProgress = computeClockFlipProgress(clock, clockLen, f, model.rate);
         Component phase = phaseLabel(f);
-        f.text(m, phase, rightEdge, cy, z, 0.0046f, ReplayPalette.alpha(f.frame != null && f.frame.slowMotion()
-                ? ReplayPalette.RUBY : ReplayPalette.LAMP, alpha), 1, false, pw * 0.4f);
-        // progress rail
+        int phaseColor = ReplayPalette.alpha(f.frame != null && f.frame.slowMotion()
+                ? ReplayPalette.RUBY : ReplayPalette.LAMP, alpha);
         double progress = f.frame == null ? 0 : f.frame.phase() == ReplayTimeline.Phase.BUILD ? 0
                 : model.replay.durationTicks() <= 0 ? 1 : Mth.clamp(f.replayTick / model.replay.durationTicks(), 0, 1);
         float barY = -ph / 2 + 0.05f, bx0 = left, bx1 = rightEdge;
-        ReplayDraw.rectXY(fill, m, bx0, barY - 0.004f, bx1, barY + 0.004f, 0.004f,
-                ReplayPalette.alpha(0xFF050814, alpha), ReplayPalette.alpha(0xFF050814, alpha));
         float px = bx0 + (float) ((bx1 - bx0) * progress);
-        ReplayDraw.rectXY(glow, m, bx0, barY - 0.003f, px, barY + 0.003f, 0.005f,
-                ReplayPalette.alpha(ReplayPalette.BRASS, 0.85 * alpha), ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.85 * alpha));
-        if (f.totalSections > 0 && f.presentSections < f.totalSections) {
-            Component sync = ReplayBoardTexts.tr("map_progress", f.presentSections, f.totalSections);
-            f.text(m, sync, 0, barY + 0.022f, z, 0.0032f, ReplayPalette.alpha(ReplayPalette.PASSENGER, 0.9 * alpha), 0, false, 0);
+        boolean showSync = f.totalSections > 0 && f.presentSections < f.totalSections;
+        Component sync = showSync ? ReplayBoardTexts.tr("map_progress", f.presentSections, f.totalSections) : Component.empty();
+        VertexConsumer glow = f.glow();
+        float tileW = 0.076f, tileH = 0.094f, gap = 0.009f, cy = -0.065f;
+
+        for (int side = 0; side < 4; side++) {
+            Matrix4f m = plaqueMatrix(s, side);
+            if (!plaqueFacesCamera(m)) continue;
+            // engraved night inset
+            ReplayDraw.rectXY(fill, m, -pw / 2 + 0.035f, -ph / 2 + 0.035f, pw / 2 - 0.035f, ph / 2 - 0.035f, 0.002f,
+                    ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.96 * alpha), ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.96 * alpha));
+            ReplayDraw.rectXY(fill, m, -pw / 2 + 0.05f, 0.005f, pw / 2 - 0.05f, 0.009f, 0.003f,
+                    ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha), ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha));
+            Matrix4f titleM = new Matrix4f(m).translate(0, 0.075f, 0).scale(1, flipScale, 1);
+            f.text(titleM, Component.literal(model.replay.mapName()), left, 0, z, 0.0054f,
+                    ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, alpha * flip), -1, false, pw * 0.58f);
+            f.text(titleM, model.modeLabel, rightEdge, 0, z, 0.0042f,
+                    ReplayPalette.alpha(ReplayPalette.TEXT_MUTED, alpha * flip), 1, false, pw * 0.36f);
+            // flip-board clock "mm:ss / mm:ss"
+            float x = left + tileW / 2;
+            for (int i = 0; i < clockLen; i++) {
+                char c = clock.charAt(i);
+                double p = clockFlipProgress[i];
+                float squash = (float) Math.max(0.08, Math.abs(Math.cos(p * Math.PI)));
+                boolean digit = Character.isDigit(c);
+                float w = digit ? tileW : tileW * 0.55f;
+                float cx = x + (w - tileW) / 2;
+                if (digit) {
+                    ReplayDraw.rectXY(fill, m, cx - w / 2, cy - tileH / 2, cx + w / 2, cy, 0.004f,
+                            ReplayPalette.alpha(0xFF0B0F1C, alpha), ReplayPalette.alpha(0xFF070A14, alpha));
+                    ReplayDraw.rectXY(fill, m, cx - w / 2, cy, cx + w / 2, cy + tileH / 2, 0.004f,
+                            ReplayPalette.alpha(0xFF1A2440, alpha), ReplayPalette.alpha(0xFF101830, alpha));
+                    ReplayDraw.rectXY(fill, m, cx - w / 2, cy - 0.0015f, cx + w / 2, cy + 0.0015f, 0.005f,
+                            ReplayPalette.alpha(0xFF000000, 0.9 * alpha), ReplayPalette.alpha(0xFF000000, 0.9 * alpha));
+                    if (p < 1) {
+                        ReplayDraw.rectXY(glow, m, cx - w / 2, cy - 0.003f, cx + w / 2, cy + 0.003f, 0.006f,
+                                ReplayPalette.alpha(ReplayPalette.LAMP, (1 - p) * 0.8 * alpha), ReplayPalette.alpha(ReplayPalette.LAMP, (1 - p) * 0.8 * alpha));
+                    }
+                }
+                Matrix4f cm = new Matrix4f(m).translate(cx, cy, 0).scale(1, squash, 1);
+                f.text(cm, Component.literal(String.valueOf(c)), 0, 0, z, 0.009f,
+                        ReplayPalette.alpha(digit ? ReplayPalette.BRASS_LIGHT : ReplayPalette.TEXT_MUTED, alpha), 0, false, 0);
+                x += w + gap;
+            }
+            // phase label
+            f.text(m, phase, rightEdge, cy, z, 0.0046f, phaseColor, 1, false, pw * 0.4f);
+            // progress rail
+            ReplayDraw.rectXY(fill, m, bx0, barY - 0.004f, bx1, barY + 0.004f, 0.004f,
+                    ReplayPalette.alpha(0xFF050814, alpha), ReplayPalette.alpha(0xFF050814, alpha));
+            ReplayDraw.rectXY(glow, m, bx0, barY - 0.003f, px, barY + 0.003f, 0.005f,
+                    ReplayPalette.alpha(ReplayPalette.BRASS, 0.85 * alpha), ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.85 * alpha));
+            if (showSync) {
+                f.text(m, sync, 0, barY + 0.022f, z, 0.0032f, ReplayPalette.alpha(ReplayPalette.PASSENGER, 0.9 * alpha), 0, false, 0);
+            }
         }
     }
 
+    private static double[] computeClockFlipProgress(String clock, int clockLen, ReplayFrame f, double baseRate) {
+        double[] progress = new double[clockLen];
+        java.util.Arrays.fill(progress, 1.0);
+        if (f.frame == null || f.frame.phase() != ReplayTimeline.Phase.PLAY || f.replayTick <= 0.0) {
+            return progress;
+        }
+        int slashIdx = clock.indexOf('/');
+        int colonIdx = slashIdx > 0 ? clock.lastIndexOf(':', slashIdx) : -1;
+        if (colonIdx < 1 || slashIdx < colonIdx + 3) {
+            return progress;
+        }
+        double ticks = f.replayTick;
+        int wholeSec = (int) (ticks / 20.0);
+        if (wholeSec <= 0) {
+            return progress;
+        }
+        double effectiveRate = f.frame.slowMotion() ? 0.35 : Math.max(0.25, baseRate);
+        double flipWindowTicks = Math.max(0.5, 3.2 * effectiveRate);
+        double ticksSinceSec = ticks - wholeSec * 20.0;
+        if (ticksSinceSec >= flipWindowTicks) {
+            return progress;
+        }
+        double flipVal = Mth.clamp(ticksSinceSec / flipWindowTicks, 0.0, 1.0);
+        int secOnesIdx = slashIdx - 1;
+        int secTensIdx = slashIdx - 2;
+        int minOnesIdx = colonIdx - 1;
+        int minTensIdx = colonIdx - 2;
+        if (secOnesIdx < clockLen) {
+            progress[secOnesIdx] = flipVal;
+        }
+        if (secTensIdx >= 0 && secTensIdx < clockLen && wholeSec % 10 == 0) {
+            progress[secTensIdx] = flipVal;
+        }
+        if (minOnesIdx >= 0 && minOnesIdx < clockLen && wholeSec % 60 == 0) {
+            progress[minOnesIdx] = flipVal;
+        }
+        if (minTensIdx >= 0 && minTensIdx < clockLen && wholeSec % 600 == 0) {
+            progress[minTensIdx] = flipVal;
+        }
+        return progress;
+    }
+
     private static Component phaseLabel(ReplayFrame f) {
-        if (ReplayBoardLocalState.paused()) return ReplayBoardTexts.tr("phase.paused");
         if (f.frame == null) return Component.empty();
         return switch (f.frame.phase()) {
             case BUILD -> ReplayBoardTexts.tr("phase.build");
@@ -254,35 +333,45 @@ final class ReplayTrayPainter {
         float hw = s.hw() - FRAME, hd = s.hd() - FRAME, y = FRAME_TOP + 0.02f;
         double flicker = 0.92 + 0.08 * Math.sin(f.anim * 7.3) * Math.sin(f.anim * 2.1);
         int lamp = ReplayPalette.alpha(ReplayPalette.LAMP, 0.55 * a * flicker);
-        ReplayDraw.segment(glow, m, -hw, y, hd, hw, y, hd, 0.022f, lamp, lamp);
-        ReplayDraw.segment(glow, m, -hw, y, -hd, hw, y, -hd, 0.022f, lamp, lamp);
-        ReplayDraw.segment(glow, m, -hw, y, -hd, -hw, y, hd, 0.022f, lamp, lamp);
-        ReplayDraw.segment(glow, m, hw, y, -hd, hw, y, hd, 0.022f, lamp, lamp);
-        // warm wash just inside the frame
+        float lampW = 0.022f * s.scale();
+        ReplayDraw.segment(glow, m, -hw, y, hd, hw, y, hd, lampW, lamp, lamp);
+        ReplayDraw.segment(glow, m, -hw, y, -hd, hw, y, -hd, lampW, lamp, lamp);
+        ReplayDraw.segment(glow, m, -hw, y, -hd, -hw, y, hd, lampW, lamp, lamp);
+        ReplayDraw.segment(glow, m, hw, y, -hd, hw, y, hd, lampW, lamp, lamp);
+        // warm wash just inside the frame on all 4 sides
         int wash = ReplayPalette.alpha(ReplayPalette.LAMP, 0.10 * a), clear = ReplayPalette.alpha(ReplayPalette.LAMP, 0);
         float fy = BASE_TOP + 0.003f, in = 0.22f;
         ReplayDraw.quad(glow, m, -hw, fy, hd, hw, fy, hd, hw - in, fy, hd - in, -hw + in, fy, hd - in, wash, wash, clear, clear);
         ReplayDraw.quad(glow, m, hw, fy, -hd, -hw, fy, -hd, -hw + in, fy, -hd + in, hw - in, fy, -hd + in, wash, wash, clear, clear);
+        ReplayDraw.quad(glow, m, -hw, fy, -hd, -hw, fy, hd, -hw + in, fy, hd - in, -hw + in, fy, -hd + in, wash, wash, clear, clear);
+        ReplayDraw.quad(glow, m, hw, fy, hd, hw, fy, -hd, hw - in, fy, -hd + in, hw - in, fy, hd - in, wash, wash, clear, clear);
         if (s.detail()) {
+            float dotR = 0.018f * s.scale();
+            int dotCol = ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, 0.7 * a);
             for (float x = -hw + 0.25f; x < hw; x += 0.5f) {
-                Vector3f p = m.transformPosition(x, y + 0.01f, hd, new Vector3f());
-                ReplayDraw.billboard(glow, p, f.right, f.up, 0.018f, 0.018f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, 0.7 * a));
+                ReplayDraw.billboard(glow, m.transformPosition(x, y + 0.01f, hd, new Vector3f()), f.right, f.up, dotR, dotR, dotCol);
+                ReplayDraw.billboard(glow, m.transformPosition(x, y + 0.01f, -hd, new Vector3f()), f.right, f.up, dotR, dotR, dotCol);
+            }
+            for (float z = -hd + 0.25f; z < hd; z += 0.5f) {
+                ReplayDraw.billboard(glow, m.transformPosition(-hw, y + 0.01f, z, new Vector3f()), f.right, f.up, dotR, dotR, dotCol);
+                ReplayDraw.billboard(glow, m.transformPosition(hw, y + 0.01f, z, new Vector3f()), f.right, f.up, dotR, dotR, dotCol);
             }
         }
         // Holographic support beams keep their feet on the real wooden tabletop, even when the
         // display is scaled, rotated or offset. Endpoints are already in camera-relative space.
         double beam = s.fade() * (0.6 + 0.4 * glowLevel);
+        float beamScale = Mth.clamp(s.scale(), 0.4f, 2.0f);
         for (int sx = -1; sx <= 1; sx += 2) {
             for (int sz = -1; sz <= 1; sz += 2) {
                 float x0 = sx * 0.36f, z0 = sz * 0.36f;
                 float x1 = sx * (s.hw() - 0.24f), z1 = sz * (s.hd() - 0.24f), y1 = TRAY_BOTTOM - 0.075f;
                 Vector3f start = s.table().transformPosition(x0, 0.005f, z0, new Vector3f());
                 Vector3f end = m.transformPosition(x1, y1, z1, new Vector3f());
-                ReplayDraw.segment(glow, start, end, 0.016f,
+                ReplayDraw.segment(glow, start, end, 0.016f * beamScale,
                         ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.30 * beam), ReplayPalette.alpha(ReplayPalette.LAMP, 0.08 * beam));
                 double t = (f.anim * 0.45 + (sx + 2) * 0.17 + (sz + 2) * 0.31) % 1.0;
                 Vector3f dot = new Vector3f(start).lerp(end, (float) t);
-                ReplayDraw.billboard(glow, dot, f.right, f.up, 0.02f, 0.02f,
+                ReplayDraw.billboard(glow, dot, f.right, f.up, 0.02f * beamScale, 0.02f * beamScale,
                         ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, 0.45 * beam * Math.sin(t * Math.PI)));
             }
         }
@@ -296,12 +385,13 @@ final class ReplayTrayPainter {
         VertexConsumer glow = f.glow();
         float w = model.mapW / 2 + 0.04f, dd = model.mapD / 2 + 0.04f, h = Math.max(0.12f, model.mapH + 0.04f);
         double a = s.fade();
+        float elemScale = s.scale() * (float) f.focus.zoom();
         if (stage.scan() < 1 && stage.scan() > 0) {
             float x = -w + (float) (2 * w * stage.scan());
             int gold = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.55 * a), clear = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0);
             ReplayDraw.quad(glow, d, x, 0, -dd, x, 0, dd, x, h, dd, x, h, -dd, gold, gold, clear, clear);
-            ReplayDraw.segment(glow, d, x, 0.004f, -dd, x, 0.004f, dd, 0.02f, gold, gold);
-            ReplayDraw.wireBox(glow, d, -w, 0, -dd, w, h, dd, 0.008f,
+            ReplayDraw.segment(glow, d, x, 0.004f, -dd, x, 0.004f, dd, 0.02f * elemScale, gold, gold);
+            ReplayDraw.wireBox(glow, d, -w, 0, -dd, w, h, dd, 0.008f * elemScale,
                     ReplayPalette.alpha(ReplayPalette.BRASS, 0.55 * a * (1 - stage.scan() * 0.5)));
         }
         if (stage.reviewWave() >= 0) {
@@ -316,7 +406,7 @@ final class ReplayTrayPainter {
             double pulse = 0.55 + 0.45 * Math.sin(f.anim * 5.2);
             int red = ReplayPalette.alpha(ReplayPalette.EMERGENCY, 0.16 * a * pulse);
             ReplayDraw.rectXZ(glow, d, -w, -dd, w, dd, 0.01f, red);
-            ReplayDraw.wireBox(glow, d, -w, 0, -dd, w, h, dd, 0.006f, ReplayPalette.alpha(ReplayPalette.EMERGENCY, 0.35 * a * pulse));
+            ReplayDraw.wireBox(glow, d, -w, 0, -dd, w, h, dd, 0.006f * elemScale, ReplayPalette.alpha(ReplayPalette.EMERGENCY, 0.35 * a * pulse));
         }
     }
 

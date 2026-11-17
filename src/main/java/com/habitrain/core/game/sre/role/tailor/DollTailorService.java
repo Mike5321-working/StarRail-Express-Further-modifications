@@ -293,8 +293,42 @@ public final class DollTailorService {
 
     /** The upstream gun handler has already consumed ammunition and checked its cooldown. */
     public static void gunHit(ServerPlayer attacker, int entityId) {
-        if (!attacker.getMainHandItem().is(io.wifi.starrailexpress.index.tag.TMMItemTags.GUNS)) return;
+        var gun = attacker.getMainHandItem();
+        if (!gun.is(io.wifi.starrailexpress.index.tag.TMMItemTags.GUNS)
+                || gun.is(org.agmas.noellesroles.init.ModItems.FAKE_REVOLVER)
+                || gun.is(org.agmas.noellesroles.init.ModItems.ONCE_REVOLVER)) return;
         rangedHit(attacker, entityId, 20);
+    }
+
+    public static void batHit(ServerPlayer attacker, TailorDollEntity doll) {
+        if (!ServerAimTargeting.isAliveParticipant(attacker) || isCasting(attacker)
+                || !doll.complete() || !owns(doll)
+                || attacker.getCooldowns().isOnCooldown(io.wifi.starrailexpress.index.TMMItems.BAT)
+                || attacker.getAttackStrengthScale(0.75F) < 1.0F
+                || !attacker.canInteractWithEntity(doll, 0.0D) || !attacker.hasLineOfSight(doll)) return;
+        destroy(doll, true);
+        attacker.level().playSound(null, attacker.blockPosition(), io.wifi.starrailexpress.index.TMMSounds.ITEM_BAT_HIT,
+                SoundSource.PLAYERS, 3.0F, 1.0F);
+    }
+
+    public static void shortShotgunFanHit(ServerPlayer attacker, double killRange) {
+        if (!ServerAimTargeting.isAliveParticipant(attacker) || isCasting(attacker)) return;
+        ServerLevel level = attacker.serverLevel();
+        Vec3 eye = attacker.getEyePosition();
+        Vec3 look = attacker.getLookAngle().normalize();
+        double cosHalfAngle = Math.cos(Math.toRadians(35.0D));
+        AABB box = attacker.getBoundingBox().inflate(killRange + 1.0D);
+
+        for (TailorDollEntity doll : level.getEntitiesOfClass(TailorDollEntity.class, box, TailorDollEntity::isAttackableRoleProp)) {
+            if (!owns(doll)) continue;
+            Vec3 toDoll = doll.position().add(0.0D, 0.9D, 0.0D).subtract(eye);
+            double dist = toDoll.length();
+            if (dist <= killRange + 0.5D && dist > 1.0E-4D) {
+                if (toDoll.scale(1.0D / dist).dot(look) >= cosHalfAngle && attacker.hasLineOfSight(doll)) {
+                    destroy(doll, true);
+                }
+            }
+        }
     }
 
     public static void rangedHit(ServerPlayer attacker, int entityId, double range) {

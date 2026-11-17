@@ -49,6 +49,14 @@ public final class ReplayPackets {
         @Override public Type<RequestSummary> type() { return TYPE; }
     }
 
+    public record StartPlayback(BlockPos board, UUID roundId) implements CustomPacketPayload {
+        public static final Type<StartPlayback> TYPE = typeId("replay_board_start");
+        static final StreamCodec<FriendlyByteBuf, StartPlayback> CODEC = codec(24,
+                b -> new StartPlayback(b.readBlockPos(), b.readUUID()),
+                (b, p) -> { b.writeBlockPos(p.board); b.writeUUID(p.roundId); });
+        @Override public Type<StartPlayback> type() { return TYPE; }
+    }
+
     public record LastMatchSummaryS2C(LastMatchReplay replay, byte[] tracks) implements CustomPacketPayload {
         public static final Type<LastMatchSummaryS2C> TYPE = typeId("last_match_summary");
         public static final StreamCodec<FriendlyByteBuf, LastMatchSummaryS2C> CODEC =
@@ -99,6 +107,7 @@ public final class ReplayPackets {
         PayloadTypeRegistry.playS2C().register(LastMatchSummaryS2C.TYPE, LastMatchSummaryS2C.CODEC);
         PayloadTypeRegistry.playS2C().register(ReplaySectionPatchS2C.TYPE, ReplaySectionPatchS2C.CODEC);
         PayloadTypeRegistry.playC2S().register(RequestSummary.TYPE, RequestSummary.CODEC);
+        PayloadTypeRegistry.playC2S().register(StartPlayback.TYPE, StartPlayback.CODEC);
         PayloadTypeRegistry.playC2S().register(ReplayMissingSectionsC2S.TYPE, ReplayMissingSectionsC2S.CODEC);
     }
 
@@ -154,6 +163,13 @@ public final class ReplayPackets {
             b.writeVarInt(span.startTick()); b.writeVarInt(span.endTick());
         }
         writeId(b, s.mvp()); b.writeVarInt(s.killCount()); b.writeBoolean(s.limited());
+        if (!s.drones().isEmpty()) {
+            if (s.drones().size() > MAX_DRONES) throw new IllegalArgumentException("Too many replay drones");
+            b.writeVarInt(s.drones().size());
+            for (Drone drone : s.drones()) {
+                b.writeUUID(drone.id()); b.writeUUID(drone.owner());
+            }
+        }
     }
 
     private static LastMatchSummaryS2C readSummary(FriendlyByteBuf b) {
@@ -190,9 +206,15 @@ public final class ReplayPackets {
             if (end < start) throw new DecoderException("Inverted replay span");
             spans.add(new Span(kind, actor, start, end));
         }
+        UUID mvp = readId(b);
+        int killCount = b.readVarInt();
+        boolean limited = b.readBoolean();
+        int drones = b.isReadable() ? count(b, MAX_DRONES) : 0;
+        List<Drone> aircraft = new ArrayList<>(drones);
+        for (int i = 0; i < drones; i++) aircraft.add(new Drone(b.readUUID(), b.readUUID(), List.of()));
         return new LastMatchSummaryS2C(new LastMatchReplay(id, anchor, duration, map, mode, status, win,
                 custom, title, subtitle, color, origin, manifest, people, events, spans,
-                readId(b), b.readVarInt(), b.readBoolean()), tracks);
+                mvp, killCount, limited, aircraft), tracks);
     }
 
     private static void writeManifest(FriendlyByteBuf b, ReplayMapManifest m) {

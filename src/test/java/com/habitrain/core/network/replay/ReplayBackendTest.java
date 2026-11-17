@@ -64,13 +64,26 @@ class ReplayBackendTest {
                     point(i * 5, (short) (i * 67), (short) (i * -221), i % 2 == 0 ? ALIVE : (byte) 0));
             tracks.add(samples);
         }
-        byte[] wire = ReplayTracks.encode(tracks);
+        var encoded = ReplayTracks.encodeWithStatus(tracks);
+        assertTrue(encoded.thinned(), "Expected oversized track payload to trigger thinning");
+        byte[] wire = encoded.bytes();
         assertTrue(wire.length <= ReplayTracks.MAX_BYTES);
         var decoded = ReplayTracks.decode(wire, MAX_PLAYERS, 10_000);
         for (var track : decoded) {
             assertEquals(0, track.getFirst().tick());
             assertEquals(9995, track.getLast().tick());
         }
+    }
+
+    @Test void irreducibleTracksExceedingBudgetFailFastInsteadOfLoopingForever() {
+        List<List<Sample>> irreducible = new ArrayList<>();
+        for (int i = 0; i < 6_000; i++) {
+            irreducible.add(List.of(
+                    point(0, 100, -100, ALIVE),
+                    point(1000, -100, 100, (byte) (ALIVE | BREAK))
+            ));
+        }
+        assertThrows(IllegalArgumentException.class, () -> ReplayTracks.encodeWithStatus(irreducible));
     }
 
     @Test void manifestComputesOnlyMissingOrChangedSections() {
@@ -177,6 +190,45 @@ class ReplayBackendTest {
             assertTrue(read.replay().participants().getFirst().winner());
             assertEquals(List.of(actor.track()), ReplayTracks.decode(read.tracks(), 1, 40));
         } finally { buf.release(); }
+    }
+
+    @Test void droneTrackRoundTripPreservesIndependentLifecycleAndOwner() {
+        var operator = new Participant(PLAYER, "Pilot", "", 0, "", 0,
+                MatchWinFaction.PASSENGER, false, 0, 0, 0, 0, List.of(point(0, 0, 0, ALIVE)));
+        var drone = new Drone(new UUID(3, 5), PLAYER, List.of(
+                point(2, 16, 0, (byte) (ALIVE | Drone.PILOTED)),
+                point(5, 32, 0, (byte) (ALIVE | Drone.CRASHED)),
+                point(9, 32, 0, BREAK)));
+        var clip = new LastMatchReplay(ROUND, 0, 20, "Train", "murder", "", MatchWinKind.INNOCENT,
+                "", "", "", 0, BOUNDS, null, List.of(operator), List.of(), List.of(), null, 0, false, List.of(drone));
+        var buf = new FriendlyByteBuf(Unpooled.buffer());
+        try {
+            LastMatchSummaryS2C.CODEC.encode(buf, new LastMatchSummaryS2C(clip,
+                    ReplayTracks.encode(List.of(operator.track(), drone.track()))));
+            var got = LastMatchSummaryS2C.CODEC.decode(buf);
+            assertEquals(List.of(new Drone(drone.id(), PLAYER, List.of())), got.replay().drones());
+            var samples = ReplayTracks.decode(got.tracks(), 2, 20);
+            assertEquals(operator.track(), samples.getFirst());
+            var sampler = new com.habitrain.core.scene.replay.ReplayTrackSampler(samples.getLast());
+            assertFalse(sampler.sample(1).visible());
+            assertTrue(sampler.sample(3).has(Drone.PILOTED));
+            assertTrue(sampler.sample(6).has(Drone.CRASHED));
+            assertFalse(sampler.sample(9).visible());
+        } finally { buf.release(); }
+    }
+
+    @Test void aTableHasOneScheduledPassAndElapsedVideoDoesNotLoop() {
+        var timeline = new ReplayTimeline(0, 800, List.of(240));
+        var start = new com.habitrain.core.scene.block.SettlementSummaryBoard.Marker.Playback(
+                ROUND, 1200, 1200 + timeline.cycleTicks());
+        assertFalse(start.playing(1199));
+        assertTrue(start.pendingOrPlaying(1199));
+        assertEquals(ReplayTimeline.Phase.BUILD, timeline.atElapsed(0).phase());
+        assertTrue(start.playing(1200));
+        assertTrue(start.playing(start.endTick() - 1));
+        assertFalse(start.pendingOrPlaying(start.endTick()));
+        assertFalse(start.playing(start.endTick()));
+        assertEquals(ReplayTimeline.Phase.HONORS, timeline.atElapsed(timeline.cycleTicks() + 1).phase());
     }
 
     @Test void invalidMissingRequestsAndSectionFragmentsAreRejected() {

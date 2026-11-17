@@ -111,6 +111,24 @@ public final class SettlementSummaryBoard extends BaseEntityBlock {
 
     public static final class Marker extends BlockEntity {
         private ReplayBoardSettings settings = ReplayBoardSettings.DEFAULT;
+        private Playback playback;
+
+        public record Playback(java.util.UUID roundId, long startTick, long endTick) {
+            public boolean pendingOrPlaying(long gameTick) { return gameTick < endTick; }
+            public boolean playing(long gameTick) { return gameTick >= startTick && gameTick < endTick; }
+        }
+
+        public Playback playback() { return playback; }
+
+        public boolean startPlayback(java.util.UUID round, int duration) {
+            if (level == null || level.isClientSide) return false;
+            long now = level.getGameTime();
+            if (playback != null && playback.roundId().equals(round) && playback.pendingOrPlaying(now)) return false;
+            long start = now + 12;
+            playback = new Playback(round, start, start + duration);
+            level.sendBlockUpdated(worldPosition, getBlockState(), getBlockState(), Block.UPDATE_CLIENTS);
+            return true;
+        }
 
         public Marker(BlockPos pos, BlockState state) { super(markerType, pos, state); }
 
@@ -133,10 +151,19 @@ public final class SettlementSummaryBoard extends BaseEntityBlock {
         @Override protected void loadAdditional(CompoundTag tag, HolderLookup.Provider registries) {
             super.loadAdditional(tag, registries);
             settings = ReplayBoardSettings.load(tag.getCompound("Display"));
+            playback = tag.hasUUID("PlaybackRound")
+                    ? new Playback(tag.getUUID("PlaybackRound"), tag.getLong("PlaybackStart"), tag.getLong("PlaybackEnd"))
+                    : null;
         }
 
         @Override public CompoundTag getUpdateTag(HolderLookup.Provider registries) {
-            return saveCustomOnly(registries);
+            CompoundTag tag = saveCustomOnly(registries);
+            if (level != null && playback != null && playback.pendingOrPlaying(level.getGameTime())) {
+                tag.putUUID("PlaybackRound", playback.roundId());
+                tag.putLong("PlaybackStart", playback.startTick());
+                tag.putLong("PlaybackEnd", playback.endTick());
+            }
+            return tag;
         }
 
         @Override public ClientboundBlockEntityDataPacket getUpdatePacket() {

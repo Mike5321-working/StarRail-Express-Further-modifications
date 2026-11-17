@@ -56,8 +56,13 @@ public final class ReplayTimeline {
     }
 
     public Frame at(long gameTick, float partialTick) {
-        double cursor = (Math.floorMod(gameTick - anchor, cycle) + Math.clamp(partialTick, 0, 1)) % cycle;
-        if (gameTick < anchor) cursor = 0;
+        double cursor = gameTick < anchor ? 0 : (Math.floorMod(gameTick - anchor, cycle) + Math.clamp(partialTick, 0, 1)) % cycle;
+        return atElapsed(cursor);
+    }
+
+    /** One presentation pass. The caller controls when it starts and returns to idle. */
+    public Frame atElapsed(double elapsed) {
+        double cursor = Math.clamp(elapsed, 0, Math.nextDown((double) cycle));
         if (cursor < INTRO) return new Frame(Phase.BUILD, cursor / INTRO, 0, false);
         cursor -= INTRO;
         if (cursor < action) {

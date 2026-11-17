@@ -71,6 +71,7 @@ public class HabiTrainCoreClient implements ClientModInitializer {
         new HudRegistrar();
         EliminatedRestPromptState.registerLifecycle();
         EliminatedRestCommandTip.register();
+        SpectatorRoleFactionHud.register();
 
         // 任务点统一在世界渲染 LAST 阶段直绘，避免深度状态和延迟 buffer 重新遮挡。
         TaskOverlayDrawer.registerFinalPass();
@@ -102,6 +103,7 @@ public class HabiTrainCoreClient implements ClientModInitializer {
         HabiRoleClientHooks.init();
         com.habitrain.core.client.tailor.DollTailorClient.init();
         com.habitrain.core.client.idiot.IdiotClient.init();
+        com.habitrain.core.client.drone.DroneOperatorClient.init();
         com.habitrain.core.client.role.RoleClientExtensionHooks.init();
 
         // 角色动作客户端结果 API：注册超时 tick

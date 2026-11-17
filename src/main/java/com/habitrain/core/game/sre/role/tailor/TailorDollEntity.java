@@ -1,5 +1,6 @@
 package com.habitrain.core.game.sre.role.tailor;
 
+import com.habitrain.core.game.sre.role.AttackableRoleProp;
 import net.minecraft.core.particles.BlockParticleOption;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.nbt.CompoundTag;
@@ -20,7 +21,7 @@ import java.util.Optional;
 import java.util.UUID;
 
 /** A stationary, attackable cloth prop, never a player and never a round participant. */
-public final class TailorDollEntity extends PathfinderMob {
+public final class TailorDollEntity extends PathfinderMob implements AttackableRoleProp {
     private static final EntityDataAccessor<Optional<UUID>> OWNER = SynchedEntityData.defineId(TailorDollEntity.class, EntityDataSerializers.OPTIONAL_UUID);
     private static final EntityDataAccessor<Optional<UUID>> TARGET = SynchedEntityData.defineId(TailorDollEntity.class, EntityDataSerializers.OPTIONAL_UUID);
     private static final EntityDataAccessor<String> NAME = SynchedEntityData.defineId(TailorDollEntity.class, EntityDataSerializers.STRING);
@@ -48,6 +49,7 @@ public final class TailorDollEntity extends PathfinderMob {
     public String targetName() { return entityData.get(NAME); }
     public int stitches() { return entityData.get(STITCHES); }
     public boolean complete() { return stitches() >= DollTailorRules.SEWING_TICKS; }
+    @Override public boolean isAttackableRoleProp() { return complete() && !isRemoved(); }
     public void stitches(int ticks) { entityData.set(STITCHES, ticks); }
     @Override public boolean isPushable() { return false; }
     @Override public boolean removeWhenFarAway(double distance) { return false; }

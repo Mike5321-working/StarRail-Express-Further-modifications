@@ -199,6 +199,44 @@ public final class CoreRoleExtensionProvider implements RoleExtensionEntrypoint 
                         .cooldownSeconds(0).showOnHud(true).announceToSelf(true).build()))
                 .maxSprintTime(TMMRoles.CIVILIAN.getMaxSprintTime()).build());
 
+        HabiRoles.DRONE_OPERATOR = registrar.add(RoleDefinition.builder(HabiRoles.DRONE_OPERATOR_ID)
+                .presentation(RolePresentation.builder()
+                        .color(com.habitrain.core.game.sre.role.drone.DroneRules.THEME_COLOR)
+                        .moodType(SRERole.MoodType.FAKE)
+                        .build())
+                .faction(RoleFactionProfile.builder()
+                        .neutral()
+                        .neutralForKiller()
+                        .build())
+                .spawn(RoleSpawnProfile.builder()
+                        .defaultMax(1)
+                        .build())
+                .compatibility(RoleCompatibilityProfile.builder()
+                        .canSeeCoin()
+                        .canPickUpRevolver(false)
+                        .build())
+                .visibility(RoleVisibilityProfile.builder()
+                        .canUseInstinct()
+                        .instinctNightVision()
+                        .canSeeTeammateKiller()
+                        .build())
+                .inventory(RoleInventoryProfile.builder()
+                        .item(HabiRoleItems.createDroneTerminal())
+                        .item(HabiRoleItems.createDroneBattery(1))
+                        .build())
+                .economy(RoleEconomyProfile.builder()
+                        .live(HabiRoleShops::droneOperatorShop)
+                        .build())
+                .skill(RoleSkillSpec.of(RoleSkill.skill(
+                        HabiTrainCore.id("drone_operator_link"),
+                        "skill.habitrain_core.drone_operator.link",
+                        com.habitrain.core.game.sre.role.drone.DroneOperatorService::useLinkSkill)
+                        .cooldownSeconds(0).showOnHud(true).announceToSelf(false).build()))
+                .maxSprintTime(Integer.MAX_VALUE)
+                .canSeeTime(true)
+                .build());
+        HabiRoles.DRONE_OPERATOR.setToggledOnInstinctType(io.wifi.starrailexpress.api.InstinctType.KILLER_INSTINCT);
+
         registerSins(registrar);
 
         // Managed behavior hooks for core's own roles (audit P1-1): they must

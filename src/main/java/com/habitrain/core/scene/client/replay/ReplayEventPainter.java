@@ -32,15 +32,16 @@ final class ReplayEventPainter {
         double a = s.fade() * stage.actors();
         boolean play = f.frame.phase() == ReplayTimeline.Phase.PLAY;
         double emphasis = f.frame.slowMotion() ? 1.6 : 1.0;
+        float elemScale = s.scale() * (float) f.focus.zoom();
         VertexConsumer glow = f.glow();
         for (ReplayBoardModel.EventMark e : model.events) {
             double age = t - e.node.tick();
             if (age < 0) continue;
             double window = window(e.node.kind(), model.rate);
             if (play && age <= window) {
-                live(f, s, d, glow, e, age, window, a, emphasis);
+                live(f, s, d, glow, e, age, window, a, emphasis, elemScale);
             } else if (stage.history() > 0.01 || age > window) {
-                marker(f, d, glow, e, a * (play ? 0.35 : stage.history()));
+                marker(f, d, glow, e, a * (play ? 0.35 : stage.history()), elemScale);
             }
         }
     }
@@ -57,7 +58,7 @@ final class ReplayEventPainter {
     }
 
     private static void live(ReplayFrame f, ReplayBoardSite s, Matrix4f d, VertexConsumer glow,
-                             ReplayBoardModel.EventMark e, double age, double window, double a, double emphasis) {
+                             ReplayBoardModel.EventMark e, double age, double window, double a, double emphasis, float elemScale) {
         double k = age / window;
         double fadeOut = 1 - ReplayStagePlan.easeOutCubic(k);
         float x = e.tx, y = e.ty + 0.01f, z = e.tz;
@@ -74,10 +75,10 @@ final class ReplayEventPainter {
                         ReplayPalette.alpha(ReplayPalette.RUBY, 0.55 * fadeOut * a), ReplayPalette.alpha(ReplayPalette.RUBY, 0));
                 if (e.hasFrom && k < 0.45) {
                     double sk = 1 - k / 0.45;
-                    ReplayDraw.segment(glow, d, e.fx, e.fy + 0.08f, e.fz, x, y + 0.08f, z, 0.03f,
+                    ReplayDraw.segment(glow, d, e.fx, e.fy + 0.08f, e.fz, x, y + 0.08f, z, 0.03f * elemScale,
                             ReplayPalette.alpha(0xFFFFFFFF, 0.2 * sk * a), ReplayPalette.alpha(ReplayPalette.RUBY, 0.95 * sk * a));
                 }
-                weapon(f, d, e, x, y + 0.26f, z, (float) (0.15 * emphasis), fadeOut * a);
+                weapon(f, d, e, x, y + 0.26f, z, (float) (0.15 * emphasis), fadeOut * a, elemScale);
             }
             case GUNSHOT -> {
                 boolean hit = e.has(HIT);
@@ -85,26 +86,26 @@ final class ReplayEventPainter {
                 int halo = e.has(BACKFIRE) ? ReplayPalette.EXPLOSION : ReplayPalette.BRASS_LIGHT;
                 double beam = k < 0.65 ? 1 - k / 0.65 : 0;
                 if (beam > 0) {
-                    ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.045f,
+                    ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.045f * elemScale,
                             ReplayPalette.alpha(halo, 0.35 * beam * a), ReplayPalette.alpha(halo, 0.15 * beam * a));
-                    ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.014f,
+                    ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.014f * elemScale,
                             ReplayPalette.alpha(core, 0.95 * beam * a), ReplayPalette.alpha(core, 0.6 * beam * a));
                 }
                 Vector3f muzzle = d.transformPosition(e.fx, e.fy, e.fz, new Vector3f());
-                ReplayDraw.star(glow, muzzle, f.right, f.up, (float) (0.09 * emphasis * fadeOut), 8, (float) (age * 0.3),
+                ReplayDraw.star(glow, muzzle, f.right, f.up, (float) (0.09 * emphasis * fadeOut) * elemScale, 8, (float) (age * 0.3),
                         ReplayPalette.alpha(core, fadeOut * a), ReplayPalette.alpha(halo, 0));
                 Vector3f impact = d.transformPosition(e.tx, e.ty, e.tz, new Vector3f());
                 if (hit) {
                     ReplayDraw.ring(glow, d, e.tx, e.ty, e.tz, (float) (0.04 + 0.12 * k), 0.016f, 20,
                             ReplayPalette.alpha(ReplayPalette.RUBY, fadeOut * a), ReplayPalette.alpha(ReplayPalette.RUBY, 0));
                 } else if (e.has(BACKFIRE)) {
-                    ReplayDraw.star(glow, impact, f.right, f.up, (float) (0.12 * emphasis * fadeOut), 8, 0.4f,
+                    ReplayDraw.star(glow, impact, f.right, f.up, (float) (0.12 * emphasis * fadeOut) * elemScale, 8, 0.4f,
                             ReplayPalette.alpha(ReplayPalette.EXPLOSION, fadeOut * a), ReplayPalette.alpha(ReplayPalette.LAMP, 0));
                 } else if (s.detail()) {
-                    ReplayDraw.star(glow, impact, f.right, f.up, (float) (0.05 + 0.05 * k), 10, 0.4f,
+                    ReplayDraw.star(glow, impact, f.right, f.up, (float) (0.05 + 0.05 * k) * elemScale, 10, 0.4f,
                             ReplayPalette.alpha(ReplayPalette.LAMP, fadeOut * a), ReplayPalette.alpha(ReplayPalette.LAMP, 0));
                 }
-                if (e.has(GUN_DROP)) warning(f, glow, d.transformPosition(e.fx, e.fy + 0.2f, e.fz, new Vector3f()), fadeOut * a);
+                if (e.has(GUN_DROP)) warning(f, glow, d.transformPosition(e.fx, e.fy + 0.2f, e.fz, new Vector3f()), fadeOut * a, elemScale);
             }
             case GRENADE_EXPLOSION, BOMB_DETONATE -> {
                 for (int ring = 0; ring < 3; ring++) {
@@ -115,12 +116,12 @@ final class ReplayEventPainter {
                             ReplayPalette.alpha(ReplayPalette.LAMP, 0));
                 }
                 Vector3f c = d.transformPosition(x, y + 0.08f, z, new Vector3f());
-                float flash = (float) (0.22 * emphasis * (1 - k));
+                float flash = (float) (0.22 * emphasis * (1 - k)) * elemScale;
                 ReplayDraw.billboard(glow, c, f.right, f.up, flash, flash, ReplayPalette.alpha(ReplayPalette.LAMP, 0.5 * fadeOut * a));
-                if (e.node.kind() == Kind.BOMB_DETONATE) weapon(f, d, e, x, y + 0.24f, z, 0.12f, fadeOut * a);
+                if (e.node.kind() == Kind.BOMB_DETONATE) weapon(f, d, e, x, y + 0.24f, z, 0.12f, fadeOut * a, elemScale);
             }
             case GRENADE_THROWN -> {
-                if (e.hasFrom && e.hasTo) arc(glow, d, e, fadeOut * a, ReplayPalette.EXPLOSION);
+                if (e.hasFrom && e.hasTo) arc(glow, d, e, fadeOut * a, ReplayPalette.EXPLOSION, elemScale);
                 halo(glow, d, x, y, z, k, a, ReplayPalette.EXPLOSION, 0.12f);
             }
             case POISON -> {
@@ -131,7 +132,7 @@ final class ReplayEventPainter {
                             ReplayPalette.alpha(ReplayPalette.POISON, (1 - rk) * 0.85 * a), ReplayPalette.alpha(ReplayPalette.POISON, 0));
                 }
                 Vector3f c = d.transformPosition(x, y + 0.16f + (float) k * 0.05f, z, new Vector3f());
-                ReplayDraw.billboard(glow, c, f.right, f.up, 0.025f, 0.04f, ReplayPalette.alpha(ReplayPalette.POISON, fadeOut * a));
+                ReplayDraw.billboard(glow, c, f.right, f.up, 0.025f * elemScale, 0.04f * elemScale, ReplayPalette.alpha(ReplayPalette.POISON, fadeOut * a));
             }
             case SHIELD_BROKEN -> {
                 for (int i = 0; i < 6; i++) {
@@ -140,13 +141,13 @@ final class ReplayEventPainter {
                     float c = (float) Math.cos(ang), sn = (float) Math.sin(ang);
                     float c2 = (float) Math.cos(ang + 0.7), s2 = (float) Math.sin(ang + 0.7);
                     ReplayDraw.segment(glow, d, x + c * r0, y + 0.06f, z + sn * r0, x + c2 * r1, y + 0.06f + (float) k * 0.05f,
-                            z + s2 * r1, 0.016f, ReplayPalette.alpha(ReplayPalette.SHIELD, fadeOut * a), ReplayPalette.alpha(ReplayPalette.SHIELD, 0.3 * fadeOut * a));
+                            z + s2 * r1, 0.016f * elemScale, ReplayPalette.alpha(ReplayPalette.SHIELD, fadeOut * a), ReplayPalette.alpha(ReplayPalette.SHIELD, 0.3 * fadeOut * a));
                 }
             }
             case BOMB_PLANT -> {
                 double blink = Math.sin(f.anim * 12) > 0 ? 1 : 0.25;
                 Vector3f c = d.transformPosition(x, y + 0.03f, z, new Vector3f());
-                ReplayDraw.billboard(glow, c, f.right, f.up, 0.03f, 0.03f, ReplayPalette.alpha(ReplayPalette.RUBY, blink * a));
+                ReplayDraw.billboard(glow, c, f.right, f.up, 0.03f * elemScale, 0.03f * elemScale, ReplayPalette.alpha(ReplayPalette.RUBY, blink * a));
                 halo(glow, d, x, y, z, k, a, ReplayPalette.RUBY, 0.1f);
             }
             case BOMB_DEFUSE -> halo(glow, d, x, y, z, k, a, ReplayPalette.SHIELD, 0.16f);
@@ -161,34 +162,34 @@ final class ReplayEventPainter {
                 float r = 0.05f + (float) k * 0.04f;
                 int c = ReplayPalette.alpha(e.node.kind() == Kind.DOOR_SEAL || e.node.kind() == Kind.DOOR_LOCK
                         ? ReplayPalette.SHIELD : ReplayPalette.LAMP, fadeOut * a);
-                ReplayDraw.wireBox(glow, d, x - r, y, z - r, x + r, y + 0.12f, z + r, 0.01f, c);
+                ReplayDraw.wireBox(glow, d, x - r, y, z - r, x + r, y + 0.12f, z + r, 0.01f * elemScale, c);
             }
             default -> {
                 int color = actorColor(f, e.node.actor());
                 halo(glow, d, x, y, z, k, a, color, 0.1f);
                 if (s.detail()) {
                     Vector3f c = d.transformPosition(x, y + 0.12f, z, new Vector3f());
-                    ReplayDraw.star(glow, c, f.right, f.up, (float) (0.05 * fadeOut + 0.02), 6, (float) f.anim,
+                    ReplayDraw.star(glow, c, f.right, f.up, (float) (0.05 * fadeOut + 0.02) * elemScale, 6, (float) f.anim,
                             ReplayPalette.alpha(color, fadeOut * a), ReplayPalette.alpha(color, 0));
                 }
             }
         }
     }
 
-    private static void marker(ReplayFrame f, Matrix4f d, VertexConsumer glow, ReplayBoardModel.EventMark e, double a) {
+    private static void marker(ReplayFrame f, Matrix4f d, VertexConsumer glow, ReplayBoardModel.EventMark e, double a, float elemScale) {
         if (a <= 0.02) return;
         float x = e.tx, y = e.ty + 0.008f, z = e.tz;
         switch (e.node.kind()) {
             case KILL -> {
                 float r = 0.035f;
                 int c = ReplayPalette.alpha(ReplayPalette.RUBY, 0.95 * a);
-                ReplayDraw.segment(glow, d, x - r, y, z - r, x + r, y, z + r, 0.014f, c, c);
-                ReplayDraw.segment(glow, d, x - r, y, z + r, x + r, y, z - r, 0.014f, c, c);
+                ReplayDraw.segment(glow, d, x - r, y, z - r, x + r, y, z + r, 0.014f * elemScale, c, c);
+                ReplayDraw.segment(glow, d, x - r, y, z + r, x + r, y, z - r, 0.014f * elemScale, c, c);
                 ReplayDraw.ring(glow, d, x, y, z, 0.05f, 0.008f, 16, ReplayPalette.alpha(ReplayPalette.RUBY, 0.5 * a),
                         ReplayPalette.alpha(ReplayPalette.RUBY, 0.1 * a));
-                if (a > 0.5) weapon(f, d, e, x, y + 0.14f, z, 0.08f, a * 0.8);
+                if (a > 0.5) weapon(f, d, e, x, y + 0.14f, z, 0.08f, a * 0.8, elemScale);
             }
-            case GUNSHOT -> ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.006f,
+            case GUNSHOT -> ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.006f * elemScale,
                     ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.35 * a), ReplayPalette.alpha(e.has(HIT) ? ReplayPalette.RUBY : ReplayPalette.LAMP, 0.35 * a));
             case GRENADE_EXPLOSION, BOMB_DETONATE -> ReplayDraw.ring(glow, d, x, y, z, 0.07f, 0.012f, 20,
                     ReplayPalette.alpha(ReplayPalette.EXPLOSION, 0.7 * a), ReplayPalette.alpha(ReplayPalette.EXPLOSION, 0.1 * a));
@@ -207,36 +208,38 @@ final class ReplayEventPainter {
                 ReplayPalette.alpha(color, 0));
     }
 
-    private static void arc(VertexConsumer glow, Matrix4f d, ReplayBoardModel.EventMark e, double a, int color) {
+    private static void arc(VertexConsumer glow, Matrix4f d, ReplayBoardModel.EventMark e, double a, int color, float elemScale) {
         Vector3f prev = d.transformPosition(e.fx, e.fy, e.fz, new Vector3f());
         float dist = (float) Math.sqrt((e.tx - e.fx) * (e.tx - e.fx) + (e.tz - e.fz) * (e.tz - e.fz));
         for (int i = 1; i <= 12; i++) {
             float u = i / 12f;
             float h = 4 * u * (1 - u) * Math.max(0.06f, dist * 0.35f);
             Vector3f p = d.transformPosition(e.fx + (e.tx - e.fx) * u, e.fy + (e.ty - e.fy) * u + h, e.fz + (e.tz - e.fz) * u, new Vector3f());
-            if (i % 2 == 1) ReplayDraw.segment(glow, prev, p, 0.012f, ReplayPalette.alpha(color, 0.8 * a), ReplayPalette.alpha(color, 0.8 * a));
+            if (i % 2 == 1) ReplayDraw.segment(glow, prev, p, 0.012f * elemScale, ReplayPalette.alpha(color, 0.8 * a), ReplayPalette.alpha(color, 0.8 * a));
             prev = p;
         }
     }
 
-    private static void warning(ReplayFrame f, VertexConsumer glow, Vector3f at, double a) {
-        Vector3f top = new Vector3f(at).add(new Vector3f(f.up).mul(0.05f));
-        Vector3f left = new Vector3f(at).sub(new Vector3f(f.right).mul(0.045f)).sub(new Vector3f(f.up).mul(0.03f));
-        Vector3f right = new Vector3f(at).add(new Vector3f(f.right).mul(0.045f)).sub(new Vector3f(f.up).mul(0.03f));
+    private static void warning(ReplayFrame f, VertexConsumer glow, Vector3f at, double a, float elemScale) {
+        Vector3f top = new Vector3f(at).add(new Vector3f(f.up).mul(0.05f * elemScale));
+        Vector3f left = new Vector3f(at).sub(new Vector3f(f.right).mul(0.045f * elemScale)).sub(new Vector3f(f.up).mul(0.03f * elemScale));
+        Vector3f right = new Vector3f(at).add(new Vector3f(f.right).mul(0.045f * elemScale)).sub(new Vector3f(f.up).mul(0.03f * elemScale));
         int c = ReplayPalette.alpha(ReplayPalette.LAMP, a);
-        ReplayDraw.segment(glow, top, left, 0.012f, c, c);
-        ReplayDraw.segment(glow, left, right, 0.012f, c, c);
-        ReplayDraw.segment(glow, right, top, 0.012f, c, c);
-        f.billboardText(new Vector3f(at).sub(new Vector3f(f.up).mul(0.005f)), Component.literal("!"), 0.004f, c);
+        ReplayDraw.segment(glow, top, left, 0.012f * elemScale, c, c);
+        ReplayDraw.segment(glow, left, right, 0.012f * elemScale, c, c);
+        ReplayDraw.segment(glow, right, top, 0.012f * elemScale, c, c);
+        f.billboardText(new Vector3f(at).sub(new Vector3f(f.up).mul(0.005f * elemScale)), Component.literal("!"), 0.004f * elemScale, c);
     }
 
     /** Floating, slowly spinning 3D weapon model above a kill / detonation. */
     private static void weapon(ReplayFrame f, Matrix4f d, ReplayBoardModel.EventMark e, float x, float y, float z,
-                               float size, double a) {
+                               float size, double a, float elemScale) {
         if (a <= 0.1) return;
         Vector3f c = d.transformPosition(x, y, z, new Vector3f());
-        ReplayDraw.billboard(f.glow(), c, f.right, f.up, size * 0.75f, size * 0.75f,
-                ReplayPalette.alpha(e.icon.color(), 0.18 * a));
+        if (!f.video) {
+            ReplayDraw.billboard(f.glow(), c, f.right, f.up, size * 0.75f * elemScale, size * 0.75f * elemScale,
+                    ReplayPalette.alpha(e.icon.color(), 0.18 * a));
+        }
         float bob = (float) Math.sin(f.anim * 2.4 + e.node.tick()) * 0.012f;
         Matrix4f m = new Matrix4f(d).translate(x, y + bob, z).rotateY((float) (f.anim * 1.6 + e.node.tick() * 0.1)).scale(size * 1.6f);
         var stack = e.item();
@@ -275,7 +278,9 @@ final class ReplayEventPainter {
             default -> ReplayBoardTexts.tr("brief.explosion", ReplayBoardTexts.name(model.participantData(focus.actor())));
         };
         float y = ReplayBoardSite.MAP_BASE + Math.max(0.35f, model.mapH + 0.22f);
-        Matrix4f m = new Matrix4f(s.board()).translate(0, y, 0.0f);
+        Vector3f anchor = s.board().transformPosition(0, y, 0, new Vector3f());
+        float worldScale = s.scale();
+        Matrix4f m = new Matrix4f().translate(anchor).rotate(f.rotation).scale(worldScale);
         float w = Math.min(s.hw() * 2 - 0.2f, Minecraft.getInstance().font.width(line) * 0.0062f + 0.36f);
         float h = 0.13f;
         VertexConsumer fill = f.fill();
@@ -283,8 +288,8 @@ final class ReplayEventPainter {
                 ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.88 * a));
         VertexConsumer glow = f.glow();
         int brass = ReplayPalette.alpha(ReplayPalette.BRASS, 0.9 * a);
-        ReplayDraw.segment(glow, m, -w / 2, h / 2, 0.002f, w / 2, h / 2, 0.002f, 0.007f, brass, brass);
-        ReplayDraw.segment(glow, m, -w / 2, -h / 2, 0.002f, w / 2, -h / 2, 0.002f, 0.007f, brass, brass);
+        ReplayDraw.segment(glow, m, -w / 2, h / 2, 0.002f, w / 2, h / 2, 0.002f, 0.007f * worldScale, brass, brass);
+        ReplayDraw.segment(glow, m, -w / 2, -h / 2, 0.002f, w / 2, -h / 2, 0.002f, 0.007f * worldScale, brass, brass);
         int ruby = ReplayPalette.alpha(ReplayPalette.RUBY, 0.95 * a);
         ReplayDraw.rectXY(fill, m, -w / 2, -h / 2, -w / 2 + 0.03f, h / 2, 0.001f, ruby, ruby);
         f.text(m, line, 0.015f, 0, 0.004f, 0.0062f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a), 0, true, w - 0.12f);
