@@ -30,6 +30,7 @@ import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.GameType;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.AABB;
+import org.agmas.noellesroles.init.ModEffects;
 import pro.fazeclan.river.stupid_express.modifier.refugee.cca.RefugeeComponent;
 
 import java.util.ArrayList;
@@ -75,6 +76,8 @@ public final class EliminatedRestAreaService {
     private static final Map<UUID, Long> TOGGLE_COOLDOWN_UNTIL = new HashMap<>();
     private static final Map<UUID, StashedLoadout> STASHED_LOADOUTS = new HashMap<>();
     private static final int TOGGLE_COOLDOWN_TICKS = 10;
+    private static final int REST_SKILL_SEAL_TICKS = 60;
+    private static final int REST_SKILL_SEAL_REFRESH_TICKS = 20;
     /** 往返等待房间的玩家命令；客户端右上角提示里显示的就是它。 */
     public static final String REST_COMMAND = "rest";
     private static boolean initialized;
@@ -108,8 +111,12 @@ public final class EliminatedRestAreaService {
         OnGameEnd.EVENT.register((level, gameWorld) -> clearRoundStateForLevel(level));
         ServerLifecycleEvents.SERVER_STOPPED.register(server -> clearRoundState());
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
-            if (handler.getPlayer() != null) {
-                handleDisconnect(handler.getPlayer().getUUID());
+            ServerPlayer player = handler.getPlayer();
+            if (player != null) {
+                if (isResting(player)) {
+                    player.removeEffect(ModEffects.SKILL_BANED);
+                }
+                handleDisconnect(player.getUUID());
             }
         });
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
@@ -458,6 +465,7 @@ public final class EliminatedRestAreaService {
         player.setCamera(player);
         player.teleportTo(postGameLevel, spawn.pos.x, spawn.pos.y, spawn.pos.z, spawn.yaw, spawn.pitch);
 
+        keepRestSkillSeal(player);
         ENTERING_REST_PLAYERS.add(player.getUUID());
         try {
             player.setGameMode(GameType.ADVENTURE);
@@ -575,8 +583,20 @@ public final class EliminatedRestAreaService {
                 PROMPT_STATES.remove(playerId);
                 continue;
             }
+            if (isResting(player) && !REVIVING_PLAYERS.contains(playerId)) {
+                keepRestSkillSeal(player);
+            }
             VoiceGroupService.ensureSpectatorVoiceGroup(playerId);
             syncPrompt(player, false);
+        }
+    }
+
+    private static void keepRestSkillSeal(ServerPlayer player) {
+        MobEffectInstance seal = player.getEffect(ModEffects.SKILL_BANED);
+        if (seal == null || (!seal.isInfiniteDuration() && seal.getDuration() <= REST_SKILL_SEAL_REFRESH_TICKS)) {
+            // 短效果让异常停服留下的休息区封印也能自行过期。
+            player.addEffect(new MobEffectInstance(ModEffects.SKILL_BANED, REST_SKILL_SEAL_TICKS,
+                    0, false, false, false));
         }
     }
 
