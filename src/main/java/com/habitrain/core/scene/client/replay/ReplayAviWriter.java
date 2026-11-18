@@ -14,8 +14,12 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Indexed AVI 1.0 with one Motion JPEG video stream; uses the JDK JPEG encoder. */
+/** Indexed AVI 1.0 with Motion JPEG video and optional 48 kHz 16-bit stereo PCM audio; uses the JDK JPEG encoder. */
 final class ReplayAviWriter implements ReplayVideoWriter {
+    private static final int AUDIO_SAMPLE_RATE = 48_000;
+    private static final int AUDIO_CHANNELS = 2;
+    private static final int AUDIO_BLOCK_ALIGN = AUDIO_CHANNELS * 2;
+
     private final RandomAccessFile out;
     private final ImageWriter jpeg;
     private final ImageWriteParam compression;
@@ -23,11 +27,21 @@ final class ReplayAviWriter implements ReplayVideoWriter {
     private final byte[] topDown;
     private final ByteArrayOutputStream scratch = new ByteArrayOutputStream(128 * 1024);
     private final List<Index> index = new ArrayList<>();
-    private final long moviSize, moviStart, mainFrames, streamFrames;
+    private final long moviSize, moviStart, mainFrames, streamFrames, audioStreamFrames;
     private final int rowBytes;
-    private record Index(int offset, int length) {}
+    private final boolean includeAudio;
+    private byte[] pcmScratch = new byte[0];
+    private int videoFrameCount;
+    private int audioStereoFrames;
+
+    private record Index(String fourcc, int offset, int length) {}
 
     ReplayAviWriter(Path path, int width, int height, int fps) throws IOException {
+        this(path, width, height, fps, false);
+    }
+
+    ReplayAviWriter(Path path, int width, int height, int fps, boolean includeAudio) throws IOException {
+        this.includeAudio = includeAudio;
         rowBytes = Math.multiplyExact(width, 3);
         image = new BufferedImage(width, height, BufferedImage.TYPE_3BYTE_BGR);
         topDown = ((DataBufferByte) image.getRaster().getDataBuffer()).getData();
@@ -49,7 +63,7 @@ final class ReplayAviWriter implements ReplayVideoWriter {
             four("avih"); le(56);
             le(1_000_000 / fps); le(0); le(0); le(0x10);
             mainFrames = out.getFilePointer(); le(0);
-            le(0); le(1); le(0); le(width); le(height);
+            le(0); le(includeAudio ? 2 : 1); le(0); le(width); le(height);
             le(0); le(0); le(0); le(0);
             long stream = list("strl");
             four("strh"); le(56);
@@ -62,6 +76,22 @@ final class ReplayAviWriter implements ReplayVideoWriter {
             le(40); le(width); le(height); shortLe(1); shortLe(24); four("MJPG");
             le(topDown.length); le(0); le(0); le(0); le(0);
             finishList(stream);
+            if (includeAudio) {
+                long audioStream = list("strl");
+                four("strh"); le(56);
+                four("auds"); le(0); le(0); le(0); le(0);
+                le(AUDIO_BLOCK_ALIGN); le(AUDIO_SAMPLE_RATE * AUDIO_BLOCK_ALIGN); le(0);
+                audioStreamFrames = out.getFilePointer(); le(0);
+                le(16384); le(-1); le(AUDIO_BLOCK_ALIGN);
+                shortLe(0); shortLe(0); shortLe(0); shortLe(0);
+                four("strf"); le(18);
+                shortLe(1); shortLe(AUDIO_CHANNELS); le(AUDIO_SAMPLE_RATE);
+                le(AUDIO_SAMPLE_RATE * AUDIO_BLOCK_ALIGN);
+                shortLe(AUDIO_BLOCK_ALIGN); shortLe(16); shortLe(0);
+                finishList(audioStream);
+            } else {
+                audioStreamFrames = -1L;
+            }
             finishList(header);
             moviSize = list("movi");
             moviStart = moviSize + 4;
@@ -86,7 +116,8 @@ final class ReplayAviWriter implements ReplayVideoWriter {
         }
         int size = scratch.size();
         int offset = uint32(out.getFilePointer() - moviStart);
-        index.add(new Index(offset, size));
+        index.add(new Index("00dc", offset, size));
+        videoFrameCount++;
         four("00dc"); le(size);
         scratch.writeTo(new java.io.OutputStream() {
             @Override public void write(int value) throws IOException { out.write(value); }
@@ -96,15 +127,45 @@ final class ReplayAviWriter implements ReplayVideoWriter {
     }
 
     @Override
+    public void addAudio(short[] stereo, int stereoFrameOffset, int stereoFrames) throws IOException {
+        if (!includeAudio || stereoFrames <= 0) return;
+        int byteLen = Math.multiplyExact(stereoFrames, AUDIO_BLOCK_ALIGN);
+        if (pcmScratch.length < byteLen) pcmScratch = new byte[byteLen];
+        int totalSrcFrames = stereo == null ? 0 : stereo.length / AUDIO_CHANNELS;
+        for (int i = 0; i < stereoFrames; i++) {
+            int srcFrame = stereoFrameOffset + i;
+            short l = 0;
+            short r = 0;
+            if (srcFrame >= 0 && srcFrame < totalSrcFrames) {
+                l = stereo[srcFrame * 2];
+                r = stereo[srcFrame * 2 + 1];
+            }
+            int p = i * 4;
+            pcmScratch[p] = (byte) (l & 0xFF);
+            pcmScratch[p + 1] = (byte) ((l >>> 8) & 0xFF);
+            pcmScratch[p + 2] = (byte) (r & 0xFF);
+            pcmScratch[p + 3] = (byte) ((r >>> 8) & 0xFF);
+        }
+        int offset = uint32(out.getFilePointer() - moviStart);
+        index.add(new Index("01wb", offset, byteLen));
+        audioStereoFrames += stereoFrames;
+        four("01wb"); le(byteLen);
+        out.write(pcmScratch, 0, byteLen);
+    }
+
+    @Override
     public void finish() throws IOException {
         finishList(moviSize);
         four("idx1"); le(index.size() * 16);
         for (Index entry : index) {
-            four("00dc"); le(0x10); le(entry.offset); le(entry.length);
+            four(entry.fourcc); le(0x10); le(entry.offset); le(entry.length);
         }
         patch(4, uint32(out.getFilePointer() - 8));
-        patch(mainFrames, index.size());
-        patch(streamFrames, index.size());
+        patch(mainFrames, videoFrameCount);
+        patch(streamFrames, videoFrameCount);
+        if (includeAudio && audioStreamFrames >= 0) {
+            patch(audioStreamFrames, audioStereoFrames);
+        }
     }
 
     private long list(String type) throws IOException {

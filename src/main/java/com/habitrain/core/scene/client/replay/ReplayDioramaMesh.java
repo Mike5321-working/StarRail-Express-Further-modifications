@@ -13,7 +13,7 @@ import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Owns the single GPU mesh shared by every board (they all show the same last match).
+ * Keeps a bounded set of GPU meshes for the world boards, archive viewer and video exporter.
  *
  * <p>Rebuilds are keyed by map fingerprint and delivered section count. The moving fan openings
  * are applied at draw time, so avatar motion and camera turns never rebuild the map. While patches
@@ -30,113 +30,144 @@ final class ReplayDioramaMesh {
         boolean sameMap(Key other) { return other != null && fingerprint.equals(other.fingerprint); }
     }
 
-    private static @Nullable SceneMeshSet mesh;
-    private static @Nullable Key builtKey;
-    private static @Nullable CompletableFuture<SceneMeshBuilder.MeshBuildResult> pending;
-    private static @Nullable Key pendingKey;
-    private static Object ticket = new Object();
-    private static long lastSubmit, lastUse;
-
+    private static final java.util.LinkedHashMap<String, Slot> slots = new java.util.LinkedHashMap<>(8, .75f, true);
+    private static Slot selected;
     private ReplayDioramaMesh() {}
 
-    /** Mesh to draw this frame (possibly an older partial one), or null. */
-    static @Nullable SceneMeshSet current() {
-        lastUse = System.nanoTime();
-        SceneMeshSet m = mesh;
-        return m == null || m.isClosed() || m.isEmpty() ? null : m;
-    }
-
-    static @Nullable Key builtKey() { return builtKey; }
+    static @Nullable SceneMeshSet current() { return selected == null ? null : selected.current(); }
+    static @Nullable Key builtKey() { return selected == null ? null : selected.builtKey; }
+    static boolean matches(@Nullable SceneAssetCodec.AssetData asset) { return selected != null && selected.matches(asset); }
 
     static void update(@Nullable SceneAssetCodec.AssetData asset, int present, int total) {
-        lastUse = System.nanoTime();
-        if (asset == null || asset.sections.isEmpty()) return;
-        Key want = new Key(asset.fingerprint, present);
-        if (want.equals(builtKey) || want.equals(pendingKey)) return;
-        if (builtKey != null && !builtKey.sameMap(want)) closeMesh();
-        if (pending != null) {
-            if (pendingKey != null && pendingKey.sameMap(want)) return;
-            cancelPending();
-        }
-        long now = System.nanoTime();
-        boolean complete = present >= total;
-        boolean sameGeometryClass = builtKey != null && builtKey.sameMap(want);
-        if (sameGeometryClass && !complete && now - lastSubmit < PARTIAL_REBUILD_NS) return;
-        submit(asset, want);
+        if (asset == null || asset.sections.isEmpty()) { selected = null; return; }
+        selected = slots.computeIfAbsent(asset.fingerprint, key -> new Slot());
+        while (slots.size() > 5) slots.pollFirstEntry().getValue().reset();
+        selected.update(asset, present, total);
     }
 
-    private static void submit(SceneAssetCodec.AssetData asset, Key key) {
-        Object token = new Object();
-        ticket = token;
-        lastSubmit = System.nanoTime();
-        CompletableFuture<SceneMeshBuilder.MeshBuildResult> future;
-        try {
-            future = SceneMeshBuilder.buildCutawayMeshAsync(asset, SceneBuildScheduler.Priority.ADDITIONAL);
-        } catch (RuntimeException failure) {
-            LOGGER.warn("Replay diorama mesh submission failed", failure);
-            return;
-        }
-        pending = future;
-        pendingKey = key;
-        future.whenComplete((result, failure) -> {
-            Runnable install = () -> install(token, key, future, result, failure);
-            Minecraft client = Minecraft.getInstance();
-            if (client.isSameThread()) install.run();
-            else client.execute(install);
-        });
-    }
-
-    private static void install(Object token, Key key, CompletableFuture<?> future,
-                                SceneMeshBuilder.MeshBuildResult result, Throwable failure) {
-        SceneMeshSet built = result == null ? null : result.meshSet();
-        if (token != ticket) {
-            if (built != null) built.close();
-            return;
-        }
-        if (pending == future) { pending = null; pendingKey = null; }
-        if (failure != null || built == null || built.isClosed() || built.isEmpty()) {
-            if (built != null) built.close();
-            if (failure != null && !(failure instanceof java.util.concurrent.CancellationException)) {
-                LOGGER.warn("Replay diorama mesh build failed", failure);
-            }
-            // Remember the key so a failing input does not resubmit every frame.
-            builtKey = key;
-            return;
-        }
-        SceneMeshSet previous = mesh;
-        mesh = built;
-        builtKey = key;
-        if (previous != null && previous != built) previous.close();
-    }
-
-    /** Releases GPU memory when no board has been rendered for a while. */
     static void tickIdle() {
-        if ((mesh != null || pending != null) && System.nanoTime() - lastUse > IDLE_RELEASE_NS) reset();
+        long now = System.nanoTime();
+        var iterator = slots.values().iterator();
+        while (iterator.hasNext()) {
+            var slot = iterator.next();
+            if (now - slot.lastUse > IDLE_RELEASE_NS) {
+                slot.reset();
+                if (slot == selected) selected = null;
+                iterator.remove();
+            }
+        }
     }
 
-    private static void cancelPending() {
-        CompletableFuture<?> p = pending;
-        pending = null;
-        pendingKey = null;
-        ticket = new Object();
-        if (p != null) p.cancel(false);
-    }
-
-    private static void closeMesh() {
-        SceneMeshSet m = mesh;
-        mesh = null;
-        builtKey = null;
-        if (m != null) m.close();
-    }
-
-    /** Disconnect, level change, new incompatible round or resource reload. */
     static void reset() {
-        cancelPending();
-        closeMesh();
-        lastSubmit = 0;
+        slots.values().forEach(Slot::reset);
+        slots.clear();
+        selected = null;
     }
 
-    static boolean matches(@Nullable SceneAssetCodec.AssetData asset) {
-        return asset != null && builtKey != null && Objects.equals(builtKey.fingerprint(), asset.fingerprint);
+    private static final class Slot {
+        private @Nullable SceneMeshSet mesh;
+        private @Nullable Key builtKey;
+        private @Nullable CompletableFuture<SceneMeshBuilder.MeshBuildResult> pending;
+        private @Nullable Key pendingKey;
+        private Object ticket = new Object();
+        private long lastSubmit, lastUse;
+
+
+
+        /** Mesh to draw this frame (possibly an older partial one), or null. */
+        @Nullable SceneMeshSet current() {
+            lastUse = System.nanoTime();
+            SceneMeshSet m = mesh;
+            return m == null || m.isClosed() || m.isEmpty() ? null : m;
+        }
+
+
+
+        void update(@Nullable SceneAssetCodec.AssetData asset, int present, int total) {
+            lastUse = System.nanoTime();
+            if (asset == null || asset.sections.isEmpty()) return;
+            Key want = new Key(asset.fingerprint, present);
+            if (want.equals(builtKey) || want.equals(pendingKey)) return;
+            if (builtKey != null && !builtKey.sameMap(want)) closeMesh();
+            if (pending != null) {
+                if (pendingKey != null && pendingKey.sameMap(want)) return;
+                cancelPending();
+            }
+            long now = System.nanoTime();
+            boolean complete = present >= total;
+            boolean sameGeometryClass = builtKey != null && builtKey.sameMap(want);
+            if (sameGeometryClass && !complete && now - lastSubmit < PARTIAL_REBUILD_NS) return;
+            submit(asset, want);
+        }
+
+        private void submit(SceneAssetCodec.AssetData asset, Key key) {
+            Object token = new Object();
+            ticket = token;
+            lastSubmit = System.nanoTime();
+            CompletableFuture<SceneMeshBuilder.MeshBuildResult> future;
+            try {
+                future = SceneMeshBuilder.buildCutawayMeshAsync(asset, SceneBuildScheduler.Priority.ADDITIONAL);
+            } catch (RuntimeException failure) {
+                LOGGER.warn("Replay diorama mesh submission failed", failure);
+                return;
+            }
+            pending = future;
+            pendingKey = key;
+            future.whenComplete((result, failure) -> {
+                Runnable install = () -> install(token, key, future, result, failure);
+                Minecraft client = Minecraft.getInstance();
+                if (client.isSameThread()) install.run();
+                else client.execute(install);
+            });
+        }
+
+        private void install(Object token, Key key, CompletableFuture<?> future,
+                                    SceneMeshBuilder.MeshBuildResult result, Throwable failure) {
+            SceneMeshSet built = result == null ? null : result.meshSet();
+            if (token != ticket) {
+                if (built != null) built.close();
+                return;
+            }
+            if (pending == future) { pending = null; pendingKey = null; }
+            if (failure != null || built == null || built.isClosed() || built.isEmpty()) {
+                if (built != null) built.close();
+                if (failure != null && !(failure instanceof java.util.concurrent.CancellationException)) {
+                    LOGGER.warn("Replay diorama mesh build failed", failure);
+                }
+                // Remember the key so a failing input does not resubmit every frame.
+                builtKey = key;
+                return;
+            }
+            SceneMeshSet previous = mesh;
+            mesh = built;
+            builtKey = key;
+            if (previous != null && previous != built) previous.close();
+        }
+
+        private void cancelPending() {
+            CompletableFuture<?> p = pending;
+            pending = null;
+            pendingKey = null;
+            ticket = new Object();
+            if (p != null) p.cancel(false);
+        }
+
+        private void closeMesh() {
+            SceneMeshSet m = mesh;
+            mesh = null;
+            builtKey = null;
+            if (m != null) m.close();
+        }
+
+        /** Disconnect, level change, new incompatible round or resource reload. */
+        void reset() {
+            cancelPending();
+            closeMesh();
+            lastSubmit = 0;
+        }
+
+        boolean matches(@Nullable SceneAssetCodec.AssetData asset) {
+            return asset != null && builtKey != null && Objects.equals(builtKey.fingerprint(), asset.fingerprint);
+        }
     }
 }

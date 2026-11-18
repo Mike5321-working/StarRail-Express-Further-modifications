@@ -46,6 +46,10 @@ public final class C2SReceiverRegistrar {
                 com.habitrain.core.network.replay.ReplayPackets.ReplayMissingSectionsC2S.TYPE, (payload, context) ->
                         runOnServer(context.server(), () ->
                                 com.habitrain.core.game.sre.replay.ReplayBoardService.request(context.player(), payload)));
+        ServerPlayNetworking.registerGlobalReceiver(
+                com.habitrain.core.network.replay.ReplayPackets.RequestVoiceC2S.TYPE, (payload, context) ->
+                        runOnServer(context.server(), () ->
+                                com.habitrain.core.game.sre.replay.ReplayBoardService.request(context.player(), payload)));
         ServerPlayNetworking.registerGlobalReceiver(AppleShopBuyPayload.TYPE, (payload, context) ->
                 runOnServer(context.server(), () -> {
                     ServerPlayer player = context.player();

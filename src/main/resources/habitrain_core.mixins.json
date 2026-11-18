@@ -9,6 +9,7 @@
     "mixins": [
         "RefugeeRestorationMixin",
         "ReplayMapWriteMixin",
+        "ReplayArchiveMatchIdMixin",
         "ReplayGunTracerMixin",
         "ReplayGunDropMixin",
         "ReplayPoisonMixin",

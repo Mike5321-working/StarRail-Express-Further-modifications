@@ -16,6 +16,7 @@ import com.habitrain.core.scene.replay.ReplayFocusPlan;
 import com.habitrain.core.scene.replay.ReplayMapViewport;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.ByteBufferBuilder;
+import io.wifi.starrailexpress.event.client.OnGameStartedClient;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
@@ -42,9 +43,11 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.SequencedMap;
+import java.util.Set;
 
 /**
  * World renderer for settlement summary boards: a wooden diorama tray one block above each loaded
@@ -55,7 +58,7 @@ import java.util.SequencedMap;
  * configurable diorama. Instead the loaded-board index from {@link ClientReplayBoard} is culled here
  * against the whole table, transformed tray and honors screen volume, faded between 48 and 64 blocks and
  * capped to the nearest few boards. Only the nearest board renews the data demand; the others reuse
- * the same shared view (every board shows the same last match).</p>
+ * the latest-match view unless a historical match was shared to a specific table.</p>
  */
 public final class ReplayBoardRenderer {
     private static final Logger LOGGER = LoggerFactory.getLogger(ReplayBoardRenderer.class.getSimpleName());
@@ -68,6 +71,7 @@ public final class ReplayBoardRenderer {
     private static RenderType trayType;
     private static @Nullable ReplayBoardModel model;
     private static @Nullable LastMatchReplay modelSource;
+    private static final java.util.LinkedHashMap<java.util.UUID, ReplayBoardModel> archivedModels = new java.util.LinkedHashMap<>(8, .75f, true);
     private static @Nullable ClientLevel observedLevel;
     private static @Nullable ClientLevel animOriginLevel;
     private static long animOriginTick;
@@ -82,6 +86,10 @@ public final class ReplayBoardRenderer {
         registered = true;
         WorldRenderEvents.AFTER_TRANSLUCENT.register(ReplayBoardRenderer::render);
         ReplayBoardLocalState.register();
+        OnGameStartedClient.EVENT.register(() -> {
+            var client = Minecraft.getInstance();
+            client.execute(() -> ReplayExportClient.onGameStarted(client));
+        });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(ReplayBoardRenderer::reset));
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             if (client.level != observedLevel) {
@@ -101,7 +109,6 @@ public final class ReplayBoardRenderer {
 
     /** Resource reload: atlas sprites and baked models changed, so the diorama mesh must be rebuilt. */
     public static void onResourceReload() {
-        ReplayBoardControlsScreen.cancelExport();
         ReplayTrayPainter.invalidateSprites();
         ReplayVideoCanvas.invalidate();
         ReplayDioramaMesh.reset();
@@ -109,12 +116,15 @@ public final class ReplayBoardRenderer {
 
     /** Disconnect / session reset: drop GPU mesh, cached skins, models and local toggles. */
     public static void reset() {
-        ReplayBoardControlsScreen.cancelExport();
+        ReplayAudioPlaybackController.reset();
+        ReplayExportClient.reset();
         failed = false;
         animOriginLevel = null;
         ReplayDioramaMesh.reset();
         ReplayHeadSkins.clear();
         ReplayBoardLocalState.reset();
+        ReplayBoardButtons.reset();
+        archivedModels.clear();
         model = null;
         modelSource = null;
     }
@@ -124,13 +134,19 @@ public final class ReplayBoardRenderer {
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null || mc.player == null) return;
+        ReplayBoardButtons.beginFrame(mc, context.camera().getPosition(),
+                context.tickCounter().getGameTimeDeltaPartialTick(true));
         List<BlockPos> loaded = ClientReplayBoard.loadedBoards();
-        if (loaded.isEmpty()) return;
+        if (loaded.isEmpty()) {
+            ReplayAudioPlaybackController.endBoardFrame(mc, Set.of());
+            return;
+        }
         try {
             renderBoards(context, mc, level, loaded);
         } catch (RuntimeException failure) {
             // A renderer bug must never take the world pass down with it.
             failed = true;
+            ReplayAudioPlaybackController.endBoardFrame(mc, Set.of());
             LOGGER.error("Settlement board rendering disabled after an unexpected failure", failure);
         }
     }
@@ -179,7 +195,10 @@ public final class ReplayBoardRenderer {
                     Math.max(pos.getY() + 1, center.y + visualTop), Math.max(pos.getZ() + 1, center.z + reach))) continue;
             candidates.add(new Candidate(pos, facing, distance, settings, marker.playback()));
         }
-        if (candidates.isEmpty()) return;
+        if (candidates.isEmpty()) {
+            ReplayAudioPlaybackController.endBoardFrame(mc, Set.of());
+            return;
+        }
         candidates.sort(Comparator.comparingDouble(Candidate::distance));
         if (candidates.size() > MAX_BOARDS) candidates = candidates.subList(0, MAX_BOARDS);
 
@@ -211,24 +230,36 @@ public final class ReplayBoardRenderer {
         double anim = ((double) (gameTime - animOriginTick) + (double) partial) / 20.0;
 
         var round = ClientReplayBoard.availableRound();
-        boolean needsMap = current != null && current.layout != null && candidates.stream().anyMatch(c ->
-                c.playback() != null && c.playback().roundId().equals(round) && c.playback().pendingOrPlaying(gameTime));
-        SceneMeshSet mesh = null;
-        if (needsMap && view.asset() != null) {
-            ReplayDioramaMesh.update(view.asset(), view.presentSections(), view.totalSections());
-            if (ReplayDioramaMesh.matches(view.asset())) mesh = ReplayDioramaMesh.current();
-        }
-
         MultiBufferSource.BufferSource source = buffers();
         var camera = context.camera();
+        Set<BlockPos> activeAudioBoards = new HashSet<>();
         try (var guard = ClientRenderState.capture()) {
             for (Candidate c : candidates) {
                 double distScale = Math.max(1.0, c.settings().scale());
                 float fade = (float) ReplayStagePlan.distanceFade(c.distance() / distScale);
                 if (fade <= 0.01f) continue;
                 var playing = c.playback();
-                boolean active = playing != null && playing.roundId().equals(round) && playing.playing(gameTime);
-                ReplayBoardModel shown = active ? current : null;
+                boolean active = playing != null && playing.playing(gameTime);
+                var selected = playing != null && playing.pendingOrPlaying(gameTime) && (playing.shared() || !playing.roundId().equals(round))
+                        ? com.habitrain.core.scene.client.ReplayHistoryClient.watch(playing.roundId()) : view;
+                ReplayBoardModel shown = null;
+                if (active && selected.replay() != null && selected.timeline() != null) {
+                    if (selected == view) shown = current;
+                    else {
+                        var id = selected.replay().roundId();
+                        shown = archivedModels.get(id);
+                        if (shown == null || shown.replay != selected.replay()) {
+                            shown = new ReplayBoardModel(selected.replay(), selected.timeline());
+                            archivedModels.put(id, shown);
+                            while (archivedModels.size() > MAX_BOARDS) archivedModels.pollFirstEntry();
+                        }
+                    }
+                }
+                SceneMeshSet mesh = null;
+                if (playing != null && playing.pendingOrPlaying(gameTime) && selected.asset() != null) {
+                    ReplayDioramaMesh.update(selected.asset(), selected.presentSections(), selected.totalSections());
+                    if (ReplayDioramaMesh.matches(selected.asset())) mesh = ReplayDioramaMesh.current();
+                }
                 double elapsed = active ? gameTime - playing.startTick() + partial : 0;
                 ReplayTimeline.Frame frame = shown == null ? null : shown.timeline.atElapsed(elapsed);
                 float halfSize = trayHalfSize(shown);
@@ -238,14 +269,19 @@ public final class ReplayBoardRenderer {
                 Matrix4f display = ReplayBoardPlacement.displayMatrix(table, c.settings(), ReplayBoardSite.MAP_BASE);
                 var site = new ReplayBoardSite(c.pos(), c.facing(), c.distance(), display, table, c.settings().scale(),
                         halfSize, halfSize, fade, c.distance() < ReplayStagePlan.DETAIL_DISTANCE * distScale, light);
+                if (active && shown != null) {
+                    activeAudioBoards.add(c.pos().immutable());
+                    ReplayAudioPlaybackController.updateBoard(mc, c.pos(), cam, site, shown, selected, true, elapsed);
+                }
                 var f = new ReplayFrame(mc, level, camera.rotation(), source, trayType,
                         active ? elapsed / 20.0 : anim, shown, frame, active,
-                        active ? view.presentSections() : 0, active ? view.totalSections() : 0,
+                        active ? selected.presentSections() : 0, active ? selected.totalSections() : 0,
                         new Vector3f(camera.getLeftVector()).negate(), new Vector3f(camera.getUpVector()),
                         new Vector3f(camera.getLookVector()));
                 drawFrame(context.positionMatrix(), context.projectionMatrix(), f, site, mesh, ReplayBoardLocalState.fullBody());
             }
         }
+        ReplayAudioPlaybackController.endBoardFrame(mc, activeAudioBoards);
     }
 
     static void drawVideoFrame(Minecraft mc, ReplayBoardModel current, ReplayTimeline.Frame frame, ReplayStagePlan.Stage stage,
@@ -268,7 +304,7 @@ public final class ReplayBoardRenderer {
         drawMap(shot.view(), shot.projection(), f, site, mesh, fullBody);
         ReplayTrayPainter.lights(f, site);
         ReplayTrayPainter.plaque(f, site);
-        fx.environment(f, site);
+        if (fx != null) fx.environment(f, site);
         if (current.layout != null) {
             float sink = (float) stage.mapSink() * 0.2f;
             Matrix4f d = f.focus.apply(new Matrix4f(site.board()).translate(0, ReplayBoardSite.MAP_BASE - sink, 0));
@@ -277,7 +313,7 @@ public final class ReplayBoardRenderer {
                 ReplayActorPainter.paint(f, site, d);
                 ReplayDronePainter.paint(f, site, d);
                 ReplayEventPainter.paint(f, site, d);
-                fx.map(f, site, d);
+                if (fx != null) fx.map(f, site, d);
             }
         }
         source.endBatch(ReplayDraw.FILL);
@@ -313,6 +349,8 @@ public final class ReplayBoardRenderer {
             ReplayHonorsPainter.paint(f, site);
         }
         source.endBatch(ReplayDraw.FILL);
+        // In-world buttons write depth, so they must be flushed before the additive glow pass.
+        source.endBatch(ReplayDraw.PANEL);
         f.flushModels();
         source.endLastBatch();
         source.endBatch(ReplayDraw.GLOW);
@@ -407,6 +445,7 @@ public final class ReplayBoardRenderer {
             SequencedMap<RenderType, ByteBufferBuilder> fixed = new LinkedHashMap<>();
             fixed.put(trayType, own(1 << 17));
             fixed.put(ReplayDraw.FILL, own(1 << 18));
+            fixed.put(ReplayDraw.PANEL, own(1 << 15));
             fixed.put(ReplayDraw.GLOW, own(1 << 18));
             buffers = MultiBufferSource.immediateWithBuffers(fixed, own(1 << 17));
         }

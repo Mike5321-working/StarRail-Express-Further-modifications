@@ -50,6 +50,21 @@ final class ReplayDraw {
 
     // ------------------------------------------------------------------ flat quads in a local frame
 
+    /**
+     * Alpha-blended panels that also write depth. Used for the in-world buttons: the additive {@link #GLOW} pass
+     * is flushed afterwards, so anything glowing <em>behind</em> a button is rejected instead of shining through it.
+     */
+    static final RenderType PANEL = RenderType.create("habitrain_replay_panel", DefaultVertexFormat.POSITION_COLOR,
+            VertexFormat.Mode.QUADS, 1 << 14, false, false,
+            RenderType.CompositeState.builder()
+                    .setShaderState(RenderStateShard.POSITION_COLOR_SHADER)
+                    .setTransparencyState(RenderStateShard.TRANSLUCENT_TRANSPARENCY)
+                    .setWriteMaskState(RenderStateShard.COLOR_DEPTH_WRITE)
+                    .setCullState(RenderStateShard.NO_CULL)
+                    .setDepthTestState(RenderStateShard.LEQUAL_DEPTH_TEST)
+                    .setLayeringState(RenderStateShard.VIEW_OFFSET_Z_LAYERING)
+                    .createCompositeState(false));
+
     static void quad(VertexConsumer vc, Matrix4f m, float x0, float y0, float z0, float x1, float y1, float z1,
                      float x2, float y2, float z2, float x3, float y3, float z3, int c0, int c1, int c2, int c3) {
         vc.addVertex(m, x0, y0, z0).setColor(c0);

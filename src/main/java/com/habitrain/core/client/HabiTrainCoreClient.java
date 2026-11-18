@@ -111,6 +111,7 @@ public class HabiTrainCoreClient implements ClientModInitializer {
 
         // 生命周期事件处理（JOIN / DISCONNECT / 游戏结束 / 配置保存回调）
         new ClientLifecycleHandler(shaderMonitor);
+        com.habitrain.core.scene.client.replay.ReplayAudioSelfTest.initIfRequested();
 
         // 注：加载界面纹理由 HabiLoadingScreenTextures.registerTextures 幂等按需注册；
         //     SREClient.cachedHighLightMap 由 InstinctCacheFixMixin 在 <clinit> 统一替换为 ConcurrentHashMap；

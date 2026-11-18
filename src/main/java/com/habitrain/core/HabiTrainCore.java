@@ -223,6 +223,7 @@ public class HabiTrainCore implements ModInitializer {
         com.habitrain.core.game.sre.mode.RepairModeManager.registerEvents();
         MvpScoreTracker.init();
         com.habitrain.core.game.sre.replay.ReplayBoardService.register();
+        com.habitrain.core.game.sre.replay.ReplayArchiveService.register();
         // 6. C2S 接收器注册
         C2SReceiverRegistrar.init();
         EliminatedRestAreaService.init();

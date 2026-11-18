@@ -79,6 +79,13 @@ public class NetworkReceiverRegistrar {
         ClientPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.ReplaySectionPatchS2C.TYPE, (payload, context) ->
                         context.client().execute(() -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
+        ClientPlayNetworking.registerGlobalReceiver(
+                com.habitrain.core.network.replay.ReplayPackets.ReplayVoiceChunkS2C.TYPE, (payload, context) ->
+                        context.client().execute(() -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
+        ClientPlayNetworking.registerGlobalReceiver(
+                com.habitrain.core.network.replay.ReplayPackets.VoiceExportAccessS2C.TYPE, (payload, context) ->
+                        executeIfConnected(context, () ->
+                                com.habitrain.core.scene.client.replay.ReplayExportClient.acceptVoiceExportAccess(payload)));
         // 1) 接收服务端任务配置同步
         ClientPlayNetworking.registerGlobalReceiver(TaskConfigPayload.TYPE, (payload, context) -> {
             executeIfConnected(context, () -> {

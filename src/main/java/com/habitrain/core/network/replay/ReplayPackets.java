@@ -6,6 +6,7 @@ import com.habitrain.core.api.match.MatchWinKind;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
 import com.habitrain.core.api.scene.model.SceneBounds;
+import com.habitrain.core.scene.replay.ReplayVoiceData;
 import io.netty.handler.codec.DecoderException;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.minecraft.core.BlockPos;
@@ -102,13 +103,61 @@ public final class ReplayPackets {
         @Override public Type<ReplaySectionPatchS2C> type() { return TYPE; }
     }
 
+    public record RequestVoiceC2S(BlockPos board, UUID roundId) implements CustomPacketPayload {
+        public static final Type<RequestVoiceC2S> TYPE = typeId("replay_voice_request");
+        static final StreamCodec<FriendlyByteBuf, RequestVoiceC2S> CODEC = codec(24,
+                b -> new RequestVoiceC2S(b.readBlockPos(), b.readUUID()),
+                (b, p) -> { b.writeBlockPos(p.board); b.writeUUID(p.roundId); });
+        @Override public Type<RequestVoiceC2S> type() { return TYPE; }
+    }
+
+    public record RequestVoiceExportC2S(UUID roundId) implements CustomPacketPayload {
+        public static final Type<RequestVoiceExportC2S> TYPE = typeId("replay_voice_export_request");
+        static final StreamCodec<FriendlyByteBuf, RequestVoiceExportC2S> CODEC = codec(16,
+                b -> new RequestVoiceExportC2S(b.readUUID()), (b, p) -> b.writeUUID(p.roundId));
+        @Override public Type<RequestVoiceExportC2S> type() { return TYPE; }
+    }
+
+    public record VoiceExportAccessS2C(UUID roundId, boolean allowed) implements CustomPacketPayload {
+        public static final Type<VoiceExportAccessS2C> TYPE = typeId("replay_voice_export_access");
+        static final StreamCodec<FriendlyByteBuf, VoiceExportAccessS2C> CODEC = codec(17,
+                b -> new VoiceExportAccessS2C(b.readUUID(), b.readBoolean()),
+                (b, p) -> { b.writeUUID(p.roundId); b.writeBoolean(p.allowed); });
+        @Override public Type<VoiceExportAccessS2C> type() { return TYPE; }
+    }
+
+    public record ReplayVoiceChunkS2C(UUID roundId, int offset, int total, byte[] bytes)
+            implements CustomPacketPayload {
+        public static final Type<ReplayVoiceChunkS2C> TYPE = typeId("replay_voice_chunk");
+        public static final StreamCodec<FriendlyByteBuf, ReplayVoiceChunkS2C> CODEC = codec(FRAGMENT_BYTES + 32,
+                b -> new ReplayVoiceChunkS2C(b.readUUID(), b.readVarInt(), b.readVarInt(),
+                        b.readByteArray(FRAGMENT_BYTES)),
+                (b, p) -> {
+                    b.writeUUID(p.roundId); b.writeVarInt(p.offset);
+                    b.writeVarInt(p.total); b.writeByteArray(p.bytes);
+                });
+        public ReplayVoiceChunkS2C {
+            if (total == 0) {
+                if (offset != 0 || bytes.length != 0) throw new IllegalArgumentException("Bad empty replay voice marker");
+            } else if (total < 0 || total > ReplayVoiceData.MAX_VOICE_BYTES || offset < 0 || offset % FRAGMENT_BYTES != 0
+                    || offset >= total || bytes.length != Math.min(FRAGMENT_BYTES, total - offset)) {
+                throw new IllegalArgumentException("Bad replay voice fragment");
+            }
+        }
+        @Override public Type<ReplayVoiceChunkS2C> type() { return TYPE; }
+    }
+
     public static void register() {
         PayloadTypeRegistry.playS2C().register(Available.TYPE, Available.CODEC);
         PayloadTypeRegistry.playS2C().register(LastMatchSummaryS2C.TYPE, LastMatchSummaryS2C.CODEC);
         PayloadTypeRegistry.playS2C().register(ReplaySectionPatchS2C.TYPE, ReplaySectionPatchS2C.CODEC);
+        PayloadTypeRegistry.playS2C().register(ReplayVoiceChunkS2C.TYPE, ReplayVoiceChunkS2C.CODEC);
+        PayloadTypeRegistry.playS2C().register(VoiceExportAccessS2C.TYPE, VoiceExportAccessS2C.CODEC);
         PayloadTypeRegistry.playC2S().register(RequestSummary.TYPE, RequestSummary.CODEC);
         PayloadTypeRegistry.playC2S().register(StartPlayback.TYPE, StartPlayback.CODEC);
         PayloadTypeRegistry.playC2S().register(ReplayMissingSectionsC2S.TYPE, ReplayMissingSectionsC2S.CODEC);
+        PayloadTypeRegistry.playC2S().register(RequestVoiceC2S.TYPE, RequestVoiceC2S.CODEC);
+        PayloadTypeRegistry.playC2S().register(RequestVoiceExportC2S.TYPE, RequestVoiceExportC2S.CODEC);
     }
 
     private static <T extends CustomPacketPayload> CustomPacketPayload.Type<T> typeId(String id) {

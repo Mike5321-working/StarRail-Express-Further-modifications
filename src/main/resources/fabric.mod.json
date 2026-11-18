@@ -20,7 +20,8 @@
         "cardinal-components": ["com.habitrain.core.game.sre.role.HabiComponents"],
         "voicechat": [
             "com.habitrain.core.game.sre.role.sins.SlothVoicePlugin",
-            "com.habitrain.core.role.capability.RoleVoiceCapabilityPlugin"
+            "com.habitrain.core.role.capability.RoleVoiceCapabilityPlugin",
+            "com.habitrain.core.game.sre.replay.ReplayVoicePlugin"
         ],
         "habitrain:role_extensions": ["com.habitrain.core.role.extension.CoreRoleExtensionProvider"]
     },

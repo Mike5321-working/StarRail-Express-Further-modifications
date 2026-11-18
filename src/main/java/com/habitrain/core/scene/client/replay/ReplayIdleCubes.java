@@ -141,7 +141,11 @@ final class ReplayIdleCubes {
         }
 
         // 9. Yaw-tracking Art Deco holographic status banner crowning the sculpture
-        paintStatusBanner(f, s, fill, glow, centerY, localScale, wScale, fade, loading);
+        ReplayBoardButtons.Phase phase = ReplayBoardButtons.phase(f, s);
+        paintStatusBanner(f, s, fill, glow, centerY, localScale, wScale, fade, loading, phase);
+
+        // 10. Camera-facing "start playback" / "export video" plaques floating in front of the sculpture
+        ReplayBoardButtons.paint(f, s, phase, localScale, fade);
     }
 
     // ------------------------------------------------------------------ 1. floor astrolabe
@@ -806,9 +810,10 @@ final class ReplayIdleCubes {
     // ------------------------------------------------------------------ 9. yaw-tracking Art Deco status banner
 
     private static void paintStatusBanner(ReplayFrame f, ReplayBoardSite s, VertexConsumer fill, VertexConsumer glow,
-                                          float centerY, float localScale, float wScale, double fade, boolean loading) {
+                                          float centerY, float localScale, float wScale, double fade, boolean loading,
+                                          ReplayBoardButtons.Phase phase) {
         float bannerY = Math.max(FRAME_TOP + 1.62f, centerY + 1.30f * localScale);
-        Component text = loading ? ReplayBoardTexts.tr("loading") : ReplayBoardTexts.tr("idle");
+        Component text = ReplayBoardButtons.bannerText(phase);
         float textScale = 0.0082f * localScale * s.scale();
         float halfW = (Minecraft.getInstance().font.width(text) * 0.0082f * localScale + 0.38f * localScale) * 0.5f * s.scale();
         float halfH = 0.098f * localScale * s.scale();

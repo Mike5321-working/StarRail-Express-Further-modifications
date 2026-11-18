@@ -17,6 +17,15 @@ public record ReplayBoardSettings(float mapSize, float height, float offsetX, fl
 
     public float scale() { return mapSize / DEFAULT_MAP_SIZE; }
 
+    /**
+     * Largest player-to-marker distance (blocks) from which this table's in-world buttons may be used.
+     * The floating display grows with {@link #scale()} and can sit up to {@link #MAX_OFFSET} blocks away from
+     * the marker, so a fixed radius would make large or offset tables unusable.
+     */
+    public double interactReach() {
+        return 8.0 * Math.max(1.0f, scale()) + Math.hypot(offsetX, offsetZ) + height + 2.0;
+    }
+
     public CompoundTag save() {
         CompoundTag tag = new CompoundTag();
         tag.putFloat("MapSize", mapSize);

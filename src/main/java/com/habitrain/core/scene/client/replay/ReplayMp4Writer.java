@@ -3,6 +3,7 @@ package com.habitrain.core.scene.client.replay;
 import org.jcodec.codecs.h264.H264Encoder;
 import org.jcodec.codecs.h264.encode.RateControl;
 import org.jcodec.codecs.h264.io.model.SliceType;
+import org.jcodec.common.AudioFormat;
 import org.jcodec.common.Codec;
 import org.jcodec.common.MuxerTrack;
 import org.jcodec.common.VideoCodecMeta;
@@ -20,9 +21,10 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 
 /**
- * Pure-Java H.264 / MP4 writer backed by JCodec. Converts OpenGL's bottom-up BGR24 frames
- * directly into {@link ColorSpace#YUV420J} in a single allocation-free pass and encodes with
- * constant quantization so dark starfield and flat UI regions compress cleanly without bitrate bloat.
+ * Pure-Java H.264 (+ optional AAC-LC stereo audio) / MP4 writer backed by JCodec. Converts OpenGL's
+ * bottom-up BGR24 frames directly into {@link ColorSpace#YUV420J} in a single allocation-free pass
+ * and encodes with constant quantization so dark starfield and flat UI regions compress cleanly without
+ * bitrate bloat.
  */
 final class ReplayMp4Writer implements ReplayVideoWriter {
     private static final int KEY_INTERVAL = 60;
@@ -32,6 +34,8 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
     private final SeekableByteChannel channel;
     private final MP4Muxer muxer;
     private final MuxerTrack track;
+    private final MuxerTrack audioTrack;
+    private final ReplayAacEncoder aacEncoder;
     private final H264Encoder encoder;
     private final Picture yuv;
     private final ByteBuffer packetScratch;
@@ -40,8 +44,13 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
     private final int fps;
     private final int expectedBytes;
     private int frameNo;
+    private long aacFrameNo;
 
     ReplayMp4Writer(Path path, int width, int height, int fps) throws IOException {
+        this(path, width, height, fps, false);
+    }
+
+    ReplayMp4Writer(Path path, int width, int height, int fps, boolean includeAudio) throws IOException {
         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
             throw new IllegalArgumentException("MP4 dimensions must be positive even integers: " + width + "x" + height);
         }
@@ -64,6 +73,13 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
             this.track = muxer.addVideoTrack(
                     Codec.H264,
                     VideoCodecMeta.createSimpleVideoCodecMeta(new Size(width, height), ColorSpace.YUV420J));
+            if (includeAudio) {
+                this.audioTrack = muxer.addCompressedAudioTrack(Codec.AAC, AudioFormat.STEREO_48K_S16_LE);
+                this.aacEncoder = new ReplayAacEncoder(this::writeAacPacket);
+            } else {
+                this.audioTrack = null;
+                this.aacEncoder = null;
+            }
             this.channel = opened;
         } catch (IOException | RuntimeException failure) {
             try {
@@ -73,6 +89,19 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
             }
             throw failure;
         }
+    }
+
+    private void writeAacPacket(ByteBuffer adtsFrame) throws IOException {
+        Packet audioPkt = Packet.createPacket(
+                adtsFrame,
+                aacFrameNo * 1024L,
+                ReplayAacEncoder.SAMPLE_RATE,
+                1024L,
+                aacFrameNo,
+                Packet.FrameType.KEY,
+                null);
+        audioTrack.addFrame(audioPkt);
+        aacFrameNo++;
     }
 
     @Override
@@ -104,7 +133,17 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
     }
 
     @Override
+    public void addAudio(short[] interleavedStereo48k, int stereoFrameOffset, int stereoFrames) throws IOException {
+        if (aacEncoder != null) {
+            aacEncoder.push(interleavedStereo48k, stereoFrameOffset, stereoFrames);
+        }
+    }
+
+    @Override
     public void finish() throws IOException {
+        if (aacEncoder != null) {
+            aacEncoder.finish();
+        }
         muxer.finish();
     }
 

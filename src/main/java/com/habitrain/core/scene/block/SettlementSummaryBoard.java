@@ -113,7 +113,11 @@ public final class SettlementSummaryBoard extends BaseEntityBlock {
         private ReplayBoardSettings settings = ReplayBoardSettings.DEFAULT;
         private Playback playback;
 
-        public record Playback(java.util.UUID roundId, long startTick, long endTick) {
+        public record Playback(java.util.UUID roundId, long startTick, long endTick, boolean shared) {
+            public Playback(java.util.UUID roundId, long startTick, long endTick) {
+                this(roundId, startTick, endTick, false);
+            }
+            public boolean preparing() { return startTick == Long.MAX_VALUE; }
             public boolean pendingOrPlaying(long gameTick) { return gameTick < endTick; }
             public boolean playing(long gameTick) { return gameTick >= startTick && gameTick < endTick; }
         }
@@ -121,13 +125,30 @@ public final class SettlementSummaryBoard extends BaseEntityBlock {
         public Playback playback() { return playback; }
 
         public boolean startPlayback(java.util.UUID round, int duration) {
+            return startPlayback(round, duration, false);
+        }
+
+        private boolean startPlayback(java.util.UUID round, int duration, boolean shared) {
             if (level == null || level.isClientSide) return false;
             long now = level.getGameTime();
-            if (playback != null && playback.roundId().equals(round) && playback.pendingOrPlaying(now)) return false;
+            if (playback != null && playback.pendingOrPlaying(now)) return false;
             long start = now + 12;
-            playback = new Playback(round, start, start + duration);
+            playback = new Playback(round, start, start + duration, shared);
             level.sendBlockUpdated(worldPosition, getBlockState(), getBlockState(), Block.UPDATE_CLIENTS);
             return true;
+        }
+
+        public boolean preparePlayback(java.util.UUID round) {
+            if (level == null || level.isClientSide || playback != null && playback.pendingOrPlaying(level.getGameTime())) return false;
+            playback = new Playback(round, Long.MAX_VALUE, Long.MAX_VALUE, true);
+            level.sendBlockUpdated(worldPosition, getBlockState(), getBlockState(), Block.UPDATE_CLIENTS);
+            return true;
+        }
+
+        public boolean beginPreparedPlayback(java.util.UUID round, int duration) {
+            if (level == null || level.isClientSide || playback == null || !playback.preparing() || !playback.roundId().equals(round)) return false;
+            playback = null;
+            return startPlayback(round, duration, true);
         }
 
         public Marker(BlockPos pos, BlockState state) { super(markerType, pos, state); }
@@ -152,7 +173,7 @@ public final class SettlementSummaryBoard extends BaseEntityBlock {
             super.loadAdditional(tag, registries);
             settings = ReplayBoardSettings.load(tag.getCompound("Display"));
             playback = tag.hasUUID("PlaybackRound")
-                    ? new Playback(tag.getUUID("PlaybackRound"), tag.getLong("PlaybackStart"), tag.getLong("PlaybackEnd"))
+                    ? new Playback(tag.getUUID("PlaybackRound"), tag.getLong("PlaybackStart"), tag.getLong("PlaybackEnd"), tag.getBoolean("PlaybackShared"))
                     : null;
         }
 
@@ -162,6 +183,7 @@ public final class SettlementSummaryBoard extends BaseEntityBlock {
                 tag.putUUID("PlaybackRound", playback.roundId());
                 tag.putLong("PlaybackStart", playback.startTick());
                 tag.putLong("PlaybackEnd", playback.endTick());
+                tag.putBoolean("PlaybackShared", playback.shared());
             }
             return tag;
         }

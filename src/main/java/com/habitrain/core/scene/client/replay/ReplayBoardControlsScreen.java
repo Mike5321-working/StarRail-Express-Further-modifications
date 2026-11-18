@@ -16,7 +16,6 @@ import net.minecraft.network.chat.Component;
 
 final class ReplayBoardControlsScreen extends Screen {
     private static final int PANEL_HEIGHT = 162;
-    private static ReplayVideoExport activeExport;
     private final ClientLevel level;
     private final BlockPos pos;
     private ReplayExportResolution resolution;
@@ -52,20 +51,14 @@ final class ReplayBoardControlsScreen extends Screen {
             }
         }).bounds(left + 12, top + 42, half, 20).build());
         export = addRenderableWidget(Button.builder(tr("export"), button -> {
-            if (video != null && video.running()) {
-                video.cancel();
-                if (video == activeExport) {
-                    activeExport = null;
-                }
+            var current = ReplayExportClient.current();
+            if (current != null && current.running()) {
+                current.cancel();
             } else {
-                cancelExport();
                 folderFailed = false;
-                video = new ReplayVideoExport(
-                        ClientReplayBoard.availableRound(),
-                        ReplayBoardLocalState.fullBody(),
-                        resolution,
-                        compress);
-                activeExport = video;
+                BlockPos board = pos;
+                ReplayExportClient.start(ClientReplayBoard.viewAt(board), ReplayBoardLocalState.fullBody(),
+                        resolution, compress, () -> ClientReplayBoard.viewAt(board));
             }
             refresh();
         }).bounds(left + 18 + half, top + 42, half, 20).build());
@@ -115,19 +108,20 @@ final class ReplayBoardControlsScreen extends Screen {
     private boolean playing() {
         if (level == null || !(level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) return false;
         var playback = marker.playback();
-        return playback != null && playback.roundId().equals(ClientReplayBoard.availableRound())
+        return playback != null
                 && playback.pendingOrPlaying(level.getGameTime());
     }
 
     private void refresh() {
         view = ClientReplayBoard.viewAt(pos);
+        video = ReplayExportClient.forScreen(video);
         boolean exporting = video != null && video.running();
         boolean playing = playing();
         play.setMessage(tr(playing ? "playing" : "play"));
         play.active = view.replay() != null && !playing && !exporting
                 && ClientPlayNetworking.canSend(ReplayPackets.StartPlayback.TYPE);
         export.setMessage(tr(exporting ? "cancel" : "export"));
-        export.active = exporting || (view.replay() != null && ClientReplayBoard.mapAvailable());
+        export.active = exporting || (ReplayExportClient.canStart() && ReplayExportClient.mapReady(view));
 
         ReplayExportResolution shownRes = exporting ? video.resolution : resolution;
         boolean shownCompress = exporting ? video.compress : compress;
@@ -150,37 +144,15 @@ final class ReplayBoardControlsScreen extends Screen {
 
     private Component exportStatus() {
         if (folderFailed) return tr("folder_error");
-        if (video == null) {
-            if (view != null && view.replay() != null && !ClientReplayBoard.mapAvailable()) {
-                return tr("map_unavailable");
-            }
-            return tr("export_hint", resolution.label(), tr(compress ? "format_mp4" : "format_avi"));
+        if (video != null) return video.status();
+        if (view != null && view.replay() != null && !ClientReplayBoard.mapAvailable()) return tr("map_unavailable");
+        if (view != null && view.presentSections() < view.totalSections()) {
+            return tr("receiving_map", view.presentSections(), view.totalSections());
         }
-        if (video.failed()) return tr("failed");
-        if (video.cancelled()) return tr("cancelled");
-        if (video.saved() != null) return tr("saved");
-        if (video.preparing()) {
-            return view != null && view.totalSections() > 0 && view.presentSections() < view.totalSections()
-                    ? tr("receiving_map", view.presentSections(), view.totalSections()) : tr("preparing");
-        }
-        if (video.finalizing() && video.compress) {
-            return tr("compressing", (int) (video.progress() * 100));
-        }
-        return tr("progress", (int) (video.progress() * 100));
-    }
-
-    private double progress() {
-        if (video == null || video.failed() || video.cancelled()) return 0;
-        if (video.saved() != null) return 1;
-        if (video.preparing()) return view.totalSections() <= 0 ? 0 : .20 * view.presentSections() / view.totalSections();
-        return .20 + .80 * video.progress();
+        return tr("export_hint", resolution.label(), tr(compress ? "format_mp4" : "format_avi"));
     }
 
     @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float delta) {
-        if (video != null && validTable()) {
-            graphics.flush();
-            video.renderNext(minecraft, view);
-        }
         graphics.fill(left, top, left + panelWidth, top + PANEL_HEIGHT, 0xF2141D29);
         graphics.renderOutline(left, top, panelWidth, PANEL_HEIGHT, 0xFFD2A458);
         graphics.drawCenteredString(font, title, width / 2, top + 9, 0xFFFFD896);
@@ -188,21 +160,12 @@ final class ReplayBoardControlsScreen extends Screen {
         graphics.drawCenteredString(font, font.plainSubstrByWidth(status, panelWidth - 24), width / 2, top + 25, 0xFFDDDFE7);
         int x = left + 12, barWidth = panelWidth - 24;
         graphics.fill(x, top + 96, x + barWidth, top + 103, 0xFF313F53);
-        graphics.fill(x, top + 96, x + (int) (barWidth * progress()), top + 103, 0xFF52C5B9);
+        if (video != null) {
+            graphics.fill(x, top + 96, x + (int) (barWidth * video.displayProgress()), top + 103, 0xFF52C5B9);
+        }
         graphics.drawCenteredString(font, font.plainSubstrByWidth(exportStatus().getString(), panelWidth - 24),
                 width / 2, top + 110, 0xFFC5D3E2);
         super.render(graphics, mouseX, mouseY, delta);
     }
 
-    static void cancelExport() {
-        if (activeExport != null) {
-            activeExport.cancel();
-            activeExport = null;
-        }
-    }
-
-    @Override public void removed() {
-        if (video == activeExport) cancelExport();
-        super.removed();
-    }
 }

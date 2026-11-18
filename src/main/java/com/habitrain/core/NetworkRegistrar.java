@@ -12,7 +12,7 @@ public final class NetworkRegistrar {
 
     public static void init() {
         int count = 0;
-        com.habitrain.core.network.replay.ReplayPackets.register(); count += 6;
+        com.habitrain.core.network.replay.ReplayPackets.register(); count += 8;
         com.habitrain.core.network.replay.ReplayBoardSettingsPackets.register(); count += 2;
         TaskConfigPayload.register(); count++;
         ActiveTaskPayload.register(); count++;

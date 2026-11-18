@@ -105,7 +105,7 @@ public class ConfigMenuScreen extends Screen {
     private final SubTabBar[] subBars = new SubTabBar[4];
     private SaveBar saveBar;
     private int subHitThisFrame = -1;
-    private net.minecraft.client.gui.components.Button idiotVisuals;
+    private net.minecraft.client.gui.components.Button idiotVisuals, replayStorage;
 
     /**
      * 场景配置器的数据包可能在屏幕交给 Minecraft 初始化之前到达。此时 Screen.font
@@ -153,6 +153,13 @@ public class ConfigMenuScreen extends Screen {
                 Component.translatable("screen.habitrain_core.idiot.visuals"), button ->
                         Minecraft.getInstance().setScreen(new com.habitrain.core.client.idiot.IdiotVisualScreen(this)))
                 .bounds(Math.max(8, width - 124), 31, Math.min(114, width - 16), 17).build());
+        if (accessMode == AccessMode.FULL) {
+            int itemWidth = Math.min(112, (width - 28) / 3);
+            replayStorage = addRenderableWidget(net.minecraft.client.gui.components.Button.builder(
+                    Component.translatable("screen.habitrain_core.replay_storage.title"),
+                    button -> minecraft.setScreen(new ReplayArchiveSettingsScreen(this)))
+                    .bounds(width - 130 - itemWidth, 31, itemWidth, 17).build());
+        }
     }
 
     @Override
@@ -282,6 +289,7 @@ public class ConfigMenuScreen extends Screen {
             MenuTheme.drawBackdrop(g, width, height, MenuTheme.DANGER);
             drawLockedOverlay(g);
             if (idiotVisuals != null) idiotVisuals.render(g, mx, my, delta);
+        if (replayStorage != null) replayStorage.render(g, mx, my, delta);
             return;
         }
         int accent = activeAccent();
@@ -333,6 +341,7 @@ public class ConfigMenuScreen extends Screen {
             }
         }
         if (idiotVisuals != null) idiotVisuals.render(g, mx, my, delta);
+        if (replayStorage != null) replayStorage.render(g, mx, my, delta);
     }
 
     private void drawSidebar(GuiGraphics g, int mx, int my, int navW) {
@@ -481,6 +490,7 @@ public class ConfigMenuScreen extends Screen {
     @Override
     public boolean mouseClicked(double mx, double my, int btn) {
         if (idiotVisuals != null && idiotVisuals.mouseClicked(mx, my, btn)) return true;
+        if (replayStorage != null && replayStorage.mouseClicked(mx, my, btn)) return true;
         if (!isScreenAllowed()) return false;
         if (currentPage().canSave() && ConfigManager.getInstance().hasClientConfigConflict()
                 && MenuTheme.inBounds(mx, my, contentX() + Math.max(0, contentW() - 226), height - SaveBar.HEIGHT + 10, 122, 22)) {

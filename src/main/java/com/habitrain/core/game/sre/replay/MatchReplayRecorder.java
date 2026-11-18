@@ -33,6 +33,9 @@ import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
 import io.wifi.starrailexpress.game.GameUtils;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerEntityEvents;
+import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.world.entity.projectile.Projectile;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -64,6 +67,8 @@ public final class MatchReplayRecorder {
         });
         MatchEventBridge.WINNERS_FINALIZED.register(MatchReplayRecorder::finish);
         ServerTickEvents.END_WORLD_TICK.register(MatchReplayRecorder::tick);
+        ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player, previous, next) -> leave(player, previous));
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> leave(handler.player, handler.player.serverLevel()));
         ServerEntityEvents.ENTITY_UNLOAD.register((entity, level) -> {
             Round r = current;
             if (r != null && r.level == level && entity instanceof ReconDroneEntity drone) r.removeDrone(drone);
@@ -111,6 +116,16 @@ public final class MatchReplayRecorder {
     public static void reset() {
         if (current != null) current.capture.cancel();
         current = null;
+        MatchVoiceRecorder.reset();
+    }
+
+    public static void stopVoice(ServerLevel level) {
+        MatchVoiceRecorder.stop(level);
+    }
+
+    private static void leave(ServerPlayer player, ServerLevel level) {
+        Round r = current;
+        if (r != null && r.level == level && r.start >= 0) MatchVoiceRecorder.leave(level, player.getUUID(), r.now());
     }
 
     private static void begin(ServerLevel level) {
@@ -123,6 +138,9 @@ public final class MatchReplayRecorder {
         String mapKey = bounded(areas.mapName, 128);
         String label = bounded(areas.mapDisplayName, 128);
         current = new Round(level, bounds, mapKey, label.isBlank() ? mapKey : label);
+        if (ReplayArchiveService.shouldRecordVoice(level.getServer()) && FabricLoader.getInstance().isModLoaded("voicechat")) {
+            MatchVoiceRecorder.beginRound(current.id, level, bounds);
+        }
         if (game.getGameStatus() == SREGameWorldComponent.GameStatus.ACTIVE) current.activate(game);
     }
 
@@ -139,7 +157,10 @@ public final class MatchReplayRecorder {
             catch (RuntimeException failure) { r.failMap(failure); }
         }
         if (game.getGameStatus() != SREGameWorldComponent.GameStatus.ACTIVE) {
-            if (r.start >= 0 && r.activeEnd < 0) r.activeEnd = level.getGameTime();
+            if (r.start >= 0 && r.activeEnd < 0) {
+                r.activeEnd = level.getGameTime();
+                stopVoice(level);
+            }
             return;
         }
         if (r.start < 0) r.activate(game);
@@ -153,6 +174,13 @@ public final class MatchReplayRecorder {
                     && SREPlayerPsychoComponent.KEY.get(player).getPsychoTicks() > 0;
             r.environment(SpanKind.PSYCHO, id, psycho, at, player.position());
         }
+        if (MatchVoiceRecorder.isRecording()) {
+            Set<UUID> deathsAtTick = new HashSet<>();
+            for (var entry : r.deaths.entrySet()) {
+                if (entry.getValue() == at) deathsAtTick.add(entry.getKey());
+            }
+            MatchVoiceRecorder.tick(level, at, deathsAtTick, r.events);
+        }
         if (at != r.lastSample && at % 5 == 0) r.sample(game, at);
     }
 
@@ -162,6 +190,7 @@ public final class MatchReplayRecorder {
         current = null;
         if (r.start < 0 || settlement.participants().isEmpty()) {
             r.capture.cancel();
+            MatchVoiceRecorder.reset();
             return;
         }
         if (!r.captureDone) {
@@ -198,7 +227,10 @@ public final class MatchReplayRecorder {
                     score == null ? 0 : score.score(), score == null ? 0 : score.itemUses(),
                     person == null ? List.of() : person.track));
         }
-        if (people.isEmpty()) return;
+        if (people.isEmpty()) {
+            MatchVoiceRecorder.reset();
+            return;
+        }
         for (var entry : r.open.entrySet()) r.close(entry.getKey(), entry.getValue(), at);
         UUID mvp = people.stream().filter(p -> p.winner() && scores.containsKey(p.id())).min(
                 Comparator.comparingInt(Participant::score).reversed()
@@ -210,10 +242,11 @@ public final class MatchReplayRecorder {
         var win = cca.getWinStatus();
         r.events.sort(Comparator.comparingInt(Node::tick));
         r.spans.sort(Comparator.comparingInt(Span::startTick));
-        ReplayBoardService.publish(new LastMatchReplay(UUID.randomUUID(), anchor, at, r.label, bounded(settlement.modeId(), 128),
+        byte[] voice = MatchVoiceRecorder.finishRound(r.id, r.events);
+        ReplayBoardService.publish(new LastMatchReplay(r.id, anchor, at, r.label, bounded(settlement.modeId(), 128),
                 win == null ? "NONE" : win.name(), settlement.winKind(),
                 bounded(cca.CustomWinnerID, 128), title(cca.CustomWinnerTitle, level), title(cca.CustomWinnerSubtitle, level),
-                cca.CustomWinnerColor, r.bounds, null, people, r.events, r.spans, mvp, r.kills, r.limited, r.droneTracks(ids)), r.map);
+                cca.CustomWinnerColor, r.bounds, null, people, r.events, r.spans, mvp, r.kills, r.limited, r.droneTracks(ids)), r.map, voice);
     }
 
     private static String title(Component c, ServerLevel level) {
@@ -386,7 +419,13 @@ public final class MatchReplayRecorder {
                 impact == null ? shot.from() : impact, shot.detail(), (shot.flags() & ~HIT) | BACKFIRE);
     }
 
+    public static UUID recordId(ServerLevel level) {
+        Round r = current;
+        return r != null && r.level == level && r.start >= 0 ? r.id : null;
+    }
+
     private static final class Round {
+        final UUID id = UUID.randomUUID();
         final ServerLevel level;
         final long started;
         final SceneBounds bounds;
@@ -425,6 +464,8 @@ public final class MatchReplayRecorder {
         int now() { return (int) Math.clamp((activeEnd >= 0 ? activeEnd : level.getGameTime()) - start, 0L, MAX_TICKS); }
         void activate(SREGameWorldComponent game) {
             start = level.getGameTime();
+            MatchVoiceRecorder.activateRound(id);
+            MatchVoiceRecorder.tick(level, 0, Set.of(), events);
             sample(game, 0);
         }
         boolean eligible(UUID id) {

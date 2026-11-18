@@ -1,0 +1,125 @@
+package com.habitrain.core.scene.client.replay;
+
+import com.habitrain.core.network.replay.ReplayPackets.RequestVoiceExportC2S;
+import com.habitrain.core.network.replay.ReplayPackets.VoiceExportAccessS2C;
+import com.habitrain.core.scene.client.ClientReplayBoard;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.network.chat.Component;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
+
+/** Owns the local export and its HUD independently of any replay screen or table. */
+public final class ReplayExportClient {
+    private static ReplayVideoExport video;
+    private static Supplier<ClientReplayBoard.View> voiceSource;
+    private static long finishedAt;
+    private static long nextAccessRequest;
+
+    private ReplayExportClient() {}
+
+    static boolean mapReady(ClientReplayBoard.View view) {
+        return view != null && view.replay() != null && view.timeline() != null && view.asset() != null
+                && view.presentSections() == view.totalSections();
+    }
+
+    static ReplayVideoExport current() { return video; }
+
+    static ReplayVideoExport forScreen(ReplayVideoExport shown) {
+        return video != null && (video == shown || video.running()) ? video : null;
+    }
+
+    static boolean canStart() {
+        return video == null || (!video.running() && !video.encoderBusy());
+    }
+
+    static @Nullable ReplayVideoExport start(ClientReplayBoard.View view, boolean fullBody, ReplayExportResolution resolution,
+                                             boolean compress, Supplier<ClientReplayBoard.View> source) {
+        if (!canStart() || !mapReady(view)) return null;
+        video = new ReplayVideoExport(view, fullBody, resolution, compress);
+        voiceSource = view.voiceReady() ? null : source;
+        nextAccessRequest = 0;
+        if (!ClientPlayNetworking.canSend(RequestVoiceExportC2S.TYPE)) video.setVoiceExportAllowed(false);
+        finishedAt = 0;
+        return video;
+    }
+
+    public static void acceptVoiceExportAccess(VoiceExportAccessS2C reply) {
+        if (video != null && video.running() && video.roundId().equals(reply.roundId())) {
+            video.setVoiceExportAllowed(reply.allowed());
+        }
+    }
+
+    static void onGameStarted(Minecraft client) {
+        if (video != null && video.running() && isExportScreen(client.screen)) client.setScreen(null);
+    }
+
+    static void reset() {
+        if (video != null) video.cancel();
+        video = null;
+        voiceSource = null;
+        finishedAt = 0;
+    }
+
+    private static boolean isExportScreen(Screen screen) {
+        return screen instanceof ReplayBoardControlsScreen || screen instanceof ReplayExportScreen;
+    }
+
+    /** An Escape in the export page closes that page. Only a new press in the background cancels. */
+    public static boolean cancelInBackground(Minecraft client) {
+        return client.level != null && client.player != null && client.getOverlay() == null
+                && !isExportScreen(client.screen) && video != null && video.running() && video.cancel();
+    }
+
+    public static void renderFrame(Minecraft client) {
+        if (video == null || client.level == null || client.player == null || client.getOverlay() != null) return;
+        long now = System.nanoTime();
+        if (video.waitingForVoiceAccess() && (nextAccessRequest == 0 || now - nextAccessRequest >= 0)
+                && ClientPlayNetworking.canSend(RequestVoiceExportC2S.TYPE)) {
+            ClientPlayNetworking.send(new RequestVoiceExportC2S(video.roundId()));
+            nextAccessRequest = now + TimeUnit.SECONDS.toNanos(3);
+        }
+        if (video.running()) video.renderNext(client, voiceSource);
+        if (!video.waitingForVoice()) voiceSource = null;
+
+        if (!video.running() && finishedAt == 0) {
+            video.releaseRenderResources();
+            finishedAt = now;
+        }
+        if (isExportScreen(client.screen) || (client.options.hideGui && client.screen == null)
+                || (finishedAt != 0 && now - finishedAt >= TimeUnit.SECONDS.toNanos(6))) return;
+
+        GuiGraphics g = new GuiGraphics(client, client.renderBuffers().bufferSource());
+        int width = Math.min(180, g.guiWidth() - 16);
+        if (width <= 16) return;
+        int right = g.guiWidth() - 8, left = right - width;
+        int top = Math.max(8, g.guiHeight() * 2 / 3 - 24);
+        var font = client.font;
+        Component status = video.saved() != null && !video.voiceExportRestricted()
+                ? ReplayBoardTexts.tr("export.hud_saved") : video.status();
+        var lines = font.split(status, width - 16);
+        int barY = top + 22 + lines.size() * font.lineHeight;
+        boolean running = video.running();
+        int bottom = barY + (running ? 24 : 10);
+
+        g.fill(left, top, right, bottom, 0xEA0D1727);
+        g.renderOutline(left, top, width, bottom - top, ReplayPalette.BRASS_DIM);
+        g.drawString(font, ReplayBoardTexts.tr("export.hud_title"), left + 8, top + 7, ReplayPalette.BRASS_LIGHT, false);
+        int lineY = top + 20;
+        for (var line : lines) {
+            g.drawString(font, line, left + 8, lineY, ReplayPalette.TEXT, false);
+            lineY += font.lineHeight;
+        }
+        g.fill(left + 8, barY, right - 8, barY + 4, 0xFF313F53);
+        int filled = (int) ((width - 16) * video.displayProgress());
+        g.fill(left + 8, barY, left + 8 + filled, barY + 4, 0xFF52C5B9);
+        if (running) {
+            g.drawString(font, ReplayBoardTexts.tr("export.hud_cancel"), left + 8, barY + 10, ReplayPalette.TEXT_MUTED, false);
+        }
+        g.flush();
+    }
+}
