@@ -1,6 +1,5 @@
 package com.habitrain.core.game.sre.role.drone;
 
-import com.habitrain.core.HabiTrainCore;
 import com.habitrain.core.game.sre.role.HabiRoleItems;
 import com.habitrain.core.game.sre.role.idiot.IdiotService;
 import com.habitrain.core.game.sre.role.sins.ServerAimTargeting;

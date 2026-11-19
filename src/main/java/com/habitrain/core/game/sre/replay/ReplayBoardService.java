@@ -240,10 +240,10 @@ public final class ReplayBoardService {
     }
 
     private static boolean accessible(ServerPlayer p, BlockPos board) {
-        if (p.distanceToSqr(board.getX() + .5, board.getY() + .5, board.getZ() + .5) > VIEW_DISTANCE * VIEW_DISTANCE
-                || p.serverLevel().isOutsideBuildHeight(board)) return false;
+        if (p.serverLevel().isOutsideBuildHeight(board)) return false;
         var chunk = p.serverLevel().getChunkSource().getChunkNow(board.getX() >> 4, board.getZ() >> 4);
-        return chunk != null && chunk.getBlockState(board).is(SettlementSummaryBoard.BLOCK);
+        return chunk != null && chunk.getBlockEntity(board) instanceof SettlementSummaryBoard.Marker marker
+                && marker.settings().inView(board, marker.getBlockState().getValue(SettlementSummaryBoard.FACING), p.getEyePosition());
     }
 
     private static void tick(MinecraftServer s) {

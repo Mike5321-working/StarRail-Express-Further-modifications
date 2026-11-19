@@ -12,6 +12,19 @@ import static com.habitrain.core.api.match.replay.LastMatchReplay.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class MatchReplayRecorderTest {
+    @Test void outOfRangeLeavesOnceAndReentryDoesNotInterpolate() {
+        var track = new java.util.ArrayList<Sample>();
+        track.add(new Sample(0, Position.quantize(0, 0, 0), (byte) 0, ALIVE));
+        assertNull(Position.quantize(3000, 0, 0));
+        MatchReplayRecorder.markAbsent(track, 5);
+        MatchReplayRecorder.markAbsent(track, 10);
+        track.add(new Sample(20, Position.quantize(2, 0, 0), (byte) 0, (byte) (ALIVE | BREAK)));
+        var sampler = new com.habitrain.core.scene.replay.ReplayTrackSampler(track);
+        assertEquals(3, track.size());
+        assertFalse(sampler.sample(15).visible());
+        assertTrue(sampler.sample(20).visible());
+        assertFalse(sampler.connects(2));
+    }
     @Test void onlyPublicUpstreamEventsEnterTheBoardTimeline() {
         for (EventType type : new EventType[]{EventType.ITEM_USED, EventType.TRAP_TRIGGERED}) {
             assertEquals(Kind.valueOf(type.name()), MatchReplayRecorder.publicEventKind(event(type, false)));

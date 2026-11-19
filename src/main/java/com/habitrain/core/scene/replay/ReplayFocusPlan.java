@@ -4,10 +4,12 @@ import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayProjection;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import org.joml.Matrix4f;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.UUID;
 
 /** Deterministic event close-ups, timed in presentation ticks rather than compressed match time. */
 public final class ReplayFocusPlan {
@@ -15,6 +17,7 @@ public final class ReplayFocusPlan {
     public static final double ATTACK = 6, HOLD = 16, RELEASE = 14;
     public static final double LENGTH = HOLD + RELEASE;
     public static final Pose WIDE = new Pose(1, 0, 0, 0);
+    public static final Sample UNFOCUSED = new Sample(WIDE, Highlight.NONE, Highlight.NONE);
 
     /** Offset is in the unscaled diorama frame. The tray, plaque and honors screen never move. */
     public record Pose(double zoom, double x, double y, double z) {
@@ -23,7 +26,22 @@ public final class ReplayFocusPlan {
         }
     }
 
-    private record Cue(double tick, int priority, Pose incoming, Pose target) {
+    public record Highlight(@Nullable LastMatchReplay.Node event, double weight) {
+        private static final Highlight NONE = new Highlight(null, 0);
+
+        double amount(UUID id) {
+            return event != null && (id.equals(event.actor()) || id.equals(event.target())) ? weight : 0;
+        }
+
+        Highlight scaled(double factor) { return new Highlight(event, weight * factor); }
+    }
+
+    public record Sample(Pose pose, Highlight outgoing, Highlight current) {
+        public double emphasis(UUID id) { return outgoing.amount(id) + current.amount(id); }
+    }
+
+    private record Cue(double tick, int priority, Pose incoming, Pose target, LastMatchReplay.Node event,
+                       Highlight previous) {
         Pose at(double tick) {
             double age = tick - this.tick;
             if (age < 0) return incoming;
@@ -36,6 +54,16 @@ public final class ReplayFocusPlan {
             if (age <= HOLD) return target;
             double out = ReplayStagePlan.easeInOutQuart((age - HOLD) / RELEASE);
             return mix(target, WIDE, out, out);
+        }
+
+        Highlight highlightAt(double tick) {
+            double age = tick - this.tick;
+            return new Highlight(event, age < ATTACK ? attackWeight(age)
+                    : 1 - ReplayStagePlan.easeInOutQuart((age - HOLD) / RELEASE));
+        }
+
+        private static double attackWeight(double age) {
+            return ReplayStagePlan.smoothstep(0, ATTACK, age);
         }
     }
 
@@ -59,25 +87,32 @@ public final class ReplayFocusPlan {
                 if (previous != null && (at - previous.tick < ATTACK
                         || at - previous.tick < HOLD && priority < previous.priority)) continue;
                 Pose incoming = previous == null ? WIDE : previous.at(at);
-                built.add(new Cue(at, priority, incoming, target(layout, event, priority)));
+                built.add(new Cue(at, priority, incoming, target(layout, event, priority), event,
+                        previous == null ? Highlight.NONE : previous.highlightAt(at)));
             }
         }
         cues = List.copyOf(built);
     }
 
     public Pose at(ReplayTimeline.Frame frame) {
-        if (frame == null || frame.phase() != ReplayTimeline.Phase.PLAY) return WIDE;
+        return sample(frame).pose();
+    }
+
+    public Sample sample(@Nullable ReplayTimeline.Frame frame) {
+        if (frame == null || frame.phase() != ReplayTimeline.Phase.PLAY) return UNFOCUSED;
         double tick = frame.progress() * actionLength;
         Cue selected = null;
         for (Cue cue : cues) {
             if (cue.tick > tick) break;
             selected = cue;
         }
-        if (selected == null) return WIDE;
+        if (selected == null || tick - selected.tick >= LENGTH) return UNFOCUSED;
         Pose pose = selected.at(tick);
         // Even a last-tick kill must hand the complete map back to the review act without a cut.
         double exit = ReplayStagePlan.easeInOutQuart(Math.max(0, (tick - (actionLength - RELEASE)) / RELEASE));
-        return mix(pose, WIDE, exit, exit);
+        double attack = Cue.attackWeight(tick - selected.tick);
+        return new Sample(mix(pose, WIDE, exit, exit), selected.previous.scaled((1 - attack) * (1 - exit)),
+                selected.highlightAt(tick).scaled(1 - exit));
     }
 
     public static int priority(LastMatchReplay.Node event) {

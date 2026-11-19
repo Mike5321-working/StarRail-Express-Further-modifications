@@ -20,7 +20,7 @@ final class ReplayBoardControlsScreen extends Screen {
     private final BlockPos pos;
     private ReplayExportResolution resolution;
     private boolean compress;
-    private Button play, export, resolutionButton, compressButton, folder, close;
+    private Button play, export, resolutionButton, compressButton;
     private int left, top, panelWidth;
     private ClientReplayBoard.View view;
     private ReplayVideoExport video;
@@ -72,10 +72,10 @@ final class ReplayBoardControlsScreen extends Screen {
             ClientVisualPreferences.setReplayVideoCompress(compress);
             refresh();
         }).bounds(left + 18 + half, top + 68, half, 20).build());
-        folder = addRenderableWidget(Button.builder(tr("folder"), button -> {
+        addRenderableWidget(Button.builder(tr("folder"), button -> {
             folderFailed = !ReplayVideoExport.openFolder(minecraft);
         }).bounds(left + 12, top + 130, half, 20).build());
-        close = addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, button -> onClose())
+        addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, button -> onClose())
                 .bounds(left + 18 + half, top + 130, half, 20).build());
         refresh();
     }

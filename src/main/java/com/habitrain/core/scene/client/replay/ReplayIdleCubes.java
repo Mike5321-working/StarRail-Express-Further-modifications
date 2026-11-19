@@ -86,20 +86,22 @@ final class ReplayIdleCubes {
     }
 
     static void paint(ReplayFrame f, ReplayBoardSite s) {
-        double fade = s.fade();
+        double idle = f.handoff.idle();
+        double fade = s.fade() * idle;
         if (fade <= 0.01) return;
 
         float innerHalf = Math.max(0.8f, s.hw() - FRAME);
         float localScale = Math.min(1.05f, innerHalf / 2.14f);
         float wScale = Math.max(0.18f, s.scale() * localScale);
         boolean detail = s.detail();
-        boolean loading = f.hasRound;
+        boolean loading = f.hasRound && f.model == null;
 
+        double ambient = f.ambient;
         double speedMul = loading ? 1.55 : 1.0;
-        double t = f.anim * speedMul;
-        float bob = (sinf(f.anim * 1.15) * 0.042f + sinf(f.anim * 2.35 + 0.7) * 0.012f) * localScale;
+        double t = ambient * speedMul;
+        float bob = (sinf(ambient * 1.15) * 0.042f + sinf(ambient * 2.35 + 0.7) * 0.012f) * localScale;
         float centerY = BASE_TOP + 1.14f * localScale + bob;
-        double loadPulse = loading ? 0.84 + 0.16 * Math.sin(wrapAngleRad(f.anim * 5.0)) : 1.0;
+        double loadPulse = loading ? 0.84 + 0.16 * Math.sin(wrapAngleRad(ambient * 5.0)) : 1.0;
         double masterAlpha = fade * loadPulse;
 
         VertexConsumer fill = f.fill();
@@ -107,11 +109,15 @@ final class ReplayIdleCubes {
         Matrix4f board = s.board();
 
         // 1. Velvet contrast well + Art Deco astrolabe dial on the mahogany floor
-        paintFloorAstrolabe(fill, glow, board, f.anim, t, centerY, bob, localScale, wScale, masterAlpha, detail);
+        float settle = (float) idle;
+        float cubeScale = localScale * (0.18f + 0.82f * settle);
+        float cubeY = Mth.lerp(settle, BASE_TOP + 0.13f, centerY);
+        float cubeWorldScale = s.scale() * cubeScale;
+        paintFloorAstrolabe(fill, glow, board, ambient, t, cubeY, bob, localScale, wScale, masterAlpha, detail);
 
         // 2. Construct poses for the 4 overlapping central 3D cubes & 3 orbiting miniature 3D cubes
-        buildHeroPoses(board, t, f.anim, centerY, localScale);
-        buildSatellitePoses(board, f.anim, t, centerY, localScale);
+        buildHeroPoses(board, t, ambient, cubeY, cubeScale);
+        buildSatellitePoses(board, ambient, t, cubeY, cubeScale);
 
         // 3. Emit & depth-sort all beveled-frame and smoked-crystal sub-quads back-to-front into FILL,
         //    plus subtle specular reflections into GLOW
@@ -119,30 +125,31 @@ final class ReplayIdleCubes {
 
         // 4. Crisp depth-cued glowing outer edges, inner window bevel trims & round vertex jewels
         for (int i = 0; i < HERO_CUBES; i++) {
-            paintHeroCubeEdges(f, glow, HERO[i], i, t, wScale, masterAlpha, detail);
+            paintHeroCubeEdges(f, glow, HERO[i], i, t, cubeWorldScale, masterAlpha, detail);
         }
 
         // 5. Exact live 3D exterior intersection seams (∂Cube_i ∩ ∂Cube_j) where cubes slice through each other
         for (int i = 0; i < HERO_CUBES; i++) {
             for (int j = i + 1; j < HERO_CUBES; j++) {
-                paintSurfaceIntersections(f, glow, board, HERO[i], HERO[j], wScale, masterAlpha, detail);
+                paintSurfaceIntersections(f, glow, board, HERO[i], HERO[j], cubeWorldScale, masterAlpha, detail);
             }
         }
 
         // 6. Smooth circular radiant core heart inside the innermost chronocube
-        paintCoreHeart(f, glow, HERO[3].camCenter, f.anim, wScale, masterAlpha);
+        paintCoreHeart(f, glow, HERO[3].camCenter, ambient, cubeWorldScale, masterAlpha);
 
         // 7. Precessing gyroscope rings, satellite mini-cube edges, comet ribbons & ascending starlight motes
-        paintOrbitalField(f, glow, board, f.anim, t, centerY, localScale, wScale, masterAlpha, detail);
+        paintOrbitalField(f, glow, board, ambient, t, cubeY, cubeScale, cubeWorldScale, masterAlpha, detail);
 
         // 8. Active materialization scan wave when replay summary is streaming in
         if (loading) {
-            paintLoadingScanWave(glow, board, f.anim, centerY, localScale, wScale, fade);
+            paintLoadingScanWave(glow, board, ambient, centerY, localScale, wScale, fade);
         }
 
         // 9. Yaw-tracking Art Deco holographic status banner crowning the sculpture
         ReplayBoardButtons.Phase phase = ReplayBoardButtons.phase(f, s);
-        paintStatusBanner(f, s, fill, glow, centerY, localScale, wScale, fade, loading, phase);
+        var bannerPhase = loading || f.model == null ? phase : ReplayBoardButtons.Phase.READY;
+        paintStatusBanner(f, s, fill, glow, centerY, localScale, wScale, fade * idle, loading, bannerPhase);
 
         // 10. Camera-facing "start playback" / "export video" plaques floating in front of the sculpture
         ReplayBoardButtons.paint(f, s, phase, localScale, fade);

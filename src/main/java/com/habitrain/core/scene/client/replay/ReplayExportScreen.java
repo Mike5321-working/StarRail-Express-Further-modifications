@@ -35,7 +35,7 @@ final class ReplayExportScreen extends Screen {
     private ReplayExportResolution resolution;
     private boolean compress;
     private final Button[] resolutionButtons = new Button[ReplayExportResolution.values().length];
-    private Button mp4, avi, roofCut, roofFull, start, folder, close;
+    private Button mp4, avi, roofCut, roofFull, start;
     private int left, top, panelWidth, panelHeight, spacing;
     private ClientReplayBoard.View view;
     private ReplayVideoExport video;
@@ -119,9 +119,9 @@ final class ReplayExportScreen extends Screen {
         int third = (inner - GAP * 2) / 3;
         int buttonsY = top + panelHeight - 32;
         start = addRenderableWidget(new BrassButton(x, buttonsY, third, 20, tr("export.start"), b -> toggleExport()));
-        folder = addRenderableWidget(new BrassButton(x + third + GAP, buttonsY, third, 20, tr("controls.folder"), b ->
+        addRenderableWidget(new BrassButton(x + third + GAP, buttonsY, third, 20, tr("controls.folder"), b ->
                 folderFailed = !ReplayVideoExport.openFolder(minecraft)));
-        close = addRenderableWidget(new BrassButton(x + (third + GAP) * 2, buttonsY, inner - (third + GAP) * 2, 20,
+        addRenderableWidget(new BrassButton(x + (third + GAP) * 2, buttonsY, inner - (third + GAP) * 2, 20,
                 CommonComponents.GUI_DONE, b -> onClose()));
         refresh();
     }
@@ -227,6 +227,7 @@ final class ReplayExportScreen extends Screen {
     private Component exportStatus() {
         if (folderFailed) return tr("controls.folder_error");
         if (video == null) {
+            if (history != null && ReplayHistoryClient.voiceUnavailable(history)) return tr("controls.missing_voice_hint");
             if (history != null && !ReplayExportClient.mapReady(view)) return ReplayHistoryScreen.loadStatus(history, view);
             if (view != null && view.presentSections() < view.totalSections()) {
                 return tr("controls.receiving_map", view.presentSections(), view.totalSections());

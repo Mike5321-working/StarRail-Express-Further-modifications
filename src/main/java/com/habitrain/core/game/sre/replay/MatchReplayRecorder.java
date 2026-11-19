@@ -414,6 +414,12 @@ public final class MatchReplayRecorder {
     private record Shot(int tick, int index, boolean authoritative) {}
     private record Backfire(int tick, @Nullable Position impact) {}
 
+    static void markAbsent(List<Sample> track, int tick) {
+        if (track.isEmpty()) return;
+        Sample last = track.getLast();
+        if (last.flags() != BREAK) ReplayTracks.append(track, new Sample(tick, last.position(), last.yaw(), BREAK));
+    }
+
     static Node backfireShot(Node shot, @Nullable Position impact) {
         return new Node(shot.tick(), shot.kind(), shot.actor(), shot.actor(), shot.from(),
                 impact == null ? shot.from() : impact, shot.detail(), (shot.flags() & ~HIT) | BACKFIRE);
@@ -536,7 +542,11 @@ public final class MatchReplayRecorder {
                     p.lastRole = role;
                 }
                 Position fixed = pos(position);
-                if (fixed == null) { p.present = false; continue; }
+                if (fixed == null) {
+                    if (p.present) markAbsent(p.track, tick);
+                    p.present = false;
+                    continue;
+                }
                 Sample last = p.track.isEmpty() ? null : p.track.getLast();
                 if (!alive) {
                     if (last != null && (last.flags() & ALIVE) != 0) ReplayTracks.append(p.track, new Sample(tick, fixed, yaw(player), (byte) 0));
@@ -566,8 +576,7 @@ public final class MatchReplayRecorder {
                 Person p = entry.getValue();
                 if (!seen.contains(entry.getKey()) && p.present && !p.track.isEmpty()) {
                     p.present = false;
-                    Sample last = p.track.getLast();
-                    ReplayTracks.append(p.track, new Sample(tick, last.position(), last.yaw(), BREAK));
+                    markAbsent(p.track, tick);
                     environment(SpanKind.PSYCHO, entry.getKey(), false, tick, null);
                 }
             }

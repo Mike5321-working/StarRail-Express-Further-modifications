@@ -1,6 +1,5 @@
 package com.habitrain.core.scene.client.replay;
 
-import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import net.sourceforge.jaad.aac.Decoder;
@@ -24,6 +23,27 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ReplayVideoAudioMuxTest {
+
+    @Test
+    void soundContinuesAcrossMixWindowsWithoutFadingOrDecodingTwice() {
+        int rate = ReplayVideoAudioRenderer.SAMPLE_RATE;
+        float[] constant = new float[rate / 2];
+        Arrays.fill(constant, .5f);
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var schedule = new ReplaySoundCuePlan.Schedule(List.of(
+                new ReplaySoundCuePlan.SoundCue(.75, 0, List.of("continuous"), 1, 1, -1)), List.of());
+        short[] pcm = ReplayVideoAudioRenderer.renderSchedule(schedule, keys -> {
+            calls.incrementAndGet();
+            return new ReplayVideoAudioRenderer.DecodedSound(constant, 1, rate, 1, 1);
+        }, 42);
+        assertEquals(1, calls.get());
+        assertEquals(0, pcm[(rate * 3 / 4 - 1) * 2]);
+        for (int frame = rate * 3 / 4; frame < rate * 5 / 4; frame++) {
+            assertEquals(Math.round(.5f * .85f * 32767), pcm[frame * 2]);
+            assertEquals(0, pcm[frame * 2 + 1]);
+        }
+        assertEquals(0, pcm[rate * 5 / 4 * 2]);
+    }
 
     @Test
     void aacEncoderRoundTripsThroughJaadWithExactSyncAndStereoSeparation() throws Exception {

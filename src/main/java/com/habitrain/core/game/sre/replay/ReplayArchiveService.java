@@ -93,7 +93,7 @@ public final class ReplayArchiveService {
         State s = state;
         if (s == null || s.server != owner || map == null) return;
         byte[] voiceCopy = voice == null ? new byte[0] : voice.clone();
-        s.submit(() -> {
+        s.submit(true, () -> {
             if (s.archive != null) s.archive.save(data.replay().roundId(), finishedAt, map.manifest().hash(),
                     ReplayArchiveData.encode(data), map.patches(), voiceCopy);
         }, () -> LOG.warn("Could not queue 3D replay {}", data.replay().roundId()));
@@ -106,11 +106,7 @@ public final class ReplayArchiveService {
 
     private static final class State {
         final MinecraftServer server;
-        final ThreadPoolExecutor io = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(32), r -> {
-            Thread t = new Thread(r, "habitrain-replay-archive");
-            t.setDaemon(true);
-            return t;
-        });
+        final ReplayArchiveQueue io = new ReplayArchiveQueue(32);
         final Path root;
         final Map<UUID, Delivery> pending = new LinkedHashMap<>();
         final Map<UUID, Long> last = new HashMap<>();
@@ -134,8 +130,12 @@ public final class ReplayArchiveService {
         }
 
         void submit(Work work, Runnable rejected) {
+            submit(false, work, rejected);
+        }
+
+        void submit(boolean settlement, Work work, Runnable rejected) {
             try {
-                io.execute(() -> {
+                io.submitWork(settlement, () -> {
                     try { work.run(); }
                     catch (Exception failure) { LOG.warn("Replay archive I/O failed", failure); }
                 });

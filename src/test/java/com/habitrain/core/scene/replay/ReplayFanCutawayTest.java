@@ -1,6 +1,5 @@
 package com.habitrain.core.scene.replay;
 
-import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;

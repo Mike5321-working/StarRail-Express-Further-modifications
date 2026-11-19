@@ -17,6 +17,20 @@ import static org.junit.jupiter.api.Assertions.*;
 class ReplayBoardSettingsTest {
     private static final float MAP_BASE = 0.239f;
 
+    @Test void displayAndDataShareScaledOffsetRangeInAllFacings() {
+        var settings = new ReplayBoardSettings(12.5f, 10, 14, -12, 90);
+        var board = new BlockPos(8, 72, -4);
+        for (var facing : Direction.Plane.HORIZONTAL) {
+            var center = new Matrix4f().translation(8.5f, 73, -3.5f).rotateY((float) Math.toRadians(-facing.toYRot()))
+                    .transformPosition(14, 10, -12, new Vector3f());
+            assertEquals(0, settings.viewDistance(board, facing, new net.minecraft.world.phys.Vec3(center)), 1e-5);
+            var nearViewer = new net.minecraft.world.phys.Vec3(center).add(0, 126, 0);
+            assertTrue(settings.inView(board, facing, nearViewer));
+            assertFalse(ReplayBoardSettings.DEFAULT.inView(board, facing, nearViewer));
+            assertFalse(settings.inView(board, facing, nearViewer.add(0, 3, 0)));
+        }
+    }
+
     @Test void oldWorldMarkersUseDefaultsAndTablesKeepIndependentValues() {
         assertEquals(ReplayBoardSettings.DEFAULT, ReplayBoardSettings.load(new CompoundTag()));
         var first = new ReplayBoardSettings(12, 3.5f, -4, 6, 75);

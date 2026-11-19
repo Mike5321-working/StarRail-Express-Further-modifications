@@ -38,6 +38,13 @@ final class ReplayDioramaMesh {
     static @Nullable Key builtKey() { return selected == null ? null : selected.builtKey; }
     static boolean matches(@Nullable SceneAssetCodec.AssetData asset) { return selected != null && selected.matches(asset); }
 
+    static boolean failed(Key key) { return selected != null && key.equals(selected.failedKey); }
+
+    static void retry(String fingerprint) {
+        Slot slot = slots.get(fingerprint);
+        if (slot != null) slot.failedKey = null;
+    }
+
     static void update(@Nullable SceneAssetCodec.AssetData asset, int present, int total) {
         if (asset == null || asset.sections.isEmpty()) { selected = null; return; }
         selected = slots.computeIfAbsent(asset.fingerprint, key -> new Slot());
@@ -64,9 +71,10 @@ final class ReplayDioramaMesh {
         selected = null;
     }
 
-    private static final class Slot {
+    static final class Slot {
         private @Nullable SceneMeshSet mesh;
         private @Nullable Key builtKey;
+        private @Nullable Key failedKey;
         private @Nullable CompletableFuture<SceneMeshBuilder.MeshBuildResult> pending;
         private @Nullable Key pendingKey;
         private Object ticket = new Object();
@@ -87,7 +95,7 @@ final class ReplayDioramaMesh {
             lastUse = System.nanoTime();
             if (asset == null || asset.sections.isEmpty()) return;
             Key want = new Key(asset.fingerprint, present);
-            if (want.equals(builtKey) || want.equals(pendingKey)) return;
+            if (want.equals(builtKey) || want.equals(pendingKey) || want.equals(failedKey)) return;
             if (builtKey != null && !builtKey.sameMap(want)) closeMesh();
             if (pending != null) {
                 if (pendingKey != null && pendingKey.sameMap(want)) return;
@@ -108,6 +116,7 @@ final class ReplayDioramaMesh {
             try {
                 future = SceneMeshBuilder.buildCutawayMeshAsync(asset, SceneBuildScheduler.Priority.ADDITIONAL);
             } catch (RuntimeException failure) {
+                failedKey = key;
                 LOGGER.warn("Replay diorama mesh submission failed", failure);
                 return;
             }
@@ -129,18 +138,25 @@ final class ReplayDioramaMesh {
                 return;
             }
             if (pending == future) { pending = null; pendingKey = null; }
+            installBuilt(key, built, failure);
+        }
+
+        @Nullable Key installedKey() { return builtKey; }
+
+        void installBuilt(Key key, @Nullable SceneMeshSet built, @Nullable Throwable failure) {
             if (failure != null || built == null || built.isClosed() || built.isEmpty()) {
                 if (built != null) built.close();
                 if (failure != null && !(failure instanceof java.util.concurrent.CancellationException)) {
                     LOGGER.warn("Replay diorama mesh build failed", failure);
                 }
                 // Remember the key so a failing input does not resubmit every frame.
-                builtKey = key;
+                failedKey = key;
                 return;
             }
             SceneMeshSet previous = mesh;
             mesh = built;
             builtKey = key;
+            failedKey = null;
             if (previous != null && previous != built) previous.close();
         }
 
@@ -163,6 +179,7 @@ final class ReplayDioramaMesh {
         void reset() {
             cancelPending();
             closeMesh();
+            failedKey = null;
             lastSubmit = 0;
         }
 

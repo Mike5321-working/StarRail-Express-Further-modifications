@@ -42,7 +42,6 @@ public final class ReplayAudioPlaybackController {
 
     private static final Map<BlockPos, BoardState> BOARDS = new HashMap<>();
     private static @Nullable HistoryState history;
-    private static long lastHistoryUpdateNs;
 
     private ReplayAudioPlaybackController() {}
 
@@ -196,7 +195,6 @@ public final class ReplayAudioPlaybackController {
             history.prevCursor = cursorTicks;
             history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 0.5);
             history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), cursorTicks);
-            lastHistoryUpdateNs = System.nanoTime();
             return;
         }
         if (history.voice != currentVoice) {
@@ -214,13 +212,8 @@ public final class ReplayAudioPlaybackController {
             history.prevCursor = cursorTicks;
             history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 0.5);
             history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), cursorTicks);
-            lastHistoryUpdateNs = System.nanoTime();
             return;
         }
-
-        // Prevent bursts if paused in background or resumed after a stall.
-        long now = System.nanoTime();
-        lastHistoryUpdateNs = now;
 
         List<ReplaySoundCuePlan.SoundCue> sounds = history.schedule.sounds();
         while (history.nextSoundIdx < sounds.size()) {
@@ -377,7 +370,7 @@ public final class ReplayAudioPlaybackController {
      * Streaming 48 kHz mono 16-bit PCM {@link SoundInstance} backed by Fabric's {@link FabricSoundInstance}
      * hook so server-recorded ADPCM clips play natively through OpenAL without writing temporary .ogg files.
      */
-    static final class VoiceClipSoundInstance extends AbstractTickableSoundInstance implements FabricSoundInstance {
+    static final class VoiceClipSoundInstance extends AbstractTickableSoundInstance {
         private final byte[] pcmBytes;
         private final int maxTicks;
         private int ticksAlive;

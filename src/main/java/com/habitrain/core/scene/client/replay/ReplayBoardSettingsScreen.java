@@ -11,6 +11,7 @@ import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
@@ -161,7 +162,9 @@ public final class ReplayBoardSettingsScreen extends Screen {
         if (minecraft.player == null || minecraft.level == null || !minecraft.player.isCreative()
                 || !minecraft.player.isAlive() || !minecraft.player.mayBuild()
                 || !dimension.equals(minecraft.level.dimension().location())
-                || !minecraft.player.canInteractWithBlock(pos, 1.0) || !minecraft.level.hasChunkAt(pos)
+                || !minecraft.player.canInteractWithBlock(pos, 1.0)
+                || !minecraft.level.getChunkSource().hasChunk(SectionPos.blockToSectionCoord(pos.getX()),
+                        SectionPos.blockToSectionCoord(pos.getZ()))
                 || !minecraft.level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK)) onClose();
     }
 

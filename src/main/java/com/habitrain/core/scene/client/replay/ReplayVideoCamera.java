@@ -8,6 +8,8 @@ import org.joml.Matrix4f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -25,7 +27,13 @@ final class ReplayVideoCamera {
     static final float SAFE_GAP = 0.32f;
     static final float ASPECT = 16f / 9f;
 
-    record Shot(Vector3f eye, Vector3f look, Quaternionf rotation, Matrix4f view, Matrix4f projection) {
+    record Shot(Vector3f eye, Vector3f look, Quaternionf rotation, Matrix4f view, Matrix4f projection,
+                Map<UUID, Double> focusedActors) {
+        Shot(Vector3f eye, Vector3f look, Quaternionf rotation, Matrix4f view, Matrix4f projection) {
+            this(eye, look, rotation, view, projection, Map.of());
+        }
+
+        double emphasis(UUID id) { return focusedActors.getOrDefault(id, 0.0); }
         /** Board-frame point to pixel coordinates (top-left origin); z &lt; 0 when behind the camera. */
         Vector3f toScreen(Vector3f board, float width, float height) {
             var clip = new org.joml.Vector4f(board.x - eye.x, board.y - eye.y, board.z - eye.z, 1);
@@ -42,10 +50,11 @@ final class ReplayVideoCamera {
         @Nullable Vector3f actor(@Nullable UUID id, double tick);
         Vector3f event(LastMatchReplay.Node node, boolean to);
         @Nullable Vector3f mvp();
+        default @Nullable UUID mvpId() { return null; }
         Vector3f winners();
     }
 
-    record Stage(float half, float mapW, float mapD, float mapH, float geometryTop) {}
+    record Stage(float half, float mapW, float mapD, float mapH, float geometryTop, float headSize) {}
 
     private static final class Rig {
         double tx, ty, tz, yaw, pitch, dist, fov = 34, shift, roll;
@@ -80,6 +89,7 @@ final class ReplayVideoCamera {
         float fit = fitDistance(stage.half());
         double base = ReplayBoardSite.MAP_BASE;
         Rig rig = new Rig();
+        Map<UUID, Double> focusedActors = new HashMap<>();
         switch (sample.act()) {
             case TITLE -> {
                 double e = ReplayStagePlan.easeInOutQuart(k), o = ReplayStagePlan.easeOutCubic(k);
@@ -96,6 +106,10 @@ final class ReplayVideoCamera {
                     beat(close, beat, subjects, stage, time, overviewYaw(script, beat.approach()), sample.replayTick());
                     // influence() is already smoothstep-eased; easing again would turn the move into a whip.
                     rig.mix(close, w);
+                    focusedActors.replaceAll((id, weight) -> weight * (1 - w));
+                    var node = beat.node();
+                    if (node.actor() != null) focusedActors.merge(node.actor(), w, Double::sum);
+                    if (node.target() != null && !node.target().equals(node.actor())) focusedActors.merge(node.target(), w, Double::sum);
                 }
             }
             case REVIEW -> {
@@ -113,14 +127,16 @@ final class ReplayVideoCamera {
                 if (m == null) {
                     rig.set(0, base + stage.mapH() * 0.3, 0, -0.6 + 0.6 * k, 0.5, fit * 0.7, 32, -0.3);
                 } else {
-                    rig.set(m.x, m.y + ReplayActorPainter.HEAD * 0.6, m.z, -0.65 + 0.8 * k, lerp(0.52, 0.4, k),
+                    rig.set(m.x, m.y + ReplayActorSizing.centerOffset(stage.headSize()) * 1.38, m.z, -0.65 + 0.8 * k, lerp(0.52, 0.4, k),
                             lerp(1.75, 1.15, ReplayStagePlan.easeOutCubic(k)), 30, -0.34);
+                    UUID id = subjects.mvpId();
+                    if (id != null) focusedActors.put(id, ReplayStagePlan.smoothstep(0, 0.12, k));
                 }
             }
             case OUTRO -> rig.set(0, base + stage.mapH() * 0.2, 0, 0.35 - 0.45 * k, 0.8, fit * lerp(1.0, 1.28, k), 34, -0.42);
         }
         shake(rig, script, time);
-        return build(rig, stage);
+        return build(rig, stage, Map.copyOf(focusedActors));
     }
 
     private static void overview(Rig rig, ReplayVideoScript script, Subjects subjects, Stage stage, double time, float fit) {
@@ -150,11 +166,10 @@ final class ReplayVideoCamera {
         Vector3f from = subjects.event(node, false), to = subjects.event(node, true);
         // Follow the attacker's live position while the camera travels in.
         Vector3f live = beat.type() == ReplayVideoScript.BeatType.KILL && time < beat.impact() ? subjects.actor(node.actor(), tick) : null;
-        float head = ReplayActorPainter.HEAD;
         float sx = to.x - from.x, sz = to.z - from.z;
         float len = (float) Math.sqrt(sx * sx + sz * sz);
         Vector3f mid = new Vector3f(from).add(to).mul(0.5f);
-        mid.y = Math.max(from.y, to.y) + head * 0.6f;
+        mid.y = Math.max(from.y, to.y) + ReplayActorSizing.centerOffset(stage.headSize()) * 1.38f;
         double yaw0;
         if (len < 0.05f) yaw0 = -0.45;
         else {
@@ -208,7 +223,7 @@ final class ReplayVideoCamera {
         return Math.max(ReplayBoardSite.FRAME_TOP, ReplayBoardSite.MAP_BASE + geometryTop);
     }
 
-    private static Shot build(Rig rig, Stage stage) {
+    private static Shot build(Rig rig, Stage stage, Map<UUID, Double> focusedActors) {
         double cp = Math.cos(rig.pitch);
         var target = new Vector3f((float) rig.tx, (float) rig.ty, (float) rig.tz);
         var eye = new Vector3f((float) (rig.tx + rig.dist * cp * Math.sin(rig.yaw)), (float) (rig.ty + rig.dist * Math.sin(rig.pitch)),
@@ -228,7 +243,7 @@ final class ReplayVideoCamera {
         var rotation = view.getUnnormalizedRotation(new Quaternionf()).conjugate().normalize();
         var projection = new Matrix4f().translation((float) rig.shift, 0, 0)
                 .mul(new Matrix4f().perspective((float) Math.toRadians(rig.fov), ASPECT, NEAR, Math.max(128, eye.length() * 5)));
-        return new Shot(eye, direction, rotation, view, projection);
+        return new Shot(eye, direction, rotation, view, projection, focusedActors);
     }
 
     private static double lerp(double a, double b, double t) { return a + (b - a) * t; }

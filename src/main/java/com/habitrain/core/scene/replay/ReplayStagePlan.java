@@ -29,6 +29,45 @@ public final class ReplayStagePlan {
     public record Stage(double trayGlow, double scan, double plaqueFlip, double actors, double reviewWave,
                         double history, double mapSink, double honors, double honorsTime) {}
 
+    public record Handoff(double idle, double idlePlaque, double pulse, double pulseRadius) {}
+
+    public static final Handoff IDLE = new Handoff(1, 1, 0, 0);
+    public static final Handoff REPLAY = new Handoff(0, 0, 0, 0);
+
+    public static Handoff boardHandoff(ReplayTimeline.Frame frame) {
+        double progress = clamp01(frame.progress());
+        return switch (frame.phase()) {
+            case BUILD -> new Handoff(1 - smoothstep(0, 0.36, progress), 1 - smoothstep(0.12, 0.54, progress),
+                    smoothstep(0.08, 0.32, progress) * (1 - smoothstep(0.32, 0.66, progress)),
+                    smoothstep(0.20, 0.66, progress));
+            case HONORS -> new Handoff(smoothstep(0.89, 1, progress), smoothstep(0.84, 0.98, progress),
+                    smoothstep(0.79, 0.91, progress) * (1 - smoothstep(0.91, 0.995, progress)),
+                    1 - smoothstep(0.79, 0.95, progress));
+            default -> REPLAY;
+        };
+    }
+
+    public static Stage boardStage(ReplayTimeline.Frame frame) {
+        double progress = clamp01(frame.progress());
+        if (frame.phase() == ReplayTimeline.Phase.BUILD) {
+            Stage base = stage(frame);
+            double lamp = 0.75 + 0.25 * smoothstep(0, 0.50, progress);
+            double scan = smoothstep(0.25, 0.94, progress);
+            return new Stage(lamp, scan, base.plaqueFlip(), base.actors(), -1, 0, 0, 0, 0);
+        }
+        if (frame.phase() == ReplayTimeline.Phase.HONORS && progress > 0.75) {
+            double fold = smoothstep(0.75, 0.89, progress);
+            double retract = smoothstep(0.79, 0.94, progress);
+            double sink = 0.65 + 0.35 * retract;
+            return new Stage(1 - 0.25 * smoothstep(0.82, 1, progress), 1 - retract, 1,
+                    0.15 * (1 - retract), -1, 0, sink, 1 - fold, progress * ReplayTimeline.HONORS / 20.0);
+        }
+        Stage base = stage(frame);
+        if (frame.phase() != ReplayTimeline.Phase.HONORS) return base;
+        return new Stage(base.trayGlow(), base.scan(), base.plaqueFlip(), base.actors(), base.reviewWave(),
+                base.history(), base.mapSink() * 0.65, base.honors(), base.honorsTime());
+    }
+
     public static Stage stage(ReplayTimeline.Frame frame) {
         double p = clamp01(frame.progress());
         return switch (frame.phase()) {

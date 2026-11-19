@@ -65,12 +65,14 @@ final class ReplayVideoExport {
     private TextureTarget target;
     private ByteBuffer pixels;
     private Encoder encoder;
+    private java.util.concurrent.FutureTask<short[]> audioTask;
     private int captured;
     private final long voiceDeadline = System.nanoTime() + PREPARE_LIMIT_NS;
     private @Nullable Boolean voiceExportAllowed;
     private @Nullable String failureStatus;
     private boolean failed;
     private boolean cancelled;
+    private boolean voiceUnavailable;
 
     ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution, boolean compress) {
         this.snapshot = snapshot;
@@ -79,6 +81,7 @@ final class ReplayVideoExport {
         this.resolution = Objects.requireNonNull(resolution, "resolution");
         this.compress = compress;
         this.frameBytes = resolution.frameBytes();
+        if (snapshot.asset() != null) ReplayDioramaMesh.retry(snapshot.asset().fingerprint);
     }
 
     static Path directory(Minecraft client) {
@@ -98,7 +101,7 @@ final class ReplayVideoExport {
     boolean preparing() { return encoder == null && running(); }
     UUID roundId() { return roundId; }
     boolean waitingForVoiceAccess() { return preparing() && voiceExportAllowed == null; }
-    boolean voiceExportRestricted() { return Boolean.FALSE.equals(voiceExportAllowed); }
+    boolean voiceExportRestricted() { return Boolean.FALSE.equals(voiceExportAllowed) || voiceUnavailable; }
     boolean waitingForVoice() { return preparing() && !voiceExportRestricted() && !snapshot.voiceReady(); }
     void setVoiceExportAllowed(boolean allowed) {
         if (waitingForVoiceAccess()) voiceExportAllowed = allowed;
@@ -118,7 +121,7 @@ final class ReplayVideoExport {
         String key;
         if (failed()) key = failureStatus == null ? "failed" : failureStatus;
         else if (cancelled()) key = "cancelled";
-        else if (saved() != null) key = voiceExportRestricted() ? "saved_no_player_voice" : "saved";
+        else if (saved() != null) key = voiceUnavailable ? "saved_without_missing_voice" : voiceExportRestricted() ? "saved_no_player_voice" : "saved";
         else if (waitingForVoiceAccess()) key = "checking_voice_access";
         else if (waitingForVoice()) key = "waiting_for_voice";
         else if (preparing()) key = "preparing";
@@ -142,7 +145,7 @@ final class ReplayVideoExport {
                         && view.replay().roundId().equals(liveView.replay().roundId())) {
                     snapshot = view = new ClientReplayBoard.View(view.replay(), view.timeline(), view.asset(),
                             view.presentSections(), view.totalSections(), true, liveView.voice(), true);
-                }
+                } else if (ReplayHistoryClient.voiceUnavailable(roundId())) voiceUnavailable = true;
             }
             if ((waitingForVoiceAccess() || waitingForVoice()) && System.nanoTime() - voiceDeadline >= 0) {
                 failureStatus = waitingForVoiceAccess() ? "voice_access_timeout" : "voice_download_timeout";
@@ -151,6 +154,9 @@ final class ReplayVideoExport {
             // The original map remains available when the table unloads or the next match replaces it.
             // A world switch or resource reload can invalidate the GPU mesh, so rebuild it from that map.
             ReplayDioramaMesh.update(view.asset(), view.presentSections(), view.totalSections());
+            if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(view.asset().fingerprint, view.totalSections()))) {
+                throw new IOException("Could not build the complete replay map");
+            }
             var key = ReplayDioramaMesh.builtKey();
             if (key == null || key.present() != view.totalSections() || !ReplayDioramaMesh.matches(view.asset())) {
                 long now = System.nanoTime();
@@ -168,18 +174,28 @@ final class ReplayVideoExport {
                             + " exceeds GPU max texture size " + maxTex);
                 }
                 if (waitingForVoiceAccess() || waitingForVoice()) return;
-                model = new ReplayBoardModel(view.replay(), view.timeline());
-                script = new ReplayVideoScript(view.replay());
-                fx = new ReplayVideoFx(script, model);
-                overlay = new ReplayVideoOverlay(script, model, compress);
-                subjects = new ModelSubjects(model);
-                cameraStage = new ReplayVideoCamera.Stage(ReplayBoardRenderer.trayHalfSize(model), model.mapW, model.mapD, model.mapH,
-                        (float) Math.max(model.mapH, mesh.replayCeiling() * model.scale));
-                int totalFrames = script.frames(FPS);
-                ReplayVoiceData voice = Boolean.TRUE.equals(voiceExportAllowed) ? view.voice() : ReplayVoiceData.EMPTY;
-                short[] soundtrack = ReplayVideoAudioRenderer.render(client, view.replay(), script, voice, totalFrames);
+                if (audioTask == null) {
+                    model = new ReplayBoardModel(view.replay(), view.timeline());
+                    script = new ReplayVideoScript(view.replay());
+                    fx = new ReplayVideoFx(script, model);
+                    overlay = new ReplayVideoOverlay(script, model, compress);
+                    subjects = new ModelSubjects(model);
+                    cameraStage = new ReplayVideoCamera.Stage(ReplayBoardRenderer.trayHalfSize(model), model.mapW, model.mapD, model.mapH,
+                            (float) Math.max(model.mapH, mesh.replayCeiling() * model.scale), ReplayActorSizing.baseSize(model.scale));
+                    ReplayVoiceData voice = voiceExportRestricted() ? ReplayVoiceData.EMPTY : view.voice();
+                    var audio = ReplayVideoAudioRenderer.prepare(client, view.replay(), script, voice, script.frames(FPS));
+                    audioTask = new java.util.concurrent.FutureTask<>(audio::get);
+                    Thread.ofPlatform().daemon().name("habitrain-replay-audio-mix").start(audioTask);
+                    return;
+                }
+                if (!audioTask.isDone()) return;
+                short[] soundtrack;
+                try { soundtrack = audioTask.get(); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
+                catch (java.util.concurrent.ExecutionException failure) { throw new IOException("Could not prepare replay audio", failure.getCause()); }
+                audioTask = null;
                 pixels = MemoryUtil.memAlloc(frameBytes);
-                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress, totalFrames, soundtrack);
+                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress, script.frames(FPS), soundtrack);
                 encoder.thread.start();
             }
 
@@ -241,10 +257,10 @@ final class ReplayVideoExport {
             RenderSystem.defaultBlendFunc();
             FogRenderer.setupNoFog();
             client.gameRenderer.lightTexture().turnOnLightLayer();
-            ReplayBoardRenderer.drawVideoFrame(client, model, frame, stage, sample.world(), shot, mesh, fullBody, fx);
+            var heads = ReplayBoardRenderer.drawVideoFrame(client, model, frame, stage, sample.world(), shot, mesh, fullBody, fx);
 
             canvas.begin();
-            overlay.foreground(canvas, time, sample, shot, index);
+            overlay.foreground(canvas, time, sample, shot, index, heads);
             RenderSystem.enableDepthTest();
 
             GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, target.frameBufferId);
@@ -274,6 +290,7 @@ final class ReplayVideoExport {
     }
 
     void releaseRenderResources() {
+        if (audioTask != null) { audioTask.cancel(true); audioTask = null; }
         snapshot = null;
         model = null;
         script = null;
@@ -344,6 +361,8 @@ final class ReplayVideoExport {
         @Override public @Nullable Vector3f mvp() {
             return model.mvp == null ? null : actor(model.mvp.p.id(), model.replay.durationTicks());
         }
+
+        @Override public @Nullable UUID mvpId() { return model.mvp == null ? null : model.mvp.p.id(); }
 
         @Override public Vector3f winners() {
             float x = 0, z = 0;

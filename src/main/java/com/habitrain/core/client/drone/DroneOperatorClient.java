@@ -5,7 +5,6 @@ import com.habitrain.core.game.sre.role.HabiRoles;
 import com.habitrain.core.game.sre.role.drone.DroneInputLatch;
 import com.habitrain.core.game.sre.role.drone.DroneOperatorService;
 import com.habitrain.core.game.sre.role.drone.DronePayloadCategory;
-import com.habitrain.core.game.sre.role.drone.DronePayloadHandler;
 import com.habitrain.core.game.sre.role.drone.DroneRules;
 import com.habitrain.core.game.sre.role.drone.ReconDroneEntity;
 import com.habitrain.core.network.DroneCommandPayload;

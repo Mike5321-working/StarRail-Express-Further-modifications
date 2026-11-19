@@ -84,7 +84,8 @@ public final class ReplayHistoryScreen extends Screen {
         addRenderableWidget(Button.builder(CommonComponents.GUI_BACK, b -> onClose())
                 .bounds(left + (a + gap) * 3, y, w - (a + gap) * 3, 20).build());
         retry = addRenderableWidget(Button.builder(text("retry"), b -> {
-            ReplayHistoryClient.retry(id);
+            if (view != null && view.asset() != null) ReplayDioramaMesh.retry(view.asset().fingerprint);
+            if (ReplayHistoryClient.phase(id) != ReplayHistoryClient.Phase.READY) ReplayHistoryClient.retry(id);
             previewFailed = false;
         }).bounds(width / 2 - 45, (bottom + top) / 2 + 8, 90, 20).build());
         refresh();
@@ -95,7 +96,7 @@ public final class ReplayHistoryScreen extends Screen {
     private void refresh() {
         view = id == null ? new ClientReplayBoard.View(null, null, null, 0, 0, false) : ReplayHistoryClient.watch(id);
         boolean ready = id != null && ReplayHistoryClient.phase(id) == ReplayHistoryClient.Phase.READY;
-        retry.visible = id != null && (ReplayHistoryClient.phase(id) == ReplayHistoryClient.Phase.FAILED
+        retry.visible = id != null && (previewFailed || ReplayHistoryClient.phase(id) == ReplayHistoryClient.Phase.FAILED
                 || ReplayHistoryClient.phase(id) == ReplayHistoryClient.Phase.MISSING);
         play.active = seek.active = ready && duration() > 0;
         play.setMessage(text(playing ? "pause" : "play"));
@@ -177,8 +178,9 @@ public final class ReplayHistoryScreen extends Screen {
         if (!previewFailed && model != null && data.asset() != null && (id == null ||
                 ReplayHistoryClient.phase(id) != ReplayHistoryClient.Phase.MISSING && ReplayHistoryClient.phase(id) != ReplayHistoryClient.Phase.FAILED)) {
             ReplayDioramaMesh.update(data.asset(), data.presentSections(), data.totalSections());
+            if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(data.asset().fingerprint, data.totalSections()))) previewFailed = true;
             var mesh = ReplayDioramaMesh.matches(data.asset()) ? ReplayDioramaMesh.current() : null;
-            if (mesh != null) {
+            if (mesh != null && !previewFailed) {
                 double at = Math.min(duration(), cursor + (playing ? delta : 0));
                 var frame = new ReplayTimeline.Frame(ReplayTimeline.Phase.PLAY, at / Math.max(1, duration()), at, false);
                 try {

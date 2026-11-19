@@ -30,7 +30,6 @@ import static com.habitrain.core.network.replay.ReplayPackets.*;
 public final class ClientReplayBoard {
     private static final ClientMatchMapSectionCache LOCAL = new ClientMatchMapSectionCache();
     private static final long RETRY_NS = 8_000_000_000L, VIEW_NS = 1_500_000_000L;
-    private static final double VIEW_DISTANCE_SQUARED = 64 * 64;
     private static Available available = new Available(EMPTY, false);
     private static LastMatchReplay replay;
     private static ReplayTimeline timeline;
@@ -257,9 +256,9 @@ public final class ClientReplayBoard {
     }
 
     private static boolean visible(Minecraft client, ClientLevel level, BlockPos pos) {
-        if (client.player == null || level == null || level != client.level
-                || client.player.distanceToSqr(pos.getX() + .5, pos.getY() + .5, pos.getZ() + .5) > VIEW_DISTANCE_SQUARED) return false;
-        return level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4) && level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK);
+        return client.player != null && level != null && level == client.level && level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)
+                && level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker
+                && marker.settings().inView(pos, marker.getBlockState().getValue(SettlementSummaryBoard.FACING), client.player.getEyePosition());
     }
 
     private static void clearView() {
@@ -277,7 +276,7 @@ public final class ClientReplayBoard {
 
     static final class MapData {
         final ReplayMapManifest manifest;
-        final TreeMap<Integer, SceneAssetCodec.SectionData> parts = new TreeMap<>();
+        final TreeMap<Integer, SceneAssetCodec.SectionData> parts;
         final Map<Integer, Fragment> partial = new HashMap<>();
         final BitSet decoding = new BitSet();
         BitSet requested = new BitSet();
@@ -286,7 +285,11 @@ public final class ClientReplayBoard {
         boolean diskLoading = true, saved;
         SceneAssetCodec.AssetData assembled;
 
-        MapData(ReplayMapManifest manifest) { this.manifest = manifest; }
+        MapData(ReplayMapManifest manifest) { this(manifest, new TreeMap<>()); }
+        MapData(ReplayMapManifest manifest, TreeMap<Integer, SceneAssetCodec.SectionData> parts) {
+            this.manifest = manifest;
+            this.parts = parts;
+        }
         void add(int index, SceneAssetCodec.SectionData s) {
             if (parts.putIfAbsent(index, s) == null) assembled = null;
         }
@@ -323,6 +326,7 @@ public final class ClientReplayBoard {
         }
 
         void step(long now, java.util.function.Predicate<BitSet> send) {
+            if (complete()) { persistIfComplete(); return; }
             var entries = manifest.sections();
             BitSet missing = new BitSet(entries.size());
             for (int i = 0; i < entries.size(); i++) {
@@ -332,10 +336,7 @@ public final class ClientReplayBoard {
                 else if (!decoding.get(i) && missing.cardinality() < MAX_REQUESTED) missing.set(i);
             }
             if (parts.size() == entries.size()) {
-                if (!saved && !diskLoading && !parts.isEmpty()) {
-                    saved = true;
-                    SceneAssetCache.getInstance().writeReplayMap(manifest, asset());
-                }
+                persistIfComplete();
                 return;
             }
             if (diskLoading || missing.isEmpty() || LOCAL.finalizingGeometry() && now - localDeadline < 0
@@ -349,6 +350,12 @@ public final class ClientReplayBoard {
                 retryAt = now + RETRY_NS;
                 nextBatch = now + 600_000_000L;
             }
+        }
+
+        private void persistIfComplete() {
+            if (saved || diskLoading || parts.isEmpty()) return;
+            saved = true;
+            SceneAssetCache.getInstance().writeReplayMap(manifest, asset());
         }
     }
 }

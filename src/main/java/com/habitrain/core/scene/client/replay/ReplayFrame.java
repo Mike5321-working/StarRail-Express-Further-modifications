@@ -40,13 +40,16 @@ final class ReplayFrame {
     final MultiBufferSource.BufferSource buffers;
     final RenderType trayType;
     final double anim;
+    final double ambient;
     final @Nullable ReplayBoardModel model;
     final @Nullable ReplayTimeline.Frame frame;
     final @Nullable ReplayStagePlan.Stage stage;
+    final ReplayStagePlan.Handoff handoff;
     /** Directed video export frame (its own effects replace some board-only decorations). */
     final boolean video;
     final double replayTick;
     final ReplayFocusPlan.Pose focus;
+    final ReplayFocusPlan.Sample focusSample;
     final boolean blackout;
     final boolean hasRound;
     final int presentSections, totalSections;
@@ -56,19 +59,19 @@ final class ReplayFrame {
     private MultiBufferSource drawingBuffers;
 
     ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
-                double anim, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
+                double anim, double ambient, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
                 boolean hasRound, int presentSections, int totalSections,
                 Vector3f right, Vector3f up, Vector3f look) {
-        this(mc, level, rotation, buffers, trayType, anim, model, frame, hasRound, presentSections, totalSections,
-                right, up, look, null, null);
+        this(mc, level, rotation, buffers, trayType, anim, ambient, model, frame, hasRound, presentSections, totalSections,
+                right, up, look, null);
     }
 
     /** Video export: the director supplies its own act choreography and keeps the map at its natural scale. */
     ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
-                double anim, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
+                double anim, double ambient, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
                 boolean hasRound, int presentSections, int totalSections,
                 Vector3f right, Vector3f up, Vector3f look,
-                @Nullable ReplayStagePlan.Stage stageOverride, @Nullable ReplayFocusPlan.Pose focusOverride) {
+                @Nullable ReplayStagePlan.Stage stageOverride) {
         this.mc = mc;
         this.level = level;
         this.rotation = rotation;
@@ -78,12 +81,15 @@ final class ReplayFrame {
         this.buffers = buffers;
         this.trayType = trayType;
         this.anim = anim;
+        this.ambient = ambient;
         this.model = model;
         this.frame = frame;
-        this.stage = stageOverride != null ? stageOverride : frame == null ? null : ReplayStagePlan.stage(frame);
+        this.stage = stageOverride != null ? stageOverride : frame == null ? null : ReplayStagePlan.boardStage(frame);
         this.video = stageOverride != null;
+        this.handoff = video ? ReplayStagePlan.REPLAY : frame == null ? ReplayStagePlan.IDLE : ReplayStagePlan.boardHandoff(frame);
         this.replayTick = frame == null ? 0 : frame.replayTick();
-        this.focus = focusOverride != null ? focusOverride : model == null ? ReplayFocusPlan.WIDE : model.focus.at(frame);
+        this.focusSample = video || model == null ? ReplayFocusPlan.UNFOCUSED : model.focus.sample(frame);
+        this.focus = focusSample.pose();
         this.drawingBuffers = buffers;
         this.blackout = model != null && frame != null && frame.phase() == ReplayTimeline.Phase.PLAY && model.blackoutAt(replayTick);
         this.hasRound = hasRound;

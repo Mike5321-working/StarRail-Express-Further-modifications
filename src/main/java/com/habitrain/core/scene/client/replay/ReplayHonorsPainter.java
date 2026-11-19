@@ -39,10 +39,13 @@ final class ReplayHonorsPainter {
         return new Matrix4f().translate(anchor).rotate(cameraRotation).scale(worldScale, worldScale * unfoldScale, worldScale);
     }
 
+    static boolean visible(ReplayFrame frame) {
+        return frame.model != null && frame.stage != null && frame.stage.honors() > 0.01;
+    }
+
     static void paint(ReplayFrame f, ReplayBoardSite s) {
         ReplayBoardModel model = f.model;
         ReplayStagePlan.Stage stage = f.stage;
-        if (model == null || stage == null || stage.honors() <= 0.01) return;
         double unfold = stage.honors();
         double a = s.fade() * Math.min(1, unfold * 1.4);
         float worldScale = honorsWorldScale(s.scale(), s.hw());
@@ -54,8 +57,8 @@ final class ReplayHonorsPainter {
         double time = stage.honorsTime();
 
         // body
-        ReplayDraw.rectXY(fill, m, -hw, bottom, hw, top, 0, ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.93 * a),
-                ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.95 * a));
+        ReplayDraw.rectXY(fill, m, -hw, bottom, hw, top, 0, ReplayPalette.alpha(ReplayPalette.NIGHT_2, a),
+                ReplayPalette.alpha(ReplayPalette.NIGHT_0, a));
         // sunburst behind the banner
         int rayC = ReplayPalette.alpha(ReplayPalette.BRASS, 0.16 * a), rayClear = ReplayPalette.alpha(ReplayPalette.BRASS, 0);
         float sx = 0, sy = top - 0.62f;

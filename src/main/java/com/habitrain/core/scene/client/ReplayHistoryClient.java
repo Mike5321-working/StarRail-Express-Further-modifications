@@ -3,14 +3,12 @@ package com.habitrain.core.scene.client;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.network.replay.ReplayArchiveData;
-import com.habitrain.core.network.replay.ReplayArchivePackets;
 import com.habitrain.core.network.replay.ReplayArchivePackets.*;
 import com.habitrain.core.network.replay.ReplayPackets;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
-import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.BlockPos;
 
@@ -29,16 +27,19 @@ public final class ReplayHistoryClient {
     private static int shareResult;
     private static long shareDeadline, nextSend;
     private static final Map<BlockPos, Long> lastReady = new HashMap<>();
+    private static final java.util.concurrent.Executor CACHE_IO = java.util.concurrent.Executors.newSingleThreadExecutor(
+            task -> Thread.ofPlatform().daemon().name("habitrain-replay-client-cache").unstarted(task));
 
     public enum Phase { LOADING, MAP, READY, MISSING, FAILED }
-    private static final class Round {
+    static final class Round {
         final UUID id;
         long watched, requested, voiceRequested;
         int attempts;
         Path path, voicePath;
         byte[] cached, voiceBuffer;
         BitSet voiceHave;
-        boolean reading = true, readingVoice = true, voiceReady;
+        boolean reading = true, readingVoice = true, voiceReady, voiceUnavailable;
+        int voiceAttempts;
         Phase phase = Phase.LOADING;
         LastMatchReplay replay;
         ReplayTimeline timeline;
@@ -49,6 +50,7 @@ public final class ReplayHistoryClient {
     private ReplayHistoryClient() {}
 
     static void register() {
+        maintainCache(ReplayRoundCache.LIMIT);
         com.habitrain.core.api.client.replay.MatchReplayClientApi.install(
                 com.habitrain.core.scene.client.replay.ReplayHistoryScreen::open);
         ClientPlayNetworking.registerGlobalReceiver(Reply.TYPE, (r, ctx) -> ctx.client().execute(() -> onReply(r)));
@@ -83,6 +85,25 @@ public final class ReplayHistoryClient {
     }
 
     public static void retry(UUID id) { rounds.remove(id); }
+
+    public static boolean voiceUnavailable(UUID id) {
+        var round = rounds.get(id);
+        return round != null && round.voiceUnavailable;
+    }
+
+    private static Path cacheDirectory() {
+        return Minecraft.getInstance().gameDirectory.toPath().resolve("habitrain-cache").resolve("replay-rounds-v1");
+    }
+
+    public static void clearDiskCache() { maintainCache(0); }
+
+    private static void maintainCache(long limit) {
+        Path directory = cacheDirectory();
+        CACHE_IO.execute(() -> {
+            try { ReplayRoundCache.prune(directory, limit, System.currentTimeMillis()); }
+            catch (IOException failure) { org.slf4j.LoggerFactory.getLogger(ReplayHistoryClient.class).warn("Replay cache cleanup failed", failure); }
+        });
+    }
     public static Phase phase(UUID id) {
         var r = rounds.get(id);
         return r == null ? Phase.LOADING : r.phase;
@@ -106,10 +127,10 @@ public final class ReplayHistoryClient {
 
     private static void load(Round r) {
         Minecraft mc = Minecraft.getInstance();
-        Path dir = mc.gameDirectory.toPath().resolve("habitrain-cache").resolve("replay-rounds-v1");
+        Path dir = cacheDirectory();
         r.path = dir.resolve(r.id + ".bin");
         r.voicePath = dir.resolve(r.id + ".voice");
-        Util.ioPool().execute(() -> {
+        CACHE_IO.execute(() -> {
             byte[] contents = null;
             try {
                 if (Files.isRegularFile(r.path, LinkOption.NOFOLLOW_LINKS)) {
@@ -149,13 +170,14 @@ public final class ReplayHistoryClient {
 
     private static void saveVoice(Round r, byte[] data) {
         if (r.voicePath == null || data == null) return;
-        Util.ioPool().execute(() -> {
+        CACHE_IO.execute(() -> {
             Path tmp = null;
             try {
                 Files.createDirectories(r.voicePath.getParent());
                 tmp = Files.createTempFile(r.voicePath.getParent(), "voice-", ".part");
                 Files.write(tmp, data);
                 Files.move(tmp, r.voicePath, StandardCopyOption.REPLACE_EXISTING);
+                ReplayRoundCache.prune(r.voicePath.getParent(), ReplayRoundCache.LIMIT, System.currentTimeMillis());
             } catch (IOException | RuntimeException ignored) {
                 // A read-only client directory should not prevent playback.
             } finally {
@@ -165,13 +187,14 @@ public final class ReplayHistoryClient {
     }
 
     private static void save(Round r, ReplayPackets.LastMatchSummaryS2C data) {
-        Util.ioPool().execute(() -> {
+        CACHE_IO.execute(() -> {
             Path tmp = null;
             try {
                 Files.createDirectories(r.path.getParent());
                 tmp = Files.createTempFile(r.path.getParent(), "replay-", ".part");
                 Files.write(tmp, ReplayArchiveData.encode(data));
                 Files.move(tmp, r.path, StandardCopyOption.REPLACE_EXISTING);
+                ReplayRoundCache.prune(r.path.getParent(), ReplayRoundCache.LIMIT, System.currentTimeMillis());
             } catch (IOException | RuntimeException ignored) {
                 // A read-only client directory should not prevent playback.
             } finally {
@@ -182,7 +205,7 @@ public final class ReplayHistoryClient {
 
     private static void onVoice(ReplayPackets.ReplayVoiceChunkS2C chunk) {
         Round r = rounds.get(chunk.roundId());
-        if (r == null || r.voiceReady) return;
+        if (r == null || r.voiceReady || r.voiceUnavailable) return;
         r.voiceRequested = System.nanoTime();
         if (chunk.total() == 0) {
             r.voice = ReplayVoiceData.EMPTY;
@@ -222,8 +245,15 @@ public final class ReplayHistoryClient {
         }
         Round r = rounds.get(result.round());
         if (r == null) return;
-        if (r.phase == Phase.READY) return;
-        switch (result.status()) {
+        applyReply(r, result.status());
+    }
+
+    static void applyReply(Round r, int status) {
+        if (r.phase == Phase.READY) {
+            if (!r.voiceReady && r.voiceRequested != 0 && (status == MISSING || status == ERROR)) stopVoiceRequests(r);
+            return;
+        }
+        switch (status) {
             case CACHED -> {
                 try { install(r, ReplayArchiveData.decode(r.cached)); }
                 catch (RuntimeException invalid) { r.cached = null; r.requested = 0; r.attempts = 0; }
@@ -276,10 +306,12 @@ public final class ReplayHistoryClient {
                 } else {
                     r.map.step(now, bits -> send(Request.sections(r.id, bits), now));
                 }
-            } else if (r.phase == Phase.READY && !r.voiceReady && !r.readingVoice
+            } else if (r.phase == Phase.READY && !r.voiceReady && !r.voiceUnavailable && !r.readingVoice
                     && (r.voiceRequested == 0 || now - r.voiceRequested >= RETRY_NS)) {
+                if (r.voiceAttempts >= 12) { stopVoiceRequests(r); continue; }
                 if (send(Request.voice(r.id), now)) {
                     r.voiceRequested = now;
+                    r.voiceAttempts++;
                 }
             }
         }
@@ -299,6 +331,12 @@ public final class ReplayHistoryClient {
                 lastReady.put(pos, now);
             }
         }
+    }
+
+    private static void stopVoiceRequests(Round round) {
+        round.voiceUnavailable = true;
+        round.voiceBuffer = null;
+        round.voiceHave = null;
     }
 
     private static boolean send(Request request, long now) {

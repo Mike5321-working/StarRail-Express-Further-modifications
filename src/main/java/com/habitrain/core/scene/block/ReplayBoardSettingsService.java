@@ -2,6 +2,7 @@ package com.habitrain.core.scene.block;
 
 import com.habitrain.core.network.replay.ReplayBoardSettingsPackets;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+import net.minecraft.core.SectionPos;
 import net.minecraft.server.level.ServerPlayer;
 
 /** Only a nearby creative player who can build may change this loaded table. */
@@ -14,7 +15,9 @@ public final class ReplayBoardSettingsService {
         boolean saved = false;
         if (player.isCreative() && !player.isSpectator() && player.isAlive() && player.mayBuild()
                 && level.dimension().location().equals(request.dimension())
-                && player.canInteractWithBlock(pos, 1.0) && level.hasChunkAt(pos)
+                && player.canInteractWithBlock(pos, 1.0)
+                && level.getChunkSource().hasChunk(SectionPos.blockToSectionCoord(pos.getX()),
+                        SectionPos.blockToSectionCoord(pos.getZ()))
                 && level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK)
                 && level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker) {
             marker.setSettings(request.settings());

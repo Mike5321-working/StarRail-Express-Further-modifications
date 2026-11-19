@@ -125,7 +125,8 @@ final class ReplayVideoOverlay {
 
     // =================================================================== foreground (over the model)
 
-    void foreground(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, int frame) {
+    void foreground(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, int frame,
+                    ReplayActorSizing heads) {
         w = c.width; h = c.height;
         float yaw = (float) Math.atan2(shot.look().x, shot.look().z);
         // Near bokeh moves opposite and faster than the stars: depth of field without blur.
@@ -136,7 +137,7 @@ final class ReplayVideoOverlay {
             int col = i % 3 == 0 ? PASSENGER : BRASS_LIGHT;
             c.sprite(Tex.BOKEH, x, y, size, size, (float) (i * 0.4), argb(col, 0.035 + 0.05 * ReplayVideoFx.rnd(i, 34)), true);
         }
-        spans(c, t, s, shot);
+        spans(c, t, s, shot, heads);
         // Grade: cool shadows at the top, warm lift at the bottom, then vignette and grain.
         c.rect(0, 0, w, h * 0.45f, argb(0xFF030714, 0.35), argb(0xFF030714, 0));
         c.rect(0, h * 0.6f, w, h, argb(LAMP, 0), argb(LAMP, 0.05));
@@ -151,10 +152,10 @@ final class ReplayVideoOverlay {
 
         switch (s.act()) {
             case TITLE -> title(c, t, s);
-            case ACTION -> action(c, t, s, shot);
+            case ACTION -> action(c, t, s, shot, heads);
             case REVIEW -> review(c, s);
             case VICTORY -> victory(c, t, s);
-            case MVP -> mvp(c, t, s, shot);
+            case MVP -> mvp(c, t, s, shot, heads);
             case OUTRO -> outro(c, t, s);
         }
         if (s.act() == Act.ACTION || s.act() == Act.REVIEW) {
@@ -191,7 +192,7 @@ final class ReplayVideoOverlay {
         return Math.min(1, a);
     }
 
-    private void spans(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot) {
+    private void spans(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, ReplayActorSizing heads) {
         if (s.act() != Act.ACTION) return;
         for (var span : script.spans()) {
             double in = ReplayStagePlan.smoothstep(span.start(), span.start() + 0.25, t) * (1 - ReplayStagePlan.smoothstep(span.end(), span.end() + 0.4, t));
@@ -208,7 +209,7 @@ final class ReplayVideoOverlay {
                 if (actor != null) {
                     Vector3f p = actorPoint(actor, s.replayTick());
                     if (p != null) {
-                        Vector3f sp = shot.toScreen(new Vector3f(p).add(0, ReplayActorPainter.HEAD * 1.4f, 0), w, h);
+                        Vector3f sp = shot.toScreen(p.add(0, headSize(heads, actor, p) * 1.6f, 0), w, h);
                         if (onScreen(sp)) callout(c, sp.x, sp.y, Component.literal("PSYCHO · ").append(actor.name), PSYCHO, in, t - span.start());
                     }
                 }
@@ -314,7 +315,7 @@ final class ReplayVideoOverlay {
 
     // =================================================================== act two: the match
 
-    private void action(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot) {
+    private void action(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, ReplayActorSizing heads) {
         double k = s.actTime();
         double hud = ReplayStagePlan.easeOutCubic((k - 0.2) / 0.5) * (1 - ReplayStagePlan.smoothstep(s.actLength() - 0.4, s.actLength(), k));
         double cinematic = 0;
@@ -328,7 +329,7 @@ final class ReplayVideoOverlay {
         for (Beat b : script.beats()) {
             double u = b.local(t);
             if (u < -0.05 || u > 3.2) continue;
-            callout(c, t, b, shot, u);
+            callout(c, t, b, shot, u, heads);
             badge(c, b, u);
             card(c, b, u);
         }
@@ -546,11 +547,11 @@ final class ReplayVideoOverlay {
         }
     }
 
-    private void callout(ReplayVideoCanvas c, double t, Beat b, ReplayVideoCamera.Shot shot, double u) {
+    private void callout(ReplayVideoCanvas c, double t, Beat b, ReplayVideoCamera.Shot shot, double u, ReplayActorSizing heads) {
         if (u > 2.4) return;
         Vector3f p = subjectPoint(b);
         if (p == null) return;
-        Vector3f sp = shot.toScreen(new Vector3f(p).add(0, ReplayActorPainter.HEAD * 0.9f, 0), w, h);
+        Vector3f sp = shot.toScreen(p.add(0, headSize(heads, subjectActor(b), p) * 0.9f, 0), w, h);
         if (!onScreen(sp)) return;
         int color = beatColor(b);
         double a = (u < 0 ? 0.6 : 1) * (1 - ReplayStagePlan.smoothstep(1.9, 2.4, u));
@@ -697,7 +698,7 @@ final class ReplayVideoOverlay {
 
     // =================================================================== act five: MVP
 
-    private void mvp(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot) {
+    private void mvp(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, ReplayActorSizing heads) {
         ReplayBoardModel.Actor mvp = model.mvp;
         if (mvp == null) return;
         double k = s.actTime();
@@ -755,7 +756,7 @@ final class ReplayVideoOverlay {
         // A tag anchored to the champion on the model.
         Vector3f m = actorPoint(mvp, script.duration());
         if (m != null) {
-            Vector3f sp = shot.toScreen(new Vector3f(m).add(0, ReplayActorPainter.HEAD * 2.4f, 0), w, h);
+            Vector3f sp = shot.toScreen(m.add(0, headSize(heads, mvp, m) * 2.4f, 0), w, h);
             if (onScreen(sp) && k > 0.8) callout(c, sp.x, sp.y, Component.literal("MVP"), BRASS_LIGHT, a, k - 0.8);
         }
     }
@@ -953,6 +954,10 @@ final class ReplayVideoOverlay {
         float[] p = new float[3];
         model.project(pose.x(), pose.y(), pose.z(), p);
         return new Vector3f(p[0], ReplayBoardSite.MAP_BASE + p[1], p[2]);
+    }
+
+    private static float headSize(ReplayActorSizing heads, @Nullable ReplayBoardModel.Actor actor, Vector3f point) {
+        return heads.size(actor == null ? null : actor.p.id(), point.x, point.y - ReplayBoardSite.MAP_BASE, point.z);
     }
 
     private boolean onScreen(Vector3f p) {

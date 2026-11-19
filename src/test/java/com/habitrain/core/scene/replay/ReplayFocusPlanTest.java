@@ -84,6 +84,33 @@ class ReplayFocusPlanTest {
         assertEquals(midpoint.y, focused.y, 1e-5);
     }
 
+    @Test void highlightingTracksTheSelectedCueAndBlendsWhenTheCameraRetargets() {
+        UUID attacker = new UUID(0, 1), victim = new UUID(0, 2), nextVictim = new UUID(0, 3), bystander = new UUID(0, 4);
+        var first = new Node(3000, Kind.KILL, attacker, victim, Position.quantize(70, 2, 10),
+                Position.quantize(72, 2, 10), "", 0);
+        var second = new Node(3060, Kind.KILL, attacker, nextVictim, Position.quantize(20, 2, 10),
+                Position.quantize(22, 2, 10), "", 0);
+        var replay = replay(BOUNDS, List.of(first, second));
+        var timeline = new ReplayTimeline(replay);
+        var plan = new ReplayFocusPlan(replay, timeline);
+        double start = timeline.actionTickAt(first.tick());
+        double next = timeline.actionTickAt(second.tick());
+        var previousOnly = new ReplayFocusPlan(replay(BOUNDS, List.of(first)), timeline);
+        double previousWeight = sample(previousOnly, timeline, next).emphasis(victim);
+        assertEquals(0, sample(plan, timeline, start - 0.01).emphasis(attacker));
+        assertEquals(0, sample(plan, timeline, start).emphasis(victim), 1e-6);
+        var switching = sample(plan, timeline, next);
+        assertEquals(previousWeight, switching.emphasis(victim), 1e-6);
+        assertEquals(0, switching.emphasis(nextVictim), 1e-6);
+        var midpoint = sample(plan, timeline, next + ReplayFocusPlan.ATTACK / 2);
+        assertEquals(0.5 + previousWeight * 0.5, midpoint.emphasis(attacker), 1e-6);
+        assertEquals(previousWeight * 0.5, midpoint.emphasis(victim), 1e-6);
+        assertEquals(0.5, midpoint.emphasis(nextVictim), 1e-6);
+        assertEquals(0, midpoint.emphasis(bystander));
+        assertEquals(0, sample(plan, timeline, next + ReplayFocusPlan.LENGTH).emphasis(attacker), 1e-6);
+        assertEquals(0, plan.sample(new ReplayTimeline.Frame(ReplayTimeline.Phase.REVIEW, 0, 8000, false)).emphasis(nextVictim));
+    }
+
     @Test void distantAttackersAndVictimsBothFitAndAllNonPlayActsStayWide() {
         var replay = replay(BOUNDS, List.of(node(3000, Kind.KILL, 5, 95, 0), node(7999, Kind.KILL, 70, 72, 0)));
         var timeline = new ReplayTimeline(replay);
@@ -116,7 +143,10 @@ class ReplayFocusPlanTest {
     }
 
     private static ReplayFocusPlan.Pose pose(ReplayFocusPlan plan, ReplayTimeline timeline, double tick) {
-        return plan.at(new ReplayTimeline.Frame(ReplayTimeline.Phase.PLAY, tick / action(timeline), 0, false));
+        return sample(plan, timeline, tick).pose();
+    }
+    private static ReplayFocusPlan.Sample sample(ReplayFocusPlan plan, ReplayTimeline timeline, double tick) {
+        return plan.sample(new ReplayTimeline.Frame(ReplayTimeline.Phase.PLAY, tick / action(timeline), 0, false));
     }
     private static int action(ReplayTimeline timeline) {
         return timeline.cycleTicks() - ReplayTimeline.INTRO - ReplayTimeline.REVIEW - ReplayTimeline.HONORS;

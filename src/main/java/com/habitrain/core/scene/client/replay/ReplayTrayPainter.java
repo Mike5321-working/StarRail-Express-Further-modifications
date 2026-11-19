@@ -178,26 +178,30 @@ final class ReplayTrayPainter {
 
     static void plaque(ReplayFrame f, ReplayBoardSite s) {
         float pw = BASE_PLAQUE_W, ph = PLAQUE_H;
-        float alpha = s.fade();
         VertexConsumer fill = f.fill();
         float left = -pw / 2 + 0.07f, rightEdge = pw / 2 - 0.07f, z = 0.006f;
         var model = f.model;
-        if (model == null) {
-            Component line = f.hasRound ? ReplayBoardTexts.tr("loading") : ReplayBoardTexts.tr("idle");
-            int dots = (int) (f.anim * 3) % 4;
-            Component sub = ReplayBoardTexts.tr("brand").copy().append(".".repeat(f.hasRound ? dots : 0));
-            for (int side = 0; side < 4; side++) {
-                Matrix4f m = plaqueMatrix(s, side);
-                if (!plaqueFacesCamera(m)) continue;
-                ReplayDraw.rectXY(fill, m, -pw / 2 + 0.035f, -ph / 2 + 0.035f, pw / 2 - 0.035f, ph / 2 - 0.035f, 0.002f,
-                        ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.96 * alpha), ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.96 * alpha));
-                ReplayDraw.rectXY(fill, m, -pw / 2 + 0.05f, 0.005f, pw / 2 - 0.05f, 0.009f, 0.003f,
-                        ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha), ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha));
-                f.text(m, line, 0, 0.075f, z, 0.0052f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, alpha), 0, false, pw - 0.16f);
-                f.text(m, sub, 0, -0.07f, z, 0.0042f, ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, alpha), 0, false, pw - 0.16f);
-            }
-            return;
+        double idle = f.handoff.idlePlaque();
+        double standby = s.fade() * ReplayStagePlan.smoothstep(0.42, 1, idle);
+        boolean loading = model == null && f.hasRound;
+        Component line = standby > 0 ? ReplayBoardTexts.tr(loading ? "loading" : "idle") : Component.empty();
+        Component sub = standby > 0 ? ReplayBoardTexts.tr("brand").copy()
+                .append(".".repeat(loading ? (int) (f.ambient * 3) % 4 : 0)) : Component.empty();
+        Matrix4f[] faces = new Matrix4f[4];
+        for (int side = 0; side < 4; side++) {
+            Matrix4f m = plaqueMatrix(s, side);
+            if (!plaqueFacesCamera(m)) continue;
+            faces[side] = m;
+            ReplayDraw.rectXY(fill, m, -pw / 2 + 0.035f, -ph / 2 + 0.035f, pw / 2 - 0.035f, ph / 2 - 0.035f, 0.002f,
+                    ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.96 * s.fade()), ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.96 * s.fade()));
+            int engraving = ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * s.fade());
+            ReplayDraw.rectXY(fill, m, -pw / 2 + 0.05f, 0.005f, pw / 2 - 0.05f, 0.009f, 0.003f, engraving, engraving);
+            if (standby <= 0.01) continue;
+            f.text(m, line, 0, 0.075f, z, 0.0052f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, standby), 0, false, pw - 0.16f);
+            f.text(m, sub, 0, -0.07f, z, 0.0042f, ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, standby), 0, false, pw - 0.16f);
         }
+        double alpha = s.fade() * (1 - ReplayStagePlan.smoothstep(0, 0.58, idle));
+        if (model == null || alpha <= 0.01) return;
         var stage = f.stage;
         double flip = stage == null ? 1 : stage.plaqueFlip();
         float flipScale = (float) Math.max(0.05, flip);
@@ -218,14 +222,8 @@ final class ReplayTrayPainter {
         VertexConsumer glow = f.glow();
         float tileW = 0.076f, tileH = 0.094f, gap = 0.009f, cy = -0.065f;
 
-        for (int side = 0; side < 4; side++) {
-            Matrix4f m = plaqueMatrix(s, side);
-            if (!plaqueFacesCamera(m)) continue;
-            // engraved night inset
-            ReplayDraw.rectXY(fill, m, -pw / 2 + 0.035f, -ph / 2 + 0.035f, pw / 2 - 0.035f, ph / 2 - 0.035f, 0.002f,
-                    ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.96 * alpha), ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.96 * alpha));
-            ReplayDraw.rectXY(fill, m, -pw / 2 + 0.05f, 0.005f, pw / 2 - 0.05f, 0.009f, 0.003f,
-                    ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha), ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * alpha));
+        for (Matrix4f m : faces) {
+            if (m == null) continue;
             Matrix4f titleM = new Matrix4f(m).translate(0, 0.075f, 0).scale(1, flipScale, 1);
             f.text(titleM, Component.literal(model.replay.mapName()), left, 0, z, 0.0054f,
                     ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, alpha * flip), -1, false, pw * 0.58f);
@@ -331,7 +329,7 @@ final class ReplayTrayPainter {
         VertexConsumer glow = f.glow();
         Matrix4f m = s.board();
         float hw = s.hw() - FRAME, hd = s.hd() - FRAME, y = FRAME_TOP + 0.02f;
-        double flicker = 0.92 + 0.08 * Math.sin(f.anim * 7.3) * Math.sin(f.anim * 2.1);
+        double flicker = 0.92 + 0.08 * Math.sin(f.ambient * 7.3) * Math.sin(f.ambient * 2.1);
         int lamp = ReplayPalette.alpha(ReplayPalette.LAMP, 0.55 * a * flicker);
         float lampW = 0.022f * s.scale();
         ReplayDraw.segment(glow, m, -hw, y, hd, hw, y, hd, lampW, lamp, lamp);
@@ -369,7 +367,7 @@ final class ReplayTrayPainter {
                 Vector3f end = m.transformPosition(x1, y1, z1, new Vector3f());
                 ReplayDraw.segment(glow, start, end, 0.016f * beamScale,
                         ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.30 * beam), ReplayPalette.alpha(ReplayPalette.LAMP, 0.08 * beam));
-                double t = (f.anim * 0.45 + (sx + 2) * 0.17 + (sz + 2) * 0.31) % 1.0;
+                double t = (f.ambient * 0.45 + (sx + 2) * 0.17 + (sz + 2) * 0.31) % 1.0;
                 Vector3f dot = new Vector3f(start).lerp(end, (float) t);
                 ReplayDraw.billboard(glow, dot, f.right, f.up, 0.02f * beamScale, 0.02f * beamScale,
                         ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, 0.45 * beam * Math.sin(t * Math.PI)));
@@ -412,7 +410,18 @@ final class ReplayTrayPainter {
 
     // ------------------------------------------------------------------ idle / loading
 
-    static void idle(ReplayFrame f, ReplayBoardSite s) {
-        ReplayIdleCubes.paint(f, s);
+    static void handoff(ReplayFrame f, ReplayBoardSite s) {
+        double intensity = f.handoff.pulse() * s.fade();
+        if (intensity <= 0.01) return;
+        float radius = (float) Mth.lerp(f.handoff.pulseRadius(), 0.17, (s.hw() - FRAME) * 0.89);
+        float y = BASE_TOP + 0.018f;
+        VertexConsumer glow = f.glow();
+        Matrix4f board = s.board();
+        int gold = ReplayPalette.alpha(ReplayPalette.BRASS, 0.6 * intensity);
+        int white = ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, 0.85 * intensity);
+        int clear = ReplayPalette.alpha(ReplayPalette.BRASS, 0);
+        ReplayDraw.ring(glow, board, 0, y, 0, radius, 0.035f, 48, white, clear);
+        ReplayDraw.ring(glow, board, 0, y, 0, radius * 0.84f, 0.060f, 48, gold, clear);
+        ReplayDraw.disc(glow, board, 0, y, 0, Math.min(radius, 0.8f), 28, gold, clear);
     }
 }

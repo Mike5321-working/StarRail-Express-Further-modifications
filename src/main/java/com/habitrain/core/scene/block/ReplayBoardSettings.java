@@ -2,6 +2,10 @@ package com.habitrain.core.scene.block;
 
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.Tag;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.world.phys.Vec3;
+import com.habitrain.core.scene.replay.ReplayStagePlan;
 
 /** Per-table display placement. Distances are world blocks, offsets follow the table's facing. */
 public record ReplayBoardSettings(float mapSize, float height, float offsetX, float offsetZ, float rotation) {
@@ -16,6 +20,19 @@ public record ReplayBoardSettings(float mapSize, float height, float offsetX, fl
     }
 
     public float scale() { return mapSize / DEFAULT_MAP_SIZE; }
+
+    public double viewDistance(BlockPos pos, Direction facing, Vec3 eye) {
+        double dx = eye.x - (pos.getX() + .5), dz = eye.z - (pos.getZ() + .5);
+        double dy = eye.y - (pos.getY() + 1);
+        double displayX = dx - offsetX * facing.getStepZ() - offsetZ * facing.getStepX();
+        double displayZ = dz + offsetX * facing.getStepX() - offsetZ * facing.getStepZ();
+        return Math.sqrt(Math.min(dx * dx + (dy - .4) * (dy - .4) + dz * dz,
+                displayX * displayX + (dy - height) * (dy - height) + displayZ * displayZ));
+    }
+
+    public boolean inView(BlockPos pos, Direction facing, Vec3 eye) {
+        return viewDistance(pos, facing, eye) <= ReplayStagePlan.FADE_END * Math.max(1f, scale());
+    }
 
     /**
      * Largest player-to-marker distance (blocks) from which this table's in-world buttons may be used.

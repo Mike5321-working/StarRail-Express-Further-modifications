@@ -63,7 +63,7 @@ final class ReplayVideoFx {
 
     // ------------------------------------------------------------------ inside the map scope
 
-    void map(ReplayFrame f, ReplayBoardSite s, Matrix4f d) {
+    void map(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayActorSizing heads) {
         if (f.stage == null || f.stage.actors() <= 0.01) return;
         VertexConsumer glow = f.glow(), fill = f.fill();
         for (int i = 0; i < model.events.length; i++) {
@@ -71,9 +71,9 @@ final class ReplayVideoFx {
             double age = time - eventTimes[i];
             if (age < 0 || age > life(e.node.kind())) continue;
             int seed = e.node.tick() * 31 + e.node.kind().ordinal() * 7 + i;
-            event(f, d, glow, fill, e, age, seed);
+            event(f, d, glow, fill, e, age, seed, heads);
         }
-        spotlights(f, d, glow);
+        spotlights(f, d, glow, heads);
     }
 
     static double life(LastMatchReplay.Kind kind) {
@@ -92,13 +92,14 @@ final class ReplayVideoFx {
     }
 
     private void event(ReplayFrame f, Matrix4f d, VertexConsumer glow, VertexConsumer fill, ReplayBoardModel.EventMark e,
-                       double k, int seed) {
+                       double k, int seed, ReplayActorSizing heads) {
         float x = e.tx, y = e.ty + 0.004f, z = e.tz;
         double life = life(e.node.kind());
         double fade = 1 - ReplayStagePlan.smoothstep(life * 0.6, life, k);
         switch (e.node.kind()) {
-            case KILL -> kill(f, d, glow, fill, e, x, y, z, k, fade, seed);
-            case PLAYER_REVIVAL -> revival(f, d, glow, x, y, z, k, fade);
+            case KILL -> kill(f, d, glow, fill, e, x, y, z, k, fade, seed, heads.size(e.node.target(), x, e.ty, z));
+            case PLAYER_REVIVAL -> revival(f, d, glow, x, y, z, k, fade,
+                    heads.size(e.node.target() != null ? e.node.target() : e.node.actor(), x, e.ty, z));
             case GRENADE_EXPLOSION, BOMB_DETONATE -> explosion(f, d, glow, fill, x, y, z, k, fade, seed);
             case BOMB_PLANT -> {
                 boolean on = Math.sin(k * 16) > 0;
@@ -248,7 +249,7 @@ final class ReplayVideoFx {
     }
 
     private void kill(ReplayFrame f, Matrix4f d, VertexConsumer glow, VertexConsumer fill, ReplayBoardModel.EventMark e,
-                      float x, float y, float z, double k, double fade, int seed) {
+                      float x, float y, float z, double k, double fade, int seed, float headSize) {
         flash(f, d, glow, x, y + 0.07f, z, k, 0.32, 0.3f, RUBY);
         // Pillar of light.
         float h = (float) (0.95 * ReplayStagePlan.easeOutCubic(k / 0.22));
@@ -290,8 +291,8 @@ final class ReplayVideoFx {
         }
         // Target reticle locking on above the victim.
         double lock = ReplayStagePlan.easeOutCubic(k / 0.25);
-        float rr = (float) (0.16 - 0.06 * lock);
-        Vector3f c = d.transformPosition(x, y + ReplayActorPainter.HEAD * 0.7f, z, new Vector3f());
+        float rr = (float) (1.33 - 0.50 * lock) * headSize;
+        Vector3f c = d.transformPosition(x, y + ReplayActorSizing.centerOffset(headSize), z, new Vector3f());
         for (int i = 0; i < 4; i++) {
             double a0 = i * Math.PI / 2 + Math.PI / 4 + k * 0.8;
             Vector3f p0 = new Vector3f(c).add(new Vector3f(f.right).mul((float) Math.cos(a0 - 0.35) * rr)).add(new Vector3f(f.up).mul((float) Math.sin(a0 - 0.35) * rr));
@@ -300,7 +301,7 @@ final class ReplayVideoFx {
         }
     }
 
-    private void revival(ReplayFrame f, Matrix4f d, VertexConsumer glow, float x, float y, float z, double k, double fade) {
+    private void revival(ReplayFrame f, Matrix4f d, VertexConsumer glow, float x, float y, float z, double k, double fade, float headSize) {
         flash(f, d, glow, x, y + 0.08f, z, k, 0.3, 0.3f, BRASS_LIGHT);
         float h = (float) (0.85 * ReplayStagePlan.easeOutCubic(k / 0.4));
         ReplayDraw.column(glow, d, x, y, z, h, 0.1f, alpha(BRASS_LIGHT, 0.6 * fade), alpha(BRASS_LIGHT, 0));
@@ -317,8 +318,8 @@ final class ReplayVideoFx {
             }
         }
         double settle = ReplayStagePlan.easeOutCubic(k / 0.8);
-        float hy = y + (float) (ReplayActorPainter.HEAD * 1.35 * settle);
-        float rr = (float) (0.32 + (0.075 - 0.32) * settle);
+        float hy = y + (float) (headSize * 1.35 * settle);
+        float rr = (float) (0.32 + (headSize * 0.625f - 0.32) * settle);
         ReplayDraw.ring(glow, d, x, hy, z, rr, 0.014f, 32, alpha(BRASS_LIGHT, fade), alpha(CHAMPAGNE, 0.3 * fade));
         star(glow, d, x, y + 0.004f, z, 0.17f, 8, (float) (k * 0.8), 0.008f, alpha(BRASS, 0.8 * fade));
     }
@@ -354,7 +355,7 @@ final class ReplayVideoFx {
         ReplayDraw.disc(fill, d, x, y + 0.002f, z, 0.2f, 20, alpha(NIGHT_0, 0.6 * fade * grow), alpha(NIGHT_0, 0));
     }
 
-    private void spotlights(ReplayFrame f, Matrix4f d, VertexConsumer glow) {
+    private void spotlights(ReplayFrame f, Matrix4f d, VertexConsumer glow, ReplayActorSizing heads) {
         if (sample == null) return;
         double weight = switch (sample.act()) {
             case VICTORY -> 0.5 * ReplayStagePlan.easeOutCubic(sample.actTime() / 0.8);
@@ -399,7 +400,8 @@ final class ReplayVideoFx {
         }
         // A crown floats above the champion.
         float bob = (float) Math.sin(time * 2.6) * 0.012f;
-        Vector3f c = d.transformPosition(x, y + ReplayActorPainter.HEAD * 2.6f + bob, z, new Vector3f());
+        float headSize = heads.size(model.mvp.p.id(), x, p[1], z);
+        Vector3f c = d.transformPosition(x, y + headSize * 2.6f + bob, z, new Vector3f());
         crown(glow, f, c, 0.045f, alpha(BRASS_LIGHT, weight));
     }
 
@@ -474,7 +476,7 @@ final class ReplayVideoFx {
     }
 
     private static void screenPolygon(VertexConsumer glow, ReplayFrame f, Vector3f c, float r, int sides, float spin, float width, int color) {
-        Vector3f prev = null, first = null;
+        Vector3f prev = null;
         for (int i = 0; i <= sides; i++) {
             double a = spin + Math.PI * 2 * i / sides;
             Vector3f p = new Vector3f(c).add(new Vector3f(f.right).mul((float) Math.cos(a) * r)).add(new Vector3f(f.up).mul((float) Math.sin(a) * r));

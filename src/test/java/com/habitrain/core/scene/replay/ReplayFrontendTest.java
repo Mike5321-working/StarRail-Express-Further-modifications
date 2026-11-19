@@ -132,6 +132,40 @@ class ReplayFrontendTest {
         assertTrue(ReplayStagePlan.cometTicks(rate) >= 200);
     }
 
+    @Test void tabletopHandoffConnectsIdleToTheExistingPlaybackClock() {
+        var timeline = new ReplayTimeline(0, 6000, List.of());
+        int honorsStart = timeline.cycleTicks() - ReplayTimeline.HONORS;
+        var start = timeline.atElapsed(0);
+        var gathering = timeline.atElapsed(12);
+        var scanning = timeline.atElapsed(26);
+        var play = timeline.atElapsed(ReplayTimeline.INTRO);
+        var folding = timeline.atElapsed(honorsStart + ReplayTimeline.HONORS * 0.84);
+        var reforming = timeline.atElapsed(honorsStart + ReplayTimeline.HONORS * 0.94);
+        var end = timeline.atElapsed(timeline.cycleTicks());
+
+        assertEquals(ReplayStagePlan.IDLE, ReplayStagePlan.boardHandoff(start));
+        assertEquals(0.75, ReplayStagePlan.boardStage(start).trayGlow());
+        assertTrue(ReplayStagePlan.boardHandoff(gathering).idle() > 0);
+        assertTrue(ReplayStagePlan.boardHandoff(gathering).pulse() > 0);
+        assertEquals(0, ReplayStagePlan.boardStage(gathering).scan());
+        assertEquals(0, ReplayStagePlan.boardHandoff(scanning).idle());
+        assertTrue(ReplayStagePlan.boardStage(scanning).scan() > 0);
+        assertEquals(ReplayStagePlan.REPLAY, ReplayStagePlan.boardHandoff(play));
+        assertEquals(1, ReplayStagePlan.boardStage(play).scan());
+
+        assertEquals(0, ReplayStagePlan.boardHandoff(folding).idle());
+        assertTrue(ReplayStagePlan.boardStage(folding).honors() < 1);
+        assertTrue(ReplayStagePlan.boardStage(folding).scan() < 1);
+        assertEquals(0, ReplayStagePlan.boardStage(reforming).honors());
+        assertTrue(ReplayStagePlan.boardHandoff(reforming).idle() > 0);
+        assertEquals(1, ReplayStagePlan.boardHandoff(end).idle(), 1e-9);
+        assertEquals(1, ReplayStagePlan.boardHandoff(end).idlePlaque(), 1e-9);
+        assertEquals(0, ReplayStagePlan.boardHandoff(end).pulse(), 1e-9);
+        assertEquals(0, ReplayStagePlan.boardStage(end).scan(), 1e-9);
+        assertEquals(0, ReplayStagePlan.boardStage(end).actors(), 1e-9);
+        assertEquals(0.75, ReplayStagePlan.boardStage(end).trayGlow(), 1e-9);
+    }
+
     @Test void distanceFadeAndHelpers() {
         assertEquals(1, ReplayStagePlan.distanceFade(10), 1e-9);
         assertEquals(1, ReplayStagePlan.distanceFade(48), 1e-9);

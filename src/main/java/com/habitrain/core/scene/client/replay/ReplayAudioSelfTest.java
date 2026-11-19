@@ -4,7 +4,6 @@ import com.google.gson.GsonBuilder;
 import com.habitrain.core.api.match.MatchWinFaction;
 import com.habitrain.core.api.match.MatchWinKind;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
-import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.game.sre.replay.MatchVoiceRecorder;
 import com.habitrain.core.game.sre.replay.ReplayBoardService;
@@ -13,9 +12,7 @@ import com.habitrain.core.game.sre.voice.VoiceChatPresence;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.replay.ReplayMapCapture;
-import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
-import com.habitrain.core.scene.replay.ReplayVoiceData;
 import io.wifi.starrailexpress.event.client.OnGameStartedClient;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
@@ -28,7 +25,6 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.commands.arguments.EntityAnchorArgument;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -193,7 +189,8 @@ public final class ReplayAudioSelfTest {
             }
             ServerLevel level = player.serverLevel();
             BlockPos pPos = player.blockPosition();
-            BlockPos targetBoard = pPos.offset(0, 0, -2);
+            BlockPos targetBoard = pPos.offset(0, 0, -24);
+            level.setBlock(pPos.offset(0, -1, -2), Blocks.SMOOTH_STONE.defaultBlockState(), Block.UPDATE_ALL);
             level.setBlock(targetBoard.below(), Blocks.SMOOTH_STONE.defaultBlockState(), Block.UPDATE_ALL);
             level.setBlock(targetBoard, SettlementSummaryBoard.BLOCK.defaultBlockState()
                     .setValue(SettlementSummaryBoard.FACING, Direction.SOUTH), Block.UPDATE_ALL);
@@ -223,10 +220,6 @@ public final class ReplayAudioSelfTest {
             UUID victimA = UUID.randomUUID();
             UUID victimB = UUID.randomUUID();
             UUID farSpeaker = UUID.randomUUID();
-
-            double baseX = pPos.getX() - bounds.minX() + 0.5;
-            double baseY = pPos.getY() - bounds.minY();
-            double baseZ = pPos.getZ() - bounds.minZ() + 0.5;
 
             List<LastMatchReplay.Sample> killerTrack = new ArrayList<>();
             List<LastMatchReplay.Sample> vATrack = new ArrayList<>();
@@ -389,13 +382,15 @@ public final class ReplayAudioSelfTest {
     private static void tickVerifyLive3dAudio(Minecraft mc) {
         playbackTicks++;
         if (mc.player != null && boardPos != null) {
-            mc.player.lookAt(EntityAnchorArgument.Anchor.EYES, Vec3.atCenterOf(boardPos.above()));
+            Vec3 eye = mc.player.getEyePosition();
+            mc.player.lookAt(EntityAnchorArgument.Anchor.EYES, eye.add(eye.subtract(Vec3.atCenterOf(boardPos.above()))));
         }
         if (ReplayAudioPlaybackController.isBoardVoiceActive(mc, boardPos)) {
             observedBoardVoiceActive = true;
         }
         // Let 3D board animation play well past the first kill zoom (~12 + 50 + ~85 ticks) and once voice active is seen.
         if ((observedBoardVoiceActive && playbackTicks >= 95) || playbackTicks >= 165) {
+            if (!observedBoardVoiceActive) throw new IllegalStateException("Offscreen replay table lost its voice");
             mp4Export = startExport(true);
             mc.setScreen(new ReplayExportScreen(mc.level, boardPos));
             pressEscape(mc);
@@ -533,6 +528,7 @@ public final class ReplayAudioSelfTest {
         report.put("far1900Power", far1900Power);
         report.put("resolvedModSounds", resolvedModSounds);
         report.put("observedBoardVoiceActive", observedBoardVoiceActive);
+        report.put("offscreenTableAudio", observedBoardVoiceActive);
         report.put("mp4Size", mp4Size);
         report.put("mp4IntroRms", mp4IntroRms);
         report.put("mp4Beat0Rms", mp4Beat0Rms);

@@ -64,7 +64,10 @@ final class ReplayArchiveSettingsScreen extends Screen {
             voiceSentAt = System.nanoTime();
             ReplayHistoryClient.setVoiceRecording(!voiceShown.enabled());
             tick();
-        }).bounds(left, top + 122, panelWidth, 20).build());
+        }).bounds(left, top + 122, panelWidth - w - 6, 20).build());
+        var clearCache = addRenderableWidget(Button.builder(tr("clear_local"), b -> ReplayHistoryClient.clearDiskCache())
+                .bounds(left + panelWidth - w, top + 122, w, 20).build());
+        clearCache.setTooltip(Tooltip.create(tr("local_policy")));
         voiceRecording.setTooltip(Tooltip.create(tr("voice_tip")));
         setInitialFocus(limit);
         tick();
