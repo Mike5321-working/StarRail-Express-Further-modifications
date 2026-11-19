@@ -36,7 +36,10 @@ import java.util.concurrent.CompletableFuture;
  * 3D {@code SettlementSummaryBoard} playback and {@link ReplayHistoryScreen} linear previewing.
  */
 public final class ReplayAudioPlaybackController {
+    static final float REPLAY_GAIN = 0.60f;
     private static final ResourceLocation BOARD_VOICE_ID = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_voice");
+    private static final ResourceLocation REPLAY_EFFECT_ID = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_effect");
+    private static final int MAX_PLAYING_EFFECTS = 16;
     private static final double TICKS_PER_SECOND = 20.0;
     private static final int VOICE_RATE = ReplayVoiceData.VOICECHAT_SAMPLE_RATE;
 
@@ -52,6 +55,7 @@ public final class ReplayAudioPlaybackController {
         double prevActionTick = -1.0;
         int nextSoundIdx;
         int nextVoiceIdx;
+        final ArrayDeque<ReplayEffectSound> effects = new ArrayDeque<>();
         @Nullable VoiceClipSoundInstance activeVoice;
     }
 
@@ -62,6 +66,7 @@ public final class ReplayAudioPlaybackController {
         double prevCursor = -1.0;
         int nextSoundIdx;
         int nextVoiceIdx;
+        final ArrayDeque<ReplayEffectSound> effects = new ArrayDeque<>();
         @Nullable VoiceClipSoundInstance activeVoice;
     }
 
@@ -71,10 +76,11 @@ public final class ReplayAudioPlaybackController {
         if (mc == null || mc.getSoundManager() == null || model == null || view == null) return;
         double actionLength = model.timeline.cycleTicks() - ReplayTimeline.INTRO - ReplayTimeline.HONORS - ReplayTimeline.REVIEW;
         double actionTick = elapsedTicks - ReplayTimeline.INTRO;
-        if (!active || actionLength <= 0 || actionTick < 0 || actionTick >= actionLength) {
+        if (!active || actionLength <= 0 || actionTick < 0 || actionTick >= actionLength + ReplayTimeline.REVIEW) {
             BoardState existing = BOARDS.get(pos);
             if (existing != null) {
                 stopActiveVoice(mc, existing.activeVoice);
+                stopEffects(mc, existing.effects);
                 existing.activeVoice = null;
                 existing.prevActionTick = -1.0;
                 existing.nextSoundIdx = 0;
@@ -89,9 +95,11 @@ public final class ReplayAudioPlaybackController {
         if (newRound || state.voice != currentVoice) {
             state.roundId = model.replay.roundId();
             state.voice = currentVoice;
-            state.schedule = ReplaySoundCuePlan.forBoard(model.replay, model.timeline, currentVoice);
+            state.schedule = ReplaySoundCuePlan.forBoard(model.replay, model.timeline, currentVoice,
+                    file -> mc.getResourceManager().getResource(file).isPresent());
             if (newRound) {
                 stopActiveVoice(mc, state.activeVoice);
+                stopEffects(mc, state.effects);
                 state.activeVoice = null;
                 state.prevActionTick = -1.0;
                 state.nextSoundIdx = 0;
@@ -105,6 +113,7 @@ public final class ReplayAudioPlaybackController {
         if (state.prevActionTick < 0 || actionTick < state.prevActionTick - 2.0
                 || actionTick - state.prevActionTick > 15.0) {
             stopActiveVoice(mc, state.activeVoice);
+            stopEffects(mc, state.effects);
             state.activeVoice = null;
             state.nextSoundIdx = firstSoundAfter(state.schedule.sounds(), actionTick - 0.5);
             state.nextVoiceIdx = firstVoiceAtOrAfter(state.schedule.voices(), actionTick);
@@ -120,20 +129,7 @@ public final class ReplayAudioPlaybackController {
             if (cue.time() >= state.prevActionTick - 1.0 && fade > 0.02f) {
                 Vec3 emitter = boardEventWorldPos(cam, site, model, cue.eventIndex());
                 Vec3 clamped = clampAudibleDistance(cam, emitter, 12.0);
-                ResourceLocation resolved = resolveSound(mc, cue.candidates());
-                if (resolved != null) {
-                    mc.getSoundManager().play(new SimpleSoundInstance(
-                            resolved,
-                            SoundSource.PLAYERS,
-                            Math.min(1.25f, cue.volume() * fade),
-                            cue.pitch(),
-                            SoundInstance.createUnseededRandom(),
-                            false,
-                            0,
-                            SoundInstance.Attenuation.LINEAR,
-                            clamped.x, clamped.y, clamped.z,
-                            false));
-                }
+                playEffect(mc, state.effects, cue, Math.min(1.25f, cue.volume() * fade), clamped, false);
             }
             state.nextSoundIdx++;
         }
@@ -143,8 +139,8 @@ public final class ReplayAudioPlaybackController {
             ReplaySoundCuePlan.VoiceCue voiceCue = voices.get(state.nextVoiceIdx);
             if (voiceCue.startTime() > actionTick) break;
             if (actionTick < voiceCue.endTime() - 1.0 && fade > 0.02f) {
-                double skipSeconds = Math.max(0.0, (actionTick - voiceCue.startTime()) / TICKS_PER_SECOND);
-                double maxDuration = Math.max(0.1, (voiceCue.endTime() - Math.max(actionTick, voiceCue.startTime())) / TICKS_PER_SECOND);
+                double skipSeconds = (actionTick - voiceCue.sampleStartTime(TICKS_PER_SECOND)) / TICKS_PER_SECOND;
+                double maxDuration = (voiceCue.endTime() - actionTick) / TICKS_PER_SECOND;
                 byte[] pcm = buildPcm48kSlice(voiceCue.clip(), skipSeconds, maxDuration);
                 if (pcm.length > 0) {
                     stopActiveVoice(mc, state.activeVoice);
@@ -169,6 +165,7 @@ public final class ReplayAudioPlaybackController {
             Map.Entry<BlockPos, BoardState> entry = it.next();
             if (!activeBoards.contains(entry.getKey())) {
                 if (mc != null) stopActiveVoice(mc, entry.getValue().activeVoice);
+                stopEffects(mc, entry.getValue().effects);
                 it.remove();
             }
         }
@@ -180,6 +177,7 @@ public final class ReplayAudioPlaybackController {
         if (!playing || roundId == null || replay == null) {
             if (history != null) {
                 stopActiveVoice(mc, history.activeVoice);
+                stopEffects(mc, history.effects);
                 history.activeVoice = null;
                 history.prevCursor = playing ? cursorTicks : -1.0;
             }
@@ -187,11 +185,12 @@ public final class ReplayAudioPlaybackController {
         }
         ReplayVoiceData currentVoice = voice == null ? ReplayVoiceData.EMPTY : voice;
         if (history == null || !roundId.equals(history.roundId)) {
-            if (history != null) stopActiveVoice(mc, history.activeVoice);
+            stopHistory(mc);
             history = new HistoryState();
             history.roundId = roundId;
             history.voice = currentVoice;
-            history.schedule = ReplaySoundCuePlan.forLinearReplay(replay, currentVoice);
+            history.schedule = ReplaySoundCuePlan.forLinearReplay(replay, currentVoice,
+                    file -> mc.getResourceManager().getResource(file).isPresent());
             history.prevCursor = cursorTicks;
             history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 0.5);
             history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), cursorTicks);
@@ -199,7 +198,8 @@ public final class ReplayAudioPlaybackController {
         }
         if (history.voice != currentVoice) {
             history.voice = currentVoice;
-            history.schedule = ReplaySoundCuePlan.forLinearReplay(replay, currentVoice);
+            history.schedule = ReplaySoundCuePlan.forLinearReplay(replay, currentVoice,
+                    file -> mc.getResourceManager().getResource(file).isPresent());
             double anchor = history.prevCursor >= 0 ? history.prevCursor : cursorTicks;
             history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), anchor);
             history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), anchor);
@@ -208,6 +208,7 @@ public final class ReplayAudioPlaybackController {
         if (history.prevCursor < 0 || cursorTicks < history.prevCursor - 1.5
                 || cursorTicks - history.prevCursor > 8.0) {
             stopActiveVoice(mc, history.activeVoice);
+            stopEffects(mc, history.effects);
             history.activeVoice = null;
             history.prevCursor = cursorTicks;
             history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 0.5);
@@ -220,20 +221,7 @@ public final class ReplayAudioPlaybackController {
             ReplaySoundCuePlan.SoundCue cue = sounds.get(history.nextSoundIdx);
             if (cue.time() > cursorTicks) break;
             if (cue.time() >= history.prevCursor - 0.5) {
-                ResourceLocation resolved = resolveSound(mc, cue.candidates());
-                if (resolved != null) {
-                    mc.getSoundManager().play(new SimpleSoundInstance(
-                            resolved,
-                            SoundSource.PLAYERS,
-                            Math.min(1.1f, cue.volume() * 0.9f),
-                            cue.pitch(),
-                            SoundInstance.createUnseededRandom(),
-                            false,
-                            0,
-                            SoundInstance.Attenuation.NONE,
-                            0.0, 0.0, 0.0,
-                            true));
-                }
+                playEffect(mc, history.effects, cue, Math.min(1.1f, cue.volume() * 0.9f), Vec3.ZERO, true);
             }
             history.nextSoundIdx++;
         }
@@ -243,8 +231,8 @@ public final class ReplayAudioPlaybackController {
             ReplaySoundCuePlan.VoiceCue voiceCue = voices.get(history.nextVoiceIdx);
             if (voiceCue.startTime() > cursorTicks) break;
             if (cursorTicks < voiceCue.endTime() - 1.0) {
-                double skipSeconds = Math.max(0.0, (cursorTicks - voiceCue.startTime()) / TICKS_PER_SECOND);
-                double maxDuration = Math.max(0.1, (voiceCue.endTime() - Math.max(cursorTicks, voiceCue.startTime())) / TICKS_PER_SECOND);
+                double skipSeconds = (cursorTicks - voiceCue.sampleStartTime(TICKS_PER_SECOND)) / TICKS_PER_SECOND;
+                double maxDuration = (voiceCue.endTime() - cursorTicks) / TICKS_PER_SECOND;
                 byte[] pcm = buildPcm48kSlice(voiceCue.clip(), skipSeconds, maxDuration);
                 if (pcm.length > 0) {
                     stopActiveVoice(mc, history.activeVoice);
@@ -262,6 +250,7 @@ public final class ReplayAudioPlaybackController {
     static void onHistoryScrub() {
         if (history != null) {
             stopActiveVoice(Minecraft.getInstance(), history.activeVoice);
+            stopEffects(Minecraft.getInstance(), history.effects);
             history.activeVoice = null;
             history.prevCursor = -1.0;
         }
@@ -270,6 +259,7 @@ public final class ReplayAudioPlaybackController {
     static void stopHistory(Minecraft mc) {
         if (history != null) {
             if (mc != null) stopActiveVoice(mc, history.activeVoice);
+            stopEffects(mc, history.effects);
             history = null;
         }
     }
@@ -278,6 +268,7 @@ public final class ReplayAudioPlaybackController {
         Minecraft mc = Minecraft.getInstance();
         for (BoardState state : BOARDS.values()) {
             if (mc != null) stopActiveVoice(mc, state.activeVoice);
+            stopEffects(mc, state.effects);
         }
         BOARDS.clear();
         stopHistory(mc);
@@ -295,6 +286,43 @@ public final class ReplayAudioPlaybackController {
             if (id != null && manager.getSoundEvent(id) != null) return id;
         }
         return null;
+    }
+
+    private static void playEffect(Minecraft mc, ArrayDeque<ReplayEffectSound> effects, ReplaySoundCuePlan.SoundCue cue,
+                                   float volume, Vec3 position, boolean relative) {
+        ResourceLocation file = cue.recordedFile();
+        ResourceLocation id = file == null ? resolveSound(mc, cue.candidates()) : REPLAY_EFFECT_ID;
+        if (id == null || file != null && mc.getResourceManager().getResource(file).isEmpty()) return;
+        SoundManager manager = mc.getSoundManager();
+        effects.removeIf(effect -> !manager.isActive(effect));
+        if (effects.size() >= MAX_PLAYING_EFFECTS) manager.stop(effects.removeFirst());
+        var effect = new ReplayEffectSound(id, file, volume, cue.pitch(), position, relative);
+        effects.addLast(effect);
+        manager.play(effect);
+    }
+
+    private static void stopEffects(@Nullable Minecraft mc, ArrayDeque<ReplayEffectSound> effects) {
+        if (mc != null && !effects.isEmpty()) effects.forEach(mc.getSoundManager()::stop);
+        effects.clear();
+    }
+
+    static final class ReplayEffectSound extends SimpleSoundInstance {
+        private final @Nullable Sound recorded;
+
+        ReplayEffectSound(ResourceLocation id, @Nullable ResourceLocation file, float volume, float pitch,
+                          Vec3 position, boolean relative) {
+            super(id, SoundSource.PLAYERS, volume * REPLAY_GAIN, pitch, SoundInstance.createUnseededRandom(),
+                    false, 0, relative ? Attenuation.NONE : Attenuation.LINEAR,
+                    position.x, position.y, position.z, relative);
+            recorded = file == null ? null : new Sound(file.withPath(path -> path.substring(7, path.length() - 4)),
+                    ConstantFloat.of(1f), ConstantFloat.of(1f), 1, Sound.Type.FILE, true, false, 16);
+        }
+
+        @Override public WeighedSoundEvents resolve(SoundManager manager) {
+            if (recorded == null) return super.resolve(manager);
+            this.sound = recorded;
+            return new WeighedSoundEvents(this.location, null);
+        }
     }
 
     static byte[] buildPcm48kSlice(ReplayVoiceData.Clip clip, double skipSeconds, double maxDurationSeconds) {
@@ -378,7 +406,7 @@ public final class ReplayAudioPlaybackController {
         VoiceClipSoundInstance(byte[] pcmBytes, float volume, double x, double y, double z, boolean relative) {
             super(SoundEvent.createFixedRangeEvent(BOARD_VOICE_ID, 32.0F), SoundSource.PLAYERS, SoundInstance.createUnseededRandom());
             this.pcmBytes = pcmBytes;
-            this.volume = Math.clamp(volume, 0f, 1.5f);
+            this.volume = Math.clamp(volume, 0f, 1.5f) * REPLAY_GAIN;
             this.pitch = 1.0f;
             this.x = x;
             this.y = y;

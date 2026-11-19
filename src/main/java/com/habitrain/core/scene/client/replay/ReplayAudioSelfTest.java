@@ -13,7 +13,9 @@ import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.replay.ReplayMapCapture;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
+import io.wifi.starrailexpress.client.gui.screen.ingame.LimitedInventoryScreen;
 import io.wifi.starrailexpress.event.client.OnGameStartedClient;
+import net.exmo.sre.record.client.MatchRecordsScreen;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
@@ -495,22 +497,52 @@ public final class ReplayAudioSelfTest {
     }
 
     private static void pressEscape(Minecraft mc) {
-        long window = mc.getWindow().getWindow();
-        mc.keyboardHandler.keyPress(window, GLFW.GLFW_KEY_ESCAPE, 0, GLFW.GLFW_PRESS, 0);
-        mc.keyboardHandler.keyPress(window, GLFW.GLFW_KEY_ESCAPE, 0, GLFW.GLFW_RELEASE, 0);
+        sendEscape(mc, GLFW.GLFW_PRESS);
+        sendEscape(mc, GLFW.GLFW_RELEASE);
+    }
+
+    private static void sendEscape(Minecraft mc, int action) {
+        mc.keyboardHandler.keyPress(mc.getWindow().getWindow(), GLFW.GLFW_KEY_ESCAPE, 0, action, 0);
+    }
+
+    private static void verifyEscapeClosesScreen(Minecraft mc, Screen expected) {
+        Screen previous = mc.screen;
+        pressEscape(mc);
+        if (mc.screen != expected || !cancelledExport.running()) {
+            throw new IllegalStateException("Escape from " + screenName(previous) + " reached " + screenName(mc.screen)
+                    + " instead of " + screenName(expected) + "; export running=" + cancelledExport.running());
+        }
+    }
+
+    private static String screenName(Screen screen) {
+        return screen == null ? "gameplay" : screen.getClass().getSimpleName();
     }
 
     private static void tickCancelExport(Minecraft mc) throws IOException {
         if (!cancelledExport.cancelled()) {
             if (!cancelledExport.running()) throw new IllegalStateException("Third export stopped before cancellation");
             if (cancelledExport.displayProgress() < 0.05) return;
+            Screen inventory = new LimitedInventoryScreen(mc.player);
+            Screen records = new MatchRecordsScreen(inventory);
+            Screen history = ReplayHistoryScreen.open(records, testRoundId.toString(), false);
+            mc.setScreen(new ReplayExportScreen(history, testRoundId));
+            verifyEscapeClosesScreen(mc, history);
+            verifyEscapeClosesScreen(mc, records);
+            verifyEscapeClosesScreen(mc, inventory);
+            verifyEscapeClosesScreen(mc, null);
             try (var screenshot = Screenshot.takeScreenshot(mc.getMainRenderTarget())) {
                 screenshot.writeToFile(reportPath.resolveSibling("progress.png"));
             }
-            pressEscape(mc);
+            sendEscape(mc, GLFW.GLFW_PRESS);
+            sendEscape(mc, GLFW.GLFW_REPEAT);
+            sendEscape(mc, GLFW.GLFW_RELEASE);
             if (!cancelledExport.cancelled() || mc.screen != null) {
-                throw new IllegalStateException("Escape did not cancel the background export");
+                throw new IllegalStateException("Escape reached " + screenName(mc.screen)
+                        + "; export cancelled=" + cancelledExport.cancelled());
             }
+            pressEscape(mc);
+            if (!(mc.screen instanceof PauseScreen)) throw new IllegalStateException("The next Escape did not pause");
+            mc.setScreen(null);
         }
         if (!ReplayExportClient.canStart()) return;
         try (var files = Files.list(ReplayVideoExport.directory(mc))) {
@@ -537,7 +569,9 @@ public final class ReplayAudioSelfTest {
         report.put("aviIntroRms", aviIntroRms);
         report.put("aviBeat0Rms", aviBeat0Rms);
         report.put("aviBeat1Rms", aviBeat1Rms);
+        report.put("escapeClosedReplayScreensWithoutCancelling", true);
         report.put("backgroundExportCancelled", true);
+        report.put("escapePauseRestoredAfterCancellation", true);
         writeReport(report);
 
         phase = Phase.DONE;

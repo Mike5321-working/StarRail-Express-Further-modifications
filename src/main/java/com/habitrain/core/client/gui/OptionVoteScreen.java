@@ -17,6 +17,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.sounds.SoundEvents;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
+import org.jetbrains.annotations.Nullable;
 import org.lwjgl.glfw.GLFW;
 
 import java.util.ArrayList;
@@ -163,8 +164,9 @@ public class OptionVoteScreen extends Screen {
         updateAutoPickAnimation(now, candidates);
         frameTotalVotes = candidates.stream().mapToInt(OptionVotePayload.Entry::votes).sum();
 
-        OptionVoteLayout.Panel layout = OptionVoteLayout.panel(width, height, candidates.size());
-        float target = OptionVoteLayout.scrollTarget(layout, focusedIndex, candidates.size());
+        int cardCount = candidates.size() + firstCandidateSlot();
+        OptionVoteLayout.Panel layout = OptionVoteLayout.panel(width, height, cardCount);
+        float target = OptionVoteLayout.scrollTarget(layout, focusedIndex, cardCount);
         if (Float.isNaN(scroll)) {
             scroll = target;
         }
@@ -319,26 +321,29 @@ public class OptionVoteScreen extends Screen {
         }
 
         boolean mapPhase = "map".equals(OptionVoteState.getVoteId());
+        int firstCandidate = firstCandidateSlot();
+        int cardCount = candidates.size() + firstCandidate;
         List<CardHitbox> hitboxes = new ArrayList<>();
         g.flush();
         g.enableScissor(clipLeft, Math.max(0, clipTop), clipRight, Math.max(1, clipBottom));
         try {
             int step = layout.cardW() + OptionVoteLayout.GAP;
-            for (int i = 0; i < candidates.size(); i++) {
-                OptionVotePayload.Entry entry = candidates.get(i);
-                float cardX = layout.stripX() - scroll + i * step;
+            for (int slot = 0; slot < cardCount; slot++) {
+                float cardX = layout.stripX() - scroll + slot * step;
                 if (cardX + layout.cardW() < clipLeft - 2 || cardX > clipRight + 2) {
                     continue;
                 }
-                String id = entry.optionId();
+                int candidateIndex = slot - firstCandidate;
+                OptionVotePayload.Entry entry = candidateIndex < 0 ? null : candidates.get(candidateIndex);
+                String id = entry == null ? "" : entry.optionId();
                 Rect bounds = new Rect(Math.round(cardX), stripTop, layout.cardW(), layout.cardH());
                 boolean hovered = closingAtMillis == 0L && bounds.contains(mouseX, mouseY)
                         && mouseX >= clipLeft && mouseX < clipRight;
-                boolean focused = i == focusedIndex;
-                boolean selected = OptionVoteState.isSelected(id);
+                boolean focused = slot == focusedIndex;
+                boolean selected = entry != null && OptionVoteState.isSelected(id);
                 float emphasis = approach(cardEmphasis, id, focused ? 1.0f : (hovered ? 0.55f : 0.0f), dt, 12.0f);
                 float selectedT = approach(cardSelected, id, selected ? 1.0f : 0.0f, dt, 9.0f);
-                float shareTarget = frameTotalVotes <= 0 ? 0.0f : entry.votes() / (float) frameTotalVotes;
+                float shareTarget = entry == null || frameTotalVotes <= 0 ? 0.0f : entry.votes() / (float) frameTotalVotes;
                 float share = approach(cardShare, id, shareTarget, dt, 6.0f);
 
                 // 入场：车票自上缘逐张翻下（像翻牌器一样绕顶边展开）
@@ -348,12 +353,12 @@ public class OptionVoteScreen extends Screen {
                 if (flip <= 0.0f) {
                     continue;
                 }
-                renderCard(g, entry, i, cardX, stripTop, layout.cardW(), layout.cardH(),
-                        easeOutBack(flip, 1.6f), emphasis, selectedT, share, hovered, focused, mapPhase, now);
+                renderCard(g, entry, candidateIndex, cardX, stripTop, layout.cardW(), layout.cardH(),
+                        easeOutBack(flip, 1.6f), emphasis, selectedT, share, focused, mapPhase, now);
                 int hitLeft = Math.max(clipLeft, bounds.x());
                 int hitRight = Math.min(clipRight, bounds.right());
                 if (hitRight > hitLeft) {
-                    hitboxes.add(new CardHitbox(i, new Rect(hitLeft, bounds.y(), hitRight - hitLeft, bounds.height())));
+                    hitboxes.add(new CardHitbox(slot, new Rect(hitLeft, bounds.y(), hitRight - hitLeft, bounds.height())));
                 }
             }
         } finally {
@@ -373,7 +378,7 @@ public class OptionVoteScreen extends Screen {
             nextBounds = new Rect(layout.right() - OptionVoteLayout.SIDE - OptionVoteLayout.ARROW, arrowY,
                     OptionVoteLayout.ARROW, OptionVoteLayout.ARROW);
             renderArrow(g, previousBounds, -1, focusedIndex > 0, previousBounds.contains(mouseX, mouseY));
-            renderArrow(g, nextBounds, 1, focusedIndex < candidates.size() - 1, nextBounds.contains(mouseX, mouseY));
+            renderArrow(g, nextBounds, 1, focusedIndex < cardCount - 1, nextBounds.contains(mouseX, mouseY));
         } else {
             previousBounds = Rect.EMPTY;
             nextBounds = Rect.EMPTY;
@@ -384,13 +389,14 @@ public class OptionVoteScreen extends Screen {
      * 单张候选车票：左侧票身写名称（地图有预览图时作为车窗风景），右侧票根是票数与占比。
      * 选中后由蓝票过渡为象牙头等票，票面盖「✓」章、票根打孔。
      */
-    private void renderCard(GuiGraphics g, OptionVotePayload.Entry entry, int index, float x, float y,
+    private void renderCard(GuiGraphics g, @Nullable OptionVotePayload.Entry entry, int index, float x, float y,
                             int w, int h, float flip, float emphasis, float selectedT, float share,
-                            boolean hovered, boolean focused, boolean mapPhase, long now) {
-        String id = entry.optionId();
+                            boolean focused, boolean mapPhase, long now) {
+        String id = entry == null ? "" : entry.optionId();
         TicketArt.Shape shape = TicketArt.Shape.of(w, h, STUB_FRACTION);
-        TicketArt.Palette palette = TicketArt.Palette.mix(TicketArt.SAPPHIRE, TicketArt.IVORY, selectedT);
-        float pulse = id.equals(pulseOptionId)
+        TicketArt.Palette palette = entry == null ? TicketArt.EMERALD
+                : TicketArt.Palette.mix(TicketArt.SAPPHIRE, TicketArt.IVORY, selectedT);
+        float pulse = entry != null && id.equals(pulseOptionId)
                 ? TransitionFx.clamp01((now - pulseAtMillis) / (pulseBig ? 900.0f : 600.0f)) : 1.0f;
         float lift = Math.round(emphasis * 2.0f);
 
@@ -415,7 +421,7 @@ public class OptionVoteScreen extends Screen {
         }
 
         TicketArt.paper(g, shape, palette, TicketArt.Part.WHOLE, 1.0f);
-        TicketArt.details(g, shape, palette, TicketArt.Part.WHOLE, 1.0f, index * 7 + 3, false);
+        TicketArt.details(g, shape, palette, TicketArt.Part.WHOLE, 1.0f, entry == null ? 2 : index * 7 + 3, false);
 
         float bodyL = shape.inset() + 1.5f;
         float bodyR = shape.bodyRight() - 0.5f;
@@ -425,12 +431,16 @@ public class OptionVoteScreen extends Screen {
         float small = TicketArt.crispAscii(0.5f);
 
         // 票头：编号
-        TicketArt.drawScaled(g, font, Component.literal(String.format(Locale.ROOT, "No.%02d", index + 1)),
+        Component serial = Component.literal(entry == null ? "No.??" : String.format(Locale.ROOT, "No.%02d", index + 1));
+        TicketArt.drawScaled(g, font, serial,
                 shape.inset() + 3.0f, (shape.band() - 8.0f * small) / 2.0f + 0.5f, small, palette.bandInk());
 
         // 票身：地图预览（车窗风景）或名称
-        Component label = OptionVoteTexts.candidateLabel(id, entry.displayName());
-        boolean drewPreview = mapPhase && renderPreview(g, id, bodyL, bodyT, bodyR, bodyB);
+        Component label = entry == null ? OptionVoteTexts.randomMap() : OptionVoteTexts.candidateLabel(id, entry.displayName());
+        if (entry == null) {
+            renderRandomMapPreview(g, bodyL, bodyT, bodyR, bodyB);
+        }
+        boolean drewPreview = entry == null || (mapPhase && renderPreview(g, id, bodyL, bodyT, bodyR, bodyB));
         if (drewPreview) {
             GuiGeo veil = GuiGeo.begin(g);
             veil.rectV(bodyL, bodyB - 13.0f, bodyR, bodyB, RailArt.a(INK, 0), RailArt.a(INK, 0.78f));
@@ -463,9 +473,51 @@ public class OptionVoteScreen extends Screen {
             }
         }
 
-        // 票根：票数 + 占比 + 细条
+        if (entry == null) {
+            renderRandomMapDie(g, shape);
+        } else {
+            renderVoteStub(g, shape, palette, entry, selectedT, share, small, now);
+        }
+
+        // 选中印章：脉冲期间从大落到原位（盖章），其余时刻静止
+        if (selectedT > 0.02f) {
+            float slam = pulse < 1.0f ? TransitionFx.clamp01(pulse / (pulseBig ? 0.3f : 0.24f)) : 1.0f;
+            float stampScale = Mth.lerp(slam * slam, pulseBig ? 2.4f : 1.9f, 1.0f);
+            float stampAlpha = selectedT * TransitionFx.clamp01(slam * 1.6f);
+            renderCheckStamp(g, bodyR - 6.0f, bodyT + 5.0f, stampScale, stampAlpha, palette.serial());
+        }
+
+        // 焦点/悬停：黄铜描边；焦点额外在票下方挂一枚指示
+        if (emphasis > 0.02f) {
+            GuiGeo frame = GuiGeo.begin(g);
+            frame.outline(RailArt.chamfer(-1.0f, -1.0f, w + 2.0f, h + 2.0f, shape.corner() + 1.0f), 1.0f,
+                    RailArt.a(focused ? GOLD_BRIGHT : GOLD, emphasis));
+            frame.end();
+        }
+
+        // 揭晓/检票闪光
+        if (pulse < 1.0f) {
+            float fadeOut = 1.0f - pulse;
+            GuiGeo flash = GuiGeo.glow(g);
+            flash.convexV(RailArt.chamfer(0, 0, w, h, shape.corner()), 0, h,
+                    RailArt.a(IVORY, (pulseBig ? 0.45f : 0.25f) * fadeOut * fadeOut),
+                    RailArt.a(GOLD, 0.1f * fadeOut * fadeOut));
+            float grow = (pulseBig ? 7.0f : 4.0f) * TransitionFx.easeOutCubic(pulse);
+            flash.outline(RailArt.chamfer(-grow, -grow, w + grow * 2.0f, h + grow * 2.0f, shape.corner() + grow), 1.0f,
+                    RailArt.a(GOLD_BRIGHT, 0.75f * fadeOut * fadeOut));
+            flash.end();
+        }
+        } finally {
+            g.pose().popPose();
+        }
+    }
+
+    private void renderVoteStub(GuiGraphics g, TicketArt.Shape shape, TicketArt.Palette palette,
+                                OptionVotePayload.Entry entry, float selectedT, float share, float small, long now) {
+        float h = shape.h();
+        String id = entry.optionId();
         float stubL = shape.stubLeft();
-        float stubR = w - shape.inset() - 1.0f;
+        float stubR = shape.w() - shape.inset() - 1.0f;
         float stubCx = (stubL + stubR) / 2.0f;
         int votes = entry.votes();
         Integer previous = lastVotes.put(id, votes);
@@ -504,38 +556,52 @@ public class OptionVoteScreen extends Screen {
                     RailArt.a(INK, 1.0f), TicketArt.fade(palette.edge(), 1.0f));
         }
         bar.end();
+    }
 
-        // 选中印章：脉冲期间从大落到原位（盖章），其余时刻静止
-        if (selectedT > 0.02f) {
-            float slam = pulse < 1.0f ? TransitionFx.clamp01(pulse / (pulseBig ? 0.3f : 0.24f)) : 1.0f;
-            float stampScale = Mth.lerp(slam * slam, pulseBig ? 2.4f : 1.9f, 1.0f);
-            float stampAlpha = selectedT * TransitionFx.clamp01(slam * 1.6f);
-            renderCheckStamp(g, bodyR - 6.0f, bodyT + 5.0f, stampScale, stampAlpha, palette.serial());
+    private static void renderRandomMapPreview(GuiGraphics g, float left, float top, float right, float bottom) {
+        float width = right - left;
+        float height = bottom - top;
+        float startX = left + width * 0.16f;
+        float startY = top + height * 0.55f;
+        float bendX = left + width * 0.43f;
+        float endX = right - width * 0.16f;
+        float endY = top + height * 0.24f;
+        float rise = startY - endY;
+        GuiGeo map = GuiGeo.begin(g);
+        map.rectV(left, top, right, bottom, 0xFF245F50, 0xFF0B211E);
+        for (int column = 1; column < 8; column++) {
+            float gridX = left + column * width / 8.0f;
+            map.line(gridX, top, gridX, bottom, 0.6f, 0x386BA795);
         }
+        for (int row = 1; row < 5; row++) {
+            float gridY = top + row * height / 5.0f;
+            map.line(left, gridY, right, gridY, 0.6f, 0x386BA795);
+        }
+        map.line(startX, startY, bendX, startY, 1.2f, GOLD);
+        map.line(bendX, startY, bendX + rise, endY, 1.2f, GOLD);
+        map.line(bendX + rise, endY, endX, endY, 1.2f, GOLD);
+        map.disc(startX, startY, 1.8f, IVORY);
+        map.disc(endX, endY, 2.1f, IVORY);
+        map.end();
+    }
 
-        // 焦点/悬停：黄铜描边；焦点额外在票下方挂一枚指示
-        if (emphasis > 0.02f) {
-            GuiGeo frame = GuiGeo.begin(g);
-            frame.outline(RailArt.chamfer(-1.0f, -1.0f, w + 2.0f, h + 2.0f, shape.corner() + 1.0f), 1.0f,
-                    RailArt.a(focused ? GOLD_BRIGHT : GOLD, emphasis));
-            frame.end();
-        }
-
-        // 揭晓/检票闪光
-        if (pulse < 1.0f) {
-            float fadeOut = 1.0f - pulse;
-            GuiGeo flash = GuiGeo.glow(g);
-            flash.convexV(RailArt.chamfer(0, 0, w, h, shape.corner()), 0, h,
-                    RailArt.a(IVORY, (pulseBig ? 0.45f : 0.25f) * fadeOut * fadeOut),
-                    RailArt.a(GOLD, 0.1f * fadeOut * fadeOut));
-            float grow = (pulseBig ? 7.0f : 4.0f) * TransitionFx.easeOutCubic(pulse);
-            flash.outline(RailArt.chamfer(-grow, -grow, w + grow * 2.0f, h + grow * 2.0f, shape.corner() + grow), 1.0f,
-                    RailArt.a(GOLD_BRIGHT, 0.75f * fadeOut * fadeOut));
-            flash.end();
-        }
-        } finally {
-            g.pose().popPose();
-        }
+    private static void renderRandomMapDie(GuiGraphics g, TicketArt.Shape shape) {
+        float stubRight = shape.w() - shape.inset() - 1.0f;
+        float size = Math.min(16.0f, Math.max(5.0f, stubRight - shape.stubLeft() - 2.0f));
+        float cx = (shape.stubLeft() + stubRight) / 2.0f;
+        float cy = (shape.band() + shape.h()) / 2.0f;
+        float half = size / 2.0f;
+        float pipOffset = size * 0.23f;
+        float pipRadius = size * 0.08f;
+        GuiGeo die = GuiGeo.begin(g);
+        die.convexV(RailArt.chamfer(cx - half, cy - half, size, size, size * 0.16f),
+                cy - half, cy + half, IVORY, GOLD);
+        die.disc(cx - pipOffset, cy - pipOffset, pipRadius, INK);
+        die.disc(cx + pipOffset, cy - pipOffset, pipRadius, INK);
+        die.disc(cx, cy, pipRadius, INK);
+        die.disc(cx - pipOffset, cy + pipOffset, pipRadius, INK);
+        die.disc(cx + pipOffset, cy + pipOffset, pipRadius, INK);
+        die.end();
     }
 
     /** 选中车票的「✓」检票章：圆环 + 对勾，略微倾斜。 */
@@ -600,8 +666,13 @@ public class OptionVoteScreen extends Screen {
         int span = right - left;
 
         Component status = Component.empty();
-        if (focusedIndex >= 0 && focusedIndex < candidates.size()) {
-            OptionVotePayload.Entry focused = candidates.get(focusedIndex);
+        int firstCandidate = firstCandidateSlot();
+        int candidateIndex = focusedIndex - firstCandidate;
+        if (focusedIndex == 0 && firstCandidate > 0) {
+            status = Component.literal("▸ ").withStyle(ChatFormatting.GOLD)
+                    .append(OptionVoteTexts.randomMap().copy().withStyle(ChatFormatting.WHITE));
+        } else if (candidateIndex >= 0 && candidateIndex < candidates.size()) {
+            OptionVotePayload.Entry focused = candidates.get(candidateIndex);
             int percent = frameTotalVotes <= 0 ? 0 : Math.round(focused.votes() * 100.0f / frameTotalVotes);
             status = Component.literal("▸ ").withStyle(ChatFormatting.GOLD)
                     .append(OptionVoteTexts.candidateLabel(focused.optionId(), focused.displayName()).copy()
@@ -692,11 +763,16 @@ public class OptionVoteScreen extends Screen {
 
     // ==================== 焦点 / 投票 ====================
 
+    private static int firstCandidateSlot() {
+        return OptionVoteState.hasRandomMapChoice() ? 1 : 0;
+    }
+
     /** Cycles the map deck during the final three seconds, then reveals the reported random pick. */
     private void updateAutoPickAnimation(long now, List<OptionVotePayload.Entry> candidates) {
         if (!"map".equals(OptionVoteState.getVoteId()) || candidates.isEmpty()) {
             return;
         }
+        int firstCandidate = firstCandidateSlot();
         if (OptionVoteState.isAutoPickAnimating()) {
             if (autoPickStartedMillis == 0L) {
                 autoPickStartedMillis = now;
@@ -704,7 +780,7 @@ public class OptionVoteScreen extends Screen {
             // 55ms 起步，约 3 秒后放慢到 ~280ms 一格，像真正的轮盘在减速
             long stepInterval = 55L + Math.min(240L, (now - autoPickStartedMillis) * 3L / 40L);
             if (lastAutoPickStepMillis == 0L || now - lastAutoPickStepMillis >= stepInterval) {
-                int next = focusedIndex < 0 ? 0 : (focusedIndex + 1) % candidates.size();
+                int next = firstCandidate + Math.max(0, focusedIndex + 1 - firstCandidate) % candidates.size();
                 setFocus(next, candidates, false);
                 playUiSound(0.90f + (next % 4) * 0.08f);
                 lastAutoPickStepMillis = now;
@@ -719,7 +795,7 @@ public class OptionVoteScreen extends Screen {
         }
         for (int i = 0; i < candidates.size(); i++) {
             if (autoPickedId.equals(candidates.get(i).optionId())) {
-                setFocus(i, candidates, false);
+                setFocus(i + firstCandidate, candidates, false);
                 revealedAutoPickId = autoPickedId;
                 startPulse(autoPickedId, true);
                 playUiSound(1.45f);
@@ -734,17 +810,21 @@ public class OptionVoteScreen extends Screen {
             focusedOptionId = "";
             return;
         }
+        int firstCandidate = firstCandidateSlot();
+        if (firstCandidate > 0 && focusedIndex == 0 && focusedOptionId.isEmpty()) {
+            return;
+        }
         if (!focusedOptionId.isBlank()) {
             for (int i = 0; i < candidates.size(); i++) {
                 if (focusedOptionId.equals(candidates.get(i).optionId())) {
-                    focusedIndex = i;
+                    focusedIndex = i + firstCandidate;
                     return;
                 }
             }
         }
         for (int i = 0; i < candidates.size(); i++) {
             if (OptionVoteState.isSelected(candidates.get(i).optionId())) {
-                setFocus(i, candidates, false);
+                setFocus(i + firstCandidate, candidates, false);
                 return;
             }
         }
@@ -757,7 +837,7 @@ public class OptionVoteScreen extends Screen {
         if (candidates.isEmpty()) {
             return;
         }
-        int next = Mth.clamp(focusedIndex + delta, 0, candidates.size() - 1);
+        int next = Mth.clamp(focusedIndex + delta, 0, candidates.size() + firstCandidateSlot() - 1);
         if (next != focusedIndex) {
             setFocus(next, candidates, true);
         }
@@ -767,10 +847,11 @@ public class OptionVoteScreen extends Screen {
         if (candidates.isEmpty()) {
             return;
         }
-        int clamped = Mth.clamp(index, 0, candidates.size() - 1);
+        int firstCandidate = firstCandidateSlot();
+        int clamped = Mth.clamp(index, 0, candidates.size() + firstCandidate - 1);
         boolean changed = focusedIndex != clamped;
         focusedIndex = clamped;
-        focusedOptionId = candidates.get(clamped).optionId();
+        focusedOptionId = clamped < firstCandidate ? "" : candidates.get(clamped - firstCandidate).optionId();
         if (sound && changed) {
             playUiSound(1.25f);
         }
@@ -787,17 +868,25 @@ public class OptionVoteScreen extends Screen {
             return;
         }
         List<OptionVotePayload.Entry> candidates = OptionVoteState.getCandidates();
-        if (index < 0 || index >= candidates.size()) {
+        int firstCandidate = firstCandidateSlot();
+        int candidateIndex = index - firstCandidate;
+        boolean randomMap = index == 0 && firstCandidate > 0;
+        if (randomMap) {
+            candidateIndex = OptionVoteState.randomMapCandidateIndex(ThreadLocalRandom.current()::nextInt);
+        }
+        if (candidateIndex < 0 || candidateIndex >= candidates.size()) {
             return;
         }
-        OptionVotePayload.Entry entry = candidates.get(index);
-        setFocus(index, candidates, false);
+        OptionVotePayload.Entry entry = candidates.get(candidateIndex);
+        setFocus(candidateIndex + firstCandidate, candidates, false);
         if ("map".equals(OptionVoteState.getVoteId())) {
             // 地图票只能改投、不能撤回（保证随机抽选前一定有明确意向）。
             boolean changed = !OptionVoteState.isSelected(entry.optionId());
             OptionVoteState.select(entry.optionId());
             if (changed) {
                 PayloadSenders.sendOptionVoteCast(OptionVoteState.getVoteId(), entry.optionId());
+            }
+            if (changed || randomMap) {
                 startPulse(entry.optionId(), false);
             }
             playUiSound(1.05f);
@@ -827,7 +916,6 @@ public class OptionVoteScreen extends Screen {
                 hideByUser();
                 return true;
             }
-            List<OptionVotePayload.Entry> candidates = OptionVoteState.getCandidates();
             if (previousBounds.contains(mouseX, mouseY)) {
                 changeFocus(-1);
                 return true;
@@ -838,7 +926,7 @@ public class OptionVoteScreen extends Screen {
             }
             if (OptionVoteState.isActive()) {
                 for (CardHitbox hitbox : cardHitboxes) {
-                    if (hitbox.bounds().contains(mouseX, mouseY) && hitbox.index() < candidates.size()) {
+                    if (hitbox.bounds().contains(mouseX, mouseY)) {
                         castVote(hitbox.index());
                         return true;
                     }

@@ -78,6 +78,10 @@ public final class OptionVoteTexts {
         return Component.translatable("vote.habitrain_core.ui.random_selecting");
     }
 
+    static Component randomMap() {
+        return Component.translatable("vote.habitrain_core.ui.random_map");
+    }
+
     /** 顶部投票面板的操作提示（含当前绑定的隐藏键）。 */
     public static Component panelHint() {
         return Component.translatable(

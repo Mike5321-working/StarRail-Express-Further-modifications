@@ -25,8 +25,8 @@ import java.util.*;
  * Ordinary speech rolls out of the buffer as the match advances.</p>
  */
 public final class MatchVoiceRecorder {
-    private static final int PRE_EVENT_MS = 1000;
-    private static final int POST_EVENT_MS = 2000;
+    private static final int PRE_EVENT_MS = 2000;
+    private static final int POST_EVENT_MS = 1000;
     private static final int WINDOW_MS = PRE_EVENT_MS + POST_EVENT_MS;
     private static final int WINDOW_SAMPLES_24K = (WINDOW_MS * ReplayVoiceData.SAMPLE_RATE) / 1000;
     private static final int DEATH_GRACE_MS = 150;

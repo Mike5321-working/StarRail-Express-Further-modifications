@@ -14,7 +14,8 @@ public record LastMatchReplay(UUID roundId, long playbackAnchorTick, int duratio
                               String customWinId, String customTitleJson, String customSubtitleJson, int customColor,
                               SceneBounds origin, @Nullable ReplayMapManifest manifest,
                               List<Participant> participants, List<Node> events, List<Span> spans,
-                              @Nullable UUID mvp, int killCount, boolean limited, List<Drone> drones) {
+                              @Nullable UUID mvp, int killCount, boolean limited, List<Drone> drones,
+                              List<ReplayKillSounds.Window> killSounds) {
     public static final int MAX_PLAYERS = 128;
     public static final int MAX_DRONES = 64;
     public static final int MAX_EVENTS = 768;
@@ -26,6 +27,24 @@ public record LastMatchReplay(UUID roundId, long playbackAnchorTick, int duratio
         events = List.copyOf(events);
         spans = List.copyOf(spans);
         drones = List.copyOf(drones);
+        killSounds = List.copyOf(killSounds);
+    }
+
+    public LastMatchReplay(UUID roundId, long playbackAnchorTick, int durationTicks,
+                           String mapName, String modeId, String winStatus, MatchWinKind winKind,
+                           String customWinId, String customTitleJson, String customSubtitleJson, int customColor,
+                           SceneBounds origin, @Nullable ReplayMapManifest manifest,
+                           List<Participant> participants, List<Node> events, List<Span> spans,
+                           @Nullable UUID mvp, int killCount, boolean limited, List<Drone> drones) {
+        this(roundId, playbackAnchorTick, durationTicks, mapName, modeId, winStatus, winKind, customWinId,
+                customTitleJson, customSubtitleJson, customColor, origin, manifest, participants, events, spans,
+                mvp, killCount, limited, drones, List.of());
+    }
+
+    public LastMatchReplay withKillSounds(List<ReplayKillSounds.Window> sounds) {
+        return new LastMatchReplay(roundId, playbackAnchorTick, durationTicks, mapName, modeId, winStatus, winKind,
+                customWinId, customTitleJson, customSubtitleJson, customColor, origin, manifest, participants, events,
+                spans, mvp, killCount, limited, drones, sounds);
     }
 
     /** Compatibility constructor for producers that only have player tracks. */

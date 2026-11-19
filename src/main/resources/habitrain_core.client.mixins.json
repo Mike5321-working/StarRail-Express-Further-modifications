@@ -28,6 +28,7 @@
         "ReplayBoardButtonUseMixin",
         "ReplayExportRenderMixin",
         "ReplayExportKeyboardMixin",
+        "ReplayKillSoundMixin",
         "DroneMouseHandlerMixin",
         "DroneGlowMixin",
         "DroneTurnAndOutlineMixin",

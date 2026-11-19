@@ -4,6 +4,7 @@ import com.habitrain.core.HabiTrainCore;
 import com.habitrain.core.api.match.MatchWinFaction;
 import com.habitrain.core.api.match.MatchWinKind;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayKillSounds;
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
@@ -13,6 +14,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.world.phys.Vec3;
 
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -63,6 +66,35 @@ public final class ReplayPackets {
         public static final StreamCodec<FriendlyByteBuf, LastMatchSummaryS2C> CODEC =
                 codec(MAX_SUMMARY, ReplayPackets::readSummary, ReplayPackets::writeSummary);
         @Override public Type<LastMatchSummaryS2C> type() { return TYPE; }
+
+        public LastMatchSummaryS2C withoutKillSounds() {
+            return replay.killSounds().isEmpty() ? this : new LastMatchSummaryS2C(replay.withKillSounds(List.of()), tracks);
+        }
+    }
+
+    public record CaptureKillSoundS2C(UUID ticket, Vec3 listener, long serverGameTime) implements CustomPacketPayload {
+        public static final Type<CaptureKillSoundS2C> TYPE = typeId("capture_kill_sound");
+        public static final StreamCodec<FriendlyByteBuf, CaptureKillSoundS2C> CODEC = codec(48,
+                buffer -> new CaptureKillSoundS2C(buffer.readUUID(),
+                        new Vec3(buffer.readDouble(), buffer.readDouble(), buffer.readDouble()), buffer.readLong()),
+                (buffer, value) -> {
+                    buffer.writeUUID(value.ticket());
+                    buffer.writeDouble(value.listener().x).writeDouble(value.listener().y).writeDouble(value.listener().z)
+                            .writeLong(value.serverGameTime());
+                });
+        @Override public Type<CaptureKillSoundS2C> type() { return TYPE; }
+    }
+
+    public record KillSoundC2S(UUID ticket, List<ReplayKillSounds.Cue> cues) implements CustomPacketPayload {
+        public static final Type<KillSoundC2S> TYPE = typeId("kill_sound");
+        public static final StreamCodec<FriendlyByteBuf, KillSoundC2S> CODEC = codec(8192,
+                buffer -> new KillSoundC2S(buffer.readUUID(), readKillCues(buffer)),
+                (buffer, value) -> {
+                    buffer.writeUUID(value.ticket());
+                    writeKillCues(buffer, value.cues());
+                });
+        public KillSoundC2S { cues = List.copyOf(cues); }
+        @Override public Type<KillSoundC2S> type() { return TYPE; }
     }
 
     /** One bounded batch; indices reference the exact round's manifest ordering. */
@@ -150,6 +182,8 @@ public final class ReplayPackets {
     public static void register() {
         PayloadTypeRegistry.playS2C().register(Available.TYPE, Available.CODEC);
         PayloadTypeRegistry.playS2C().register(LastMatchSummaryS2C.TYPE, LastMatchSummaryS2C.CODEC);
+        PayloadTypeRegistry.playS2C().register(CaptureKillSoundS2C.TYPE, CaptureKillSoundS2C.CODEC);
+        PayloadTypeRegistry.playC2S().register(KillSoundC2S.TYPE, KillSoundC2S.CODEC);
         PayloadTypeRegistry.playS2C().register(ReplaySectionPatchS2C.TYPE, ReplaySectionPatchS2C.CODEC);
         PayloadTypeRegistry.playS2C().register(ReplayVoiceChunkS2C.TYPE, ReplayVoiceChunkS2C.CODEC);
         PayloadTypeRegistry.playS2C().register(VoiceExportAccessS2C.TYPE, VoiceExportAccessS2C.CODEC);
@@ -212,11 +246,19 @@ public final class ReplayPackets {
             b.writeVarInt(span.startTick()); b.writeVarInt(span.endTick());
         }
         writeId(b, s.mvp()); b.writeVarInt(s.killCount()); b.writeBoolean(s.limited());
-        if (!s.drones().isEmpty()) {
+        if (!s.drones().isEmpty() || !s.killSounds().isEmpty()) {
             if (s.drones().size() > MAX_DRONES) throw new IllegalArgumentException("Too many replay drones");
             b.writeVarInt(s.drones().size());
             for (Drone drone : s.drones()) {
                 b.writeUUID(drone.id()); b.writeUUID(drone.owner());
+            }
+        }
+        if (!s.killSounds().isEmpty()) {
+            checkKillWindows(s.events(), s.killSounds());
+            b.writeVarInt(s.killSounds().size());
+            for (var window : s.killSounds()) {
+                b.writeVarInt(window.eventIndex());
+                writeKillCues(b, window.cues());
             }
         }
     }
@@ -261,9 +303,50 @@ public final class ReplayPackets {
         int drones = b.isReadable() ? count(b, MAX_DRONES) : 0;
         List<Drone> aircraft = new ArrayList<>(drones);
         for (int i = 0; i < drones; i++) aircraft.add(new Drone(b.readUUID(), b.readUUID(), List.of()));
+        int windows = b.isReadable() ? count(b, ReplayKillSounds.MAX_WINDOWS) : 0;
+        List<ReplayKillSounds.Window> killSounds = new ArrayList<>(windows);
+        for (int index = 0; index < windows; index++) {
+            killSounds.add(new ReplayKillSounds.Window(count(b, MAX_EVENTS - 1), readKillCues(b)));
+        }
+        checkKillWindows(events, killSounds);
         return new LastMatchSummaryS2C(new LastMatchReplay(id, anchor, duration, map, mode, status, win,
                 custom, title, subtitle, color, origin, manifest, people, events, spans,
-                mvp, killCount, limited, aircraft), tracks);
+                mvp, killCount, limited, aircraft, killSounds), tracks);
+    }
+
+    private static void checkKillWindows(List<Node> events, List<ReplayKillSounds.Window> windows) {
+        int last = -1;
+        int total = 0;
+        if (windows.size() > ReplayKillSounds.MAX_WINDOWS) throw new IllegalArgumentException("Too many kill sound windows");
+        for (var window : windows) {
+            int index = window.eventIndex();
+            total += window.cues().size();
+            if (index <= last || index >= events.size() || events.get(index).kind() != Kind.KILL
+                    || total > ReplayKillSounds.MAX_PER_ROUND) {
+                throw new IllegalArgumentException("Invalid replay kill sound index or count");
+            }
+            last = index;
+        }
+    }
+
+    private static List<ReplayKillSounds.Cue> readKillCues(FriendlyByteBuf buffer) {
+        int size = count(buffer, ReplayKillSounds.MAX_PER_KILL);
+        List<ReplayKillSounds.Cue> cues = new ArrayList<>(size);
+        for (int index = 0; index < size; index++) {
+            cues.add(new ReplayKillSounds.Cue(buffer.readShort(),
+                    ResourceLocation.parse(buffer.readUtf(ReplayKillSounds.MAX_FILE_LENGTH)), buffer.readFloat(), buffer.readFloat()));
+        }
+        return cues;
+    }
+
+    private static void writeKillCues(FriendlyByteBuf buffer, List<ReplayKillSounds.Cue> cues) {
+        if (cues.size() > ReplayKillSounds.MAX_PER_KILL) throw new IllegalArgumentException("Too many recorded sounds");
+        buffer.writeVarInt(cues.size());
+        for (var cue : cues) {
+            buffer.writeShort(cue.offsetMs());
+            buffer.writeUtf(cue.file().toString(), ReplayKillSounds.MAX_FILE_LENGTH);
+            buffer.writeFloat(cue.volume()).writeFloat(cue.pitch());
+        }
     }
 
     private static void writeManifest(FriendlyByteBuf b, ReplayMapManifest m) {

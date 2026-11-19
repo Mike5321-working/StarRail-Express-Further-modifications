@@ -25,6 +25,39 @@ import static org.junit.jupiter.api.Assertions.*;
 class ReplayVideoAudioMuxTest {
 
     @Test
+    void trimmedVoiceIsSilentBeforeItsScheduledStartAndKeepsItsSampleOffset() {
+        int rate = ReplayVoiceData.SAMPLE_RATE;
+        short[] samples = new short[rate];
+        Arrays.fill(samples, 0, rate / 2, (short) -12000);
+        Arrays.fill(samples, rate / 2, rate, (short) 12000);
+        var clip = new ReplayVoiceData.Clip(0, 0, -500, samples.length, ReplayVoiceData.encodeAdpcm(samples));
+        var cue = new ReplaySoundCuePlan.VoiceCue(clip, 1.0, 1.0, 1.5, 0f);
+        var schedule = new ReplaySoundCuePlan.Schedule(List.of(), List.of(cue));
+        short[] pcm = ReplayVideoAudioRenderer.renderSchedule(schedule, keys -> null, 60);
+        int outputRate = ReplayVideoAudioRenderer.SAMPLE_RATE;
+
+        assertEquals(0, pcm[(outputRate - 1) * 2]);
+        assertTrue(pcm[(outputRate + outputRate / 10) * 2] > 1000);
+    }
+
+    @Test
+    void capturedSoundUsesExactResourceInsteadOfRandomEventVariant() {
+        var file = net.minecraft.resources.ResourceLocation.parse("test:sounds/private_hint.ogg");
+        var cue = new ReplaySoundCuePlan.SoundCue(.25, 0, List.of(), .5f, 1f, -1f, file);
+        var schedule = new ReplaySoundCuePlan.Schedule(List.of(cue), List.of());
+        int rate = ReplayVideoAudioRenderer.SAMPLE_RATE;
+        float[] samples = new float[rate / 4];
+        Arrays.fill(samples, 1f);
+        short[] pcm = ReplayVideoAudioRenderer.renderSchedule(schedule, keys -> {
+            assertEquals(List.of(file.toString()), keys);
+            return new ReplayVideoAudioRenderer.DecodedSound(samples, 1, rate, 1f, 1f);
+        }, 30);
+        assertEquals(0, pcm[rate / 2 - 2]);
+        assertEquals(Math.round(.5f * .85f * .60f * 32767), pcm[rate / 2]);
+        assertEquals(0, pcm[rate]);
+    }
+
+    @Test
     void soundContinuesAcrossMixWindowsWithoutFadingOrDecodingTwice() {
         int rate = ReplayVideoAudioRenderer.SAMPLE_RATE;
         float[] constant = new float[rate / 2];
@@ -39,10 +72,25 @@ class ReplayVideoAudioMuxTest {
         assertEquals(1, calls.get());
         assertEquals(0, pcm[(rate * 3 / 4 - 1) * 2]);
         for (int frame = rate * 3 / 4; frame < rate * 5 / 4; frame++) {
-            assertEquals(Math.round(.5f * .85f * 32767), pcm[frame * 2]);
+            assertEquals(Math.round(.5f * .85f * .60f * 32767), pcm[frame * 2]);
             assertEquals(0, pcm[frame * 2 + 1]);
         }
         assertEquals(0, pcm[rate * 5 / 4 * 2]);
+    }
+
+    @Test
+    void overlappingReplaySoundsStayBelowTheQuietOutputCeiling() {
+        int rate = ReplayVideoAudioRenderer.SAMPLE_RATE;
+        float[] constant = new float[rate];
+        Arrays.fill(constant, 1f);
+        var cue = new ReplaySoundCuePlan.SoundCue(.25, 0, List.of("loud"), 1, 1, -1);
+        var schedule = new ReplaySoundCuePlan.Schedule(List.of(cue, cue, cue, cue), List.of());
+        short[] pcm = ReplayVideoAudioRenderer.renderSchedule(schedule,
+                keys -> new ReplayVideoAudioRenderer.DecodedSound(constant, 1, rate, 1, 1), 60);
+
+        int peak = 0;
+        for (short sample : pcm) peak = Math.max(peak, Math.abs((int) sample));
+        assertTrue(peak > 17_000 && peak <= Math.round(.60f * Short.MAX_VALUE), "Replay peak: " + peak);
     }
 
     @Test

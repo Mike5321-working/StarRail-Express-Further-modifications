@@ -243,10 +243,11 @@ public final class MatchReplayRecorder {
         r.events.sort(Comparator.comparingInt(Node::tick));
         r.spans.sort(Comparator.comparingInt(Span::startTick));
         byte[] voice = MatchVoiceRecorder.finishRound(r.id, r.events);
-        ReplayBoardService.publish(new LastMatchReplay(r.id, anchor, at, r.label, bounded(settlement.modeId(), 128),
+        var summary = new LastMatchReplay(r.id, anchor, at, r.label, bounded(settlement.modeId(), 128),
                 win == null ? "NONE" : win.name(), settlement.winKind(),
                 bounded(cca.CustomWinnerID, 128), title(cca.CustomWinnerTitle, level), title(cca.CustomWinnerSubtitle, level),
-                cca.CustomWinnerColor, r.bounds, null, people, r.events, r.spans, mvp, r.kills, r.limited, r.droneTracks(ids)), r.map, voice);
+                cca.CustomWinnerColor, r.bounds, null, people, r.events, r.spans, mvp, r.kills, r.limited, r.droneTracks(ids));
+        ReplayBoardService.publish(summary, r.map, voice, r.killSounds.finish(summary.events()));
     }
 
     private static String title(Component c, ServerLevel level) {
@@ -262,7 +263,10 @@ public final class MatchReplayRecorder {
         if (r == null || !r.eligible(victim.getUUID())) return;
         String key = reason == null ? "" : reason.toString();
         if (r.deaths.getOrDefault(victim.getUUID(), -1) != r.now()) {
-            if (r.node(Kind.KILL, id(killer), victim.getUUID(), killer == null ? null : killer.position(), victim.position(), key, 0)) r.kills++;
+            if (r.node(Kind.KILL, id(killer), victim.getUUID(), killer == null ? null : killer.position(), victim.position(), key, 0)) {
+                r.kills++;
+                if (victim instanceof ServerPlayer player) r.killSounds.capture(player, r.events.getLast());
+            }
             r.deaths.put(victim.getUUID(), r.now());
         }
         r.environment(SpanKind.PSYCHO, victim.getUUID(), false, r.now(), victim.position());
@@ -437,6 +441,7 @@ public final class MatchReplayRecorder {
         final SceneBounds bounds;
         final String label;
         final ReplayMapCapture capture;
+        final MatchKillSoundRecorder killSounds = new MatchKillSoundRecorder();
         final Map<UUID, Person> people = new LinkedHashMap<>();
         final Map<UUID, DroneTrack> drones = new LinkedHashMap<>();
         final Map<UUID, ReconDroneEntity> deployed = new LinkedHashMap<>();

@@ -61,6 +61,7 @@ public final class ClientReplayBoard {
 
     public static void register() {
         ReplayHistoryClient.register();
+        com.habitrain.core.scene.client.replay.ClientKillSoundRecorder.register();
         ClientTickEvents.END_CLIENT_TICK.register(ClientReplayBoard::tick);
         ClientChunkEvents.CHUNK_UNLOAD.register(LOCAL::unload);
         ClientBlockEntityEvents.BLOCK_ENTITY_LOAD.register((entity, level) -> {
@@ -104,6 +105,11 @@ public final class ClientReplayBoard {
     }
 
     public static UUID availableRound() { return available.roundId(); }
+
+    public static boolean inMatch(ClientLevel level) {
+        var status = SREGameWorldComponent.KEY.get(level).getGameStatus();
+        return status == SREGameWorldComponent.GameStatus.INITIATING || status == SREGameWorldComponent.GameStatus.ACTIVE;
+    }
 
     public static boolean mapAvailable() { return available.mapReady(); }
 
@@ -150,7 +156,7 @@ public final class ClientReplayBoard {
         }
         return new LastMatchReplay(s.roundId(), s.playbackAnchorTick(), s.durationTicks(), s.mapName(), s.modeId(),
                 s.winStatus(), s.winKind(), s.customWinId(), s.customTitleJson(), s.customSubtitleJson(), s.customColor(),
-                s.origin(), s.manifest(), players, s.events(), s.spans(), s.mvp(), s.killCount(), s.limited(), drones);
+                s.origin(), s.manifest(), players, s.events(), s.spans(), s.mvp(), s.killCount(), s.limited(), drones, s.killSounds());
     }
 
     static MapData loadMap(ReplayMapManifest manifest) {
@@ -217,9 +223,7 @@ public final class ClientReplayBoard {
             LOADED_BOARDS.values().removeIf(other -> other != level);
         }
         if (level == null) return;
-        var status = SREGameWorldComponent.KEY.get(level).getGameStatus();
-        boolean inMatch = status == SREGameWorldComponent.GameStatus.INITIATING
-                || status == SREGameWorldComponent.GameStatus.ACTIVE;
+        boolean inMatch = inMatch(level);
         if (inMatch && !wasInMatch) LOCAL.begin(level);
         else if (inMatch) LOCAL.observe(level);
         else if (wasInMatch) LOCAL.finish(level);

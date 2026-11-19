@@ -1,6 +1,7 @@
 package com.habitrain.core.game.sre.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayKillSounds;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.network.replay.ReplayTracks;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
@@ -42,6 +43,7 @@ public final class ReplayBoardService {
 
     public static void register() {
         MatchReplayRecorder.register();
+        MatchKillSoundRecorder.register();
         ServerLifecycleEvents.SERVER_STARTING.register(s -> {
             server = s;
             worker = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(2), task -> {
@@ -50,6 +52,7 @@ public final class ReplayBoardService {
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(s -> {
             MatchReplayRecorder.reset();
+            MatchKillSoundRecorder.resetPending();
             server = null;
             latest = null;
             TRANSFERS.clear();
@@ -112,18 +115,31 @@ public final class ReplayBoardService {
     }
 
     public static void publish(LastMatchReplay summary, CompletableFuture<ReplayMapCapture.Result> map, byte[] voice) {
+        publish(summary, map, voice, CompletableFuture.completedFuture(summary.killSounds()));
+    }
+
+    static void publish(LastMatchReplay summary, CompletableFuture<ReplayMapCapture.Result> map, byte[] voice,
+                        CompletableFuture<List<ReplayKillSounds.Window>> killSounds) {
         MinecraftServer owner = server;
         if (owner == null) return;
+        long finishedAt = System.currentTimeMillis();
+        killSounds.thenAccept(windows -> owner.execute(() -> {
+            if (server == owner) publishReady(owner, summary.withKillSounds(windows), map, voice, finishedAt);
+        }));
+    }
+
+    private static void publishReady(MinecraftServer owner, LastMatchReplay summary,
+                                     CompletableFuture<ReplayMapCapture.Result> map, byte[] voice, long finishedAt) {
         byte[] voiceBytes = voice == null ? new byte[0] : voice.clone();
         var data = new ArrayList<List<LastMatchReplay.Sample>>(summary.participants().size() + summary.drones().size());
         summary.participants().forEach(p -> data.add(p.track()));
         summary.drones().forEach(drone -> data.add(drone.track()));
         var encoded = ReplayTracks.encodeWithStatus(data);
         byte[] tracks = encoded.bytes();
-        long finishedAt = System.currentTimeMillis();
         if (map != null) map.thenAccept(result -> {
             if (result != null) ReplayArchiveService.archive(owner, makePacket(summary, tracks, result, encoded.thinned()), result, finishedAt, voiceBytes);
         });
+        if (latest != null && latest.packet.replay().playbackAnchorTick() > summary.playbackAnchorTick()) return;
         var resolved = map == null ? null : map.getNow(null);
         publishRevision(summary, tracks, resolved, true, encoded.thinned(), voiceBytes);
         if (map != null && !map.isDone()) map.thenAccept(result -> {
@@ -162,7 +178,7 @@ public final class ReplayBoardService {
                 s.winStatus(), s.winKind(), s.customWinId(), s.customTitleJson(), s.customSubtitleJson(), s.customColor(),
                 s.origin(), map == null ? null : map.manifest(), people, s.events(), s.spans(),
                 s.mvp(), s.killCount(), s.limited() || tracksThinned, s.drones().stream()
-                        .map(d -> new LastMatchReplay.Drone(d.id(), d.owner(), List.of())).toList());
+                        .map(d -> new LastMatchReplay.Drone(d.id(), d.owner(), List.of())).toList(), s.killSounds());
         return new LastMatchSummaryS2C(replay, tracks);
     }
 
@@ -275,7 +291,8 @@ public final class ReplayBoardService {
                 continue;
             }
             if (t.indices == null) {
-                ServerPlayNetworking.send(player, t.round.packet);
+                ServerPlayNetworking.send(player, ServerPlayNetworking.canSend(player, CaptureKillSoundS2C.TYPE)
+                        ? t.round.packet : t.round.packet.withoutKillSounds());
                 iterator.remove();
                 continue;
             }

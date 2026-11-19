@@ -69,10 +69,13 @@ public final class ReplayExportClient {
         return screen instanceof ReplayBoardControlsScreen || screen instanceof ReplayExportScreen;
     }
 
-    /** An Escape in the export page closes that page. Only a new press in the background cancels. */
-    public static boolean cancelInBackground(Minecraft client) {
+    private static boolean canCancelWithEscape(Minecraft client) {
         return client.level != null && client.player != null && client.getOverlay() == null
-                && !isExportScreen(client.screen) && video != null && video.running() && video.cancel();
+                && client.screen == null && client.isWindowActive() && client.mouseHandler.isMouseGrabbed();
+    }
+
+    public static boolean cancelInBackground(Minecraft client) {
+        return video != null && video.running() && canCancelWithEscape(client) && video.cancel();
     }
 
     public static void renderFrame(Minecraft client) {
@@ -103,8 +106,8 @@ public final class ReplayExportClient {
                 ? ReplayBoardTexts.tr("export.hud_saved") : video.status();
         var lines = font.split(status, width - 16);
         int barY = top + 22 + lines.size() * font.lineHeight;
-        boolean running = video.running();
-        int bottom = barY + (running ? 24 : 10);
+        boolean showCancelHint = video.running() && canCancelWithEscape(client);
+        int bottom = barY + (showCancelHint ? 24 : 10);
 
         g.fill(left, top, right, bottom, 0xEA0D1727);
         g.renderOutline(left, top, width, bottom - top, ReplayPalette.BRASS_DIM);
@@ -117,7 +120,7 @@ public final class ReplayExportClient {
         g.fill(left + 8, barY, right - 8, barY + 4, 0xFF313F53);
         int filled = (int) ((width - 16) * video.displayProgress());
         g.fill(left + 8, barY, left + 8 + filled, barY + 4, 0xFF52C5B9);
-        if (running) {
+        if (showCancelHint) {
             g.drawString(font, ReplayBoardTexts.tr("export.hud_cancel"), left + 8, barY + 10, ReplayPalette.TEXT_MUTED, false);
         }
         g.flush();

@@ -45,6 +45,54 @@ class OptionVoteAutoPickTest {
     }
 
     @Test
+    void manualRandomMapChoiceCanDrawEveryDisplayedMapEvenAfterVoting() {
+        OptionVoteState.update(payload("map", 10));
+        OptionVoteState.select("map_a");
+
+        assertTrue(OptionVoteState.hasRandomMapChoice());
+        for (int index = 0; index < 2; index++) {
+            int drawnIndex = index;
+            int candidateIndex = OptionVoteState.randomMapCandidateIndex(bound -> {
+                assertEquals(2, bound);
+                return drawnIndex;
+            });
+            assertEquals(List.of("map_a", "map_b").get(index),
+                    OptionVoteState.getCandidates().get(candidateIndex).optionId());
+        }
+    }
+
+    @Test
+    void manualRandomMapChoiceUsesTheLatestCandidateList() {
+        OptionVoteState.update(payload("map", 10));
+        OptionVoteState.update(new OptionVotePayload(
+                "map", true, 9, 10, 1, "map", "", "",
+                List.of(new OptionVotePayload.Entry("only_map", "Only Map", 0))));
+
+        int candidateIndex = OptionVoteState.randomMapCandidateIndex(bound -> {
+            assertEquals(1, bound);
+            return 0;
+        });
+        assertEquals("only_map", OptionVoteState.getCandidates().get(candidateIndex).optionId());
+    }
+
+    @Test
+    void manualRandomMapChoiceCannotDrawOutsideAnActiveMapVote() {
+        OptionVoteState.update(payload("mode", 10));
+        assertFalse(OptionVoteState.hasRandomMapChoice());
+        assertEquals(-1, OptionVoteState.randomMapCandidateIndex(bound -> 0));
+
+        OptionVoteState.update(new OptionVotePayload(
+                "map", true, 10, 10, 1, "map", "", "", List.of()));
+        assertFalse(OptionVoteState.hasRandomMapChoice());
+        assertEquals(-1, OptionVoteState.randomMapCandidateIndex(bound -> 0));
+
+        OptionVoteState.update(new OptionVotePayload(
+                "map", false, 0, 10, 1, "map", "", "",
+                List.of(new OptionVotePayload.Entry("map_a", "Map A", 0))));
+        assertEquals(-1, OptionVoteState.randomMapCandidateIndex(bound -> 0));
+    }
+
+    @Test
     void hidingUnselectedVotePicksImmediatelyForModeAndMap() {
         for (String voteId : List.of("mode", "map")) {
             OptionVoteState.clear();

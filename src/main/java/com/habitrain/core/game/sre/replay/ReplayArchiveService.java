@@ -429,14 +429,18 @@ public final class ReplayArchiveService {
                     CustomPacketPayload next = delivery.packets.next();
                     int bytes = next instanceof Section s ? s.data().bytes().length + 64
                             : next instanceof Voice v ? v.data().bytes().length + 64
-                            : next instanceof Summary s ? s.data().tracks().length + 128 * 1024 : 64;
+                            : next instanceof Summary s ? s.data().tracks().length + 128 * 1024
+                            + 144 * s.data().replay().killSounds().stream().mapToInt(window -> window.cues().size()).sum() : 64;
                     delivery = new Delivery(delivery.player, delivery.packets, next,
                             bandwidth.reserve(entry.getKey(), bytes, RATE));
                     entry.setValue(delivery);
                 }
                 if (bandwidth.nowNanos() - delivery.at < 0) continue;
                 if (ServerPlayNetworking.canSend(delivery.player, delivery.next.type())) {
-                    ServerPlayNetworking.send(delivery.player, delivery.next);
+                    CustomPacketPayload payload = delivery.next instanceof Summary summary
+                            && !ServerPlayNetworking.canSend(delivery.player, ReplayPackets.CaptureKillSoundS2C.TYPE)
+                            ? new Summary(summary.data().withoutKillSounds()) : delivery.next;
+                    ServerPlayNetworking.send(delivery.player, payload);
                     UUID round = delivery.next instanceof Summary s ? s.data().replay().roundId()
                             : delivery.next instanceof Reply r && r.status() == CACHED ? r.round() : null;
                     if (round != null) {

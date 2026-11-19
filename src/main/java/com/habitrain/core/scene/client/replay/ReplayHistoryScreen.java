@@ -121,9 +121,12 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     @Override public void tick() {
+        boolean audioPlaying = playing;
         if (playing) {
-            cursor = Math.min(duration(), cursor + 1);
-            if (cursor >= duration()) playing = false;
+            double end = duration() + (view != null && view.replay() != null && view.replay().lastKill() != null
+                    && view.replay().lastKill().tick() >= duration() - 40 ? 50 : 0);
+            cursor = Math.min(end, cursor + 1);
+            if (cursor >= end) playing = false;
         }
         refresh();
         ReplayAudioPlaybackController.updateHistory(
@@ -131,7 +134,7 @@ public final class ReplayHistoryScreen extends Screen {
                 id,
                 view == null ? null : view.replay(),
                 view == null ? ReplayVoiceData.EMPTY : view.voice(),
-                playing,
+                audioPlaying,
                 cursor);
     }
 
@@ -147,7 +150,7 @@ public final class ReplayHistoryScreen extends Screen {
 
     @Override public boolean mouseDragged(double x, double y, int button, double dx, double dy) {
         if (button == 0 && inPreview(x - dx, y - dy) && model != null) {
-            yaw = (yaw + dx * .014) % (Math.PI * 2);
+            yaw = (yaw - dx * .014) % (Math.PI * 2);
             pitch = Math.clamp(pitch - dy * .012, .22, 1.48);
             return true;
         }
@@ -216,11 +219,11 @@ public final class ReplayHistoryScreen extends Screen {
     private final class Scrubber extends AbstractSliderButton {
         Scrubber(int x, int y, int w) { super(x, y, w, 20, Component.empty(), 0); }
         void updatePosition() {
-            value = cursor / Math.max(1, duration());
+            value = Math.min(cursor, duration()) / Math.max(1, duration());
             updateMessage();
         }
         @Override protected void updateMessage() {
-            setMessage(Component.literal(ReplayStagePlan.clock(cursor) + " / " + ReplayStagePlan.clock(duration())));
+            setMessage(Component.literal(ReplayStagePlan.clock(Math.min(cursor, duration())) + " / " + ReplayStagePlan.clock(duration())));
         }
         @Override protected void applyValue() {
             cursor = value * duration();

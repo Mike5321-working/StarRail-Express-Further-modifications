@@ -238,6 +238,7 @@ public final class ReplayBoardRenderer {
         var round = ClientReplayBoard.availableRound();
         MultiBufferSource.BufferSource source = buffers();
         var camera = context.camera();
+        boolean allowBoardAudio = !ClientReplayBoard.inMatch(level);
         Set<BlockPos> activeAudioBoards = new HashSet<>();
         List<BoardDraw> boards = new ArrayList<>(MAX_BOARDS);
         try (var guard = ClientRenderState.capture()) {
@@ -275,7 +276,7 @@ public final class ReplayBoardRenderer {
                 var site = new ReplayBoardSite(c.pos(), c.facing(), c.distance(), display, table, c.settings().scale(),
                         WORLD_TRAY_HALF_SIZE, WORLD_TRAY_HALF_SIZE, fade,
                         c.distance() < ReplayStagePlan.DETAIL_DISTANCE * distScale, light);
-                if (active && shown != null) {
+                if (active && shown != null && allowBoardAudio && activeAudioBoards.isEmpty()) {
                     activeAudioBoards.add(c.pos().immutable());
                     ReplayAudioPlaybackController.updateBoard(mc, c.pos(), cam, site, shown, selected, true, elapsed);
                 }

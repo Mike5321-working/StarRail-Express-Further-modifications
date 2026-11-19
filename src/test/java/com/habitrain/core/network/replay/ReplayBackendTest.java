@@ -217,6 +217,34 @@ class ReplayBackendTest {
         } finally { buf.release(); }
     }
 
+    @Test void killSoundsRoundTripWithOptionalLegacySummary() {
+        var file = net.minecraft.resources.ResourceLocation.parse("test:sounds/role_hint.ogg");
+        var cue = new com.habitrain.core.api.match.replay.ReplayKillSounds.Cue(180, file, .35f, 1.25f);
+        var window = new com.habitrain.core.api.match.replay.ReplayKillSounds.Window(0, List.of(cue));
+        var events = List.of(new Node(100, Kind.KILL, null, PLAYER, null, Position.quantize(1, 2, 3), "", 0));
+        var replay = new LastMatchReplay(ROUND, 0, 100, "Train", "murder", "", MatchWinKind.INNOCENT, "", "", "",
+                0, BOUNDS, null, List.of(), events, List.of(), null, 1, false).withKillSounds(List.of(window));
+        var packet = new LastMatchSummaryS2C(replay, new byte[0]);
+        assertEquals(List.of(window), ReplayArchiveData.decode(ReplayArchiveData.encode(packet)).replay().killSounds());
+        var old = ReplayArchiveData.decode(ReplayArchiveData.encode(packet.withoutKillSounds())).replay();
+        assertTrue(old.killSounds().isEmpty());
+        assertEquals(events, old.events());
+
+        var buffer = new FriendlyByteBuf(Unpooled.buffer());
+        try {
+            var report = new ReplayPackets.KillSoundC2S(ROUND, List.of(cue));
+            ReplayPackets.KillSoundC2S.CODEC.encode(buffer, report);
+            assertEquals(report, ReplayPackets.KillSoundC2S.CODEC.decode(buffer));
+            buffer.clear();
+            buffer.writeUUID(ROUND).writeVarInt(49);
+            assertThrows(io.netty.handler.codec.DecoderException.class, () -> ReplayPackets.KillSoundC2S.CODEC.decode(buffer));
+            buffer.clear();
+            var capture = new ReplayPackets.CaptureKillSoundS2C(ROUND, new net.minecraft.world.phys.Vec3(1, 2, 3), 9876L);
+            ReplayPackets.CaptureKillSoundS2C.CODEC.encode(buffer, capture);
+            assertEquals(capture, ReplayPackets.CaptureKillSoundS2C.CODEC.decode(buffer));
+        } finally { buffer.release(); }
+    }
+
     @Test void aTableHasOneScheduledPassAndElapsedVideoDoesNotLoop() {
         var timeline = new ReplayTimeline(0, 800, List.of(240));
         var start = new com.habitrain.core.scene.block.SettlementSummaryBoard.Marker.Playback(

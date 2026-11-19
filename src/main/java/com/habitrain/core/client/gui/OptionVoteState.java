@@ -175,6 +175,14 @@ public final class OptionVoteState {
         return candidates;
     }
 
+    static boolean hasRandomMapChoice() {
+        return "map".equals(voteId) && !candidates.isEmpty();
+    }
+
+    static int randomMapCandidateIndex(IntUnaryOperator randomIndex) {
+        return active && hasRandomMapChoice() ? pickRandomIndex(randomIndex) : -1;
+    }
+
     public static boolean isSelected(String optionId) {
         return optionId != null && optionId.equals(selectedOptionId);
     }
@@ -213,11 +221,14 @@ public final class OptionVoteState {
         if (!uiHiddenByUser && (!"map".equals(voteId) || remainingSeconds > 1)) {
             return null;
         }
-        int rawIndex = randomIndex == null ? 0 : randomIndex.applyAsInt(candidates.size());
-        int index = Math.floorMod(rawIndex, candidates.size());
-        selectedOptionId = candidates.get(index).optionId();
+        selectedOptionId = candidates.get(pickRandomIndex(randomIndex)).optionId();
         autoPickedOptionId = selectedOptionId;
         return selectedOptionId;
+    }
+
+    private static int pickRandomIndex(IntUnaryOperator randomIndex) {
+        int size = candidates.size();
+        return randomIndex == null ? 0 : Math.floorMod(randomIndex.applyAsInt(size), size);
     }
 
     public static void toggleSelection(String optionId) {

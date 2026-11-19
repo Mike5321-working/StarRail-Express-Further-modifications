@@ -10,8 +10,10 @@ import static org.junit.jupiter.api.Assertions.*;
 import com.habitrain.core.api.match.MatchWinFaction;
 import com.habitrain.core.api.match.MatchWinKind;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayKillSounds;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.api.scene.model.SceneBounds;
+import net.minecraft.resources.ResourceLocation;
 
 class ReplayVoiceCodecAndSyncTest {
 
@@ -133,6 +135,106 @@ class ReplayVoiceCodecAndSyncTest {
                 .filter(c -> c.candidates().contains("starrailexpress:item.revolver.shoot"))
                 .findFirst().orElseThrow();
         assertEquals(expectedBoardKill0, boardShot.time(), 1e-6);
+    }
+
+    @Test
+    void recordedPrivateCueReplacesSimulatedKillSoundOnAllThreeTimelines() {
+        UUID victim = UUID.randomUUID();
+        var pos = LastMatchReplay.Position.quantize(10, 2, 10);
+        var kill = new LastMatchReplay.Node(100, LastMatchReplay.Kind.KILL, null, victim, null, pos, "knife", 0);
+        var privateSound = ResourceLocation.parse("noellesroles:sounds/role/private_hint.ogg");
+        var replay = new LastMatchReplay(UUID.randomUUID(), 0, 120, "Train", "classic", "", MatchWinKind.KILLER,
+                "", "", "", 0, new SceneBounds(0, 0, 32, 80, 16, 64), null,
+                List.of(), List.of(kill), List.of(), null, 1, false).withKillSounds(List.of(
+                new ReplayKillSounds.Window(0, List.of(new ReplayKillSounds.Cue(-200, privateSound, .35f, 1.3f)))));
+        var video = new ReplayVideoScript(replay);
+        var board = new ReplayTimeline(replay);
+
+        var live = ReplaySoundCuePlan.forLinearReplay(replay, null).sounds();
+        var table = ReplaySoundCuePlan.forBoard(replay, board, null).sounds();
+        var export = ReplaySoundCuePlan.forVideo(replay, video, null).sounds();
+        assertEquals(1, live.size());
+        assertEquals(1, table.size());
+        assertEquals(1, export.size());
+        assertEquals(privateSound, live.getFirst().recordedFile());
+        assertEquals(96.0, live.getFirst().time(), 1e-6);
+        assertEquals(board.actionTickAt(100) - 4, table.getFirst().time(), 1e-6);
+        assertEquals(video.beats().getFirst().impact() - .2, export.getFirst().time(), 1e-6);
+        assertEquals(.35f, export.getFirst().volume());
+        assertEquals(1.3f, export.getFirst().pitch());
+
+        var silent = replay.withKillSounds(List.of(new ReplayKillSounds.Window(0, List.of())));
+        assertFalse(ReplaySoundCuePlan.forLinearReplay(silent, null).sounds().isEmpty());
+        var legacy = replay.withKillSounds(List.of());
+        assertEquals(ReplaySoundCuePlan.forLinearReplay(legacy, null).sounds(),
+                ReplaySoundCuePlan.forLinearReplay(replay, null, file -> false).sounds());
+        assertEquals(ReplaySoundCuePlan.forBoard(legacy, board, null).sounds(),
+                ReplaySoundCuePlan.forBoard(replay, board, null, file -> false).sounds());
+        assertEquals(ReplaySoundCuePlan.forVideo(legacy, video, null).sounds(),
+                ReplaySoundCuePlan.forVideo(replay, video, null, file -> false).sounds());
+    }
+
+    @Test
+    void boardSchedulesFinalImpactAndItsFullRecordedTailIntoReview() {
+        var kill = knifeKillAt(600);
+        var file = ResourceLocation.parse("test:sounds/finish.ogg");
+        var replay = replayWithKills(600, kill).withKillSounds(List.of(new ReplayKillSounds.Window(0, List.of(
+                new ReplayKillSounds.Cue(0, file, .5f, 1f),
+                new ReplayKillSounds.Cue(ReplayKillSounds.AFTER_MS, file, .5f, 1f)))));
+        var timeline = new ReplayTimeline(replay);
+        double impact = timeline.actionTickAt(replay.durationTicks());
+        var sounds = ReplaySoundCuePlan.forBoard(replay, timeline, null).sounds();
+
+        assertEquals(2, sounds.size());
+        assertEquals(impact, sounds.getFirst().time(), 1e-6);
+        double tail = sounds.getLast().time();
+        assertEquals(impact + 20, tail, 1e-6);
+        assertEquals(ReplayTimeline.Phase.REVIEW, timeline.atElapsed(ReplayTimeline.INTRO + tail).phase());
+    }
+
+    @Test
+    void overlappingSecondaryKillVoiceUsesOnlyTheGapAfterTheFeaturedVoice() {
+        var replay = replayWithKills(600, knifeKillAt(200), knifeKillAt(200));
+        var featured = voiceClip(0, 200, -400, 1);
+        var secondary = voiceClip(1, 200, -500, 2);
+        var voice = new ReplayVoiceData(List.of(featured, secondary));
+        var featuredOnly = new ReplayVoiceData(List.of(featured));
+        var timeline = new ReplayTimeline(replay);
+        var script = new ReplayVideoScript(replay);
+
+        var board = ReplaySoundCuePlan.forBoard(replay, timeline, voice).voices();
+        var video = ReplaySoundCuePlan.forVideo(replay, script, voice).voices();
+        assertVoiceFitsAfterFeatured(board, ReplaySoundCuePlan.forBoard(replay, timeline, featuredOnly).voices().getFirst(),
+                secondary, 20);
+        assertVoiceFitsAfterFeatured(video, ReplaySoundCuePlan.forVideo(replay, script, featuredOnly).voices().getFirst(),
+                secondary, 1);
+    }
+
+    private static void assertVoiceFitsAfterFeatured(List<ReplaySoundCuePlan.VoiceCue> voices,
+                                                     ReplaySoundCuePlan.VoiceCue original,
+                                                     ReplayVoiceData.Clip secondary, double unitsPerSecond) {
+        assertEquals(2, voices.size());
+        assertEquals(original, voices.getFirst());
+        var added = voices.getLast();
+        assertSame(secondary, added.clip());
+        assertTrue(added.startTime() >= original.endTime() + .08 * unitsPerSecond - 1e-6);
+        assertTrue(added.sampleStartTime(unitsPerSecond) < added.startTime());
+    }
+
+    private static LastMatchReplay.Node knifeKillAt(int tick) {
+        var pos = LastMatchReplay.Position.quantize(10, 2, 10);
+        return new LastMatchReplay.Node(tick, LastMatchReplay.Kind.KILL, null, UUID.randomUUID(), null, pos, "knife", 0);
+    }
+
+    private static LastMatchReplay replayWithKills(int duration, LastMatchReplay.Node... kills) {
+        return new LastMatchReplay(UUID.randomUUID(), 0, duration, "Train", "classic", "", MatchWinKind.KILLER,
+                "", "", "", 0, new SceneBounds(0, 0, 0, 80, 16, 64), null,
+                List.of(), List.of(kills), List.of(), null, kills.length, false);
+    }
+
+    private static ReplayVoiceData.Clip voiceClip(int eventIndex, int tick, int offsetMs, int seconds) {
+        short[] samples = new short[seconds * ReplayVoiceData.SAMPLE_RATE];
+        return new ReplayVoiceData.Clip(eventIndex, tick, offsetMs, samples.length, ReplayVoiceData.encodeAdpcm(samples));
     }
 
     private static double pearsonCorrelation(short[] a, short[] b, int start, int end) {

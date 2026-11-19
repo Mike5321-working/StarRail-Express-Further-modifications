@@ -21,6 +21,8 @@ import javax.sound.sampled.AudioFormat;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -59,11 +61,14 @@ final class ReplayVideoAudioRenderer {
 
     static Supplier<short[]> prepare(Minecraft client, LastMatchReplay replay, ReplayVideoScript script,
                                      ReplayVoiceData voice, int frames) {
-        var schedule = ReplaySoundCuePlan.forVideo(replay, script, voice);
+        var schedule = ReplaySoundCuePlan.forVideo(replay, script, voice,
+                file -> client != null && client.getResourceManager().getResource(file).isPresent());
         var assets = new HashMap<List<String>, List<SoundAsset>>();
         var random = RandomSource.create(0x5245504C4159L);
         if (client != null) for (var cue : schedule.sounds()) {
-            assets.computeIfAbsent(cue.candidates(), keys -> resolve(client, keys, random));
+            assets.computeIfAbsent(soundKey(cue), keys -> cue.recordedFile() == null ? resolve(client, keys, random)
+                    : client.getResourceManager().getResource(cue.recordedFile())
+                            .map(resource -> List.of(new SoundAsset(cue.recordedFile(), resource, 1f, 1f))).orElseGet(List::of));
         }
         return () -> renderSchedule(schedule, keys -> decode(assets.getOrDefault(keys, List.of())), frames);
     }
@@ -75,15 +80,20 @@ final class ReplayVideoAudioRenderer {
 
         float[] mixL = new float[Math.min(SAMPLE_RATE, totalStereoFrames)];
         float[] mixR = new float[mixL.length];
-        Map<List<String>, Optional<DecodedSound>> cache = new HashMap<>();
+        var cache = new LinkedHashMap<List<String>, Optional<DecodedSound>>(32, 0.75f, true);
+        var ended = new IdentityHashMap<ReplaySoundCuePlan.SoundCue, Integer>();
         var voices = new java.util.IdentityHashMap<ReplayVoiceData.Clip, short[]>();
         for (int offset = 0; offset < totalStereoFrames; offset += mixL.length) {
             checkInterrupted();
             java.util.Arrays.fill(mixL, 0);
             java.util.Arrays.fill(mixR, 0);
             for (var cue : schedule.sounds()) {
-                DecodedSound asset = cache.computeIfAbsent(cue.candidates(), keys -> Optional.ofNullable(resolver.resolve(keys))).orElse(null);
-                if (asset != null && asset.samples().length != 0) mixSoundCue(mixL, mixR, totalStereoFrames, offset, cue, asset);
+                if (Math.round(cue.time() * SAMPLE_RATE) >= offset + mixL.length
+                        || ended.getOrDefault(cue, totalStereoFrames) <= offset) continue;
+                DecodedSound asset = cache.computeIfAbsent(soundKey(cue), keys -> Optional.ofNullable(resolver.resolve(keys))).orElse(null);
+                if (cache.size() > 32) cache.pollFirstEntry();
+                int end = asset == null ? offset : mixSoundCue(mixL, mixR, totalStereoFrames, offset, cue, asset);
+                ended.put(cue, end);
             }
             int nextAllowedVoiceSample = 0;
             for (var cue : schedule.voices()) {
@@ -95,15 +105,19 @@ final class ReplayVideoAudioRenderer {
         return pcm;
     }
 
-    private static void mixSoundCue(float[] mixL, float[] mixR, int totalStereoFrames, int offset,
+    private static List<String> soundKey(ReplaySoundCuePlan.SoundCue cue) {
+        return cue.recordedFile() == null ? cue.candidates() : List.of(cue.recordedFile().toString());
+    }
+
+    private static int mixSoundCue(float[] mixL, float[] mixR, int totalStereoFrames, int offset,
                                     ReplaySoundCuePlan.SoundCue cue, DecodedSound asset) {
         int startStereo = (int) Math.round(cue.time() * SAMPLE_RATE);
-        if (startStereo >= totalStereoFrames) return;
+        if (startStereo >= totalStereoFrames) return totalStereoFrames;
 
         float effectivePitch = Math.clamp(cue.pitch() * asset.soundPitch(), 0.45f, 2.2f);
         double srcStep = (asset.sampleRate() * effectivePitch) / (double) SAMPLE_RATE;
         int srcFrames = asset.samples().length / Math.max(1, asset.channels());
-        if (srcFrames <= 0 || srcStep <= 0) return;
+        if (srcFrames <= 0 || srcStep <= 0) return offset;
 
         int dstFrames = (int) Math.floor((srcFrames - 1) / srcStep) + 1;
         float gain = cue.volume() * asset.soundVolume() * 0.85f;
@@ -137,16 +151,16 @@ final class ReplayVideoAudioRenderer {
             mixL[dst - offset] += lSample * gainL;
             mixR[dst - offset] += rSample * gainR;
         }
+        return Math.min(totalStereoFrames, startStereo + dstFrames);
     }
 
     private static int mixVoiceCue(float[] mixL, float[] mixR, int totalStereoFrames, int offset,
                                    ReplaySoundCuePlan.VoiceCue voiceCue, int minStartSample, short[] samples) {
-        ReplayVoiceData.Clip clip = voiceCue.clip();
         if (samples.length == 0) return minStartSample;
 
-        long impactSample = Math.round(voiceCue.impactTime() * SAMPLE_RATE);
-        long rawStartSample = impactSample + Math.round(clip.offsetMs() * (SAMPLE_RATE / 1000.0));
-        int activeStart = (int) Math.max(minStartSample, Math.max(0L, rawStartSample));
+        long rawStartSample = Math.round(voiceCue.sampleStartTime(1.0) * SAMPLE_RATE);
+        long scheduledStartSample = Math.round(voiceCue.startTime() * SAMPLE_RATE);
+        int activeStart = (int) Math.max(minStartSample, Math.max(rawStartSample, scheduledStartSample));
         int maxEnd = (int) Math.min(totalStereoFrames, Math.min(Math.round(voiceCue.endTime() * SAMPLE_RATE),
                 rawStartSample + samples.length));
         int count = maxEnd - activeStart;
@@ -188,8 +202,8 @@ final class ReplayVideoAudioRenderer {
 
             float l = softLimit(mixL[i - offset] * env);
             float r = softLimit(mixR[i - offset] * env);
-            outInterleaved[i * 2] = (short) Math.clamp(Math.round(l * 32767.0f), Short.MIN_VALUE, Short.MAX_VALUE);
-            outInterleaved[i * 2 + 1] = (short) Math.clamp(Math.round(r * 32767.0f), Short.MIN_VALUE, Short.MAX_VALUE);
+            outInterleaved[i * 2] = (short) Math.round(l * ReplayAudioPlaybackController.REPLAY_GAIN * 32767.0f);
+            outInterleaved[i * 2 + 1] = (short) Math.round(r * ReplayAudioPlaybackController.REPLAY_GAIN * 32767.0f);
         }
     }
 

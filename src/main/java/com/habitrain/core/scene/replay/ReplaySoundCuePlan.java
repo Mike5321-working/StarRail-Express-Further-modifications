@@ -1,11 +1,15 @@
 package com.habitrain.core.scene.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayKillSounds;
 import com.habitrain.core.api.match.replay.ReplayProjection;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import org.jetbrains.annotations.Nullable;
+import net.minecraft.resources.ResourceLocation;
 
 import java.util.*;
+import java.util.function.IntToDoubleFunction;
+import java.util.function.Predicate;
 
 /**
  * Shared deterministic audio cue planner for both exported replay videos and live 3D board / history
@@ -31,9 +35,14 @@ public final class ReplaySoundCuePlan {
      * @param pitch       playback pitch multiplier
      * @param pan         stereo pan (-1 left .. +1 right, 0 center)
      */
-    public record SoundCue(double time, int eventIndex, List<String> candidates, float volume, float pitch, float pan) {
+    public record SoundCue(double time, int eventIndex, List<String> candidates, float volume, float pitch, float pan,
+                           @Nullable ResourceLocation recordedFile) {
         public SoundCue {
             candidates = List.copyOf(candidates);
+        }
+
+        public SoundCue(double time, int eventIndex, List<String> candidates, float volume, float pitch, float pan) {
+            this(time, eventIndex, candidates, volume, pitch, pan, null);
         }
     }
 
@@ -41,12 +50,16 @@ public final class ReplaySoundCuePlan {
      * One recorded proximity voice segment anchored to a close-up/highlight.
      *
      * @param clip       recorded voice data
-     * @param startTime  timeline start (video seconds or presentation/match ticks)
+     * @param startTime  audible start after trimming (video seconds or presentation/match ticks)
      * @param impactTime timeline impact instant (where clip offset {@code 0ms} lands)
      * @param endTime    maximum allowed end time before cutting or fading out
      * @param pan        stereo pan (-1 .. +1)
      */
-    public record VoiceCue(ReplayVoiceData.Clip clip, double startTime, double impactTime, double endTime, float pan) {}
+    public record VoiceCue(ReplayVoiceData.Clip clip, double startTime, double impactTime, double endTime, float pan) {
+        public double sampleStartTime(double unitsPerSecond) {
+            return impactTime + clip.offsetMs() * unitsPerSecond / 1000.0;
+        }
+    }
 
     public record Schedule(List<SoundCue> sounds, List<VoiceCue> voices) {
         public static final Schedule EMPTY = new Schedule(List.of(), List.of());
@@ -92,6 +105,11 @@ public final class ReplaySoundCuePlan {
 
     /** Builds the sample-synchronized audio schedule for an exported video ({@code time} in video seconds). */
     public static Schedule forVideo(LastMatchReplay replay, ReplayVideoScript script, @Nullable ReplayVoiceData voice) {
+        return forVideo(replay, script, voice, file -> true);
+    }
+
+    public static Schedule forVideo(LastMatchReplay replay, ReplayVideoScript script, @Nullable ReplayVoiceData voice,
+                                    Predicate<ResourceLocation> availableSound) {
         if (replay == null || script == null) return Schedule.EMPTY;
         List<LastMatchReplay.Node> events = replay.events();
         Map<LastMatchReplay.Node, Integer> indexMap = identityIndices(events);
@@ -100,11 +118,13 @@ public final class ReplaySoundCuePlan {
         Map<Integer, LastMatchReplay.Node> pairedGunshotToKill = findPairedGunshots(events);
         Set<Integer> suppressedGunshots = pairedGunshotToKill.keySet();
         Map<Integer, ReplayVoiceData.Clip> clipByEvent = indexVoiceClips(voice);
+        var recorded = indexKillSounds(replay, availableSound);
 
         List<SoundCue> soundCues = new ArrayList<>();
         List<VoiceCue> voiceCues = new ArrayList<>();
         double actionStart = script.actStart(ReplayVideoScript.Act.ACTION);
         double reviewStart = script.actStart(ReplayVideoScript.Act.REVIEW);
+        double soundEnd = Math.max(actionStart, reviewStart - 0.05);
         double lastVoiceEnd = actionStart;
 
         List<ReplayVideoScript.Beat> beats = script.beats();
@@ -122,12 +142,9 @@ public final class ReplaySoundCuePlan {
                 if (shotIdx >= 0) handledEvents.add(shotIdx);
             }
 
-            List<RelativeSound> sounds = resolveEventSounds(beat.node(), pairedShot);
-            for (RelativeSound rel : sounds) {
-                double cueTime = Math.clamp(beat.impact() + rel.offsetSeconds(),
-                        Math.max(0.05, actionStart - 0.15), Math.max(actionStart, reviewStart - 0.05));
-                soundCues.add(new SoundCue(cueTime, primaryIdx, rel.candidates(), rel.volume(), rel.pitch(), pan));
-            }
+            addSounds(soundCues, recorded, primaryIdx, beat.node(), pairedShot, beat.impact(), 1.0,
+                    Math.max(0.05, actionStart - (recorded.containsKey(primaryIdx) ? 2.0 : .15)),
+                    soundEnd, soundEnd, 1f, pan);
 
             ReplayVoiceData.Clip clip = findClipForBeat(primaryIdx, pairedShot == null ? -1 : indexMap.getOrDefault(pairedShot, -1), clipByEvent);
             if (clip != null && clip.sampleCount() > 0) {
@@ -141,7 +158,7 @@ public final class ReplaySoundCuePlan {
                 double desiredEnd = rawStart + clip.durationSeconds();
                 double effectiveEnd = Math.min(maxEnd, desiredEnd);
                 if (effectiveEnd - effectiveStart >= 0.18 && anchorShift < clip.durationSeconds() - 0.18) {
-                    voiceCues.add(new VoiceCue(clip, rawStart, beat.impact(), effectiveEnd, pan));
+                    voiceCues.add(new VoiceCue(clip, effectiveStart, beat.impact(), effectiveEnd, pan));
                     lastVoiceEnd = effectiveEnd;
                 }
             }
@@ -159,12 +176,11 @@ public final class ReplaySoundCuePlan {
             double impactTime = script.videoTimeOf(node.tick());
             float pan = panFor(layout, node);
             LastMatchReplay.Node pairedShot = findPairedShotForKill(events, i, node);
-            for (RelativeSound rel : resolveEventSounds(node, pairedShot)) {
-                double cueTime = Math.clamp(impactTime + rel.offsetSeconds(), actionStart, Math.max(actionStart, reviewStart - 0.05));
-                soundCues.add(new SoundCue(cueTime, i, rel.candidates(), rel.volume() * 0.72f, rel.pitch(), pan));
-            }
+            addSounds(soundCues, recorded, i, node, pairedShot, impactTime, 1.0,
+                    actionStart, soundEnd, soundEnd, .72f, pan);
         }
 
+        addUnfeaturedKillVoices(voiceCues, replay, clipByEvent, script::videoTimeOf, 1.0, actionStart, reviewStart);
         soundCues.sort(Comparator.comparingDouble(SoundCue::time));
         voiceCues.sort(Comparator.comparingDouble(VoiceCue::startTime));
         return new Schedule(List.copyOf(soundCues), List.copyOf(voiceCues));
@@ -172,18 +188,25 @@ public final class ReplaySoundCuePlan {
 
     /**
      * Builds the audio schedule for the in-world 3D {@code SettlementSummaryBoard} diorama
-     * ({@code time} in presentation ticks during {@code ReplayTimeline.Phase.PLAY}: {@code 0 .. actionTicks}).
+     * ({@code time} in presentation ticks since {@link ReplayTimeline.Phase#PLAY}, with an effects tail in review).
      */
     public static Schedule forBoard(LastMatchReplay replay, ReplayTimeline timeline, @Nullable ReplayVoiceData voice) {
+        return forBoard(replay, timeline, voice, file -> true);
+    }
+
+    public static Schedule forBoard(LastMatchReplay replay, ReplayTimeline timeline, @Nullable ReplayVoiceData voice,
+                                    Predicate<ResourceLocation> availableSound) {
         if (replay == null || timeline == null) return Schedule.EMPTY;
         List<LastMatchReplay.Node> events = replay.events();
         Map<LastMatchReplay.Node, Integer> indexMap = identityIndices(events);
         Map<Integer, LastMatchReplay.Node> pairedGunshotToKill = findPairedGunshots(events);
         Set<Integer> suppressedGunshots = pairedGunshotToKill.keySet();
         Map<Integer, ReplayVoiceData.Clip> clipByEvent = indexVoiceClips(voice);
+        var recorded = indexKillSounds(replay, availableSound);
 
         double actionLength = timeline.cycleTicks() - ReplayTimeline.INTRO - ReplayTimeline.REVIEW - ReplayTimeline.HONORS;
         if (actionLength <= 0) return Schedule.EMPTY;
+        double recordedEnd = actionLength + ReplayKillSounds.AFTER_MS * TICKS_PER_SECOND / 1000.0;
 
         // Replicate ReplayFocusPlan close-up selection so sound cues lock directly onto every close-up zoom.
         List<LastMatchReplay.Node> sorted = events.stream()
@@ -238,10 +261,8 @@ public final class ReplaySoundCuePlan {
             int prio = ReplayFocusPlan.priority(effectiveNode);
             if (prio >= 2 || effectiveNode.kind() == LastMatchReplay.Kind.GUNSHOT) {
                 float gain = prio >= 3 ? 1.0f : 0.7f;
-                for (RelativeSound rel : resolveEventSounds(effectiveNode, pairedShot)) {
-                    double t = Math.clamp(impactTick + rel.offsetSeconds() * TICKS_PER_SECOND, 0.0, Math.max(0.0, actionLength - 1.0));
-                    soundCues.add(new SoundCue(t, effectiveIdx, rel.candidates(), rel.volume() * gain, rel.pitch(), 0f));
-                }
+                addSounds(soundCues, recorded, effectiveIdx, effectiveNode, pairedShot, impactTick, TICKS_PER_SECOND,
+                        0, actionLength - 1.0, recordedEnd, gain, 0f);
             }
 
             ReplayVoiceData.Clip clip = findClipForBeat(effectiveIdx, idx, clipByEvent);
@@ -252,7 +273,7 @@ public final class ReplaySoundCuePlan {
                 double clampedStart = Math.max(0.0, Math.max(clipStartTick, lastVoiceEndTick + 1.0));
                 double clampedEnd = Math.min(actionLength, Math.min(nextCueTick, clipEndTick));
                 if (clampedEnd - clampedStart >= 3.5) {
-                    voiceCues.add(new VoiceCue(clip, clipStartTick, impactTick, clampedEnd, 0f));
+                    voiceCues.add(new VoiceCue(clip, clampedStart, impactTick, clampedEnd, 0f));
                     lastVoiceEndTick = clampedEnd;
                 }
             }
@@ -268,12 +289,11 @@ public final class ReplaySoundCuePlan {
             }
             double impactTick = timeline.actionTickAt(node.tick());
             LastMatchReplay.Node pairedShot = findPairedShotForKill(events, i, node);
-            for (RelativeSound rel : resolveEventSounds(node, pairedShot)) {
-                double t = Math.clamp(impactTick + rel.offsetSeconds() * TICKS_PER_SECOND, 0.0, Math.max(0.0, actionLength - 1.0));
-                soundCues.add(new SoundCue(t, i, rel.candidates(), rel.volume() * 0.65f, rel.pitch(), 0f));
-            }
+            addSounds(soundCues, recorded, i, node, pairedShot, impactTick, TICKS_PER_SECOND,
+                    0, actionLength - 1.0, recordedEnd, .65f, 0f);
         }
 
+        addUnfeaturedKillVoices(voiceCues, replay, clipByEvent, timeline::actionTickAt, TICKS_PER_SECOND, 0, actionLength);
         soundCues.sort(Comparator.comparingDouble(SoundCue::time));
         voiceCues.sort(Comparator.comparingDouble(VoiceCue::startTime));
         return new Schedule(List.copyOf(soundCues), List.copyOf(voiceCues));
@@ -284,10 +304,16 @@ public final class ReplaySoundCuePlan {
      * ({@code time} in match ticks {@code 0 .. durationTicks}).
      */
     public static Schedule forLinearReplay(LastMatchReplay replay, @Nullable ReplayVoiceData voice) {
+        return forLinearReplay(replay, voice, file -> true);
+    }
+
+    public static Schedule forLinearReplay(LastMatchReplay replay, @Nullable ReplayVoiceData voice,
+                                           Predicate<ResourceLocation> availableSound) {
         if (replay == null) return Schedule.EMPTY;
         List<LastMatchReplay.Node> events = replay.events();
         Map<Integer, LastMatchReplay.Node> pairedGunshots = findPairedGunshots(events);
         Map<Integer, ReplayVoiceData.Clip> clipByEvent = indexVoiceClips(voice);
+        var recorded = indexKillSounds(replay, availableSound);
 
         List<SoundCue> soundCues = new ArrayList<>();
         List<VoiceCue> voiceCues = new ArrayList<>();
@@ -303,10 +329,8 @@ public final class ReplaySoundCuePlan {
                 continue;
             }
             LastMatchReplay.Node pairedShot = findPairedShotForKill(events, i, node);
-            for (RelativeSound rel : resolveEventSounds(node, pairedShot)) {
-                double t = Math.clamp(node.tick() + rel.offsetSeconds() * TICKS_PER_SECOND, 0.0, duration);
-                soundCues.add(new SoundCue(t, i, rel.candidates(), rel.volume(), rel.pitch(), 0f));
-            }
+            addSounds(soundCues, recorded, i, node, pairedShot, node.tick(), TICKS_PER_SECOND,
+                    0, duration, duration + ReplayKillSounds.AFTER_MS / 50.0, 1f, 0f);
             ReplayVoiceData.Clip clip = findClipForBeat(i, pairedShot == null ? -1 : i - 1, clipByEvent);
             if (clip != null && clip.sampleCount() > 0) {
                 double rawStart = node.tick() + clip.offsetMs() / 50.0;
@@ -314,7 +338,7 @@ public final class ReplaySoundCuePlan {
                 double start = Math.max(0.0, Math.max(rawStart, lastVoiceEnd + 1.0));
                 double end = Math.min(duration + 40.0, rawEnd);
                 if (end - start >= 3.5) {
-                    voiceCues.add(new VoiceCue(clip, rawStart, node.tick(), end, 0f));
+                    voiceCues.add(new VoiceCue(clip, start, node.tick(), end, 0f));
                     lastVoiceEnd = end;
                 }
             }
@@ -322,6 +346,78 @@ public final class ReplaySoundCuePlan {
         soundCues.sort(Comparator.comparingDouble(SoundCue::time));
         voiceCues.sort(Comparator.comparingDouble(VoiceCue::startTime));
         return new Schedule(List.copyOf(soundCues), List.copyOf(voiceCues));
+    }
+
+    private static Map<Integer, List<ReplayKillSounds.Cue>> indexKillSounds(LastMatchReplay replay,
+                                                                          Predicate<ResourceLocation> availableSound) {
+        Map<Integer, List<ReplayKillSounds.Cue>> windows = new HashMap<>();
+        Map<ResourceLocation, Boolean> availability = new HashMap<>();
+        for (var window : replay.killSounds()) {
+            var playable = window.cues().stream().filter(cue ->
+                    availability.computeIfAbsent(cue.file(), availableSound::test)).toList();
+            if (!playable.isEmpty()) windows.put(window.eventIndex(), playable);
+        }
+        return windows;
+    }
+
+    private static void addSounds(List<SoundCue> output, Map<Integer, List<ReplayKillSounds.Cue>> recorded, int index,
+                                  LastMatchReplay.Node node, @Nullable LastMatchReplay.Node pairedShot,
+                                  double impact, double unitsPerSecond, double start, double end, double recordedEnd,
+                                  float fallbackGain, float pan) {
+        var window = recorded.get(index);
+        if (window != null) {
+            int before = output.size();
+            for (var cue : window) {
+                double at = impact + cue.offsetMs() * unitsPerSecond / 1000.0;
+                if (at >= start && at <= recordedEnd + 1e-6) {
+                    output.add(new SoundCue(at, index, List.of(), cue.volume(), cue.pitch(), pan, cue.file()));
+                }
+            }
+            if (output.size() != before) return;
+        }
+        for (var cue : resolveEventSounds(node, pairedShot)) {
+            double at = Math.clamp(impact + cue.offsetSeconds() * unitsPerSecond, start, end);
+            output.add(new SoundCue(at, index, cue.candidates(), cue.volume() * fallbackGain, cue.pitch(), pan));
+        }
+    }
+
+    private static void addUnfeaturedKillVoices(List<VoiceCue> output, LastMatchReplay replay,
+                                                 Map<Integer, ReplayVoiceData.Clip> clips,
+                                                 IntToDoubleFunction timeline,
+                                                 double unitsPerSecond, double start, double end) {
+        if (clips.isEmpty()) return;
+        var byStart = Comparator.comparingDouble(VoiceCue::startTime);
+        output.sort(byStart);
+        double gap = MIN_VOICE_GAP_SECONDS * unitsPerSecond;
+        for (int index = 0; index < replay.events().size(); index++) {
+            var node = replay.events().get(index);
+            var clip = clips.get(index);
+            if (clip == null || node.kind() != LastMatchReplay.Kind.KILL
+                    || output.stream().anyMatch(cue -> cue.clip() == clip)) continue;
+            double impact = timeline.applyAsDouble(node.tick());
+            double clipStart = impact + clip.offsetMs() * unitsPerSecond / 1000.0;
+            double clipEnd = Math.min(end, clipStart + clip.durationSeconds() * unitsPerSecond);
+            double freeStart = Math.max(start, clipStart);
+            double bestStart = freeStart;
+            double bestEnd = freeStart;
+            for (var occupied : output) {
+                double freeEnd = Math.min(clipEnd, occupied.startTime() - gap);
+                if (freeEnd - freeStart > bestEnd - bestStart) {
+                    bestStart = freeStart;
+                    bestEnd = freeEnd;
+                }
+                freeStart = Math.max(freeStart, occupied.endTime() + gap);
+                if (freeStart >= clipEnd) break;
+            }
+            if (clipEnd - freeStart > bestEnd - bestStart) {
+                bestStart = freeStart;
+                bestEnd = clipEnd;
+            }
+            if (bestEnd - bestStart >= .18 * unitsPerSecond) {
+                output.add(new VoiceCue(clip, bestStart, impact, bestEnd, 0f));
+                output.sort(byStart);
+            }
+        }
     }
 
     private static Map<LastMatchReplay.Node, Integer> identityIndices(List<LastMatchReplay.Node> events) {

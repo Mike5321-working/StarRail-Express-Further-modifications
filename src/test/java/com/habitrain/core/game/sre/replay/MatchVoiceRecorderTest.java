@@ -48,7 +48,7 @@ class MatchVoiceRecorderTest {
             MatchVoiceRecorder.recordPcm48kAtMs(roundId, whisperer, 5100L + k * 20L, 8.0f, whisperFrame);
             MatchVoiceRecorder.recordPcm48kAtMs(roundId, deadSpectator, 5200L + k * 20L, 48.0f, ghostFrame);
         }
-        // Victim death cry right after kill tick (5000..5120 ms <= 5150 ms)
+        // Victim death cry right after kill tick (5000..5120 ms <= 6000 ms)
         for (int k = 0; k < 5; k++) {
             MatchVoiceRecorder.recordPcm48kAtMs(roundId, victim, 5020L + k * 20L, 48.0f, cryFrame);
         }
@@ -73,7 +73,7 @@ class MatchVoiceRecorderTest {
         assertTrue(killerRms > 3000, "Expected strong in-range killer voice RMS, got " + killerRms);
         assertTrue(cryRms > 2000, "Expected preserved victim death-cry RMS, got " + cryRms);
 
-        // Tail past 5150ms only contained farPlayer, whisperer, and deadSpectator -> must be silent / trimmed!
+        // Tail past 5180ms only contained farPlayer, whisperer, and deadSpectator -> must be silent / trimmed!
         int postWindowSamples = (5180 - clipStartMs) * (sr / 1000);
         if (postWindowSamples < decoded.length) {
             double ghostRms = rms(decoded, postWindowSamples, decoded.length);
