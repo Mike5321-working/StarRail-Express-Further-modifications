@@ -12,8 +12,8 @@ import com.mojang.blaze3d.pipeline.TextureTarget;
 import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.VertexSorting;
-import net.minecraft.Util;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.components.toasts.SystemToast;
 import net.minecraft.client.renderer.FogRenderer;
 import net.minecraft.network.chat.Component;
 import org.jetbrains.annotations.Nullable;
@@ -46,6 +46,7 @@ import java.util.function.Supplier;
  */
 final class ReplayVideoExport {
     private static final Logger LOGGER = LoggerFactory.getLogger(ReplayVideoExport.class);
+    private static final SystemToast.SystemToastId OPEN_FOLDER_TOAST = new SystemToast.SystemToastId();
     static final int FPS = 30;
     private static final long PREPARE_LIMIT_NS = TimeUnit.MINUTES.toNanos(2);
 
@@ -93,11 +94,14 @@ final class ReplayVideoExport {
     }
 
     static boolean openFolder(Minecraft client) {
+        Path dir = directory(client);
+        client.getToasts().addToast(SystemToast.multiline(client, OPEN_FOLDER_TOAST,
+                ReplayBoardTexts.tr("controls.folder"), ReplayBoardTexts.tr("controls.folder_opening", dir.toString())));
         try {
-            Util.getPlatform().openFile(Files.createDirectories(directory(client)).toFile());
+            ReplayFolderOpener.open(dir);
             return true;
         } catch (IOException | RuntimeException | OutOfMemoryError failure) {
-            LOGGER.warn("Could not open replay video directory", failure);
+            LOGGER.warn("Could not open replay video directory: {}", dir, failure);
             return false;
         }
     }

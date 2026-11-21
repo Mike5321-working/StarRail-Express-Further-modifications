@@ -1,7 +1,6 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.client.config.ClientVisualPreferences;
-import net.minecraft.Util;
 import net.minecraft.network.chat.Component;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.PointerBuffer;
@@ -436,13 +435,13 @@ final class ReplayFfmpegManager {
     }
 
     static boolean openBinFolder(Path gameDir) {
+        Path dir = binDirectory(gameDir);
         try {
-            Path dir = Files.createDirectories(binDirectory(gameDir));
-            Util.getPlatform().openFile(dir.toFile());
+            ReplayFolderOpener.open(dir);
             invalidateCache();
             return true;
         } catch (IOException | RuntimeException | OutOfMemoryError failure) {
-            LOGGER.warn("Could not open FFmpeg bin directory", failure);
+            LOGGER.warn("Could not open FFmpeg bin directory: {}", dir, failure);
             return false;
         }
     }

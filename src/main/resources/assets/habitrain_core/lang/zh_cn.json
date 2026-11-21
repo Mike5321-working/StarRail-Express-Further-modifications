@@ -929,6 +929,7 @@
     "habitrain_core.replay_board.controls.saved": "已保存视频，可点击「打开视频文件夹」。",
     "habitrain_core.replay_board.controls.failed": "导出失败，请重试或查看游戏日志。",
     "habitrain_core.replay_board.controls.cancelled": "已取消导出",
+    "habitrain_core.replay_board.controls.folder_opening": "正在打开“%s”文件夹",
     "habitrain_core.replay_board.controls.folder_error": "无法打开视频文件夹",
     "habitrain_core.replay_board.idle": "暂无上局对局记录 · 等待发车",
     "habitrain_core.replay_board.loading": "正在接收上局结算数据",

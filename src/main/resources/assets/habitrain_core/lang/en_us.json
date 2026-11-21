@@ -929,6 +929,7 @@
     "habitrain_core.replay_board.controls.saved": "Video saved. Select Open video folder.",
     "habitrain_core.replay_board.controls.failed": "Export failed. Try again or check the game log.",
     "habitrain_core.replay_board.controls.cancelled": "Export cancelled",
+    "habitrain_core.replay_board.controls.folder_opening": "Opening the folder ‘%s’",
     "habitrain_core.replay_board.controls.folder_error": "Could not open the video folder",
     "habitrain_core.replay_board.idle": "No previous match yet · Awaiting departure",
     "habitrain_core.replay_board.loading": "Receiving last match settlement",
