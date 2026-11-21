@@ -27,6 +27,10 @@ public final class SreRuntimeBridgeImpl implements SreRuntimeBridge {
 
     private SreRuntimeBridgeImpl() {}
 
+    @Override public boolean startNativeMode(GameMode mode, ServerLevel level) {
+        return SREModeStartAdapter.requestNativeStart(mode, level, false);
+    }
+
     @Override public boolean reserveMatch(ServerLevel level) {
         return com.habitrain.core.game.sre.match.ServerMatchContext.GATE.start(
                 com.habitrain.core.game.sre.match.ServerMatchContext.dimension(level));

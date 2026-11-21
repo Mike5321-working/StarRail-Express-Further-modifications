@@ -149,13 +149,13 @@ playerAnimator **2.0.4+1.21.1 已内嵌在 Core 中**。Simple Voice Chat 是固
 | `/habi_api scene status` | 查看地图级移动场景状态 |
 | `/habitrain roleapi providers` | 查看已加载的角色扩展提供方 |
 | `/habitrain roleapi list` | 查看当前有效角色目录 |
-| `/instantgroup [range]` | 将范围内玩家加入临时语音群组，默认 128 格 |
+| `/habi_group [range]` | 将范围内玩家加入临时语音群组，默认 128 格 |
 
 更多管理命令见[使用教程](docs/使用教程.md)。Iris 光影白名单依赖客户端上报信息，无法防止修改后的客户端伪造上报。
 
 ## 开发附属模组
 
-公开 API 根包为 **`com.habitrain.core.api.**`**。请通过公开接口扩展功能，避免在编译期引用 Core 内部实现包。
+下游通过 [API 参考手册](docs/API参考手册.md#1-公开边界与生命周期) 列出的接口扩展功能。`api.spi` 是 Core 内部装配，角色 v2 是预览接口；不要依赖内部实现包。
 
 ### 接入依赖
 
@@ -227,7 +227,7 @@ Linux / macOS：
 .\gradlew.bat runClient --no-daemon
 ```
 
-开发运行使用 SRE `-dev.jar`。发布验收应使用固定 SRE 成品与新构建的 Core，具体项目见[运行验收清单](docs/运行验收清单.md)。
+开发运行使用 SRE `-dev.jar`。发布前应使用固定 SRE 成品与新构建的 Core，分别核对客户端和专用服的实际启动结果。
 
 ## 文档索引
 
@@ -241,7 +241,6 @@ Linux / macOS：
 | [移动场景 API](docs/移动场景API使用教程.md) | 场景实例、资产、锚点、参数与生命周期 |
 | [大厅移动背景](docs/大厅移动背景.md) | 大厅移动外景的配置与使用 |
 | [配置提交协议](docs/配置提交协议.md) | 草稿、提交确认、权限与冲突处理 |
-| [运行验收清单](docs/运行验收清单.md) | 成品启动与多人场景验收项 |
 
 ## 许可证与致谢
 

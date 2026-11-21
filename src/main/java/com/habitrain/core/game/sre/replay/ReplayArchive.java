@@ -1,6 +1,7 @@
 package com.habitrain.core.game.sre.replay;
 
 import com.habitrain.core.scene.replay.ReplayVoiceData;
+import org.slf4j.LoggerFactory;
 
 import java.io.*;
 import java.nio.file.*;
@@ -14,10 +15,12 @@ import static java.nio.file.StandardCopyOption.ATOMIC_MOVE;
 final class ReplayArchive {
     static final long GIB = 1L << 30, DEFAULT_LIMIT = 5 * GIB, MAX_LIMIT = 1024 * GIB;
     private static final int MAGIC = 0x48525031, MAX_SUMMARY = 768 * 1024, MAX_PATCH = 256 * 1024;
+    private static final int HEADER_BYTES = Integer.BYTES + Long.BYTES + Short.BYTES + 64;
     private final Path root, rounds, maps, voice, config, voiceConfig;
     private final Map<UUID, Entry> entries = new HashMap<>();
     private final Map<String, Long> mapSizes = new HashMap<>();
-    private long limit = DEFAULT_LIMIT, bytes;
+    private final Set<UUID> unreadable = new HashSet<>();
+    private long limit = DEFAULT_LIMIT, bytes, unreadableBytes;
     private boolean recordVoice = true;
 
     private record Entry(UUID id, Path file, long when, String map, long bytes, long voiceBytes) {}
@@ -87,12 +90,16 @@ final class ReplayArchive {
                         map = in.readUTF();
                     }
                 } catch (EOFException | UTFDataFormatException ignored) { }
-                if (map == null || !mapSizes.containsKey(map) || n <= 78 || n > MAX_SUMMARY + 78L) {
-                    Files.delete(p);
+                Path vp = voicePath(id);
+                if (map == null || !mapSizes.containsKey(map) || n <= HEADER_BYTES || n > MAX_SUMMARY + (long) HEADER_BYTES) {
+                    unreadable.add(id);
+                    long preserved = n + (Files.isRegularFile(vp, NOFOLLOW_LINKS) ? Files.size(vp) : 0);
+                    bytes += preserved;
+                    unreadableBytes += preserved;
+                    LoggerFactory.getLogger(ReplayArchive.class).warn("Preserving unreadable replay archive {}", p);
                     continue;
                 }
                 long voiceSize = 0;
-                Path vp = voicePath(id);
                 if (Files.isRegularFile(vp, NOFOLLOW_LINKS)) {
                     long vs = Files.size(vp);
                     if (vs > 0 && vs <= ReplayVoiceData.MAX_VOICE_BYTES) {
@@ -105,8 +112,7 @@ final class ReplayArchive {
                 bytes += n + voiceSize;
             }
         }
-        dropOrphans(null);
-        prune();
+        maintainQuota(true);
     }
 
     Path root() { return root; }
@@ -119,8 +125,7 @@ final class ReplayArchive {
         if (!validLimit(value)) throw new IllegalArgumentException("Invalid replay limit");
         atomicWrite(config, out -> out.writeBytes(Long.toString(value)));
         limit = value;
-        dropOrphans(null);
-        prune();
+        maintainQuota(true);
     }
 
     void setRecordVoice(boolean enabled) throws IOException {
@@ -132,8 +137,13 @@ final class ReplayArchive {
         save(id, when, map, summary, patches, new byte[0]);
     }
 
-    void save(UUID id, long when, String map, byte[] summary, List<byte[]> patches, byte[] voiceData) throws IOException {
-        if (entries.containsKey(id)) return;
+    boolean save(UUID id, long when, String map, byte[] summary, List<byte[]> patches, byte[] voiceData) throws IOException {
+        if (entries.containsKey(id)) return true;
+        if (unreadable.contains(id)) return false;
+        if (bytes > limit) {
+            maintainQuota(true);
+            if (bytes > limit) return false;
+        }
         byte[] v = voiceData == null ? new byte[0] : voiceData;
         if (!map.matches("[0-9a-f]{64}") || summary.length < 1 || summary.length > MAX_SUMMARY ||
                 patches.isEmpty() || patches.size() > 1024 || v.length > ReplayVoiceData.MAX_VOICE_BYTES) {
@@ -144,9 +154,11 @@ final class ReplayArchive {
             if (patch.length < 1 || patch.length > MAX_PATCH) throw new IOException("Invalid replay section size");
             mapBytes += patch.length;
         }
-        long roundBytes = 78L + summary.length;
+        long roundBytes = (long) HEADER_BYTES + summary.length;
         long voiceBytes = v.length;
-        if (roundBytes + voiceBytes + mapSizes.getOrDefault(map, mapBytes) > limit) return;
+        if (roundBytes + voiceBytes + mapSizes.getOrDefault(map, mapBytes) > limit) return false;
+        if (!unreadable.isEmpty() && retainedBytes() + roundBytes + voiceBytes
+                + (mapSizes.containsKey(map) ? 0 : mapBytes) > limit) return false;
         if (!mapSizes.containsKey(map)) {
             atomicWrite(mapPath(map), out -> {
                 out.writeInt(patches.size());
@@ -175,22 +187,23 @@ final class ReplayArchive {
             });
         } catch (IOException failure) {
             try { Files.deleteIfExists(vFile); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
-            try { dropOrphans(null); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
+            try { dropOrphans(); } catch (IOException cleanup) { failure.addSuppressed(cleanup); }
             throw failure;
         }
         entries.put(id, new Entry(id, file, when, map, roundBytes, voiceBytes));
         bytes += roundBytes + voiceBytes;
         // The new round is readable before any existing round can be evicted.
-        prune();
+        maintainQuota(false);
+        return entries.containsKey(id);
     }
 
     byte[] summary(UUID id) throws IOException {
         Entry e = entries.get(id);
         if (e == null) return null;
         try (var in = Files.newInputStream(e.file, NOFOLLOW_LINKS)) {
-            in.skipNBytes(78);
+            in.skipNBytes(HEADER_BYTES);
             byte[] contents = in.readNBytes(MAX_SUMMARY + 1);
-            if (contents.length != e.bytes - 78) throw new IOException("Wrong replay summary length");
+            if (contents.length != e.bytes - HEADER_BYTES) throw new IOException("Wrong replay summary length");
             return contents;
         }
     }
@@ -231,18 +244,35 @@ final class ReplayArchive {
         }
     }
 
+    private void maintainQuota(boolean cleanOrphans) {
+        try {
+            if (cleanOrphans) dropOrphans();
+            prune();
+        } catch (IOException failure) {
+            LoggerFactory.getLogger(ReplayArchive.class).warn("Could not clean replay archive {}", root, failure);
+        }
+    }
+
     private void prune() throws IOException {
-        if (bytes <= limit) return;
+        if (bytes <= limit || retainedBytes() >= limit) return;
         var oldest = entries.values().stream().sorted(Comparator.comparingLong(Entry::when).thenComparing(Entry::id)).toList();
         var references = references();
         for (Entry entry : oldest) {
             if (bytes <= limit) break;
-            Files.deleteIfExists(entry.file);
             Files.deleteIfExists(voicePath(entry.id));
+            if (entry.voiceBytes != 0) {
+                bytes -= entry.voiceBytes;
+                entries.put(entry.id, new Entry(entry.id, entry.file, entry.when, entry.map, entry.bytes, 0));
+            }
+            Files.deleteIfExists(entry.file);
             entries.remove(entry.id);
-            bytes -= (entry.bytes + entry.voiceBytes);
-            if (references.merge(entry.map, -1, Integer::sum) == 0) dropMap(entry.map);
+            bytes -= entry.bytes;
+            if (references.merge(entry.map, -1, Integer::sum) == 0 && unreadable.isEmpty()) dropMap(entry.map);
         }
+    }
+
+    private long retainedBytes() {
+        return unreadable.isEmpty() ? 0 : unreadableBytes + mapSizes.values().stream().mapToLong(Long::longValue).sum();
     }
 
     private Map<String, Integer> references() {
@@ -251,10 +281,12 @@ final class ReplayArchive {
         return count;
     }
 
-    private void dropOrphans(String keep) throws IOException {
-        var referenced = references();
-        for (String map : List.copyOf(mapSizes.keySet())) {
-            if (!map.equals(keep) && !referenced.containsKey(map)) dropMap(map);
+    private void dropOrphans() throws IOException {
+        if (unreadable.isEmpty()) {
+            var referenced = references();
+            for (String map : List.copyOf(mapSizes.keySet())) {
+                if (!referenced.containsKey(map)) dropMap(map);
+            }
         }
         try (Stream<Path> list = Files.list(voice)) {
             for (Path p : list.toList()) {
@@ -262,7 +294,7 @@ final class ReplayArchive {
                 if (!name.endsWith(".voice") || !Files.isRegularFile(p, NOFOLLOW_LINKS)) continue;
                 try {
                     UUID id = UUID.fromString(name.substring(0, name.length() - 6));
-                    if (!entries.containsKey(id)) Files.deleteIfExists(p);
+                    if (!entries.containsKey(id) && !unreadable.contains(id)) Files.deleteIfExists(p);
                 } catch (IllegalArgumentException ignored) {
                     Files.deleteIfExists(p);
                 }

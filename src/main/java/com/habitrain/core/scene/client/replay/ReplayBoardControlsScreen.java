@@ -14,6 +14,8 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 
+import java.util.UUID;
+
 final class ReplayBoardControlsScreen extends Screen {
     private static final int PANEL_HEIGHT = 162;
     private final ClientLevel level;
@@ -25,13 +27,16 @@ final class ReplayBoardControlsScreen extends Screen {
     private ClientReplayBoard.View view;
     private ReplayVideoExport video;
     private boolean folderFailed;
+    private UUID requestedRound;
+    private long playDeadline;
+    private boolean playTimedOut;
 
     ReplayBoardControlsScreen(ClientLevel level, BlockPos pos) {
         super(tr("title"));
         this.level = level;
         this.pos = pos.immutable();
         this.resolution = ReplayExportResolution.fromId(ClientVisualPreferences.getReplayVideoResolution());
-        this.compress = ClientVisualPreferences.isReplayVideoCompress();
+        this.compress = ClientVisualPreferences.isReplayVideoCompress() || !this.resolution.aviSupported();
     }
 
     private static Component tr(String key, Object... args) {
@@ -45,26 +50,38 @@ final class ReplayBoardControlsScreen extends Screen {
         int half = (panelWidth - 30) / 2;
         play = addRenderableWidget(Button.builder(tr("play"), button -> {
             var round = ClientReplayBoard.availableRound();
-            if (!ReplayPackets.EMPTY.equals(round) && ClientPlayNetworking.canSend(ReplayPackets.StartPlayback.TYPE)) {
+            if (requestedRound == null && !ReplayPackets.EMPTY.equals(round) && ClientPlayNetworking.canSend(ReplayPackets.StartPlayback.TYPE)) {
+                requestedRound = round;
+                playDeadline = System.nanoTime() + 5_000_000_000L;
+                playTimedOut = false;
                 ClientPlayNetworking.send(new ReplayPackets.StartPlayback(pos, round));
-                onClose();
+                refresh();
             }
         }).bounds(left + 12, top + 42, half, 20).build());
         export = addRenderableWidget(Button.builder(tr("export"), button -> {
             var current = ReplayExportClient.current();
             if (current != null && current.running()) {
                 current.cancel();
+            } else if (needsFfmpegAction()) {
+                if (ReplayFfmpegManager.isInstalling()) {
+                    ReplayFfmpegManager.cancelInstall();
+                } else if (!ReplayFfmpegManager.isImporting()) {
+                    folderFailed = false;
+                    ReplayFfmpegManager.startInstall(minecraft.gameDirectory.toPath());
+                }
             } else {
                 folderFailed = false;
                 BlockPos board = pos;
-                ReplayExportClient.start(ClientReplayBoard.viewAt(board), ReplayBoardLocalState.fullBody(),
-                        resolution, compress, () -> ClientReplayBoard.viewAt(board));
+                ReplayExportClient.start(ClientReplayBoard.viewForBoard(board), ReplayBoardLocalState.fullBody(),
+                        resolution, compress, () -> ClientReplayBoard.viewForBoard(board));
             }
             refresh();
         }).bounds(left + 18 + half, top + 42, half, 20).build());
         resolutionButton = addRenderableWidget(Button.builder(Component.empty(), button -> {
             resolution = resolution.next();
+            if (!resolution.aviSupported()) compress = true;
             ClientVisualPreferences.setReplayVideoResolution(resolution.id);
+            if (!resolution.aviSupported()) ClientVisualPreferences.setReplayVideoCompress(true);
             refresh();
         }).bounds(left + 12, top + 68, half, 20).build());
         compressButton = addRenderableWidget(Button.builder(Component.empty(), button -> {
@@ -81,9 +98,19 @@ final class ReplayBoardControlsScreen extends Screen {
     }
 
     @Override public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (button == 1 && export != null && export.active && export.isMouseOver(mouseX, mouseY) && needsFfmpegAction()) {
+            if (!ReplayFfmpegManager.isBusy()) {
+                ReplayFfmpegManager.startManualImport(minecraft.gameDirectory.toPath());
+                if (minecraft != null) export.playDownSound(minecraft.getSoundManager());
+                refresh();
+            }
+            return true;
+        }
         if (button == 1 && resolutionButton != null && resolutionButton.active && resolutionButton.isMouseOver(mouseX, mouseY)) {
             resolution = resolution.previous();
+            if (!resolution.aviSupported()) compress = true;
             ClientVisualPreferences.setReplayVideoResolution(resolution.id);
+            if (!resolution.aviSupported()) ClientVisualPreferences.setReplayVideoCompress(true);
             if (minecraft != null) resolutionButton.playDownSound(minecraft.getSoundManager());
             refresh();
             return true;
@@ -95,14 +122,27 @@ final class ReplayBoardControlsScreen extends Screen {
 
     @Override public void tick() {
         if (!validTable()) { onClose(); return; }
+        if (requestedRound != null) {
+            var playback = ((SettlementSummaryBoard.Marker) level.getBlockEntity(pos)).playback();
+            if (playback != null && requestedRound.equals(playback.roundId()) && !playback.shared()
+                    && playback.pendingOrPlaying(level.getGameTime())) {
+                onClose();
+                return;
+            }
+            if (System.nanoTime() - playDeadline >= 0) {
+                requestedRound = null;
+                playTimedOut = true;
+            }
+        }
         refresh();
     }
 
     private boolean validTable() {
-        return minecraft != null && minecraft.level == level && level != null && minecraft.player != null
-                && minecraft.player.distanceToSqr(pos.getX() + .5, pos.getY() + .5, pos.getZ() + .5) <= 64
-                && level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)
-                && level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK);
+        if (minecraft == null || minecraft.level != level || level == null || minecraft.player == null
+                || !level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)
+                || !(level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) return false;
+        double reach = marker.settings().interactReach();
+        return minecraft.player.distanceToSqr(pos.getX() + .5, pos.getY() + .5, pos.getZ() + .5) <= reach * reach;
     }
 
     private boolean playing() {
@@ -112,16 +152,39 @@ final class ReplayBoardControlsScreen extends Screen {
                 && playback.pendingOrPlaying(level.getGameTime());
     }
 
+    private boolean ffmpegReady() {
+        return minecraft != null && ReplayFfmpegManager.isReady(minecraft.gameDirectory.toPath());
+    }
+
+    private boolean needsFfmpegAction() {
+        boolean exporting = video != null && video.running();
+        return !exporting && compress && !ffmpegReady();
+    }
+
     private void refresh() {
-        view = ClientReplayBoard.viewAt(pos);
+        view = ClientReplayBoard.viewForBoard(pos);
         video = ReplayExportClient.forScreen(video);
         boolean exporting = video != null && video.running();
         boolean playing = playing();
-        play.setMessage(tr(playing ? "playing" : "play"));
-        play.active = view.replay() != null && !playing && !exporting
+        play.setMessage(tr(requestedRound != null ? "play_pending" : playing ? "playing" : "play"));
+        play.active = view.replay() != null && !playing && !exporting && requestedRound == null
                 && ClientPlayNetworking.canSend(ReplayPackets.StartPlayback.TYPE);
-        export.setMessage(tr(exporting ? "cancel" : "export"));
-        export.active = exporting || (ReplayExportClient.canStart() && ReplayExportClient.mapReady(view));
+        boolean needFfmpeg = !exporting && compress && !ffmpegReady();
+        boolean installing = ReplayFfmpegManager.isInstalling();
+        boolean importing = ReplayFfmpegManager.isImporting();
+        if (exporting) {
+            export.setMessage(tr("cancel"));
+            export.active = true;
+            export.setTooltip(null);
+        } else if (needFfmpeg) {
+            export.setMessage(ReplayBoardTexts.tr(installing ? "export.ffmpeg_cancel" : "export.ffmpeg_install"));
+            export.active = installing || !importing;
+            export.setTooltip(Tooltip.create(ReplayBoardTexts.tr("export.ffmpeg_controls_tip")));
+        } else {
+            export.setMessage(tr("export"));
+            export.active = ReplayExportClient.canStart() && ReplayExportClient.mapReady(view);
+            export.setTooltip(null);
+        }
 
         ReplayExportResolution shownRes = exporting ? video.resolution : resolution;
         boolean shownCompress = exporting ? video.compress : compress;
@@ -132,11 +195,13 @@ final class ReplayBoardControlsScreen extends Screen {
         resolutionButton.active = !exporting;
 
         compressButton.setMessage(tr(shownCompress ? "compress_on" : "compress_off"));
-        compressButton.setTooltip(Tooltip.create(tr(shownCompress ? "compress_tooltip_on" : "compress_tooltip_off")));
-        compressButton.active = !exporting;
+        compressButton.setTooltip(Tooltip.create(!resolution.aviSupported()
+                ? tr("export.avi_2160") : tr(shownCompress ? "compress_tooltip_on" : "compress_tooltip_off")));
+        compressButton.active = !exporting && resolution.aviSupported();
     }
 
     private Component matchStatus() {
+        if (playTimedOut && !playing()) return tr("play_timeout");
         if (view == null || !view.hasRound()) return tr("no_round");
         if (view.replay() == null) return tr("loading_round");
         return tr("round", view.replay().mapName());
@@ -145,6 +210,7 @@ final class ReplayBoardControlsScreen extends Screen {
     private Component exportStatus() {
         if (folderFailed) return tr("folder_error");
         if (video != null) return video.status();
+        if (needsFfmpegAction()) return ReplayFfmpegManager.statusText();
         if (view != null && view.replay() != null && !ClientReplayBoard.mapAvailable()) return tr("map_unavailable");
         if (view != null && view.presentSections() < view.totalSections()) {
             return tr("receiving_map", view.presentSections(), view.totalSections());
@@ -162,6 +228,8 @@ final class ReplayBoardControlsScreen extends Screen {
         graphics.fill(x, top + 96, x + barWidth, top + 103, 0xFF313F53);
         if (video != null) {
             graphics.fill(x, top + 96, x + (int) (barWidth * video.displayProgress()), top + 103, 0xFF52C5B9);
+        } else if (needsFfmpegAction() && ReplayFfmpegManager.isInstalling()) {
+            graphics.fill(x, top + 96, x + (int) (barWidth * ReplayFfmpegManager.progress()), top + 103, ReplayPalette.BRASS_LIGHT);
         }
         graphics.drawCenteredString(font, font.plainSubstrByWidth(exportStatus().getString(), panelWidth - 24),
                 width / 2, top + 110, 0xFFC5D3E2);

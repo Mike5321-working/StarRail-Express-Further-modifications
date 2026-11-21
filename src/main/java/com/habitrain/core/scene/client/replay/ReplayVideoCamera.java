@@ -228,11 +228,11 @@ final class ReplayVideoCamera {
         var target = new Vector3f((float) rig.tx, (float) rig.ty, (float) rig.tz);
         var eye = new Vector3f((float) (rig.tx + rig.dist * cp * Math.sin(rig.yaw)), (float) (rig.ty + rig.dist * Math.sin(rig.pitch)),
                 (float) (rig.tz + rig.dist * cp * Math.cos(rig.yaw)));
-        // Above the map footprint the near plane must clear the tallest vertex; beside it only the tray rim.
+        // A close shot may have its eye outside the footprint while its sight line still crosses
+        // the map. Checking only the eye position lets the near plane enter a roof or upper structure.
         float ex = stage.mapW() / 2 + 0.25f, ez = stage.mapD() / 2 + 0.25f;
-        float outside = Math.max(Math.abs(eye.x) - ex, Math.abs(eye.z) - ez);
-        double inside = 1 - ReplayStagePlan.smoothstep(0, 0.5, outside);
-        float minY = (float) (ReplayBoardSite.FRAME_TOP + 0.1 + inside * (ceiling(stage.geometryTop()) + SAFE_GAP - ReplayBoardSite.FRAME_TOP - 0.1));
+        boolean crossesMap = segmentIntersectsFootprint(eye, target, ex, ez);
+        float minY = crossesMap ? ceiling(stage.geometryTop()) + SAFE_GAP : ReplayBoardSite.FRAME_TOP + 0.1f;
         eye.y = Math.max(eye.y, minY);
         var direction = new Vector3f(target).sub(eye);
         if (direction.lengthSquared() < 1.0e-8f) direction.set(0, -1, -1e-3f);
@@ -244,6 +244,23 @@ final class ReplayVideoCamera {
         var projection = new Matrix4f().translation((float) rig.shift, 0, 0)
                 .mul(new Matrix4f().perspective((float) Math.toRadians(rig.fov), ASPECT, NEAR, Math.max(128, eye.length() * 5)));
         return new Shot(eye, direction, rotation, view, projection, focusedActors);
+    }
+
+    private static boolean segmentIntersectsFootprint(Vector3f start, Vector3f end, float halfX, float halfZ) {
+        float dx = end.x - start.x;
+        float dz = end.z - start.z;
+        float[] range = clipAxisRange(start.x, dx, -halfX, halfX, 0f, 1f);
+        if (range == null) return false;
+        return clipAxisRange(start.z, dz, -halfZ, halfZ, range[0], range[1]) != null;
+    }
+
+    private static float[] clipAxisRange(float start, float delta, float min, float max, float t0, float t1) {
+        if (Math.abs(delta) < 1.0e-6f) return start >= min && start <= max ? new float[]{t0, t1} : null;
+        float a = (min - start) / delta;
+        float b = (max - start) / delta;
+        if (a > b) { float swap = a; a = b; b = swap; }
+        float next0 = Math.max(t0, a), next1 = Math.min(t1, b);
+        return next0 <= next1 ? new float[]{next0, next1} : null;
     }
 
     private static double lerp(double a, double b, double t) { return a + (b - a) * t; }

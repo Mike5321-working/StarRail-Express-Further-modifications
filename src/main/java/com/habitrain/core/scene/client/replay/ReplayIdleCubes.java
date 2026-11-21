@@ -90,11 +90,10 @@ final class ReplayIdleCubes {
         double fade = s.fade() * idle;
         if (fade <= 0.01) return;
 
-        float innerHalf = Math.max(0.8f, s.hw() - FRAME);
-        float localScale = Math.min(1.05f, innerHalf / 2.14f);
+        float localScale = localScale(s);
         float wScale = Math.max(0.18f, s.scale() * localScale);
         boolean detail = s.detail();
-        boolean loading = f.hasRound && f.model == null;
+        boolean loading = f.loading;
 
         double ambient = f.ambient;
         double speedMul = loading ? 1.55 : 1.0;
@@ -152,7 +151,16 @@ final class ReplayIdleCubes {
         paintStatusBanner(f, s, fill, glow, centerY, localScale, wScale, fade * idle, loading, bannerPhase);
 
         // 10. Camera-facing "start playback" / "export video" plaques floating in front of the sculpture
-        ReplayBoardButtons.paint(f, s, phase, localScale, fade);
+        ReplayBoardButtons.paint(f, s);
+    }
+
+    static void prepareButtons(ReplayFrame frame, ReplayBoardSite site) {
+        ReplayBoardButtons.collect(frame, site, ReplayBoardButtons.phase(frame, site), localScale(site),
+                site.fade() * frame.handoff.idle());
+    }
+
+    private static float localScale(ReplayBoardSite site) {
+        return Math.min(1.05f, Math.max(0.8f, site.hw() - FRAME) / 2.14f);
     }
 
     // ------------------------------------------------------------------ 1. floor astrolabe

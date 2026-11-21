@@ -11,6 +11,37 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class ConfigRepairRegressionTest {
     @TempDir Path directory;
+
+    @Test void persistedRevisionRetriesOnlyFailedRefreshersWithoutRewriting() throws Exception {
+        var calls = new java.util.ArrayList<ConfigManager.RuntimeModule>();
+        Path file = directory.resolve("runtime.json");
+        var manager = new ConfigManager(new ConfigStore(file.toFile()), module -> {
+            calls.add(module);
+            if (calls.size() == 1) throw new IllegalStateException("injected failure");
+        });
+        var before = JsonParser.parseString(manager.toJsonString()).getAsJsonObject();
+        var after = before.deepCopy();
+        after.getAsJsonObject("tasks").add("test/example", JsonParser.parseString("{\"enabled\":false}"));
+        String knifeField = "knifeDurabilityEnabled";
+        var global = after.getAsJsonObject("global");
+        global.addProperty(knifeField, !global.get(knifeField).getAsBoolean());
+        long base = manager.revision();
+        var first = manager.submitPatch(ConfigPatch.diff(before, after), base, ConfigUpdateScope.FULL_MOD_MENU, "");
+        assertEquals(ConfigSaveResult.Status.SAVED, first.status());
+        assertTrue(first.message().contains("任务池"));
+        assertEquals(java.util.List.of(ConfigManager.RuntimeModule.TASKS, ConfigManager.RuntimeModule.KNIFE), calls);
+        long committed = manager.revision();
+        assertTrue(committed > base);
+        String stored = Files.readString(file);
+        var empty = ConfigPatch.diff(after, after);
+        assertEquals(ConfigSaveResult.Status.CONFLICT, manager.submitPatch(empty, base, ConfigUpdateScope.FULL_MOD_MENU, "").status());
+        var retry = manager.submitPatch(empty, committed, ConfigUpdateScope.FULL_MOD_MENU, "");
+        assertEquals(ConfigSaveResult.Status.NO_CHANGE, retry.status());
+        assertTrue(retry.message().contains("已生效"));
+        assertEquals(java.util.List.of(ConfigManager.RuntimeModule.TASKS, ConfigManager.RuntimeModule.KNIFE, ConfigManager.RuntimeModule.TASKS), calls);
+        assertEquals(committed, manager.revision());
+        assertEquals(stored, Files.readString(file));
+    }
     @Test void schemaInvalidPrimaryUsesBackupWithoutOverwritingIt() throws Exception {
         Path file = directory.resolve("config.json");
         String backup = "{\"global\":{\"sheriffCountDivisor\":9,\"knifeDurabilityEnabled\":true}}";

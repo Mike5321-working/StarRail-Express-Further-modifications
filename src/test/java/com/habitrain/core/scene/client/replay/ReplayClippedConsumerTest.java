@@ -11,6 +11,44 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ReplayClippedConsumerTest {
+    @Test void interleavedLayersAcquireTheirOutputOnlyWhenACompletePrimitiveIsFlushed() {
+        var base = new Collector();
+        var glint = new Collector();
+        var draws = new ArrayList<Collector>();
+        try (var baseClip = new ReplayClippedConsumer(() -> { draws.add(base); return base; }, new Matrix4f(), 1, 1, 4);
+             var glintClip = new ReplayClippedConsumer(() -> { draws.add(glint); return glint; }, new Matrix4f(), 1, 1, 4)) {
+            for (int index = 0; index < 4; index++) {
+                vertex(glintClip, -0.5f, 0, 0, index);
+                vertex(baseClip, 0.5f, 0, 0, index);
+            }
+            assertTrue(draws.isEmpty());
+        }
+        assertEquals(List.of(glint, base), draws);
+        assertEquals(4, base.vertices.size());
+        assertEquals(4, glint.vertices.size());
+    }
+
+    @Test void clipsLinesAndTrianglesWithoutEmittingIncompletePrimitives() {
+        var lines = new Collector();
+        try (var clip = new ReplayClippedConsumer(() -> lines, new Matrix4f(), 1, 1, 2)) {
+            vertex(clip, -2, 0, 0, 0);
+            vertex(clip, 2, 0, 1, 240);
+            vertex(clip, 0, 0, 0, 0);
+        }
+        assertEquals(2, lines.vertices.size());
+        assertEquals(-1, lines.vertices.getFirst()[0]);
+        assertEquals(1, lines.vertices.getLast()[0]);
+
+        var triangles = new Collector();
+        try (var clip = new ReplayClippedConsumer(() -> triangles, new Matrix4f(), 1, 1, 3)) {
+            vertex(clip, -2, 0, 0, 0);
+            vertex(clip, 0, -0.5f, 0.5f, 120);
+            vertex(clip, 0, 0.5f, 1, 240);
+        }
+        assertEquals(6, triangles.vertices.size());
+        assertTrue(triangles.vertices.stream().allMatch(vertex -> vertex[0] >= -1 && vertex[0] <= 1));
+    }
+
     @Test void cutsCrossingQuadsExactlyAndInterpolatesSkinUvsColorAndLighting() {
         var output = new Collector();
         try (var clip = new ReplayClippedConsumer(output, new Matrix4f(), 1, 1)) {

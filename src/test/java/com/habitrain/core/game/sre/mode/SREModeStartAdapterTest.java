@@ -6,6 +6,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SREModeStartAdapterTest {
+    @Test
+    void countsUpstreamCountdownAsAcceptanceWithoutDependingOnItsGlobalStartingFlag() {
+        var countdown = io.wifi.starrailexpress.cca.SREGameWorldComponent.GameStatus.STARTING;
+        assertTrue(SREModeStartAdapter.startedFrom(false, SREModeStartAdapter.isCountingDown(countdown), false));
+        assertFalse(SREModeStartAdapter.isCountingDown(io.wifi.starrailexpress.cca.SREGameWorldComponent.GameStatus.INACTIVE));
+    }
+
 
     @Test
     void blockingFromTreatsLookupFailureAsBlocking() {

@@ -2,6 +2,7 @@ package com.habitrain.core.scene.client;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
+import com.habitrain.core.client.ClientConnectionSession;
 import com.habitrain.core.network.replay.ReplayArchiveData;
 import com.habitrain.core.network.replay.ReplayArchivePackets.*;
 import com.habitrain.core.network.replay.ReplayPackets;
@@ -20,17 +21,27 @@ import static com.habitrain.core.network.replay.ReplayArchivePackets.*;
 
 public final class ReplayHistoryClient {
     private static final long RETRY_NS = 3_000_000_000L, WATCH_NS = 2_000_000_000L;
+    private static final long SETTINGS_COOLDOWN_NS = 300_000_000L;
     private static final Map<UUID, Round> rounds = new LinkedHashMap<>(8, .75f, true);
     private static Settings settings;
     private static VoiceRecordingSettings voiceSettings;
     private static UUID sharing;
     private static int shareResult;
     private static long shareDeadline, nextSend;
-    private static final Map<BlockPos, Long> lastReady = new HashMap<>();
+    private static final Map<PreparingBoard, Long> lastReady = new HashMap<>();
+    private static Set<UUID> boardPins = Set.of();
+    private static final Map<UUID, Integer> pinCounts = new HashMap<>();
+    private static long nextStats, nextLimit, nextRecording;
     private static final java.util.concurrent.Executor CACHE_IO = java.util.concurrent.Executors.newSingleThreadExecutor(
             task -> Thread.ofPlatform().daemon().name("habitrain-replay-client-cache").unstarted(task));
 
-    public enum Phase { LOADING, MAP, READY, MISSING, FAILED }
+    public enum Phase {
+        LOADING, MAP, READY, MISSING, FAILED;
+
+        boolean finishedLoading() { return this == READY || this == MISSING || this == FAILED; }
+    }
+
+    private record PreparingBoard(BlockPos pos, UUID round) {}
     static final class Round {
         final UUID id;
         long watched, requested, voiceRequested;
@@ -40,6 +51,7 @@ public final class ReplayHistoryClient {
         BitSet voiceHave;
         boolean reading = true, readingVoice = true, voiceReady, voiceUnavailable;
         int voiceAttempts;
+        int pins;
         Phase phase = Phase.LOADING;
         LastMatchReplay replay;
         ReplayTimeline timeline;
@@ -53,23 +65,26 @@ public final class ReplayHistoryClient {
         maintainCache(ReplayRoundCache.LIMIT);
         com.habitrain.core.api.client.replay.MatchReplayClientApi.install(
                 com.habitrain.core.scene.client.replay.ReplayHistoryScreen::open);
-        ClientPlayNetworking.registerGlobalReceiver(Reply.TYPE, (r, ctx) -> ctx.client().execute(() -> onReply(r)));
-        ClientPlayNetworking.registerGlobalReceiver(Summary.TYPE, (r, ctx) -> ctx.client().execute(() -> onSummary(r.data())));
-        ClientPlayNetworking.registerGlobalReceiver(Section.TYPE, (r, ctx) -> ctx.client().execute(() -> {
+        ClientPlayNetworking.registerGlobalReceiver(Reply.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> onReply(r)));
+        ClientPlayNetworking.registerGlobalReceiver(Summary.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> onSummary(r.data())));
+        ClientPlayNetworking.registerGlobalReceiver(Section.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> {
             var round = rounds.get(r.data().roundId());
             if (round != null && round.map != null) round.map.accept(r.data());
         }));
-        ClientPlayNetworking.registerGlobalReceiver(Voice.TYPE, (r, ctx) -> ctx.client().execute(() -> onVoice(r.data())));
-        ClientPlayNetworking.registerGlobalReceiver(Settings.TYPE, (r, ctx) -> ctx.client().execute(() -> settings = r));
-        ClientPlayNetworking.registerGlobalReceiver(VoiceRecordingSettings.TYPE, (r, ctx) -> ctx.client().execute(() -> voiceSettings = r));
+        ClientPlayNetworking.registerGlobalReceiver(Voice.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> onVoice(r.data())));
+        ClientPlayNetworking.registerGlobalReceiver(Settings.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> settings = r));
+        ClientPlayNetworking.registerGlobalReceiver(VoiceRecordingSettings.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> voiceSettings = r));
         ClientTickEvents.END_CLIENT_TICK.register(ReplayHistoryClient::tick);
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
             rounds.clear();
             lastReady.clear();
+            boardPins = Set.of();
+            pinCounts.clear();
             settings = null;
             voiceSettings = null;
             sharing = null;
             nextSend = 0;
+            nextStats = nextLimit = nextRecording = 0;
         });
     }
 
@@ -77,14 +92,62 @@ public final class ReplayHistoryClient {
     public static Settings settings() { return settings; }
     public static VoiceRecordingSettings voiceSettings() { return voiceSettings; }
     public static boolean canSetVoiceRecording() { return ClientPlayNetworking.canSend(SetVoiceRecording.TYPE); }
-    public static void setVoiceRecording(boolean enabled) {
-        if (canSetVoiceRecording()) ClientPlayNetworking.send(new SetVoiceRecording(enabled));
+    public static boolean canRequestVoiceRecording() { return canSetVoiceRecording() && due(nextRecording); }
+    public static boolean setVoiceRecording(boolean enabled) {
+        if (!canRequestVoiceRecording()) return false;
+        nextRecording = System.nanoTime() + SETTINGS_COOLDOWN_NS;
+        ClientPlayNetworking.send(new SetVoiceRecording(enabled));
+        return true;
     }
-    public static void requestSettings(long value) {
-        if (supported()) ClientPlayNetworking.send(Request.settings(value == 0 ? STATS : LIMIT, value));
+    public static boolean canRequestSettings(long value) { return supported() && due(value == 0 ? nextStats : nextLimit); }
+    public static boolean requestSettings(long value, long expectedLimit) {
+        if (!canRequestSettings(value)) return false;
+        long deadline = System.nanoTime() + SETTINGS_COOLDOWN_NS;
+        if (value == 0) nextStats = deadline;
+        else nextLimit = deadline;
+        if (value != 0 && ClientPlayNetworking.canSend(CheckedLimit.TYPE)) {
+            ClientPlayNetworking.send(new CheckedLimit(expectedLimit, value));
+        } else {
+            ClientPlayNetworking.send(Request.settings(value == 0 ? STATS : LIMIT, value));
+        }
+        return true;
     }
 
+    private static boolean due(long deadline) { return deadline == 0 || System.nanoTime() - deadline >= 0; }
+
     public static void retry(UUID id) { rounds.remove(id); }
+
+    /** Keeps a round resident while a screen, export, or shared board is using it. */
+    public static void pin(UUID id) {
+        if (id == null) return;
+        Round round = rounds.get(id);
+        if (round == null) {
+            watch(id);
+            round = rounds.get(id);
+        }
+        if (round != null) {
+            int count = pinCounts.merge(id, 1, Integer::sum);
+            round.pins = count;
+        }
+    }
+
+    public static void unpin(UUID id) {
+        if (id == null) return;
+        Round round = rounds.get(id);
+        Integer count = pinCounts.get(id);
+        if (count == null) return;
+        if (count <= 1) pinCounts.remove(id); else pinCounts.put(id, count - 1);
+        if (round != null) round.pins = Math.max(0, count - 1);
+    }
+
+    /** Updates the set of rounds currently referenced by in-world shared boards. */
+    public static void updateBoardPins(Set<UUID> active) {
+        Set<UUID> next = active == null || active.isEmpty() ? Set.of() : Set.copyOf(active);
+        if (next.equals(boardPins)) return;
+        for (UUID id : boardPins) if (!next.contains(id)) unpin(id);
+        for (UUID id : next) if (!boardPins.contains(id)) pin(id);
+        boardPins = next;
+    }
 
     public static boolean voiceUnavailable(UUID id) {
         var round = rounds.get(id);
@@ -112,8 +175,14 @@ public final class ReplayHistoryClient {
     public static ClientReplayBoard.View watch(UUID id) {
         Round r = rounds.get(id);
         if (r == null && supported()) {
-            while (rounds.size() >= 6) rounds.remove(rounds.keySet().iterator().next());
+            while (rounds.size() >= 6) {
+                UUID victim = rounds.values().stream().filter(candidate -> candidate.pins == 0)
+                        .map(candidate -> candidate.id).findFirst().orElse(null);
+                if (victim == null) break;
+                rounds.remove(victim);
+            }
             r = new Round(id);
+            r.pins = pinCounts.getOrDefault(id, 0);
             rounds.put(id, r);
             load(r);
         }
@@ -122,7 +191,7 @@ public final class ReplayHistoryClient {
         var map = r.map;
         return new ClientReplayBoard.View(r.replay, r.timeline, map == null ? null : map.asset(),
                 map == null ? 0 : map.parts.size(), map == null ? 0 : map.manifest.sections().size(), true,
-                r.voice, r.voiceReady);
+                r.voice, r.voiceReady, map != null && map.failed());
     }
 
     private static void load(Round r) {
@@ -235,6 +304,7 @@ public final class ReplayHistoryClient {
             r.voiceReady = true;
         } catch (RuntimeException malformed) {
             r.voice = ReplayVoiceData.EMPTY;
+            stopVoiceRequests(r);
         }
     }
 
@@ -303,6 +373,9 @@ public final class ReplayHistoryClient {
                 if (r.map.complete()) {
                     r.phase = Phase.READY;
                     r.map.step(now, bits -> false);
+                } else if (r.map.stalled(now)) {
+                    r.map.markFailed(now);
+                    r.phase = Phase.FAILED;
                 } else {
                     r.map.step(now, bits -> send(Request.sections(r.id, bits), now));
                 }
@@ -326,9 +399,10 @@ public final class ReplayHistoryClient {
             var playback = marker.playback();
             if (playback == null || !playback.preparing()) continue;
             watch(playback.roundId());
-            if (phase(playback.roundId()) == Phase.READY && !lastReady.containsKey(pos)) {
+            var key = new PreparingBoard(pos, playback.roundId());
+            if (phase(playback.roundId()).finishedLoading() && !lastReady.containsKey(key)) {
                 ClientPlayNetworking.send(Request.boardReady(playback.roundId(), pos));
-                lastReady.put(pos, now);
+                lastReady.put(key, now);
             }
         }
     }

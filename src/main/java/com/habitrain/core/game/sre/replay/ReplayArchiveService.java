@@ -22,6 +22,8 @@ import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
@@ -31,6 +33,7 @@ import static com.habitrain.core.network.replay.ReplayArchivePackets.*;
 public final class ReplayArchiveService {
     private static final Logger LOG = LoggerFactory.getLogger(ReplayArchiveService.class);
     private static final int CAPACITY = 16;
+    private static final long WRITE_BUDGET_BYTES = 74L * 1024 * 1024;
     private static final long RATE = 384 * 1024, GLOBAL = 2 * 1024 * 1024;
     private static volatile State state;
     private ReplayArchiveService() {}
@@ -40,8 +43,8 @@ public final class ReplayArchiveService {
         ServerLifecycleEvents.SERVER_STARTING.register(server -> state = new State(server));
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             State s = state;
-            state = null;
-            if (s != null) {
+            if (s != null && s.server == server) {
+                state = null;
                 s.io.shutdown();
                 try {
                     if (!s.io.awaitTermination(8, TimeUnit.SECONDS)) LOG.warn("Replay archive writes still draining");
@@ -49,12 +52,16 @@ public final class ReplayArchiveService {
             }
         });
 
-        ServerTickEvents.END_SERVER_TICK.register(server -> { if (state != null) state.tick(); });
+        ServerTickEvents.END_SERVER_TICK.register(server -> {
+            State s = state;
+            if (s != null && s.server == server) s.tick();
+        });
         ServerPlayConnectionEvents.DISCONNECT.register((h, server) -> {
             if (state != null) {
                 UUID id = h.player.getUUID();
                 state.pending.remove(id);
                 state.last.remove(id);
+                state.lastVoice.remove(id);
                 state.lastShare.remove(id);
                 state.lastStats.remove(id);
                 state.lastLimit.remove(id);
@@ -73,43 +80,50 @@ public final class ReplayArchiveService {
         ServerPlayNetworking.registerGlobalReceiver(SetVoiceRecording.TYPE, (request, ctx) -> ctx.server().execute(() -> {
             if (state != null && state.server == ctx.server()) state.setVoiceRecording(ctx.player(), request.enabled());
         }));
+        ServerPlayNetworking.registerGlobalReceiver(CheckedLimit.TYPE, (request, ctx) -> ctx.server().execute(() -> {
+            if (state != null && state.server == ctx.server() && ReplayArchive.validLimit(request.expected())) {
+                state.receive(ctx.player(), Request.settings(LIMIT, request.limit()), request.expected());
+            }
+        }));
     }
 
     static boolean shouldRecordVoice(MinecraftServer server) {
         State active = state;
-        return active != null && active.server == server && active.recordVoice;
+        return active != null && active.server == server && active.voicePolicyReady && active.recordVoice;
     }
 
     static boolean canExportVoice(LastMatchReplay replay, UUID player, boolean admin) {
         return admin || replay.participants().stream().anyMatch(participant -> participant.id().equals(player));
     }
 
-    static void archive(MinecraftServer owner, ReplayPackets.LastMatchSummaryS2C data, ReplayMapCapture.Result map, long finishedAt) {
-        archive(owner, data, map, finishedAt, new byte[0]);
-    }
-
-    static void archive(MinecraftServer owner, ReplayPackets.LastMatchSummaryS2C data, ReplayMapCapture.Result map,
-                        long finishedAt, byte[] voice) {
+    static CompletableFuture<Void> archive(MinecraftServer owner, ReplayPackets.LastMatchSummaryS2C data,
+                                           ReplayMapCapture.Result map, long finishedAt, byte[] voice) {
         State s = state;
-        if (s == null || s.server != owner || map == null) return;
-        byte[] voiceCopy = voice == null ? new byte[0] : voice.clone();
-        s.submit(true, () -> {
-            if (s.archive != null) s.archive.save(data.replay().roundId(), finishedAt, map.manifest().hash(),
-                    ReplayArchiveData.encode(data), map.patches(), voiceCopy);
-        }, () -> LOG.warn("Could not queue 3D replay {}", data.replay().roundId()));
+        if (s == null || s.server != owner) return CompletableFuture.failedFuture(new IOException("Replay archive is closed"));
+        return s.io.submitSettlement(map.bytes() + ReplayPackets.MAX_SUMMARY + voice.length, () -> {
+            if (s.archive == null) throw new IOException(s.lockBusy
+                    ? "A previous replay archive writer is still draining" : "Replay archive initialization failed");
+            if (!s.archive.save(data.replay().roundId(), finishedAt, map.manifest().hash(),
+                    ReplayArchiveData.encode(data), map.patches(), voice)) {
+                throw new IOException("Replay does not fit the archive quota");
+            }
+            return null;
+        });
     }
 
-    private record Delivery(ServerPlayer player, Iterator<CustomPacketPayload> packets, CustomPacketPayload next, long at) {}
+    private record Delivery(ServerPlayer player, Request request, Iterator<CustomPacketPayload> packets,
+                            CustomPacketPayload next, long at) {}
 
     private record Preparing(ServerLevel level, SettlementSummaryBoard.Marker marker, UUID round,
                              int duration, long deadline, Set<UUID> waiting) {}
 
     private static final class State {
         final MinecraftServer server;
-        final ReplayArchiveQueue io = new ReplayArchiveQueue(32);
+        final ReplayArchiveQueue io;
         final Path root;
         final Map<UUID, Delivery> pending = new LinkedHashMap<>();
         final Map<UUID, Long> last = new HashMap<>();
+        final Map<UUID, Long> lastVoice = new HashMap<>();
         final Map<SettlementSummaryBoard.Marker, Preparing> preparing = new HashMap<>();
         final Set<UUID> sharing = new HashSet<>();
         final Map<UUID, Long> lastShare = new HashMap<>();
@@ -118,24 +132,82 @@ public final class ReplayArchiveService {
         final Map<UUID, LinkedHashSet<UUID>> viewed = new HashMap<>();
         final SceneBandwidthGovernor bandwidth = new SceneBandwidthGovernor(System::nanoTime, GLOBAL);
         ReplayArchive archive;
+        ReplayArchiveOwnership ownership;
+        volatile boolean lockBusy;
+        volatile boolean openPending;
+        volatile long nextOpenTick;
+        volatile int retryDelayTicks = 20;
         volatile boolean recordVoice;
+        volatile boolean voicePolicyReady;
 
         State(MinecraftServer server) {
             this.server = server;
             root = server.getWorldPath(LevelResource.ROOT).resolve("habitrain").resolve("replay-archive");
+            recordVoice = readVoicePolicy(root);
+            voicePolicyReady = true;
+            io = new ReplayArchiveQueue(32, WRITE_BUDGET_BYTES, this::releaseOwnership);
+            openArchive();
+        }
+
+        private static boolean readVoicePolicy(Path root) {
+            Path config = root.resolve("record-voice.txt");
+            try {
+                return !Files.isRegularFile(config) || Files.size(config) > 32
+                        || !Files.readString(config).strip().equalsIgnoreCase("false");
+            } catch (IOException | RuntimeException failure) {
+                return true;
+            }
+        }
+
+        void openArchive() {
+            if (archive != null || openPending || io.isShutdown()) return;
+            openPending = true;
             submit(() -> {
-                archive = new ReplayArchive(root);
-                recordVoice = archive.recordVoice();
-            }, () -> {});
+                try {
+                    ownership = ReplayArchiveOwnership.tryAcquire(root);
+                    if (ownership == null) {
+                        lockBusy = true;
+                        LOG.warn("Replay archive is already owned, will retry: {}", root);
+                        return;
+                    }
+                    ReplayArchive opened = new ReplayArchive(root);
+                    boolean openedRecordVoice = opened.recordVoice();
+                    archive = opened;
+                    recordVoice = openedRecordVoice;
+                    lockBusy = false;
+                    retryDelayTicks = 20;
+                    LOG.debug("Opened replay archive at {}", root);
+                } catch (Exception failure) {
+                    lockBusy = false;
+                    LOG.error("Could not initialize replay archive at {}, will retry", root, failure);
+                } finally {
+                    if (archive == null) releaseOwnership();
+                    openPending = false;
+                    if (archive == null) {
+                        nextOpenTick = server.getTickCount() + retryDelayTicks;
+                        retryDelayTicks = Math.min(retryDelayTicks * 2, 20 * 60);
+                    }
+                }
+            }, () -> {
+                openPending = false;
+                lockBusy = !io.isShutdown();
+                if (lockBusy) {
+                    nextOpenTick = server.getTickCount() + retryDelayTicks;
+                    retryDelayTicks = Math.min(retryDelayTicks * 2, 20 * 60);
+                }
+            });
+        }
+
+        void releaseOwnership() {
+            if (ownership == null) return;
+            try { ownership.close(); }
+            catch (IOException failure) { LOG.warn("Could not close replay archive writer lock for {}", root, failure); }
+            finally { ownership = null; }
         }
 
         void submit(Work work, Runnable rejected) {
-            submit(false, work, rejected);
-        }
-
-        void submit(boolean settlement, Work work, Runnable rejected) {
             try {
-                io.submitWork(settlement, () -> {
+                io.submitRead(() -> {
                     try { work.run(); }
                     catch (Exception failure) { LOG.warn("Replay archive I/O failed", failure); }
                 });
@@ -147,10 +219,14 @@ public final class ReplayArchiveService {
         }
 
         void receive(ServerPlayer p, Request r) {
+            receive(p, r, 0);
+        }
+
+        void receive(ServerPlayer p, Request r, long expectedLimit) {
             if (!online(p) || !ServerPlayNetworking.canSend(p, Reply.TYPE)) return;
             if (r.action() == BOARD_READY) {
                 for (Preparing work : preparing.values()) {
-                    if (work.level == p.serverLevel() && work.marker.getBlockPos().equals(r.board()) && work.round.equals(r.round())) {
+                    if (near(p, work.level, r.board()) && work.marker.getBlockPos().equals(r.board()) && work.round.equals(r.round())) {
                         work.waiting.remove(p.getUUID());
                         break;
                     }
@@ -162,13 +238,14 @@ public final class ReplayArchiveService {
                 case SHARE -> lastShare;
                 case STATS -> lastStats;
                 case LIMIT -> lastLimit;
+                case VOICE -> lastVoice;
                 default -> last;
             };
             Long previous = throttle.get(p.getUUID());
             if (previous != null && now - previous < 200_000_000L) return;
             throttle.put(p.getUUID(), now);
             if (r.action() == STATS || r.action() == LIMIT) {
-                settings(p, r);
+                settings(p, r, expectedLimit);
                 return;
             }
             if (r.round().equals(ReplayPackets.EMPTY)) return;
@@ -184,7 +261,6 @@ public final class ReplayArchiveService {
                     return;
                 }
             }
-            if (r.action() != SHARE && (pending.size() >= CAPACITY || pending.containsKey(p.getUUID()))) return;
             if (r.action() == SECTIONS && (r.missing().isEmpty() || r.missing().cardinality() > ReplayPackets.MAX_REQUESTED)) return;
             ServerLevel level = p.serverLevel();
             if (r.action() == SHARE && board(p, r.board(), level) == null) {
@@ -192,13 +268,17 @@ public final class ReplayArchiveService {
                 return;
             }
             UUID id = p.getUUID();
+            Delivery loading = new Delivery(p, r, null, null, 0);
             if (r.action() == SHARE) {
                 if (preparing.size() >= CAPACITY || !sharing.add(id)) {
                     ServerPlayNetworking.send(p, new Reply(r.round(), TABLE_BUSY));
                     return;
                 }
             } else {
-                pending.put(id, new Delivery(p, null, null, 0));
+                Delivery current = pending.get(id);
+                if (current == null ? pending.size() >= CAPACITY
+                        : current.request.action() != VOICE || r.action() == VOICE) return;
+                pending.put(id, loading);
             }
             submit(() -> {
                 List<CustomPacketPayload> packets;
@@ -215,12 +295,12 @@ public final class ReplayArchiveService {
                     if (r.action() == SHARE) {
                         if (!fetched.isEmpty() && fetched.getFirst() instanceof Summary summary) share(p, r, level, summary.data());
                         else ServerPlayNetworking.send(p, new Reply(r.round(), SHARE_ERROR));
-                    } else {
-                        pending.put(id, new Delivery(p, fetched.iterator(), null, 0));
+                    } else if (pending.get(id) == loading) {
+                        pending.put(id, new Delivery(p, r, fetched.iterator(), null, 0));
                     }
                 });
             }, () -> {
-                if (r.action() == SHARE) sharing.remove(id); else pending.remove(id);
+                if (r.action() == SHARE) sharing.remove(id); else pending.remove(id, loading);
                 ServerPlayNetworking.send(p, new Reply(r.round(), r.action() == SHARE ? SHARE_ERROR : ERROR));
             });
         }
@@ -294,16 +374,19 @@ public final class ReplayArchiveService {
                 sendExportAccess(player, round, canExportVoice(latest, id, admin));
                 return;
             }
-            Set<UUID> visible = viewed.get(id);
-            if (visible == null || !visible.contains(round)) {
-                sendExportAccess(player, round, false);
-                return;
-            }
             submit(() -> {
+                boolean allowed = false;
                 byte[] summary = archive == null ? null : archive.summary(round);
-                boolean allowed = summary != null && canExportVoice(ReplayArchiveData.decode(summary).replay(), id, admin);
-                server.execute(() -> { if (online(player)) sendExportAccess(player, round, allowed); });
-            }, () -> {});
+                if (summary != null) {
+                    try {
+                        allowed = canExportVoice(ReplayArchiveData.decode(summary).replay(), id, admin);
+                    } catch (RuntimeException malformed) {
+                        LOG.warn("Could not inspect replay voice export access for {}", round, malformed);
+                    }
+                }
+                boolean result = allowed;
+                server.execute(() -> { if (online(player)) sendExportAccess(player, round, result); });
+            }, () -> LOG.debug("Replay archive busy checking voice export access for {}; client may retry", round));
         }
 
         void sendExportAccess(ServerPlayer player, UUID round, boolean allowed) {
@@ -346,14 +429,15 @@ public final class ReplayArchiveService {
             }
         }
 
-        void settings(ServerPlayer p, Request r) {
+        void settings(ServerPlayer p, Request r, long expectedLimit) {
             if (!ServerPlayNetworking.canSend(p, Settings.TYPE)) return;
             boolean editable = editable(p);
             submit(() -> {
                 boolean ok = archive != null;
                 try {
                     if (r.action() == LIMIT) {
-                        ok = ok && editable && ReplayArchive.validLimit(r.limit());
+                        ok = ok && editable && ReplayArchive.validLimit(r.limit())
+                                && (expectedLimit == 0 || archive.limit() == expectedLimit);
                         if (ok) archive.setLimit(r.limit());
                     }
                 } catch (Exception failed) {
@@ -368,7 +452,10 @@ public final class ReplayArchiveService {
                     ServerPlayNetworking.send(p, info);
                     if (r.action() == STATS) sendRecordingSettings(p, editable, info.ok());
                 });
-            }, () -> ServerPlayNetworking.send(p, new Settings(0, ReplayArchive.DEFAULT_LIMIT, "", false, false)));
+            }, () -> {
+                ServerPlayNetworking.send(p, new Settings(0, ReplayArchive.DEFAULT_LIMIT, "", editable, false));
+                if (r.action() == STATS) sendRecordingSettings(p, editable, false);
+            });
         }
 
         static SettlementSummaryBoard.Marker board(ServerPlayer p, BlockPos pos, ServerLevel level) {
@@ -408,6 +495,7 @@ public final class ReplayArchiveService {
         }
 
         void tick() {
+            if (archive == null && !openPending && !io.isShutdown() && server.getTickCount() >= nextOpenTick) openArchive();
             var shares = preparing.values().iterator();
             while (shares.hasNext()) {
                 Preparing work = shares.next();
@@ -431,7 +519,7 @@ public final class ReplayArchiveService {
                             : next instanceof Voice v ? v.data().bytes().length + 64
                             : next instanceof Summary s ? s.data().tracks().length + 128 * 1024
                             + 144 * s.data().replay().killSounds().stream().mapToInt(window -> window.cues().size()).sum() : 64;
-                    delivery = new Delivery(delivery.player, delivery.packets, next,
+                    delivery = new Delivery(delivery.player, delivery.request, delivery.packets, next,
                             bandwidth.reserve(entry.getKey(), bytes, RATE));
                     entry.setValue(delivery);
                 }
@@ -449,7 +537,7 @@ public final class ReplayArchiveService {
                         if (recent.size() > 32) recent.removeFirst();
                     }
                 }
-                if (delivery.packets.hasNext()) entry.setValue(new Delivery(delivery.player, delivery.packets, null, 0));
+                if (delivery.packets.hasNext()) entry.setValue(new Delivery(delivery.player, delivery.request, delivery.packets, null, 0));
                 else iterator.remove();
             }
         }

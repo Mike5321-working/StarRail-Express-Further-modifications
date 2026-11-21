@@ -9,6 +9,7 @@ import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.Tesselator;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import com.mojang.blaze3d.vertex.VertexSorting;
+import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphics;
@@ -38,6 +39,7 @@ final class ReplayVideoCanvas {
     static final ResourceLocation BIG = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_big");
     static final ResourceLocation UI = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_ui");
     private static final Set<ResourceLocation> PREPARED = new HashSet<>();
+    private static final boolean MODERN_UI = FabricLoader.getInstance().isModLoaded("modernui");
 
     enum Tex {
         GLOW("glow", 128, 128), RING("ring", 256, 256), BOKEH("bokeh", 128, 128), STREAK("streak", 256, 32),
@@ -235,8 +237,17 @@ final class ReplayVideoCanvas {
         float w = f.width(text);
         float dx = align < 0 ? 0 : align == 0 ? -w / 2 : -w;
         Matrix4f m = new Matrix4f(pose).translate(x, y, 0).scale(scale, scale, 1);
-        f.drawInBatch(text, dx, -f.lineHeight / 2f + 0.5f, color, shadow, m, buffers, Font.DisplayMode.NORMAL, 0, LightTexture.FULL_BRIGHT);
+        f.drawInBatch(text, dx, -f.lineHeight / 2f + 0.5f + modernUiShift(text), color, shadow, m, buffers,
+                Font.DisplayMode.NORMAL, 0, LightTexture.FULL_BRIGHT);
         buffers.endBatch();
+    }
+
+    private static float modernUiShift(Component text) {
+        if (!MODERN_UI) return 0;
+        ResourceLocation font = text.getStyle().getFont();
+        if (BIG.equals(font)) return 1f;
+        if (UI.equals(font)) return 0.5f;
+        return 0;
     }
 
     /** Text squeezed to {@code maxWidth} pixels when necessary. */

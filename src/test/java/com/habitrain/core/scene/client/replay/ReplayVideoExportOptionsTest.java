@@ -1,14 +1,14 @@
 package com.habitrain.core.scene.client.replay;
 
-import org.jcodec.api.FrameGrab;
-import org.jcodec.common.model.ColorSpace;
-import org.jcodec.common.model.Picture;
-import org.jcodec.scale.ColorUtil;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -38,7 +38,10 @@ class ReplayVideoExportOptionsTest {
 
     @Test
     void mp4WriterPreservesNonMacroblockDimensionsVerticalFlipAndMultiGopStream(@TempDir Path tempDir) throws Exception {
-        // 854 is not divisible by 16 (53 * 16 + 6); exercises SPS cropping and multi-GOP (65 frames > KEY_INTERVAL=60).
+        Path ffmpeg = ReplayFfmpegManager.resolveAvailable(null, null);
+        Assumptions.assumeTrue(ffmpeg != null, "FFmpeg is required to test external MP4 export");
+
+        // 854 is not divisible by 16 (53 * 16 + 6); exercises SPS cropping and multi-GOP (65 frames).
         int w = ReplayExportResolution.P480.width;
         int h = ReplayExportResolution.P480.height;
         byte[] bottomUp = new byte[w * h * 3];
@@ -61,8 +64,9 @@ class ReplayVideoExportOptionsTest {
             }
         }
 
-        Path mp4 = tempDir.resolve("sample-480p.mp4");
-        try (ReplayVideoWriter writer = new ReplayMp4Writer(mp4, w, h, 30)) {
+        // Write to a .part path first (matching ReplayVideoExport's temp file flow) to verify explicit -f mp4.
+        Path mp4 = tempDir.resolve("sample-480p.part");
+        try (ReplayVideoWriter writer = new ReplayMp4Writer(ffmpeg, mp4, w, h, 30)) {
             for (int f = 0; f < 65; f++) {
                 writer.add(bottomUp);
             }
@@ -70,43 +74,41 @@ class ReplayVideoExportOptionsTest {
         }
 
         assertTrue(Files.size(mp4) > 512);
-        Picture last = FrameGrab.getFrameFromFile(mp4.toFile(), 64);
-        assertEquals(w, last.getCroppedWidth());
-        assertEquals(h, last.getCroppedHeight());
+        byte[] rgb = decodeSingleFrameRgb24(ffmpeg, mp4, 64);
+        assertEquals(w * h * 3, rgb.length, "Decoded frame size should match 854x480 RGB24");
 
-        Picture rgb = Picture.create(last.getWidth(), last.getHeight(), ColorSpace.RGB);
-        ColorUtil.getTransform(last.getColor(), ColorSpace.RGB).transform(last, rgb);
-        byte[] plane = rgb.getPlaneData(0);
-        int stride = rgb.getWidth() * 3;
-
-        // Top row (y = 4, x = 100) must be predominantly red
+        int stride = w * 3;
         int topIdx = 4 * stride + 100 * 3;
-        int topR = plane[topIdx] + 128;
-        int topG = plane[topIdx + 1] + 128;
-        int topB = plane[topIdx + 2] + 128;
-        assertTrue(topR > 180 && topG < 50 && topB < 50,
+        int topR = rgb[topIdx] & 0xFF;
+        int topG = rgb[topIdx + 1] & 0xFF;
+        int topB = rgb[topIdx + 2] & 0xFF;
+        assertTrue(topR > 200 && topG < 30 && topB < 30,
                 "Expected top band to be red after vertical flip, got RGB=(" + topR + "," + topG + "," + topB + ")");
 
-        // Bottom row (y = h - 5, x = 100) must be predominantly blue
         int botIdx = (h - 5) * stride + 100 * 3;
-        int botR = plane[botIdx] + 128;
-        int botG = plane[botIdx + 1] + 128;
-        int botB = plane[botIdx + 2] + 128;
-        assertTrue(botB > 180 && botR < 50 && botG < 50,
+        int botR = rgb[botIdx] & 0xFF;
+        int botG = rgb[botIdx + 1] & 0xFF;
+        int botB = rgb[botIdx + 2] & 0xFF;
+        assertTrue(botB > 200 && botR < 30 && botG < 30,
                 "Expected bottom band to be blue after vertical flip, got RGB=(" + botR + "," + botG + "," + botB + ")");
     }
 
     @Test
-    void mp4CompressionSignificantlyShrinksVideoComparedToMotionJpegAvi(@TempDir Path tempDir) throws Exception {
+    void mp4CompressionSignificantlyShrinksVideoAndMaintainsHighPsnrComparedToAvi(@TempDir Path tempDir) throws Exception {
+        Path ffmpeg = ReplayFfmpegManager.resolveAvailable(null, null);
+        Assumptions.assumeTrue(ffmpeg != null, "FFmpeg is required to test external MP4 export");
+
         int w = 640, h = 360;
         byte[] frame = new byte[w * h * 3];
+        byte[] referenceFrame15 = new byte[w * h * 3];
         Path mp4 = tempDir.resolve("compressed.mp4");
         Path avi = tempDir.resolve("uncompressed.avi");
 
-        try (ReplayVideoWriter mp4Writer = new ReplayMp4Writer(mp4, w, h, 30);
+        try (ReplayVideoWriter mp4Writer = new ReplayMp4Writer(ffmpeg, mp4, w, h, 30);
              ReplayVideoWriter aviWriter = new ReplayAviWriter(avi, w, h, 30)) {
             for (int f = 0; f < 30; f++) {
                 populateSceneFrame(frame, w, h, f);
+                if (f == 15) System.arraycopy(frame, 0, referenceFrame15, 0, frame.length);
                 mp4Writer.add(frame);
                 aviWriter.add(frame);
             }
@@ -119,6 +121,11 @@ class ReplayVideoExportOptionsTest {
         assertTrue(mp4Bytes > 0 && aviBytes > 0);
         assertTrue(mp4Bytes * 3 < aviBytes,
                 "Expected H.264 MP4 (" + mp4Bytes + " B) to be < 1/3 of MJPG AVI (" + aviBytes + " B)");
+
+        byte[] decoded15 = decodeSingleFrameRgb24(ffmpeg, mp4, 15);
+        assertEquals(w * h * 3, decoded15.length);
+        double psnr = computeTopDownRgbVsBottomUpBgrPsnr(decoded15, referenceFrame15, w, h);
+        assertTrue(psnr > 34.0, "Expected sharp H.264 output with PSNR > 34 dB, got " + psnr + " dB");
     }
 
     @Test
@@ -136,6 +143,47 @@ class ReplayVideoExportOptionsTest {
         ReplayVideoExport.aberrate(bgr2560, row2560, 2560, 2, 1.0f);
         // At 2560 width (2x), shift = 14 -> proportional visual offset
         assertEquals((byte) 255, bgr2560[(1280 - 14) * 3 + 2]);
+    }
+
+    private static byte[] decodeSingleFrameRgb24(Path ffmpeg, Path mp4, int frameIndex) throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(
+                ffmpeg.toAbsolutePath().toString(),
+                "-hide_banner", "-loglevel", "error",
+                "-i", mp4.toAbsolutePath().toString(),
+                "-vf", "select=eq(n\\," + frameIndex + ")",
+                "-vsync", "0",
+                "-vframes", "1",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+        ).start();
+        byte[] rgb = process.getInputStream().readAllBytes();
+        byte[] err = process.getErrorStream().readAllBytes();
+        assertTrue(process.waitFor(30, TimeUnit.SECONDS), "Timed out decoding video frame");
+        assertEquals(0, process.exitValue(), "FFmpeg decode failed: " + new String(err, StandardCharsets.UTF_8));
+        return rgb;
+    }
+
+    private static double computeTopDownRgbVsBottomUpBgrPsnr(byte[] topDownRgb, byte[] bottomUpBgr, int w, int h) {
+        double mseSum = 0.0;
+        int stride = w * 3;
+        for (int y = 0; y < h; y++) {
+            int rgbRow = y * stride;
+            int bgrRow = (h - 1 - y) * stride;
+            for (int x = 0; x < w; x++) {
+                int r0 = topDownRgb[rgbRow + x * 3] & 0xFF;
+                int g0 = topDownRgb[rgbRow + x * 3 + 1] & 0xFF;
+                int b0 = topDownRgb[rgbRow + x * 3 + 2] & 0xFF;
+
+                int b1 = bottomUpBgr[bgrRow + x * 3] & 0xFF;
+                int g1 = bottomUpBgr[bgrRow + x * 3 + 1] & 0xFF;
+                int r1 = bottomUpBgr[bgrRow + x * 3 + 2] & 0xFF;
+
+                int dr = r0 - r1, dg = g0 - g1, db = b0 - b1;
+                mseSum += dr * dr + dg * dg + db * db;
+            }
+        }
+        double mse = mseSum / (w * h * 3.0);
+        if (mse <= 1e-9) return 99.0;
+        return 10.0 * Math.log10((255.0 * 255.0) / mse);
     }
 
     private static void populateSceneFrame(byte[] bgr, int w, int h, int frame) {

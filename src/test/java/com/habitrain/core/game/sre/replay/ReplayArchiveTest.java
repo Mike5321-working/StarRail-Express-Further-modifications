@@ -83,6 +83,62 @@ class ReplayArchiveTest {
         assertNull(store.summary(tooLarge));
     }
 
+    @Test void unreadableArchivePreservesItsRoundVoiceAndPotentialMap() throws Exception {
+        Path root = world.resolve("archive");
+        var store = new ReplayArchive(root);
+        UUID round = UUID.randomUUID();
+        String map = "e".repeat(64);
+        store.save(round, 1, map, new byte[]{1}, List.of(new byte[]{2}), new byte[]{3});
+        Path roundFile = root.resolve("rounds").resolve(round + ".round");
+        byte[] unknownFormat = {5, 6, 7, 8, 9};
+        Files.write(roundFile, unknownFormat);
+
+        var reopened = new ReplayArchive(root);
+        assertNull(reopened.summary(round));
+        assertFalse(reopened.save(round, 2, map, new byte[]{10}, List.of(new byte[]{2}), new byte[]{3}));
+        assertArrayEquals(unknownFormat, Files.readAllBytes(roundFile));
+        assertArrayEquals(new byte[]{3}, Files.readAllBytes(root.resolve("voice").resolve(round + ".voice")));
+        assertTrue(Files.isRegularFile(root.resolve("maps").resolve(map + ".map")));
+    }
+
+    @Test void impossibleQuotaDoesNotEvictReadableRounds() throws Exception {
+        Path root = world.resolve("archive");
+        UUID readable = UUID.randomUUID();
+        UUID unreadable = UUID.randomUUID();
+        String map = "a".repeat(64);
+        var sections = List.of(new byte[256 * 1024]);
+        new ReplayArchive(root).save(readable, 1, map, new byte[]{1}, sections);
+        Files.write(root.resolve("rounds").resolve(unreadable + ".round"), new byte[800 * 1024]);
+
+        var reopened = new ReplayArchive(root);
+        reopened.setLimit(1L << 20);
+        assertArrayEquals(new byte[]{1}, reopened.summary(readable));
+        assertFalse(reopened.save(UUID.randomUUID(), 2, map, new byte[]{2}, sections, new byte[0]));
+    }
+
+    @Test void blockedQuotaCleanupKeepsOldRoundReadableAndNewSaveSuccessful() throws Exception {
+        Path root = world.resolve("archive");
+        var store = new ReplayArchive(root);
+        store.setLimit(1L << 20);
+        UUID old = UUID.randomUUID(), newest = UUID.randomUUID();
+        byte[] section = new byte[256 * 1024];
+        store.save(old, 1, "a".repeat(64), new byte[]{1}, List.of(section, section));
+        Path blocker = Files.createDirectory(root.resolve("voice").resolve(old + ".voice"));
+        Files.writeString(blocker.resolve("occupied"), "data");
+
+        assertTrue(store.save(newest, 2, "b".repeat(64), new byte[]{2}, List.of(section, section), new byte[0]));
+        assertArrayEquals(new byte[]{1}, store.summary(old));
+        assertArrayEquals(new byte[]{2}, store.summary(newest));
+        assertTrue(store.used() > store.limit());
+
+        Files.delete(blocker.resolve("occupied"));
+        Files.delete(blocker);
+        store.setLimit(store.limit());
+        assertNull(store.summary(old));
+        assertArrayEquals(new byte[]{2}, store.summary(newest));
+        assertTrue(store.used() <= store.limit());
+    }
+
     @Test void aFailedRoundWriteDoesNotEvictExistingReplays() throws Exception {
         Path root = world.resolve("archive");
         var store = new ReplayArchive(root);

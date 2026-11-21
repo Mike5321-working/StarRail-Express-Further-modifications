@@ -35,7 +35,10 @@ public final class ClientKillSoundRecorder {
         ClientPlayNetworking.registerGlobalReceiver(CaptureKillSoundS2C.TYPE, (packet, context) -> {
             observeLevel(context.client().level);
             if (level != null && pending.size() < MAX_PENDING && ClientPlayNetworking.canSend(KillSoundC2S.TYPE)) {
-                long tickDelta = Math.clamp(level.getGameTime() - packet.serverGameTime(), -100L, 100L);
+                // Server game time is synchronized in coarse updates. Only use a bounded correction
+                // when the local clock is ahead, so a stale client time cannot move the impact into
+                // the future and shift the complete window away from the kill frame.
+                long tickDelta = Math.clamp(level.getGameTime() - packet.serverGameTime(), 0L, 20L);
                 pending.addLast(new Window(packet, nowMs() - tickDelta * 50L));
             }
         });
@@ -49,20 +52,21 @@ public final class ClientKillSoundRecorder {
                 || instance instanceof ReplayAudioPlaybackController.VoiceClipSoundInstance
                 || instance.isLooping()
                 || instance.getSource() == SoundSource.MUSIC || !ReplayKillSounds.validFile(file)
-                || !Float.isFinite(rawVolume) || !(mixedVolume > 0) || !Float.isFinite(pitch) || pitch < .5f || pitch > 2f
+                || !Float.isFinite(rawVolume) || !(rawVolume > 0) || !Float.isFinite(pitch) || pitch < .5f || pitch > 2f
                 || instance.getLocation().getNamespace().equals("minecraft") && instance.getLocation().getPath().startsWith("ui.")) return;
         Minecraft client = Minecraft.getInstance();
         if (!client.isSameThread() || client.level == null || client.player == null
                 || !ClientPlayNetworking.canSend(KillSoundC2S.TYPE)) return;
         observeLevel(client.level);
-        if (pending.isEmpty() && SREGameWorldComponent.KEY.get(level).getGameStatus() != SREGameWorldComponent.GameStatus.ACTIVE) return;
+        var game = SREGameWorldComponent.KEY.get(level);
+        boolean active = game != null && game.getGameStatus() == SREGameWorldComponent.GameStatus.ACTIVE;
+        if (pending.isEmpty() && !active) return;
         Vec3 source = instance.isRelative() || instance.getAttenuation() == SoundInstance.Attenuation.NONE
                 ? null : new Vec3(instance.getX(), instance.getY(), instance.getZ());
         Vec3 listener = client.getSoundManager().getListenerTransform().position();
-        if (source != null && gainAt(source, listener, range) == 0) return;
-        if (!pending.isEmpty() && pending.stream().noneMatch(window ->
-                listener.distanceToSqr(window.request().listener()) < 64)
-                && SREGameWorldComponent.KEY.get(level).getGameStatus() != SREGameWorldComponent.GameStatus.ACTIVE) return;
+        // During a pending kill window the listener may already have respawned or been
+        // teleported. Keep the candidate and apply the original listener position in finish().
+        if (pending.isEmpty() && source != null && gainAt(source, listener, range) == 0) return;
         if (recent.size() == MAX_RECENT) recent.removeFirst();
         recent.addLast(new HeardSound(nowMs(), file, Math.min(1f, rawVolume), pitch, source, range));
     }

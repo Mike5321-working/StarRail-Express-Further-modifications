@@ -2,23 +2,19 @@ package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
-import net.sourceforge.jaad.aac.Decoder;
-import net.sourceforge.jaad.aac.SampleBuffer;
-import org.jcodec.common.DemuxerTrack;
-import org.jcodec.common.DemuxerTrackMeta;
-import org.jcodec.common.TrackType;
-import org.jcodec.common.io.NIOUtils;
-import org.jcodec.common.model.Packet;
-import org.jcodec.containers.mp4.demuxer.MP4Demuxer;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -94,69 +90,10 @@ class ReplayVideoAudioMuxTest {
     }
 
     @Test
-    void aacEncoderRoundTripsThroughJaadWithExactSyncAndStereoSeparation() throws Exception {
-        int sr = 48_000;
-        int totalStereoFrames = sr * 2; // 2.0s @ 48 kHz
-        short[] stereo = new short[totalStereoFrames * 2];
-
-        // Impulse burst 1 at 0.600s (panned hard LEFT), Impulse burst 2 at 1.300s (panned hard RIGHT).
-        int t1 = (int) (0.600 * sr);
-        int t2 = (int) (1.300 * sr);
-        for (int i = 0; i < 4800; i++) { // 100ms tonal burst
-            double env = Math.sin(Math.PI * i / 4800.0);
-            short val = (short) Math.round(18000.0 * env * Math.sin(2.0 * Math.PI * 520.0 * i / sr));
-            stereo[(t1 + i) * 2] = val;     // LEFT
-            stereo[(t2 + i) * 2 + 1] = val; // RIGHT
-        }
-
-        List<byte[]> adtsFrames = new java.util.ArrayList<>();
-        ReplayAacEncoder encoder = new ReplayAacEncoder(buf -> {
-            byte[] b = new byte[buf.remaining()];
-            buf.get(b);
-            adtsFrames.add(b);
-        });
-        encoder.push(stereo, 0, totalStereoFrames);
-        encoder.finish();
-        assertTrue(adtsFrames.size() >= 94, "Expected >= 94 AAC frames for 2s stereo 48k audio");
-
-        // AudioSpecificConfig for AAC-LC (2), 48 kHz (3), stereo (2) = 0x11, 0x90
-        Decoder decoder = new Decoder(new byte[]{0x11, (byte) 0x90});
-        SampleBuffer sb = new SampleBuffer();
-        short[] decoded = new short[adtsFrames.size() * 1024 * 2];
-        int cursor = 0;
-        for (byte[] adts : adtsFrames) {
-            byte[] rawAac = Arrays.copyOfRange(adts, 7, adts.length);
-            decoder.decodeFrame(rawAac, sb);
-            assertEquals(48_000, sb.getSampleRate());
-            assertEquals(2, sb.getChannels());
-            byte[] pcm = sb.getData();
-            sb.setBigEndian(false);
-            // Read decoded samples directly via ShortBuffer matching sb endianness:
-            ByteBuffer bb = ByteBuffer.wrap(pcm).order(sb.isBigEndian() ? ByteOrder.BIG_ENDIAN : ByteOrder.LITTLE_ENDIAN);
-            while (bb.hasRemaining() && cursor < decoded.length) {
-                decoded[cursor++] = bb.getShort();
-            }
-        }
-
-        // Check burst 1 at 0.600s (t1 .. t1 + 4800): strong LEFT, near-silent RIGHT
-        double l1 = channelRms(decoded, 0, t1, t1 + 4800);
-        double r1 = channelRms(decoded, 1, t1, t1 + 4800);
-        assertTrue(l1 > 4500, "Expected strong decoded left burst at 0.600s, got " + l1);
-        assertTrue(l1 > r1 * 8.0, "Expected stereo L/R isolation at 0.600s, got L=" + l1 + " R=" + r1);
-
-        // Check burst 2 at 1.300s (t2 .. t2 + 4800): strong RIGHT, near-silent LEFT
-        double l2 = channelRms(decoded, 0, t2, t2 + 4800);
-        double r2 = channelRms(decoded, 1, t2, t2 + 4800);
-        assertTrue(r2 > 4500, "Expected strong decoded right burst at 1.300s, got " + r2);
-        assertTrue(r2 > l2 * 8.0, "Expected stereo R/L isolation at 1.300s, got L=" + l2 + " R=" + r2);
-
-        // Check silent gap [0.15s .. 0.40s] stays silent
-        double gap = channelRms(decoded, 0, (int) (0.15 * sr), (int) (0.40 * sr));
-        assertTrue(gap < 150, "Expected quiet silence gap, got " + gap);
-    }
-
-    @Test
     void mp4AndAviMuxVideoAndAudioInExactFrameLockstep(@TempDir Path tempDir) throws Exception {
+        Path ffmpeg = ReplayFfmpegManager.resolveAvailable(null, null);
+        Assumptions.assumeTrue(ffmpeg != null, "FFmpeg is required to test external MP4 muxing");
+
         int fps = 30;
         int frames = 60; // 2.00s
         double t1 = 0.600;
@@ -194,13 +131,10 @@ class ReplayVideoAudioMuxTest {
 
         Path mp4 = tempDir.resolve("with-audio.mp4");
         Path avi = tempDir.resolve("with-audio.avi");
-        try (ReplayVideoWriter mp4Writer = new ReplayMp4Writer(mp4, w, h, fps, true);
+        try (ReplayVideoWriter mp4Writer = new ReplayMp4Writer(ffmpeg, mp4, w, h, fps, soundtrack);
              ReplayVideoWriter aviWriter = new ReplayAviWriter(avi, w, h, fps, true)) {
             for (int f = 0; f < frames; f++) {
                 mp4Writer.add(bgr);
-                mp4Writer.addAudio(soundtrack,
-                        f * ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME,
-                        ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME);
                 aviWriter.add(bgr);
                 aviWriter.addAudio(soundtrack,
                         f * ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME,
@@ -210,50 +144,35 @@ class ReplayVideoAudioMuxTest {
             aviWriter.finish();
         }
 
-        // Verify MP4 container has both video & AAC audio tracks and decodes cleanly in sync
-        try (var ch = NIOUtils.readableChannel(mp4.toFile())) {
-            MP4Demuxer demuxer = MP4Demuxer.createMP4Demuxer(ch);
-            assertEquals(1, demuxer.getVideoTracks().size());
-            assertEquals(1, demuxer.getAudioTracks().size());
-            DemuxerTrack audio = demuxer.getAudioTracks().getFirst();
-            DemuxerTrackMeta meta = audio.getMeta();
-            assertEquals(TrackType.AUDIO, meta.getType());
-            assertNotNull(meta.getCodecPrivate(), "MP4 mp4a track must contain esds codec private");
-            byte[] asc = new byte[meta.getCodecPrivate().remaining()];
-            meta.getCodecPrivate().duplicate().get(asc);
-
-            Decoder dec = new Decoder(asc);
-            SampleBuffer sb = new SampleBuffer();
-            short[] mp4Pcm = new short[frames * ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME * 2 + 8192];
-            int pos = 0;
-            Packet pkt;
-            while ((pkt = audio.nextFrame()) != null) {
-                ByteBuffer data = pkt.getData();
-                // CodecMP4DemuxerTrack.convertPacket prepends a 7-byte ADTS header; verify it parses and strip before raw AAC decode.
-                var adts = org.jcodec.codecs.aac.ADTSParser.read(data);
-                assertNotNull(adts, "Demuxed AAC packet should reconstruct valid ADTS header from esds");
-                assertEquals(48_000, adts.getSampleRate());
-                byte[] frameBytes = new byte[data.remaining()];
-                data.get(frameBytes);
-                dec.decodeFrame(frameBytes, sb);
-                sb.setBigEndian(false);
-                ByteBuffer pcmBuf = ByteBuffer.wrap(sb.getData()).order(ByteOrder.LITTLE_ENDIAN);
-                while (pcmBuf.hasRemaining() && pos < mp4Pcm.length) {
-                    mp4Pcm[pos++] = pcmBuf.getShort();
-                }
-            }
-            assertTrue(pos > 0, "Expected decoded AAC PCM samples from MP4");
-            assertPeakSync(mp4Pcm, t1, t2);
-        }
+        // Verify MP4 audio track decodes cleanly via FFmpeg in exact stereo sync
+        short[] mp4Pcm = decodeMp4Audio48kStereo(ffmpeg, mp4);
+        assertTrue(mp4Pcm.length > 0, "Expected decoded AAC PCM samples from MP4");
+        assertPeakSync(mp4Pcm, t1, t2);
 
         // Verify AVI container has 2 streams (vids + auds) and PCM chunks in lockstep
         byte[] aviBytes = Files.readAllBytes(avi);
-        String headerAscii = new String(aviBytes, 0, Math.min(aviBytes.length, 512), java.nio.charset.StandardCharsets.US_ASCII);
+        String headerAscii = new String(aviBytes, 0, Math.min(aviBytes.length, 512), StandardCharsets.US_ASCII);
         assertTrue(headerAscii.contains("vids"));
         assertTrue(headerAscii.contains("auds"));
         short[] aviPcm = extractAviPcm(aviBytes);
         assertEquals(soundtrack.length, aviPcm.length);
         assertPeakSync(aviPcm, t1, t2);
+    }
+
+    private static short[] decodeMp4Audio48kStereo(Path ffmpeg, Path mp4) throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(
+                ffmpeg.toAbsolutePath().toString(),
+                "-hide_banner", "-loglevel", "error",
+                "-i", mp4.toAbsolutePath().toString(),
+                "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1"
+        ).start();
+        byte[] pcmBytes = process.getInputStream().readAllBytes();
+        byte[] errBytes = process.getErrorStream().readAllBytes();
+        assertTrue(process.waitFor(30, TimeUnit.SECONDS), "Timed out decoding MP4 audio");
+        assertEquals(0, process.exitValue(), "FFmpeg decode error: " + new String(errBytes, StandardCharsets.UTF_8));
+        short[] out = new short[pcmBytes.length / 2];
+        ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(out);
+        return out;
     }
 
     private static void assertPeakSync(short[] interleavedStereo, double t1Sec, double t2Sec) {

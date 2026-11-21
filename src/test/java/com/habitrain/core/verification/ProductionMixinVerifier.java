@@ -1,5 +1,6 @@
 package com.habitrain.core.verification;
 
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.Type;
@@ -20,34 +21,58 @@ public final class ProductionMixinVerifier {
     private ProductionMixinVerifier() {}
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 2) throw new IllegalArgumentException("Expected production JAR and isolated runtime directory");
+        if (args.length != 3 || !List.of("true", "false").contains(args[2])) {
+            throw new IllegalArgumentException("Expected production JAR, isolated runtime directory and dedicated flag (true/false)");
+        }
         Path release = Path.of(args[0]);
         Path runtime = Path.of(args[1]);
+        List<Path> installed;
+        try (var files = Files.list(runtime.resolve("mods"))) {
+            installed = files.filter(p -> p.toString().endsWith(".jar")).toList();
+        }
+        if (Boolean.parseBoolean(args[2])) {
+            List<JsonObject> metadata = new ArrayList<>();
+            for (Path file : installed) {
+                try (var jar = new ZipFile(file.toFile())) {
+                    var entry = jar.getEntry("fabric.mod.json");
+                    if (entry != null) try (var input = jar.getInputStream(entry)) {
+                        metadata.add(JsonParser.parseString(new String(input.readAllBytes(), StandardCharsets.UTF_8)).getAsJsonObject());
+                    }
+                }
+            }
+            checkDedicatedCompatibility(metadata);
+        }
         Path exportRoot = runtime.resolve(".mixin.out/class");
         if (!Files.isDirectory(exportRoot)) {
             throw new IllegalStateException("No post-Mixin class exports. Launch this isolated runtime with "
                     + "-Dmixin.debug.export=true, exercise the safety scenarios, then run this verifier again.");
         }
         byte[] releaseDigest = digest(release);
-        try (var files = Files.list(runtime.resolve("mods"))) {
-            long matching = 0;
-            for (Path file : files.filter(p -> p.toString().endsWith(".jar")).toList()) {
-                if (Arrays.equals(releaseDigest, digest(file))) matching++;
-            }
-            if (matching != 1) throw new IllegalStateException("Runtime must contain exactly one copy of the current release JAR");
+        long matching = 0;
+        for (Path file : installed) {
+            if (Arrays.equals(releaseDigest, digest(file))) matching++;
         }
+        if (matching != 1) throw new IllegalStateException("Runtime must contain exactly one copy of the current release JAR");
         List<String> missing = new ArrayList<>();
         int checked = 0;
+        var lifecycleMixins = java.util.Set.of("MapManagerTaskIndexMixin", "MapScannerMixin", "MapScannerCacheBroadcastMixin",
+                "SRETrueStartGameMixin", "SreMatchFinalizationMixin");
         try (var jar = new ZipFile(release.toFile())) {
-            for (String config : List.of("habitrain_core.guards.mixins.json", "habitrain_core.rest_area.mixins.json")) {
+            for (String config : List.of("habitrain_core.guards.mixins.json", "habitrain_core.rest_area.mixins.json", "habitrain_core.mixins.json")) {
                 var entry = jar.getEntry(config);
                 if (entry == null) throw new IllegalStateException("Missing required config: " + config);
                 try (var input = jar.getInputStream(entry)) {
                     var json = JsonParser.parseString(new String(input.readAllBytes(), StandardCharsets.UTF_8)).getAsJsonObject();
                     if (!json.get("required").getAsBoolean()) throw new IllegalStateException("Config is optional: " + config);
                     String pkg = json.get("package").getAsString().replace('.', '/');
-                    for (var name : json.getAsJsonArray("mixins")) {
-                        var mixinEntry = jar.getEntry(pkg + "/" + name.getAsString() + ".class");
+                    var names = new java.util.HashSet<String>();
+                    json.getAsJsonArray("mixins").forEach(name -> names.add(name.getAsString()));
+                    if (config.equals("habitrain_core.mixins.json")) {
+                        if (!names.containsAll(lifecycleMixins)) throw new IllegalStateException("Missing required task-index or match-lifecycle mixins");
+                        names.retainAll(lifecycleMixins);
+                    }
+                    for (String name : names.stream().sorted().toList()) {
+                        var mixinEntry = jar.getEntry(pkg + "/" + name + ".class");
                         if (mixinEntry == null) throw new IllegalStateException("Missing release mixin: " + name);
                         ClassNode mixin;
                         try (var bytes = jar.getInputStream(mixinEntry)) { mixin = read(bytes.readAllBytes()); }
@@ -63,7 +88,8 @@ public final class ProductionMixinVerifier {
                             for (var method : mixin.methods) {
                                 boolean injector = annotations(method.visibleAnnotations, method.invisibleAnnotations).stream()
                                         .anyMatch(a -> a.desc.equals("Lorg/spongepowered/asm/mixin/injection/Inject;")
-                                                || a.desc.equals("Lorg/spongepowered/asm/mixin/injection/Redirect;"));
+                                                || a.desc.equals("Lorg/spongepowered/asm/mixin/injection/Redirect;")
+                                                || a.desc.equals("Lcom/llamalad7/mixinextras/injector/wrapmethod/WrapMethod;"));
                                 if (!injector) continue;
                                 // Mixin prefixes handler names to avoid clashes; the original name and descriptor remain.
                                 boolean applied = transformed.methods.stream().anyMatch(actual ->
@@ -76,9 +102,24 @@ public final class ProductionMixinVerifier {
                 }
             }
         }
-        if (!missing.isEmpty()) throw new IllegalStateException("Production safety Mixin evidence incomplete:\n" + String.join("\n", missing));
+        if (!missing.isEmpty()) throw new IllegalStateException("Production Mixin evidence incomplete:\n" + String.join("\n", missing));
         if (checked == 0) throw new IllegalStateException("No handlers verified");
-        System.out.println("Verified " + checked + " safety handlers in post-Mixin production exports. Gameplay behavior still requires scenario acceptance.");
+        System.out.println("Verified " + checked + " handlers in post-Mixin production exports. Gameplay behavior still requires scenario acceptance.");
+    }
+
+    static void checkDedicatedCompatibility(List<JsonObject> metadata) {
+        var sre = metadata.stream().filter(mod -> "starrailexpress".equals(mod.get("id").getAsString()) && loadsOnServer(mod))
+                .findFirst().orElseThrow(() -> new IllegalStateException("Dedicated runtime has no server-compatible StarRailExpress JAR"));
+        var dependencies = sre.getAsJsonObject("depends");
+        if (dependencies != null && dependencies.has("modmenu") && metadata.stream().filter(ProductionMixinVerifier::loadsOnServer)
+                .noneMatch(mod -> "modmenu".equals(mod.get("id").getAsString()) || mod.has("provides")
+                        && mod.getAsJsonArray("provides").asList().stream().anyMatch(alias -> "modmenu".equals(alias.getAsString())))) {
+            throw new IllegalStateException("Dedicated release blocked: StarRailExpress requires modmenu, but no installed server-compatible JAR provides it. Use an upstream-approved dedicated runtime.");
+        }
+    }
+
+    private static boolean loadsOnServer(JsonObject mod) {
+        return !mod.has("environment") || !"client".equals(mod.get("environment").getAsString());
     }
 
     private static byte[] digest(Path file) throws Exception {

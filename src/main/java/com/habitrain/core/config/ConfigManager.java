@@ -17,6 +17,11 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.util.List;
 import java.util.Map;
+import java.util.EnumMap;
+import java.util.EnumSet;
+import java.util.ArrayList;
+import java.util.Objects;
+import java.util.function.Consumer;
 
 public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
     private static final Logger LOGGER = LoggerFactory.getLogger("ConfigManager");
@@ -36,6 +41,16 @@ public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
     private volatile String revisionJson;
     private volatile String cachedAuthoritativeJson;
     private volatile boolean serverCacheDirty = true;
+    private final EnumSet<RuntimeModule> pendingRefresh = EnumSet.noneOf(RuntimeModule.class);
+    private final EnumMap<RuntimeModule, Long> appliedRefreshRevisions = new EnumMap<>(RuntimeModule.class);
+    private final Consumer<RuntimeModule> refreshModule;
+
+    enum RuntimeModule {
+        TASKS("任务池"), MINIGAMES("小游戏"), KNIFE("刀具耐久"), VOICE("大厅语音"), SHADERS("光影白名单");
+
+        final String label;
+        RuntimeModule(String label) { this.label = label; }
+    }
 
     @FunctionalInterface
     public interface ClientSaveHandler { ConfigSaveResult submit(String baseJson, String draftJson, long baseRevision); }
@@ -132,10 +147,15 @@ public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
     }
 
     ConfigManager(ConfigStore store) {
+        this(store, null);
+    }
+
+    ConfigManager(ConfigStore store, Consumer<RuntimeModule> refreshModule) {
         this.repository = new ConfigRepository();
         this.store = store;
         this.sync = new ConfigSync(store);
         this.enforcement = new MinigameEnforcement(store);
+        this.refreshModule = refreshModule == null ? this::refreshModule : refreshModule;
     }
 
     public static ConfigManager getInstance() {
@@ -151,6 +171,10 @@ public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
 
     /** 由 LifecycleEventsRegistrar 在 SERVER_STARTED 注入，供运行时改 minigame 配置后 re-enforce。 */
     public void setServer(@Nullable MinecraftServer server) {
+        if (this.currentServer != server) {
+            pendingRefresh.clear();
+            appliedRefreshRevisions.clear();
+        }
         this.currentServer = server;
         com.habitrain.core.game.sre.mode.KnifeDurabilityToggleService.applyToServer(server);
     }
@@ -278,32 +302,67 @@ public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
                 if (sceneMap != null && !sceneMap.isBlank()) allowed.add(sceneMap.trim());
                 com.habitrain.core.network.ConfigUpdateAccessPolicy.validateAdminSceneMapKeys(before, next, scope, allowed);
             }
-            if (next.equals(before)) return ConfigSaveResult.unchanged();
+            boolean mayRetryAll = scope == com.habitrain.core.network.ConfigUpdateScope.FULL_MOD_MENU;
+            if (next.equals(before)) return applyRuntimeModules(EnumSet.noneOf(RuntimeModule.class), mayRetryAll, false);
             ConfigRepository candidate = new ConfigRepository();
             if (!sync.loadFromJsonObject(candidate, next, true)) return ConfigSaveResult.failed("配置字段无效");
             ConfigRepository prepared = candidate.copy();
             ConfigRepository preparedLocalSnapshot = candidate.copy();
             prepared.setOnSaveCallback(repository.getOnSaveCallback());
             com.google.gson.JsonObject authoritativeRoot = store.buildJsonRoot(prepared, false);
+            var changedModules = changedModules(before, authoritativeRoot);
             int syncBytes = authoritativeRoot.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
             if (syncBytes > ConfigPatch.MAX_SYNC_JSON_BYTES - 256) return ConfigSaveResult.failed("完整服务器配置超过同步大小限制，请缩减配置后重试");
             if (!store.save(candidate)) return ConfigSaveResult.failed("服务器配置写入失败，权威配置未改动");
             repository = prepared; localSnapshot = preparedLocalSnapshot;
             refreshServerRevisionCache(authoritativeRoot);
-            try { applyChangedModules(before, next); }
-            catch (RuntimeException error) { LOGGER.error("配置已保存，但运行副作用失败", error); return new ConfigSaveResult(ConfigSaveResult.Status.SAVED, "服务器已保存配置，但运行刷新失败，请查看服务器日志"); }
-            return ConfigSaveResult.saved();
+            return applyRuntimeModules(changedModules, mayRetryAll, true);
         } catch (RuntimeException error) { return ConfigSaveResult.failed("配置更新被拒绝：" + error.getMessage()); }
     }
 
-    private void applyChangedModules(com.google.gson.JsonObject before, com.google.gson.JsonObject next) {
-        if (!java.util.Objects.equals(before.get("tasks"), next.get("tasks")) || !java.util.Objects.equals(before.get("gameModes"), next.get("gameModes"))) TaskPoolBuilder.invalidateAll();
-        if (!java.util.Objects.equals(before.get("minigames"), next.get("minigames"))) applyMinigameEnforcement(currentServer);
-        var oldGlobal = before.getAsJsonObject("global"); var newGlobal = next.getAsJsonObject("global");
-        if (!java.util.Objects.equals(oldGlobal.get("knifeDurabilityEnabled"), newGlobal.get("knifeDurabilityEnabled"))) KnifeDurabilityToggleService.applyToServer(currentServer);
-        if (!java.util.Objects.equals(oldGlobal.get("lobbyVoiceGroupEnabled"), newGlobal.get("lobbyVoiceGroupEnabled"))) SREGameModeBase.applyLobbyGroupToggle(currentServer);
-        if (!java.util.Objects.equals(oldGlobal.get("shaderWhitelist"), newGlobal.get("shaderWhitelist")) || !java.util.Objects.equals(oldGlobal.get("shaderWhitelistEnabled"), newGlobal.get("shaderWhitelistEnabled")))
-            com.habitrain.core.config.ShaderRuleRevalidation.rulesChanged(currentServer, revision());
+    private static EnumSet<RuntimeModule> changedModules(com.google.gson.JsonObject before, com.google.gson.JsonObject next) {
+        var changed = EnumSet.noneOf(RuntimeModule.class);
+        if (!Objects.equals(before.get("tasks"), next.get("tasks")) || !Objects.equals(before.get("gameModes"), next.get("gameModes"))) changed.add(RuntimeModule.TASKS);
+        if (!Objects.equals(before.get("minigames"), next.get("minigames"))) changed.add(RuntimeModule.MINIGAMES);
+        var oldGlobal = before.getAsJsonObject("global");
+        var newGlobal = next.getAsJsonObject("global");
+        if (!Objects.equals(oldGlobal.get("knifeDurabilityEnabled"), newGlobal.get("knifeDurabilityEnabled"))) changed.add(RuntimeModule.KNIFE);
+        if (!Objects.equals(oldGlobal.get("lobbyVoiceGroupEnabled"), newGlobal.get("lobbyVoiceGroupEnabled"))) changed.add(RuntimeModule.VOICE);
+        if (!Objects.equals(oldGlobal.get("shaderWhitelist"), newGlobal.get("shaderWhitelist"))
+                || !Objects.equals(oldGlobal.get("shaderWhitelistEnabled"), newGlobal.get("shaderWhitelistEnabled"))) changed.add(RuntimeModule.SHADERS);
+        return changed;
+    }
+
+    private ConfigSaveResult applyRuntimeModules(EnumSet<RuntimeModule> changed, boolean mayRetryAll, boolean saved) {
+        pendingRefresh.addAll(changed);
+        var requested = mayRetryAll ? pendingRefresh.clone() : changed;
+        if (requested.isEmpty()) return saved ? ConfigSaveResult.saved() : ConfigSaveResult.unchanged();
+        long revision = serverRevision;
+        var failed = new ArrayList<String>();
+        for (RuntimeModule module : requested) {
+            try {
+                refreshModule.accept(module);
+                appliedRefreshRevisions.put(module, revision);
+                pendingRefresh.remove(module);
+            } catch (RuntimeException error) {
+                failed.add(module.label);
+                LOGGER.error("配置修订 {} 已持久化，{} 刷新失败（上次成功修订：{}）",
+                        revision, module.label, appliedRefreshRevisions.get(module), error);
+            }
+        }
+        var status = saved ? ConfigSaveResult.Status.SAVED : ConfigSaveResult.Status.NO_CHANGE;
+        if (failed.isEmpty()) return saved ? ConfigSaveResult.saved() : new ConfigSaveResult(status, "配置未改动，待刷新模块已生效");
+        return new ConfigSaveResult(status, "配置已写入，但以下模块未生效：" + String.join("、", failed) + "。请从完整配置菜单再次保存以重试");
+    }
+
+    private void refreshModule(RuntimeModule module) {
+        switch (module) {
+            case TASKS -> TaskPoolBuilder.invalidateAll();
+            case MINIGAMES -> enforcement.applyStrict(currentServer, repository);
+            case KNIFE -> KnifeDurabilityToggleService.applyToServer(currentServer);
+            case VOICE -> SREGameModeBase.applyLobbyGroupToggle(currentServer);
+            case SHADERS -> ShaderRuleRevalidation.rulesChanged(currentServer, serverRevision);
+        }
     }
 
     @Override

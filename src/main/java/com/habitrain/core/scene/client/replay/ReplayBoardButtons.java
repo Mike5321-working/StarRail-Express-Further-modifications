@@ -18,6 +18,8 @@ import org.joml.Matrix4f;
 import org.joml.Vector3f;
 
 import java.util.HashMap;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -44,6 +46,9 @@ public final class ReplayBoardButtons {
     /** One plaque as drawn this frame; absolute world coordinates so it survives until the next click. */
     record Target(Action action, BlockPos board, boolean enabled, Component reason) {}
 
+    private record Plaque(Target target, Matrix4f sign, float halfWidth, float halfHeight,
+                          float scale, float textScale, Phase phase, Component label, double fade) {}
+
     private static final int GOLD_HALO = 0xFFE89E30, GOLD_CORE = 0xFFFFE6A8;
     private static final int CYAN_HALO = 0xFF28A4FF, CYAN_CORE = 0xFFAEE8FF;
 
@@ -53,6 +58,7 @@ public final class ReplayBoardButtons {
     private static final double HIT_PAD = 0.02;
 
     private static final Map<BlockPos, Long> PRESSED = new HashMap<>();
+    private static final Map<BlockPos, List<Plaque>> PLAQUES = new HashMap<>();
     private static Vec3 frameEye = Vec3.ZERO, frameDir = new Vec3(0, 0, 1), frameCam = Vec3.ZERO;
     private static Target hovered;
     private static double hoveredDistance = -1;
@@ -66,6 +72,7 @@ public final class ReplayBoardButtons {
     static void beginFrame(Minecraft mc, Vec3 camera, float partialTick) {
         hovered = null;
         hoveredDistance = -1;
+        PLAQUES.clear();
         frameCam = camera;
         var player = mc.player;
         if (player == null) return;
@@ -77,6 +84,7 @@ public final class ReplayBoardButtons {
         hovered = null;
         hoveredDistance = -1;
         PRESSED.clear();
+        PLAQUES.clear();
     }
 
     // ------------------------------------------------------------------ input
@@ -118,7 +126,7 @@ public final class ReplayBoardButtons {
         if (f.level.getBlockEntity(s.pos()) instanceof SettlementSummaryBoard.Marker marker) {
             var playback = marker.playback();
             if (playback != null && playback.pendingOrPlaying(f.level.getGameTime())) {
-                return f.hasRound ? Phase.PLAYING : Phase.STARTING;
+                return f.frame != null ? Phase.PLAYING : Phase.STARTING;
             }
         }
         if (ReplayPackets.EMPTY.equals(round)) return Phase.NO_ROUND;
@@ -154,7 +162,8 @@ public final class ReplayBoardButtons {
         return switch (phase) {
             case NO_ROUND -> ReplayBoardTexts.tr("controls.no_round");
             case LOADING -> ReplayBoardTexts.tr("controls.loading_round");
-            default -> ReplayBoardTexts.tr("controls.playing");
+            case READY -> ReplayBoardTexts.tr("controls.play_unsupported");
+            case STARTING, PLAYING -> ReplayBoardTexts.tr("controls.playing");
         };
     }
 
@@ -190,7 +199,7 @@ public final class ReplayBoardButtons {
      * @param localScale tray-relative scale of the sculpture ({@code ReplayIdleCubes} local scale)
      * @param fade       distance fade 0..1 of the table
      */
-    static void paint(ReplayFrame f, ReplayBoardSite s, Phase phase, float localScale, double fade) {
+    static void collect(ReplayFrame f, ReplayBoardSite s, Phase phase, float localScale, double fade) {
         if (fade < 0.35) return;
         float k = localScale * s.scale();
         var font = f.mc.font;
@@ -217,6 +226,8 @@ public final class ReplayBoardButtons {
 
         boolean playEnabled = phase == Phase.READY && ClientPlayNetworking.canSend(ReplayPackets.StartPlayback.TYPE);
         boolean exportEnabled = ClientReplayBoard.replayLoaded() && ClientReplayBoard.mapAvailable();
+        List<Plaque> plaques = new ArrayList<>(2);
+        PLAQUES.put(s.pos(), plaques);
 
         for (int side = -1; side <= 1; side += 2) {
             boolean play = side < 0;
@@ -226,7 +237,6 @@ public final class ReplayBoardButtons {
             Target target = new Target(play ? Action.PLAY : Action.EXPORT, s.pos(), enabled,
                     play ? playReason(phase) : exportReason(phase));
 
-            boolean hover = false;
             if (aiming) {
                 Vec3 absolute = new Vec3(center.x + frameCam.x, center.y + frameCam.y, center.z + frameCam.z);
                 Vec3 right = new Vec3(f.right.x, f.right.y, f.right.z), up = new Vec3(f.up.x, f.up.y, f.up.z);
@@ -235,12 +245,21 @@ public final class ReplayBoardButtons {
                     hovered = target;
                     hoveredDistance = t;
                     hoveredStamp = System.nanoTime();
-                    hover = true;
                 }
             }
             Matrix4f sign = new Matrix4f().translate(center.x, center.y, center.z).rotate(f.rotation);
-            drawButton(f, sign, hw, hh, k, ts, play, enabled, hover, phase, play ? playLabel : exportLabel, fade);
-            if (hover) drawHint(f, sign, hh, k, ts, enabled, target.reason(), fade);
+            plaques.add(new Plaque(target, sign, hw, hh, k, ts, phase, play ? playLabel : exportLabel, fade));
+        }
+    }
+
+    static void paint(ReplayFrame frame, ReplayBoardSite site) {
+        for (var plaque : PLAQUES.getOrDefault(site.pos(), List.of())) {
+            var target = plaque.target();
+            boolean selected = target == hovered;
+            drawButton(frame, plaque.sign(), plaque.halfWidth(), plaque.halfHeight(), plaque.scale(), plaque.textScale(),
+                    target.action() == Action.PLAY, target.enabled(), selected, plaque.phase(), plaque.label(), plaque.fade());
+            if (selected) drawHint(frame, plaque.sign(), plaque.halfHeight(), plaque.scale(), plaque.textScale(),
+                    target.enabled(), target.reason(), plaque.fade());
         }
     }
 

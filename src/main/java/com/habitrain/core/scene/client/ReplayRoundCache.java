@@ -12,6 +12,7 @@ final class ReplayRoundCache {
     static final long LIMIT = 64L << 20;
     static final long AGE = Duration.ofDays(30).toMillis();
     private static final Pattern OWNED = Pattern.compile("[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\\.(?:voice|bin)");
+    private static final Pattern PART = Pattern.compile("(?:replay|voice)-[0-9]+\\.part");
 
     static void prune(Path directory, long limit, long now) throws IOException {
         if (!Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) return;
@@ -20,11 +21,13 @@ final class ReplayRoundCache {
         long total = 0;
         try (var listing = Files.newDirectoryStream(directory)) {
             for (Path path : listing) {
-                if (!OWNED.matcher(path.getFileName().toString()).matches()) continue;
+                String name = path.getFileName().toString();
+                boolean part = PART.matcher(name).matches();
+                if (!part && !OWNED.matcher(name).matches()) continue;
                 var attrs = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
                 if (!attrs.isRegularFile()) continue;
                 long modified = attrs.lastModifiedTime().toMillis();
-                if (limit == 0 || now - modified > AGE) Files.deleteIfExists(path);
+                if (part || limit == 0 || now - modified > AGE) Files.deleteIfExists(path);
                 else {
                     entries.add(new FileInfo(path, attrs.size(), modified));
                     total += attrs.size();

@@ -44,7 +44,7 @@ public final class ClientConfigSubmission {
         try {
             var scope = ConfigUpdateContext.currentScope(); String sceneMap = ConfigUpdateContext.currentSceneMapKey();
             JsonObject patch = ConfigPatch.filtered(ConfigPatch.diff(JsonParser.parseString(baseJson).getAsJsonObject(), JsonParser.parseString(draftJson).getAsJsonObject()), scope, sceneMap);
-            if (ConfigPatch.empty(patch) && scope != ConfigUpdateScope.ADMIN_SCENE_TOOL) return ConfigSaveResult.unchanged();
+            if (ConfigPatch.empty(patch) && scope != ConfigUpdateScope.ADMIN_SCENE_TOOL && scope != ConfigUpdateScope.FULL_MOD_MENU) return ConfigSaveResult.unchanged();
             JsonObject request = new JsonObject(); String id = UUID.randomUUID().toString();
             request.addProperty("protocol", ConfigPatch.PROTOCOL); request.addProperty("requestId", id); request.addProperty("baseRevision", baseRevision); request.add("patch", patch);
             String wire = ConfigUpdateScope.attachToConfigJson(request.toString(), scope, sceneMap);

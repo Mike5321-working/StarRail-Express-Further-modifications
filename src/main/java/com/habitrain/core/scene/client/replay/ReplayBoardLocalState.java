@@ -21,10 +21,14 @@ final class ReplayBoardLocalState {
             if (player != client.player) return InteractionResult.PASS;
             // Creative configuration works even while holding a block or tool.
             if (player.isCreative() && player.isShiftKeyDown()) {
+                if (!player.mayBuild() || !player.isAlive() || !player.canInteractWithBlock(pos, 1.0)) {
+                    player.displayClientMessage(ReplayBoardTexts.tr("controls.build_required"), true);
+                    return InteractionResult.CONSUME;
+                }
                 client.setScreen(new ReplayBoardSettingsScreen(level.dimension().location(), pos, marker.settings()));
                 return InteractionResult.CONSUME;
             }
-            if (!player.getMainHandItem().isEmpty() || !player.getOffhandItem().isEmpty()) return InteractionResult.PASS;
+            if (!player.getMainHandItem().isEmpty()) return InteractionResult.PASS;
             if (player.isShiftKeyDown()) {
                 toggleRoof();
                 player.displayClientMessage(ReplayBoardTexts.tr(fullBody ? "toggle.roof_full" : "toggle.roof_cut"), true);

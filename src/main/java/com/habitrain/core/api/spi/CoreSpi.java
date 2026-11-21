@@ -262,6 +262,11 @@ public final class CoreSpi {
 
     // ==================== SRE 运行时查询 ====================
 
+    public static boolean startNativeMode(GameMode mode, ServerLevel level) {
+        SreRuntimeBridge bridge = sreRuntime;
+        return bridge != null && bridge.startNativeMode(mode, level);
+    }
+
     public static boolean reserveMatch(ServerLevel level) {
         SreRuntimeBridge bridge = sreRuntime;
         try { return bridge == null || bridge.reserveMatch(level); }

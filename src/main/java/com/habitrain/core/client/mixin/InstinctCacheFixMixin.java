@@ -2,7 +2,6 @@ package com.habitrain.core.client.mixin;
 
 import io.wifi.starrailexpress.client.SREClient;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
@@ -48,7 +47,6 @@ public class InstinctCacheFixMixin {
             ),
             remap = false
     )
-    @Unique
     private static Set habitrain$snapshotEntrySet(Map map) {
         if (map instanceof ConcurrentHashMap) {
             return map.entrySet();

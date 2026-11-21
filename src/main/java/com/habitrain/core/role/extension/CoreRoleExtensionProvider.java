@@ -242,9 +242,34 @@ public final class CoreRoleExtensionProvider implements RoleExtensionEntrypoint 
         // Managed behavior hooks for core's own roles (audit P1-1): they must
         // register through this provider-scoped registrar, not a process-global
         // write path, so identity/rollback/config gating stay uniform.
+        // 这些带 CCA componentKey 的角色由下方 v2 onAssigned 钩子显式执行 component.init()；
+        // 关闭上游 SRERole.autoReset，保留 TMMRoles.COMPONENT_KEYS 的开局/终局自动 clear()，
+        // 同时避免 ModdedRoleAssigned 先通过 RoleMethodDispatcher.onInit 调一次 init()、
+        // 再通过 v2 onAssigned 调第二次 init()（会导致 sin_greed 双倍发袋与重复提示）。
+        disableUpstreamAutoReset(
+                HabiRoles.CRIME_SCAPEGOAT,
+                HabiRoles.FLOWER_GIRL,
+                HabiRoles.SWIFT_WIND,
+                HabiRoles.MIME_KILLER,
+                SevenSins.PRIDE,
+                SevenSins.ENVY,
+                SevenSins.WRATH,
+                SevenSins.GREED,
+                SevenSins.GLUTTONY,
+                SevenSins.LUST,
+                SevenSins.SLOTH
+        );
         com.habitrain.core.game.sre.role.HabiRoleHooks.registerWith(registrar);
         com.habitrain.core.game.sre.role.sins.win.SevenSinV2Hooks.registerWith(registrar);
         com.habitrain.core.game.sre.role.sins.SevenSinV2BehaviorHooks.registerWith(registrar);
+    }
+
+    static void disableUpstreamAutoReset(SRERole... roles) {
+        for (SRERole role : roles) {
+            if (role != null) {
+                role.setAutoReset(false);
+            }
+        }
     }
 
     static RoleDefinition snakeFruitDefinition() {

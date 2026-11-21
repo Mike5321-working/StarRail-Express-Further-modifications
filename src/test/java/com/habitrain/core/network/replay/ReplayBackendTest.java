@@ -75,6 +75,35 @@ class ReplayBackendTest {
         }
     }
 
+    @Test void encoderValidatesTimesAndMakesOversizedTracksDecodable() {
+        var earlier = point(5, 0, 0, ALIVE);
+        var later = point(10, 16, 0, ALIVE);
+        var noHighlights = List.of(Collections.<Integer>emptyNavigableSet());
+        assertThrows(IllegalArgumentException.class,
+                () -> ReplayTracks.encodeWithStatus(List.of(List.of(later, earlier)), 10, noHighlights));
+        assertThrows(IllegalArgumentException.class,
+                () -> ReplayTracks.encodeWithStatus(List.of(List.of(earlier, later)), 9, noHighlights));
+        var overlong = new ArrayList<Sample>();
+        for (int tick = 0; tick <= ReplayTracks.MAX_TRACK; tick++) overlong.add(point(tick, tick, 0, ALIVE));
+        var encoded = ReplayTracks.encodeWithStatus(List.of(overlong), ReplayTracks.MAX_TRACK, noHighlights);
+        assertTrue(encoded.thinned());
+        var track = ReplayTracks.decode(encoded.bytes(), 1, ReplayTracks.MAX_TRACK).getFirst();
+        assertTrue(track.size() <= ReplayTracks.MAX_TRACK);
+        assertEquals(overlong.getLast(), track.getLast());
+    }
+
+    @Test void byteBudgetProtectsExistingSamplesAroundHighlightedAction() {
+        var samples = new ArrayList<Sample>();
+        for (int tick = 0; tick < 6000; tick += 5) samples.add(point(tick, tick, tick & 31, ALIVE));
+        var highlights = new TreeSet<>(List.of(3000));
+        var encoded = ReplayTracks.encodeWithStatus(Collections.nCopies(12, samples), 6000,
+                Collections.nCopies(12, highlights));
+        var track = ReplayTracks.decode(encoded.bytes(), 12, 6000).getFirst();
+        assertTrue(encoded.thinned());
+        assertEquals(List.of(2990, 2995, 3000, 3005, 3010), track.stream().map(Sample::tick)
+                .filter(tick -> tick >= 2990 && tick <= 3010).toList());
+    }
+
     @Test void irreducibleTracksExceedingBudgetFailFastInsteadOfLoopingForever() {
         List<List<Sample>> irreducible = new ArrayList<>();
         for (int i = 0; i < 6_000; i++) {

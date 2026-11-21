@@ -2,6 +2,7 @@ package com.habitrain.core.game.sre.map;
 
 
 import com.habitrain.core.game.sre.mode.RepairModeManager;
+import com.habitrain.core.game.sre.task.CustomTaskBlockScanner;
 import com.habitrain.core.api.GameModeRegistry;
 import com.habitrain.core.api.WinResult;
 import com.habitrain.core.game.sre.mixin.FullTrainResetTaskAccessor;
@@ -142,6 +143,7 @@ public final class MapVoteLoadCoordinator {
      */
     public static void onGameStartConfirmed(ServerLevel level, boolean started) {
         if (level == null) return;
+        if (!started) CustomTaskBlockScanner.cancelPending(level);
         LoadState st = LOADS.get(level.dimension());
         if (st == null) {
             // 非投票触发的开局（普通 SRE 轮次）：不广播，避免误播"进入游戏"转场。
@@ -188,6 +190,7 @@ public final class MapVoteLoadCoordinator {
     /** 维度清理 / 停服时释放。 */
     public static void reset(ServerLevel level) {
         if (level == null) return;
+        CustomTaskBlockScanner.cancelPending(level);
         com.habitrain.core.game.sre.match.ServerMatchContext.GATE.abortPreparing(
                 com.habitrain.core.game.sre.match.ServerMatchContext.dimension(level));
         com.habitrain.core.game.sre.mode.ForcedReadyJoinGate.clear();

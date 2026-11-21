@@ -24,6 +24,7 @@ import java.util.concurrent.CompletableFuture;
 final class ReplayDioramaMesh {
     private static final Logger LOGGER = LoggerFactory.getLogger(ReplayDioramaMesh.class.getSimpleName());
     private static final long PARTIAL_REBUILD_NS = 2_500_000_000L;
+    private static final long FAILURE_RETRY_NS = 15_000_000_000L;
     private static final long IDLE_RELEASE_NS = 45_000_000_000L;
 
     record Key(String fingerprint, int present) {
@@ -46,9 +47,18 @@ final class ReplayDioramaMesh {
     }
 
     static void update(@Nullable SceneAssetCodec.AssetData asset, int present, int total) {
+        update(asset, present, total, false);
+    }
+
+    static void updateWorld(SceneAssetCodec.AssetData asset, int present, int total) {
+        update(asset, present, total, true);
+    }
+
+    private static void update(@Nullable SceneAssetCodec.AssetData asset, int present, int total, boolean autoRetry) {
         if (asset == null || asset.sections.isEmpty()) { selected = null; return; }
         selected = slots.computeIfAbsent(asset.fingerprint, key -> new Slot());
         while (slots.size() > 5) slots.pollFirstEntry().getValue().reset();
+        if (autoRetry && selected.retryAfter != 0 && System.nanoTime() - selected.retryAfter >= 0) selected.failedKey = null;
         selected.update(asset, present, total);
     }
 
@@ -79,6 +89,7 @@ final class ReplayDioramaMesh {
         private @Nullable Key pendingKey;
         private Object ticket = new Object();
         private long lastSubmit, lastUse;
+        private long retryAfter;
 
 
 
@@ -117,6 +128,7 @@ final class ReplayDioramaMesh {
                 future = SceneMeshBuilder.buildCutawayMeshAsync(asset, SceneBuildScheduler.Priority.ADDITIONAL);
             } catch (RuntimeException failure) {
                 failedKey = key;
+                retryAfter = System.nanoTime() + FAILURE_RETRY_NS;
                 LOGGER.warn("Replay diorama mesh submission failed", failure);
                 return;
             }
@@ -151,12 +163,14 @@ final class ReplayDioramaMesh {
                 }
                 // Remember the key so a failing input does not resubmit every frame.
                 failedKey = key;
+                retryAfter = failure == null ? 0 : System.nanoTime() + FAILURE_RETRY_NS;
                 return;
             }
             SceneMeshSet previous = mesh;
             mesh = built;
             builtKey = key;
             failedKey = null;
+            retryAfter = 0;
             if (previous != null && previous != built) previous.close();
         }
 
@@ -180,6 +194,7 @@ final class ReplayDioramaMesh {
             cancelPending();
             closeMesh();
             failedKey = null;
+            retryAfter = 0;
             lastSubmit = 0;
         }
 

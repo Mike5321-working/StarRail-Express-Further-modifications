@@ -78,6 +78,14 @@ public final class ReplayArchivePackets {
         @Override public Type<SetVoiceRecording> type() { return TYPE; }
     }
 
+    public record CheckedLimit(long expected, long limit) implements CustomPacketPayload {
+        public static final Type<CheckedLimit> TYPE = new Type<>(HabiTrainCore.id("replay_archive_checked_limit"));
+        private static final StreamCodec<FriendlyByteBuf, CheckedLimit> CODEC = StreamCodec.ofMember(
+                (p, b) -> { b.writeLong(p.expected); b.writeLong(p.limit); },
+                b -> new CheckedLimit(b.readLong(), b.readLong()));
+        @Override public Type<CheckedLimit> type() { return TYPE; }
+    }
+
     public record VoiceRecordingSettings(boolean enabled, boolean editable, boolean ok) implements CustomPacketPayload {
         public static final Type<VoiceRecordingSettings> TYPE = new Type<>(HabiTrainCore.id("replay_archive_voice_recording"));
         private static final StreamCodec<FriendlyByteBuf, VoiceRecordingSettings> CODEC = StreamCodec.ofMember(
@@ -113,6 +121,7 @@ public final class ReplayArchivePackets {
     public static void register() {
         PayloadTypeRegistry.playC2S().register(Request.TYPE, Request.CODEC);
         PayloadTypeRegistry.playC2S().register(SetVoiceRecording.TYPE, SetVoiceRecording.CODEC);
+        PayloadTypeRegistry.playC2S().register(CheckedLimit.TYPE, CheckedLimit.CODEC);
         PayloadTypeRegistry.playS2C().register(Reply.TYPE, Reply.CODEC);
         PayloadTypeRegistry.playS2C().register(Summary.TYPE, Summary.CODEC);
         PayloadTypeRegistry.playS2C().register(Section.TYPE, Section.CODEC);

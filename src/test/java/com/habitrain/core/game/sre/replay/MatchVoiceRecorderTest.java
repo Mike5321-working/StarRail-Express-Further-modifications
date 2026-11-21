@@ -130,6 +130,22 @@ class MatchVoiceRecorderTest {
         assertTrue(clip.offsetMs() + clip.durationSeconds() * 1000 < 0);
     }
 
+    @Test
+    void postEventTailKeepsTheLastInMatchPosition() {
+        UUID round = UUID.randomUUID(), speaker = UUID.randomUUID();
+        MatchVoiceRecorder.beginTestRound(round, new SceneBounds(0, 0, 0, 100, 20, 40));
+        MatchVoiceRecorder.recordPositionForTest(round, speaker, 100, 20, 4, 20, true);
+        MatchVoiceRecorder.freezePostEventPositions(round);
+
+        var frame = sine48k(440, 18_000);
+        for (int i = 0; i < 8; i++) {
+            MatchVoiceRecorder.recordPcm48kAtMs(round, speaker, 5_000 + i * 20L, 48, frame);
+        }
+
+        var result = MatchVoiceRecorder.extractForTest(round, List.of(kill(100, speaker)));
+        assertEquals(1, result.clips().size(), "voice after settlement should still use the match position");
+    }
+
     private static LastMatchReplay.Node kill(int tick, UUID actor) {
         var pos = LastMatchReplay.Position.quantize(20, 4, 20);
         return new LastMatchReplay.Node(tick, LastMatchReplay.Kind.KILL, actor, null, pos, pos, "", LastMatchReplay.HIT);

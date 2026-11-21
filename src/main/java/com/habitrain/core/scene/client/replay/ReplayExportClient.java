@@ -3,6 +3,7 @@ package com.habitrain.core.scene.client.replay;
 import com.habitrain.core.network.replay.ReplayPackets.RequestVoiceExportC2S;
 import com.habitrain.core.network.replay.ReplayPackets.VoiceExportAccessS2C;
 import com.habitrain.core.scene.client.ClientReplayBoard;
+import com.habitrain.core.scene.client.ReplayHistoryClient;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -19,12 +20,13 @@ public final class ReplayExportClient {
     private static Supplier<ClientReplayBoard.View> voiceSource;
     private static long finishedAt;
     private static long nextAccessRequest;
+    private static java.util.UUID pinnedRound;
 
     private ReplayExportClient() {}
 
     static boolean mapReady(ClientReplayBoard.View view) {
         return view != null && view.replay() != null && view.timeline() != null && view.asset() != null
-                && view.presentSections() == view.totalSections();
+                && view.totalSections() > 0 && view.presentSections() == view.totalSections();
     }
 
     static ReplayVideoExport current() { return video; }
@@ -39,8 +41,18 @@ public final class ReplayExportClient {
 
     static @Nullable ReplayVideoExport start(ClientReplayBoard.View view, boolean fullBody, ReplayExportResolution resolution,
                                              boolean compress, Supplier<ClientReplayBoard.View> source) {
-        if (!canStart() || !mapReady(view)) return null;
-        video = new ReplayVideoExport(view, fullBody, resolution, compress);
+        if (!canStart() || !mapReady(view) || (!compress && !resolution.aviSupported())) return null;
+        java.nio.file.Path ffmpeg = null;
+        if (compress) {
+            Minecraft mc = Minecraft.getInstance();
+            java.nio.file.Path gameDir = mc != null ? mc.gameDirectory.toPath() : null;
+            ffmpeg = ReplayFfmpegManager.resolveAvailable(gameDir);
+            if (ffmpeg == null) return null;
+        }
+        releasePinnedRound();
+        video = new ReplayVideoExport(view, fullBody, resolution, compress, ffmpeg);
+        pinnedRound = view.replay().roundId();
+        ReplayHistoryClient.pin(pinnedRound);
         voiceSource = view.voiceReady() ? null : source;
         nextAccessRequest = 0;
         if (!ClientPlayNetworking.canSend(RequestVoiceExportC2S.TYPE)) video.setVoiceExportAllowed(false);
@@ -60,9 +72,20 @@ public final class ReplayExportClient {
 
     static void reset() {
         if (video != null) video.cancel();
+        releasePinnedRound();
         video = null;
         voiceSource = null;
         finishedAt = 0;
+    }
+
+    private static void releasePinnedRound() {
+        if (pinnedRound != null) ReplayHistoryClient.unpin(pinnedRound);
+        pinnedRound = null;
+    }
+
+    static void shutdown() {
+        ReplayFfmpegManager.cancelInstall();
+        if (video != null) video.shutdown();
     }
 
     private static boolean isExportScreen(Screen screen) {
@@ -91,6 +114,7 @@ public final class ReplayExportClient {
 
         if (!video.running() && finishedAt == 0) {
             video.releaseRenderResources();
+            releasePinnedRound();
             finishedAt = now;
         }
         if (isExportScreen(client.screen) || (client.options.hideGui && client.screen == null)
@@ -99,7 +123,7 @@ public final class ReplayExportClient {
         GuiGraphics g = new GuiGraphics(client, client.renderBuffers().bufferSource());
         int width = Math.min(180, g.guiWidth() - 16);
         if (width <= 16) return;
-        int right = g.guiWidth() - 8, left = right - width;
+        int left = 12, right = left + width;
         int top = Math.max(8, g.guiHeight() * 2 / 3 - 24);
         var font = client.font;
         Component status = video.saved() != null && !video.voiceExportRestricted()

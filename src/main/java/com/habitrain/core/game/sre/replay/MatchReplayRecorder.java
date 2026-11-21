@@ -4,6 +4,7 @@ import com.habitrain.core.api.match.MatchEvents;
 import com.habitrain.core.api.match.MatchSettlement;
 import com.habitrain.core.api.match.MatchWinFaction;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayKillSounds;
 import com.habitrain.core.api.role.v2.EffectiveRole;
 import com.habitrain.core.api.role.v2.RoleKey;
 import com.habitrain.core.api.scene.model.SceneBounds;
@@ -16,6 +17,7 @@ import com.habitrain.core.game.sre.role.drone.ReconDroneEntity;
 import com.habitrain.core.role.snapshot.RoleSnapshotManager;
 import com.habitrain.core.scene.replay.ReplayMapCapture;
 import com.habitrain.core.scene.replay.ReplaySectionGeometry;
+import io.wifi.starrailexpress.api.SREGameModes;
 import io.wifi.starrailexpress.api.SRERole;
 import io.wifi.starrailexpress.api.TMMRoles;
 import io.wifi.starrailexpress.api.replay.ReplayTimelineEvent;
@@ -58,6 +60,7 @@ import static com.habitrain.core.api.match.replay.LastMatchReplay.*;
 /** Lives on the server thread; upstream callbacks record positions before game state is cleared. */
 public final class MatchReplayRecorder {
     private static Round current;
+    private static PendingFinish pendingFinish;
     private MatchReplayRecorder() {}
 
     public static void register() {
@@ -66,6 +69,9 @@ public final class MatchReplayRecorder {
             if (current == null || current.level != level) begin(level);
         });
         MatchEventBridge.WINNERS_FINALIZED.register(MatchReplayRecorder::finish);
+        MatchEventBridge.CLEANUP.register((level, published) -> {
+            if (current != null && current.level == level && pendingFinish == null) reset();
+        });
         ServerTickEvents.END_WORLD_TICK.register(MatchReplayRecorder::tick);
         ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((player, previous, next) -> leave(player, previous));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> leave(handler.player, handler.player.serverLevel()));
@@ -99,7 +105,14 @@ public final class MatchReplayRecorder {
             }
             return InteractionResult.PASS;
         });
-        OnPlayerDeathWithKiller.EVENT.register(MatchReplayRecorder::death);
+        OnPlayerDeathWithKiller.EVENT.register((victim, killer, reason) -> {
+            try {
+                death(victim, killer, reason);
+            } catch (Throwable failure) {
+                com.habitrain.core.internal.FailurePolicy.rethrowIfFatal(failure);
+                LoggerFactory.getLogger(MatchReplayRecorder.class).warn("Could not record replay death", failure);
+            }
+        });
         OnRevolverUsed.EVENT.register((player, target) -> shot(player, target, 30, true));
         OnShieldBroken.EVENT.register((victim, attacker) -> {
             if (victim.level() instanceof ServerLevel level) spatial(level, Kind.SHIELD_BROKEN, id(attacker), id(victim),
@@ -114,7 +127,9 @@ public final class MatchReplayRecorder {
     }
 
     public static void reset() {
-        if (current != null) current.capture.cancel();
+        Round round = current;
+        if (round != null) round.capture.cancel();
+        finishPendingNow();
         current = null;
         MatchVoiceRecorder.reset();
     }
@@ -131,8 +146,10 @@ public final class MatchReplayRecorder {
     private static void begin(ServerLevel level) {
         var game = SREGameWorldComponent.KEY.get(level);
         if (game == null || game.getGameStatus() == SREGameWorldComponent.GameStatus.INACTIVE) return;
-        if (current != null && current.level == level && current.started == level.getGameTime()) return;
+        boolean shouldRecord = game.gameMode == SREGameModes.MURDER;
+        if (shouldRecord && current != null && current.level == level && current.started == level.getGameTime()) return;
         reset();
+        if (!shouldRecord) return;
         var areas = AreasWorldComponent.KEY.get(level);
         SceneBounds bounds = ReplaySectionGeometry.playBounds(areas.getPlayArea(), level.getMinBuildHeight(), level.getMaxBuildHeight());
         String mapKey = bounded(areas.mapName, 128);
@@ -146,9 +163,17 @@ public final class MatchReplayRecorder {
 
     private static void tick(ServerLevel level) {
         Round r = current;
-        if (r == null || r.level != level) return;
+        if (r == null) {
+            if (pendingFinish != null && pendingFinish.level() == level) tickPending(level);
+            return;
+        }
+        if (r.level != level) return;
         var game = SREGameWorldComponent.KEY.get(level);
         if (game.getGameStatus() == SREGameWorldComponent.GameStatus.INACTIVE) {
+            if (pendingFinish != null && pendingFinish.level() == level) {
+                tickPending(level);
+                return;
+            }
             reset();
             return;
         }
@@ -159,8 +184,8 @@ public final class MatchReplayRecorder {
         if (game.getGameStatus() != SREGameWorldComponent.GameStatus.ACTIVE) {
             if (r.start >= 0 && r.activeEnd < 0) {
                 r.activeEnd = level.getGameTime();
-                stopVoice(level);
             }
+            if (pendingFinish != null && pendingFinish.level() == level) tickPending(level);
             return;
         }
         if (r.start < 0) r.activate(game);
@@ -187,10 +212,11 @@ public final class MatchReplayRecorder {
     private static void finish(ServerLevel level, MatchSettlement settlement) {
         Round r = current;
         if (r == null || r.level != level) return;
-        current = null;
+        if (pendingFinish != null && pendingFinish.level() == level) return;
         if (r.start < 0 || settlement.participants().isEmpty()) {
             r.capture.cancel();
             MatchVoiceRecorder.reset();
+            current = null;
             return;
         }
         if (!r.captureDone) {
@@ -242,12 +268,54 @@ public final class MatchReplayRecorder {
         var win = cca.getWinStatus();
         r.events.sort(Comparator.comparingInt(Node::tick));
         r.spans.sort(Comparator.comparingInt(Span::startTick));
-        byte[] voice = MatchVoiceRecorder.finishRound(r.id, r.events);
         var summary = new LastMatchReplay(r.id, anchor, at, r.label, bounded(settlement.modeId(), 128),
                 win == null ? "NONE" : win.name(), settlement.winKind(),
                 bounded(cca.CustomWinnerID, 128), title(cca.CustomWinnerTitle, level), title(cca.CustomWinnerSubtitle, level),
                 cca.CustomWinnerColor, r.bounds, null, people, r.events, r.spans, mvp, r.kills, r.limited, r.droneTracks(ids));
-        ReplayBoardService.publish(summary, r.map, voice, r.killSounds.finish(summary.events()));
+        var killSounds = r.killSounds.finish(summary.events());
+        if (MatchVoiceRecorder.isRecording()) {
+            r.activeEnd = Math.max(r.activeEnd, level.getGameTime());
+            MatchVoiceRecorder.freezePostEventPositions(r.id);
+            pendingFinish = new PendingFinish(level, r, summary, killSounds,
+                    level.getGameTime() + MatchVoiceRecorder.postEventTicks());
+            current = null;
+            return;
+        }
+        publishFinished(level, r, summary, new byte[0], killSounds);
+    }
+
+    private static void tickPending(ServerLevel level) {
+        PendingFinish pending = pendingFinish;
+        if (pending == null || pending.level() != level) return;
+        Round round = pending.round();
+        if (round.activeEnd < 0) round.activeEnd = level.getGameTime();
+        if (MatchVoiceRecorder.isRecording()
+                && level.getGameTime() - round.activeEnd <= MatchVoiceRecorder.postEventTicks()) {
+            int voiceTick = (int) Math.clamp(level.getGameTime() - round.start, 0L, MAX_TICKS);
+            MatchVoiceRecorder.tick(level, voiceTick, Set.of(), round.events);
+        }
+        finishPending(level);
+    }
+
+    private static void finishPending(ServerLevel level) {
+        PendingFinish pending = pendingFinish;
+        if (pending == null || pending.level() != level || level.getGameTime() < pending.voiceDeadline()) return;
+        finishPendingNow();
+    }
+
+    private static void finishPendingNow() {
+        PendingFinish pending = pendingFinish;
+        if (pending == null) return;
+        MatchVoiceRecorder.stop(pending.level());
+        byte[] voice = MatchVoiceRecorder.finishRound(pending.round().id, pending.round().events);
+        publishFinished(pending.level(), pending.round(), pending.summary(), voice, pending.killSounds());
+    }
+
+    private static void publishFinished(ServerLevel level, Round round, LastMatchReplay summary,
+                                        byte[] voice, java.util.concurrent.CompletableFuture<List<ReplayKillSounds.Window>> killSounds) {
+        if (current == round) current = null;
+        if (pendingFinish != null && pendingFinish.round() == round) pendingFinish = null;
+        ReplayBoardService.publish(summary, round.map, voice, killSounds);
     }
 
     private static String title(Component c, ServerLevel level) {
@@ -392,6 +460,9 @@ public final class MatchReplayRecorder {
         return role == null || TMMRoles.DISCOVERY_CIVILIAN.identifier().equals(role.identifier());
     }
     private record Role(String id, int color) {}
+    private record PendingFinish(ServerLevel level, Round round, LastMatchReplay summary,
+                                 java.util.concurrent.CompletableFuture<List<ReplayKillSounds.Window>> killSounds,
+                                 long voiceDeadline) {}
     private static Role role(@Nullable SRERole raw) {
         if (raw == null || raw.identifier() == null) return new Role("", 0);
         var snapshot = RoleSnapshotManager.INSTANCE.current();

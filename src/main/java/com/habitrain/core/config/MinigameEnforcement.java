@@ -15,6 +15,14 @@ public class MinigameEnforcement {
     }
 
     public void apply(@Nullable MinecraftServer server, ConfigRepository repo) {
+        try {
+            applyStrict(server, repo);
+        } catch (RuntimeException error) {
+            LOGGER.warn("Failed to apply minigame settings", error);
+        }
+    }
+
+    void applyStrict(@Nullable MinecraftServer server, ConfigRepository repo) {
         if (server == null) return;
         SREIntegration.applyMinigameSettings(
                 server,

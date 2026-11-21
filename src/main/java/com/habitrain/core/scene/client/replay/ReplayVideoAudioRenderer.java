@@ -41,6 +41,7 @@ final class ReplayVideoAudioRenderer {
     static final int SAMPLES_PER_VIDEO_FRAME = SAMPLE_RATE / ReplayVideoExport.FPS; // 1600 stereo frames per 30fps frame
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ReplayVideoAudioRenderer.class);
+    private static final long MAX_SOUND_CACHE_BYTES = 24L * 1024 * 1024;
 
     private ReplayVideoAudioRenderer() {}
 
@@ -81,6 +82,7 @@ final class ReplayVideoAudioRenderer {
         float[] mixL = new float[Math.min(SAMPLE_RATE, totalStereoFrames)];
         float[] mixR = new float[mixL.length];
         var cache = new LinkedHashMap<List<String>, Optional<DecodedSound>>(32, 0.75f, true);
+        long cachedBytes = 0;
         var ended = new IdentityHashMap<ReplaySoundCuePlan.SoundCue, Integer>();
         var voices = new java.util.IdentityHashMap<ReplayVoiceData.Clip, short[]>();
         for (int offset = 0; offset < totalStereoFrames; offset += mixL.length) {
@@ -90,8 +92,20 @@ final class ReplayVideoAudioRenderer {
             for (var cue : schedule.sounds()) {
                 if (Math.round(cue.time() * SAMPLE_RATE) >= offset + mixL.length
                         || ended.getOrDefault(cue, totalStereoFrames) <= offset) continue;
-                DecodedSound asset = cache.computeIfAbsent(soundKey(cue), keys -> Optional.ofNullable(resolver.resolve(keys))).orElse(null);
-                if (cache.size() > 32) cache.pollFirstEntry();
+                var key = soundKey(cue);
+                var cached = cache.get(key);
+                DecodedSound asset;
+                if (cached == null) {
+                    asset = resolver.resolve(key);
+                    long assetBytes = soundBytes(asset);
+                    if (assetBytes <= MAX_SOUND_CACHE_BYTES) {
+                        while (cache.size() >= 32 || cachedBytes + assetBytes > MAX_SOUND_CACHE_BYTES) {
+                            cachedBytes -= soundBytes(cache.pollFirstEntry().getValue().orElse(null));
+                        }
+                        cache.put(key, Optional.ofNullable(asset));
+                        cachedBytes += assetBytes;
+                    }
+                } else asset = cached.orElse(null);
                 int end = asset == null ? offset : mixSoundCue(mixL, mixR, totalStereoFrames, offset, cue, asset);
                 ended.put(cue, end);
             }
@@ -107,6 +121,10 @@ final class ReplayVideoAudioRenderer {
 
     private static List<String> soundKey(ReplaySoundCuePlan.SoundCue cue) {
         return cue.recordedFile() == null ? cue.candidates() : List.of(cue.recordedFile().toString());
+    }
+
+    private static long soundBytes(@Nullable DecodedSound sound) {
+        return sound == null ? 0 : (long) sound.samples().length * Float.BYTES;
     }
 
     private static int mixSoundCue(float[] mixL, float[] mixR, int totalStereoFrames, int offset,

@@ -2,6 +2,7 @@ package com.habitrain.core.game.sre.match;
 
 import com.habitrain.core.api.match.MatchEvents;
 import com.habitrain.core.api.match.MatchSettlement;
+import com.habitrain.core.internal.FailurePolicy;
 import io.wifi.starrailexpress.cca.SREGameWorldComponent;
 import io.wifi.starrailexpress.event.OnGameEnd;
 import io.wifi.starrailexpress.event.OnGameStarted;
@@ -16,6 +17,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+import java.util.function.Supplier;
 
 /**
  * Bridges SRE {@code OnGameStarted}/{@code OnGameEnd} onto public {@link MatchEvents}.
@@ -31,7 +34,16 @@ public final class MatchEventBridge {
     private static final Set<ResourceKey<Level>> DELIVERED_ROUND_END = ConcurrentHashMap.newKeySet();
     /** Internal phases: winner observers run before any round-state cleanup. */
     public static final Event<MatchEvents.RoundEnded> WINNERS_FINALIZED = settlementEvent();
-    public static final Event<MatchEvents.RoundEnded> CLEANUP = settlementEvent();
+    public static final Event<RoundCleanup> CLEANUP = EventFactory.createArrayBacked(RoundCleanup.class,
+            listeners -> (level, published) -> {
+                for (RoundCleanup listener : listeners) {
+                    try { listener.run(level, published); }
+                    catch (Throwable failure) {
+                        FailurePolicy.rethrowIfFatal(failure);
+                        LOGGER.error("Internal round cleanup failed", failure);
+                    }
+                }
+            });
     private static boolean registered;
 
     private MatchEventBridge() {}
@@ -61,8 +73,9 @@ public final class MatchEventBridge {
                     PENDING_ROUND_END.add(dim);
                     return;
                 }
+                var reservation = ServerMatchContext.nativeReservation(level);
                 try { dispatchRoundEnded(level, game); }
-                finally { com.habitrain.core.game.sre.match.ServerMatchContext.release(level); }
+                finally { ServerMatchContext.GATE.release(reservation); }
             });
             LOGGER.info("Registered MatchEvents bridge (OnGameStarted/OnGameEnd)");
         } catch (Throwable t) {
@@ -71,53 +84,77 @@ public final class MatchEventBridge {
         }
     }
 
-    public static void beginFinalizeGame(@Nullable ServerLevel level) {
-        if (level == null) {
-            return;
+    public static void finalizeNativeRound(ServerLevel level, Runnable upstream) {
+        var dimension = level.dimension();
+        var reservation = ServerMatchContext.nativeReservation(level);
+        if (!FINALIZING_LEVELS.add(dimension)) return;
+        if (reservation != null) {
+            ServerMatchContext.GATE.transition(reservation.dimension(), SingleMatchGate.Phase.SETTLING);
         }
-        com.habitrain.core.game.sre.match.ServerMatchContext.GATE.transition(com.habitrain.core.game.sre.match.ServerMatchContext.dimension(level), com.habitrain.core.game.sre.match.SingleMatchGate.Phase.SETTLING);
-        FINALIZING_LEVELS.add(level.dimension());
+        runFinalization(upstream, completed -> {
+            FINALIZING_LEVELS.remove(dimension);
+            boolean pending = PENDING_ROUND_END.remove(dimension);
+            try {
+                if (pending && completed) dispatchRoundEnded(level, null);
+                else if ((pending || reservation != null) && DELIVERED_ROUND_END.add(dimension)) {
+                    CLEANUP.invoker().run(level, false);
+                }
+            } finally {
+                ServerMatchContext.GATE.release(reservation);
+            }
+        });
     }
 
-    public static void onAfterRecordWinStats(@Nullable ServerLevel level, @Nullable SREGameWorldComponent game) {
-        if (level == null) {
-            return;
-        }
-        ResourceKey<Level> dim = level.dimension();
-        if (PENDING_ROUND_END.remove(dim)) {
-            dispatchRoundEnded(level, game);
-        }
-    }
-
-    public static void endFinalizeGame(@Nullable ServerLevel level, @Nullable SREGameWorldComponent game) {
-        if (level == null) {
-            return;
-        }
-        ResourceKey<Level> dim = level.dimension();
-        FINALIZING_LEVELS.remove(dim);
+    static void runFinalization(Runnable upstream, Consumer<Boolean> finish) {
+        Throwable originalFailure = null;
         try {
-            if (PENDING_ROUND_END.remove(dim)) dispatchRoundEnded(level, game);
-        } finally { com.habitrain.core.game.sre.match.ServerMatchContext.release(level); }
+            upstream.run();
+        } catch (RuntimeException | Error failure) {
+            originalFailure = failure;
+            throw failure;
+        } finally {
+            try { finish.accept(originalFailure == null); }
+            catch (RuntimeException | Error failure) {
+                if (originalFailure == null) throw failure;
+                if (originalFailure != failure) originalFailure.addSuppressed(failure);
+            }
+        }
+    }
+
+    public static void onAfterRecordWinStats(ServerLevel level) {
+        if (PENDING_ROUND_END.remove(level.dimension())) dispatchRoundEnded(level, null);
     }
 
     private static void dispatchRoundEnded(ServerLevel level, @Nullable SREGameWorldComponent game) {
         if (!DELIVERED_ROUND_END.add(level.dimension())) return;
-        SREGameWorldComponent resolvedGame = game;
-        if (resolvedGame == null) {
-            try {
-                resolvedGame = SREGameWorldComponent.KEY.get(level);
-            } catch (RuntimeException e) {
-                LOGGER.warn("Failed to resolve SREGameWorldComponent for round end in {}", level.dimension().location(), e);
+        dispatchSettlement(() -> MatchSettlementFactory.fromRecordedStats(level,
+                game == null ? SREGameWorldComponent.KEY.get(level) : game), settlement -> {
+            try { GameEndTransitionCoordinator.onWinStatsRecorded(level, settlement); }
+            catch (Throwable failure) {
+                FailurePolicy.rethrowIfFatal(failure);
+                LOGGER.error("Could not update the settlement transition", failure);
             }
-        }
-        MatchSettlement settlement = MatchSettlementFactory.fromRecordedStats(level, resolvedGame);
-        try {
-            GameEndTransitionCoordinator.onWinStatsRecorded(level, settlement);
             WINNERS_FINALIZED.invoker().onRoundEnded(level, settlement);
             MatchEvents.ROUND_ENDED.invoker().onRoundEnded(level, settlement);
+        }, published -> CLEANUP.invoker().run(level, published));
+    }
+
+    static void dispatchSettlement(Supplier<MatchSettlement> snapshot, Consumer<MatchSettlement> publish, Consumer<Boolean> cleanup) {
+        boolean published = false;
+        try {
+            publish.accept(snapshot.get());
+            published = true;
+        } catch (Throwable failure) {
+            FailurePolicy.rethrowIfFatal(failure);
+            LOGGER.error("Could not publish native round settlement", failure);
         } finally {
-            CLEANUP.invoker().onRoundEnded(level, settlement);
+            cleanup.accept(published);
         }
+    }
+
+    @FunctionalInterface
+    public interface RoundCleanup {
+        void run(ServerLevel level, boolean settlementPublished);
     }
 
     static Event<MatchEvents.RoundEnded> settlementEvent() {

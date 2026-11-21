@@ -40,7 +40,7 @@ Windows / PowerShell（当前工作区；用仓库自带的 wrapper）：
 
 ## 命令
 
-- `/instantgroup [range]` — OP 将范围内玩家加入临时语音群组（需 voicechat）
+- `/habi_group [range]` — OP 将范围内玩家加入临时语音群组（需 voicechat）
 - `/habi_api list` — OP 列出已注册模式
 
 ## 关键约定

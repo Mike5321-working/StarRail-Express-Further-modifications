@@ -21,7 +21,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * 语音群组服务 — 处理 /instantgroup 命令的临时语音群组创建、玩家加入逻辑、大厅群组操作及淘汰观战群组隔离保障。
+ * 语音群组服务 — 处理 /habi_group 命令的临时语音群组创建、玩家加入逻辑、大厅群组操作及淘汰观战群组隔离保障。
  * 所有直接触碰 {@code de.maxhenkel.voicechat.api.*} 的调用均收口在本类中，调用方先经过 {@link VoiceChatPresence#isLoaded()} 守卫，
  * 避免未安装 Simple Voice Chat 时触发 {@link NoClassDefFoundError}。
  */
@@ -167,7 +167,7 @@ public final class VoiceGroupService {
     }
 
     /**
-     * 执行 /instantgroup 命令：将范围内玩家加入临时语音群组。
+     * 执行 /habi_group 命令：将范围内玩家加入临时语音群组。
      */
     public static int executeInstantGroup(CommandContext<CommandSourceStack> context, int range) {
         // 审核 B25：显式的可选依赖守卫（voicechat 只在 fabric.mod.json 里 suggests）。
@@ -246,7 +246,7 @@ public final class VoiceGroupService {
         for (ServerPlayer p : nearby) {
             if (api.getConnectionOf(p.getUUID()) != null) p.sendSystemMessage(notify);
         }
-        LOGGER.info("[InstantGroup] {} 执行 /instantgroup {}，{} 名玩家", sender.getName().getString(), range, count);
+        LOGGER.info("[HabiGroup] {} 执行 /habi_group {}，{} 名玩家", sender.getName().getString(), range, count);
         return count;
     }
 }

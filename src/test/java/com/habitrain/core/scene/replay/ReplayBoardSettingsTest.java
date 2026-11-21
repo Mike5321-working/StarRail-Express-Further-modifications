@@ -77,6 +77,16 @@ class ReplayBoardSettingsTest {
             var result = new ReplayBoardSettingsPackets.Result(dim, pos, false);
             ReplayBoardSettingsPackets.Result.CODEC.encode(buf, result);
             assertEquals(result, ReplayBoardSettingsPackets.Result.CODEC.decode(buf));
+            buf.clear();
+            var requestId = new java.util.UUID(17, 41);
+            var checked = new ReplayBoardSettingsPackets.CheckedSave(requestId, ReplayBoardSettings.DEFAULT, request);
+            ReplayBoardSettingsPackets.CheckedSave.CODEC.encode(buf, checked);
+            assertEquals(checked, ReplayBoardSettingsPackets.CheckedSave.CODEC.decode(buf));
+            buf.clear();
+            var conflict = new ReplayBoardSettingsPackets.CheckedResult(requestId,
+                    ReplayBoardSettingsPackets.CheckedResult.Status.CONFLICT);
+            ReplayBoardSettingsPackets.CheckedResult.CODEC.encode(buf, conflict);
+            assertEquals(conflict, ReplayBoardSettingsPackets.CheckedResult.CODEC.decode(buf));
         } finally { buf.release(); }
     }
 

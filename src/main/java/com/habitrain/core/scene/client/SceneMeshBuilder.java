@@ -300,7 +300,8 @@ public final class SceneMeshBuilder {
                 LOGGER.error("构建场景顶点网格失败", t);
                 // 失败路径同样要冻结：部分统计信息对诊断仍然有价值。
                 report.freeze();
-                result.complete(new MeshBuildResult(new SceneMeshSet(), report));
+                if (retainHiddenFaces) result.completeExceptionally(t);
+                else result.complete(new MeshBuildResult(new SceneMeshSet(), report));
                 return true;
             }
         }

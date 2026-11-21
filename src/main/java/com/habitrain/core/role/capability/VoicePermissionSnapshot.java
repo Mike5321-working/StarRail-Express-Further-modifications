@@ -6,16 +6,28 @@ import com.habitrain.core.api.role.v2.capability.RoleVoicePolicy;
 import com.habitrain.core.api.role.v2.capability.VoiceDecision;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /** Safely published voice view. Contains no player, world, CCA or config references. */
-public record VoicePermissionSnapshot(Map<UUID, Participant> players, List<RoleVoicePolicy> policies) {
-    public static final VoicePermissionSnapshot EMPTY = new VoicePermissionSnapshot(Map.of(), List.of());
+public record VoicePermissionSnapshot(Map<UUID, Participant> players, List<RoleVoicePolicy> policies,
+                                      Set<UUID> privateChannels) {
+    public static final VoicePermissionSnapshot EMPTY = new VoicePermissionSnapshot(Map.of(), List.of(), Set.of());
+
+    public VoicePermissionSnapshot(Map<UUID, Participant> players, List<RoleVoicePolicy> policies) {
+        this(players, policies, Set.of());
+    }
+
     public VoicePermissionSnapshot {
         players = Map.copyOf(players);
         policies = List.copyOf(policies);
+        privateChannels = Set.copyOf(privateChannels);
     }
     public record Participant(RoleKey role, UUID group, String dimension, double x, double y, double z) {}
+
+    public boolean isPrivateChannel(UUID speaker) {
+        return privateChannels.contains(speaker);
+    }
 
     public VoiceDecision evaluate(UUID speaker, UUID listener, UUID nativeSpeakerGroup, UUID nativeListenerGroup) {
         Participant from = players.get(speaker);

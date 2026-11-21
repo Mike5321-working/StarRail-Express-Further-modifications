@@ -8,6 +8,7 @@ import com.habitrain.core.network.replay.ReplayPackets;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.block.ReplayBoardSettings;
 import com.habitrain.core.scene.client.ClientReplayBoard;
+import com.habitrain.core.scene.client.ReplayHistoryClient;
 import com.habitrain.core.scene.client.SceneMeshSet;
 import com.habitrain.core.scene.client.SceneShaders;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
@@ -81,7 +82,8 @@ public final class ReplayBoardRenderer {
     private static long animOriginTick;
     private static long lastAnimGameTime;
     private static boolean registered;
-    private static boolean failed;
+    private static long nextRenderAttempt;
+    private static long lastHonorsDraw;
 
     private ReplayBoardRenderer() {}
 
@@ -99,15 +101,22 @@ public final class ReplayBoardRenderer {
             if (client.level != observedLevel) {
                 observedLevel = client.level;
                 animOriginLevel = null;
+                nextRenderAttempt = 0;
+                lastHonorsDraw = 0;
+                HONORS_LAYER.close();
                 ReplayDioramaMesh.reset();
                 model = null;
                 modelSource = null;
             }
+            if (lastHonorsDraw != 0 && System.nanoTime() - lastHonorsDraw >= 3_000_000_000L) {
+                HONORS_LAYER.close();
+                lastHonorsDraw = 0;
+            }
             ReplayDioramaMesh.tickIdle();
         });
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            ReplayExportClient.reset();
             reset();
-            releaseBuffers();
         });
     }
 
@@ -122,7 +131,9 @@ public final class ReplayBoardRenderer {
     public static void reset() {
         ReplayAudioPlaybackController.reset();
         ReplayExportClient.reset();
-        failed = false;
+        nextRenderAttempt = 0;
+        lastHonorsDraw = 0;
+        releaseBuffers();
         animOriginLevel = null;
         ReplayDioramaMesh.reset();
         ReplayHeadSkins.clear();
@@ -134,7 +145,8 @@ public final class ReplayBoardRenderer {
     }
 
     private static void render(WorldRenderContext context) {
-        if (failed || context == null || context.camera() == null) return;
+        if (context == null || context.camera() == null
+                || nextRenderAttempt != 0 && System.nanoTime() - nextRenderAttempt < 0) return;
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null || mc.player == null) return;
@@ -149,9 +161,11 @@ public final class ReplayBoardRenderer {
             renderBoards(context, mc, level, loaded);
         } catch (RuntimeException failure) {
             // A renderer bug must never take the world pass down with it.
-            failed = true;
+            nextRenderAttempt = System.nanoTime() + 3_000_000_000L;
+            ReplayBoardButtons.reset();
+            releaseBuffers();
             ReplayAudioPlaybackController.endBoardFrame(mc, Set.of());
-            LOGGER.error("Settlement board rendering disabled after an unexpected failure", failure);
+            LOGGER.error("Settlement board rendering paused after an unexpected failure", failure);
         }
     }
 
@@ -200,6 +214,7 @@ public final class ReplayBoardRenderer {
                 candidates.add(new Candidate(pos, facing, distance, settings, playback, visible));
         }
         if (candidates.isEmpty()) {
+            ReplayHistoryClient.updateBoardPins(Set.of());
             ReplayAudioPlaybackController.endBoardFrame(mc, Set.of());
             return;
         }
@@ -240,6 +255,7 @@ public final class ReplayBoardRenderer {
         var camera = context.camera();
         boolean allowBoardAudio = !ClientReplayBoard.inMatch(level);
         Set<BlockPos> activeAudioBoards = new HashSet<>();
+        Set<java.util.UUID> activeHistoricalRounds = new HashSet<>();
         List<BoardDraw> boards = new ArrayList<>(MAX_BOARDS);
         try (var guard = ClientRenderState.capture()) {
             for (Candidate c : candidates) {
@@ -250,8 +266,10 @@ public final class ReplayBoardRenderer {
                 boolean active = playing != null && playing.playing(gameTime);
                 boolean draw = c.visible() && boards.size() < MAX_BOARDS;
                 if (!draw && !active) continue;
-                var selected = playing != null && playing.pendingOrPlaying(gameTime) && (playing.shared() || !playing.roundId().equals(round))
-                        ? com.habitrain.core.scene.client.ReplayHistoryClient.watch(playing.roundId()) : view;
+                boolean historical = playing != null && playing.pendingOrPlaying(gameTime)
+                        && (playing.shared() || !playing.roundId().equals(round));
+                var selected = historical ? ReplayHistoryClient.watch(playing.roundId()) : view;
+                if (historical) activeHistoricalRounds.add(playing.roundId());
                 ReplayBoardModel shown = null;
                 if (active && selected.replay() != null && selected.timeline() != null) {
                     if (selected == view) shown = current;
@@ -282,28 +300,39 @@ public final class ReplayBoardRenderer {
                 }
                 if (!draw) continue;
                 ReplayTimeline.Frame frame = shown == null ? null : shown.timeline.atElapsed(elapsed);
+                boolean loading = selected.hasRound() && selected.replay() == null
+                        || playing != null && playing.preparing();
                 var f = new ReplayFrame(mc, level, camera.rotation(), source, trayType,
-                        active ? elapsed / 20.0 : anim, anim, shown, frame, active,
+                        active ? elapsed / 20.0 : anim, anim, shown, frame, loading,
                         active ? selected.presentSections() : 0, active ? selected.totalSections() : 0,
                         new Vector3f(camera.getLeftVector()).negate(), new Vector3f(camera.getUpVector()),
                         new Vector3f(camera.getLookVector()));
                 boards.add(new BoardDraw(f, site, playing != null && playing.pendingOrPlaying(gameTime) ? selected : null));
             }
+            ReplayHistoryClient.updateBoardPins(activeHistoricalRounds);
             drawBoards(context, mc, boards);
         }
         ReplayAudioPlaybackController.endBoardFrame(mc, activeAudioBoards);
     }
 
     private static void drawBoards(WorldRenderContext context, Minecraft mc, List<BoardDraw> boards) {
-        boolean honors = boards.stream().anyMatch(board -> ReplayHonorsPainter.visible(board.frame()));
+        boolean honors = false;
+        for (var board : boards) {
+            if (ReplayHonorsPainter.visible(board.frame())) honors = true;
+            else ReplayIdleCubes.prepareButtons(board.frame(), board.site());
+        }
         var world = mc.getMainRenderTarget();
         boolean isolated = honors && HONORS_LAYER.captureWorldDepth(world);
+        if (isolated) lastHonorsDraw = System.nanoTime();
         for (var board : boards) {
             SceneMeshSet mesh = null;
             var mapView = board.mapView();
+            board.frame().meshFailed = mapView != null && mapView.mapFailed();
             if (mapView != null && mapView.asset() != null) {
-                ReplayDioramaMesh.update(mapView.asset(), mapView.presentSections(), mapView.totalSections());
+                ReplayDioramaMesh.updateWorld(mapView.asset(), mapView.presentSections(), mapView.totalSections());
                 if (ReplayDioramaMesh.matches(mapView.asset())) mesh = ReplayDioramaMesh.current();
+                board.frame().meshFailed |= mesh == null && ReplayDioramaMesh.failed(
+                        new ReplayDioramaMesh.Key(mapView.asset().fingerprint, mapView.presentSections()));
             }
             drawFrame(context.positionMatrix(), context.projectionMatrix(), board.frame(), board.site(), mesh,
                     ReplayBoardLocalState.fullBody());
@@ -330,7 +359,7 @@ public final class ReplayBoardRenderer {
                 halfSize, halfSize, 1, true, LightTexture.FULL_BRIGHT);
         Quaternionf rotation = shot.rotation();
         var f = new ReplayFrame(mc, mc.level, rotation, buffers, trayType, anim, anim, current,
-                frame, true, 0, 0, rotation.transform(new Vector3f(1, 0, 0)),
+                frame, false, 0, 0, rotation.transform(new Vector3f(1, 0, 0)),
                 rotation.transform(new Vector3f(0, 1, 0)), shot.look(), stage);
         Matrix4f diorama = diorama(f, site);
         var heads = new ReplayActorSizing(current.scale, 1, diorama, shot.view(), shot.projection(), shot::emphasis, true);
@@ -355,7 +384,6 @@ public final class ReplayBoardRenderer {
         }
         source.endBatch(ReplayDraw.FILL);
         f.flushModels();
-        source.endLastBatch();
         source.endBatch(ReplayDraw.GLOW);
         f.flushTexts();
         source.endBatch();
@@ -395,7 +423,6 @@ public final class ReplayBoardRenderer {
         // In-world buttons write depth, so they must be flushed before the additive glow pass.
         source.endBatch(ReplayDraw.PANEL);
         f.flushModels();
-        source.endLastBatch();
         source.endBatch(ReplayDraw.GLOW);
         f.flushTexts();
         source.endBatch();
@@ -470,7 +497,7 @@ public final class ReplayBoardRenderer {
         FAN_CUTAWAY.faceViewer(model, new Vector3f(f.look), current.source);
         float[] projected = new float[3];
         for (ReplayBoardModel.Actor actor : current.actors) {
-            var pose = actor.track.sample(f.replayTick);
+            var pose = f.pose(actor);
             if (!pose.visible()) continue;
             current.project(pose.x(), pose.y(), pose.z(), projected);
             float size = heads.size(actor.p.id(), projected[0], projected[1], projected[2]);
@@ -499,6 +526,7 @@ public final class ReplayBoardRenderer {
             fixed.put(ReplayDraw.FILL, own(1 << 18));
             fixed.put(ReplayDraw.PANEL, own(1 << 15));
             fixed.put(ReplayDraw.GLOW, own(1 << 18));
+            for (var type : ReplayFrame.glintTypes()) fixed.put(type, own(4096));
             buffers = MultiBufferSource.immediateWithBuffers(fixed, own(1 << 17));
         }
         return buffers;

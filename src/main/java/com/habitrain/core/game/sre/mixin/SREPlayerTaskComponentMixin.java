@@ -18,31 +18,8 @@ public abstract class SREPlayerTaskComponentMixin {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("SREPlayerTaskComponentMixin");
 
-    // S6-010 @Shadow evaluation:
-    //   player                → getPlayer() method shadow (public API, least fragile)
-    //   parallelTaskGenerated → public boolean field; no public getter in SRE, kept as @Shadow
-    //   playerMoodComponent   → public field; no public getter in SRE, kept as @Shadow
-    //   tasks                 → public Map field; no public getter in SRE, kept as @Shadow
-    //   generateParallelTask() → public API method, least fragile form of @Shadow
-    // If SRE renames these public members in a future version, the mixin config should
-    // set required=false to degrade gracefully instead of crashing on load.
-
     @Shadow(remap = false)
     public abstract Player getPlayer();
-
-    @Shadow(remap = false)
-    public boolean parallelTaskGenerated;
-
-    @Shadow(remap = false)
-    public io.wifi.starrailexpress.cca.SREPlayerMoodComponent playerMoodComponent;
-
-    @Shadow(remap = false)
-    public java.util.Map<SREPlayerTaskComponent.Task, SREPlayerTaskComponent.TrainTask> tasks;
-
-    @Shadow(remap = false)
-    public io.wifi.starrailexpress.cca.SREPlayerTaskComponent.TrainTask generateParallelTask() {
-        throw new AssertionError("Shadowed");
-    }
 
     @Inject(
             method = "init",

@@ -36,7 +36,7 @@ public final class SevenSinEvents {
                 com.habitrain.core.game.sre.role.sins.component.LustComponent.onPlayerDeath(victim, reason));
         io.wifi.starrailexpress.event.OnGameStarted.EVENT.register(
                 com.habitrain.core.game.sre.role.sins.component.LustComponent::resetRound);
-        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, settlement) ->
+        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, published) ->
                 com.habitrain.core.game.sre.role.sins.component.LustComponent.resetRound(level));
         // Runs even after the only Lust disconnects or changes role, clearing stale vision.
         net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents.END_WORLD_TICK.register(level -> {
@@ -47,7 +47,7 @@ public final class SevenSinEvents {
         });
 
         io.wifi.starrailexpress.event.OnGameStarted.EVENT.register(SlothComponent::resetRound);
-        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, settlement) -> SlothComponent.resetRound(level));
+        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, published) -> SlothComponent.resetRound(level));
 
         try {
             ServerMessageEvents.ALLOW_CHAT_MESSAGE.register((message, sender, params) -> {

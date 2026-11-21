@@ -9,21 +9,20 @@
 
 ## 1. 公开边界与生命周期
 
-**唯一公开的 API 是 `com.habitrain.core.api.**`**，具体包含：
+**下游只应依赖下表中的公开入口。** 包名位于 `api` 下，不代表所有类型都承诺兼容：
 
 | 公开子包 | 说明 |
 |---|---|
 | `com.habitrain.core.api` | 顶层入口：`CoreApi`、任务、游戏模式、投票、`ItemReclaimHelper` 等 |
-| `com.habitrain.core.api.spi` | 实现层桥接接口（`CoreSpi`、`CoreLifecycle`、各 `*Bridge`、`RoleSpi`） |
 | `com.habitrain.core.api.scene` | 移动场景 v2 门面与公开值对象 |
 | `com.habitrain.core.api.role.v2` | 完整角色扩展 v2（preview / experimental） |
 | `com.habitrain.core.api.match` | 对局阶段、结算与事件 |
 | `com.habitrain.core.api.menu` | 服务端 ModMenu 门控查询 |
 | `com.habitrain.core.api.client` | 客户端专用查询（`api.client.menu`、`api.client.scene`） |
 
-**其余一切都是内部实现，不要在编译期引用**：`com.habitrain.core.task`、`game`、`role`、`scene`、`config`、`client`、`vote`、`network`、`internal`、`misc`、`persist`、`util`、`betel`。这些包既不保证兼容，也可能在任意小版本重命名或删除；升级时若发现它们变动，属于内部重构而不是 API 破坏性变更。
+`api.spi` 是 Core 内部装配协议，不是下游扩展入口；现有类型保留原位，不新增兼容承诺。`com.habitrain.core.api` 以外的实现包也不是公开 API。
 
-> **依赖边界**：`CcaRoleStateStore`、`ForcedRandomRoleChangePolicy`、`MenuGateService` / `MenuAccessGuard` 是 Core 内部实现，下游不得引用。公开签名明确使用的上游 API 类型（例如 `SRERole`、`RoleSkill`）可以用于声明和调用；不要直接修改 `TMMRoles` 注册表或绕过有效角色目录。
+> **依赖边界**：`CcaRoleStateStore`、`ForcedRandomRoleChangePolicy`、`MenuGateService` / `MenuAccessGuard` 是 Core 内部实现，下游不得引用。公开签名中的 `SRERole`、`RoleSkill` 可以使用，但与固定 SRE 成品及其二进制版本绑定，不属于独立于 SRE 的兼容承诺。不要直接修改 `TMMRoles` 注册表或绕过有效角色目录。
 
 任务和模式在初始化期注册，并在服务端启动阶段冻结。v2 通用与客户端声明分别通过 Fabric entrypoint 注册：
 
@@ -102,12 +101,12 @@ boolean isActive(ServerLevel level);
 | 方法 | 契约 |
 |---|---|
 | `register(modId, modeId, mode)` | 注册键为 `modId:modeId`，与 `GameMode.getId()` 不是同一字符串 |
-| `start(fullId, level)` | 必须传注册键；每个世界仅一个主动模式 |
-| `stop(level, result)` | `onEnd` 后 finally `onCleanup` |
+| `start(fullId, level)` | 必须传注册键，在服务端主线程调用。自定义模式由 Core 启动；原生模式只向 SRE 请求启动，真正开局以 `MatchEvents.STARTED` 为准 |
+| `stop(level, result)` | 仅停止 Core 自己启动的自定义模式：`onEnd` 后 finally `onCleanup`。原生对局由 SRE 停止 |
 | `tickAll(server)` | 只 tick 主动表中的模式 |
 | `getActiveForLevel(level)` | 主动表优先，否则检查被动 `isActive` |
 
-核心谋杀模式的注册键是 `habitrain_core:sre:murder`（`GameModeRegistry.register("habitrain_core", "sre:murder", ...)`），而 `GameMode.getId()` 是逻辑短 ID `sre:murder`。不要 `start(mode.getId())`。
+核心谋杀模式的注册键是 `habitrain_core:sre:murder`（`GameModeRegistry.register("habitrain_core", "sre:murder", ...)`），而 `GameMode.getId()` 是逻辑短 ID `sre:murder`。不要 `start(mode.getId())`。公开 API 请求沿用 SRE 的常规就绪规则；投票换图路径才提供该轮投票的强制就绪名单。
 
 `WinResult` 提供 `singleWinner`、`noWinner`、`forceEnd`。`singleWinner` 的 playerId 不可为 null；无人获胜用 `noWinner`。
 
@@ -121,7 +120,7 @@ boolean isActive(ServerLevel level);
 | `MatchStateApi.phase(level)` | 对齐 SRE `GameStatus`（含 `INITIATING`）；读失败为 `UNKNOWN` |
 | `MatchStateApi.hasLeftLobby(level)` | `phase != INACTIVE`（含 `UNKNOWN`，卡片应拒绝） |
 | `MatchStateApi.modeId(level)` | 优先 `GameModeRegistry.getActiveForLevel`，否则 SRE `identifier`。**大厅返回空串**（此前会漏出残留的 `sre:murder`），因此它**不是**锁定判据：判定大厅请用 `MatchStateApi.phase(level)` |
-| `MatchEvents.STARTED` / `ROUND_ENDED` | 对局开始 / 结算。抽奖发次只订 `ROUND_ENDED`，不要再读 RoundEnd CCA。2.0.11 起经 `GameModeRegistry.start/stop` 启动的对局也会触发；这类结算的 `winners()` / `participants()` 为空集，只能用于逐局重置，不能用于发奖。**监听器只能在 `onInitialize()` 里注册一次**（Fabric `Event` 无注销入口，写在 `SERVER_STARTED` 会随集成服反复启停累积） |
+| `MatchEvents.STARTED` / `ROUND_ENDED` | 对局开始 / 结算。原生模式只转发 SRE 确认结果，结算统计失败不伪造胜负；Core 自定义模式的结算仍为空名单，只能用于逐局重置。抽奖只订 `ROUND_ENDED`，不要再读 RoundEnd CCA。**监听器只能在 `onInitialize()` 里注册一次**（Fabric `Event` 无注销入口） |
 | `MatchSettlement` | 结算只读快照：`modeId()` / `winKind()` / `matchKey()` / `participants()` / `winners()` / `factions()`。`factionOf(uuid)` 查不到时兜底为 `PASSENGER`；要区分「查不到」与「真的是乘客」用 `factionOfOrEmpty(uuid)` → `Optional<MatchWinFaction>`。停电阵营与历史请从这里读，不要再找 `game.blackout.BlackoutRoleManager`（该内部类不存在） |
 | `RoleForceApi` | 下局强制：`queueExact` / `queueFaction` / `queueRoleType` / `isQueued` / `clear`。不要调用 Harpy / `ForcePlayerTeam` |
 
@@ -390,9 +389,9 @@ WORLD/PERMANENT persistence 或非 NONE sync 必须提供 `Codec<T>`。声明 `d
 | 问题 | 约定 |
 |---|---|
 | **谁该实现** | 只有 habitrain_core 自己。实现在 core 初始化时由 `CoreSpi` 装配；装配入口带调用者限制，不是给下游用的扩展点 |
-| **谁不该调** | 第三方 mod **只允许**读其中的查询助手（如 `CoreLifecycle.isActive()`），不得调用/替换/复装桥接实现，也不要把桥接当作「我可以提供实现」的 SPI 来用 |
+| **谁不该依赖** | `api.spi` 只供 Core 装配和内部桥接；例如 `CoreLifecycle.isActive()` 的只读限制并不表示它承诺面向第三方兼容 |
 | **失败语义** | `CoreSpi` 提供保守的默认桥接，未装配时按各接口返回空集合、false、null 等；`CoreLifecycle.isActive()` 未装配时为 false。`RoleSpi` 的必需角色服务未装配时抛 `IllegalStateException`，经 API 静态 holder 首次访问还可能包装为 `ExceptionInInitializerError`。角色服务必须在 Core 初始化后访问。客户端桥的 `*OrNull()` 探针返回 null，客户端 API 的 `instance()` 则在未装配时抛异常 |
-| **依赖方向** | `api.spi` 的实现类在 `internal` 包内；`api.**` 不反向依赖 `task` / `game` / `role` / `scene` 等实现包 |
+| **依赖方向** | `internal` 装配各实现包的桥接；字节码测试禁止 `api.**` 反向依赖 `task` / `game` / `role` / `scene` 等实现包 |
 
 ## 9. v2 客户端端口
 

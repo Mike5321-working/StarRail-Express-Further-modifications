@@ -7,4 +7,4 @@ Both fonts are licensed under the SIL Open Font License, Version 1.1.
 The license text is available at https://openfontlicense.org/open-font-license-official-text/
 The fonts are bundled unmodified and are not sold on their own.
 
-Compressed MP4 export uses JCodec 0.2.5 (http://jcodec.org), licensed under the BSD 2-Clause (FreeBSD) License.
+Compressed MP4 export invokes an external FFmpeg executable (https://ffmpeg.org) installed separately by the client.

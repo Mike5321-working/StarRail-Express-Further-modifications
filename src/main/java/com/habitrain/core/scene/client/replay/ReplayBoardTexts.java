@@ -81,8 +81,17 @@ final class ReplayBoardTexts {
 
     static Component mode(String modeId) {
         if (modeId == null || modeId.isBlank()) return Component.empty();
+        Language language = Language.getInstance();
         String key = OptionVoteTexts.optionLangKey(modeId);
-        if (Language.getInstance().has(key)) return Component.translatable(key);
+        if (language.has(key)) return Component.translatable(key);
+        // Older archives stored a short id such as "murder", while the mode-vote
+        // translations are keyed by the registry form.
+        String registryKey = OptionVoteTexts.optionLangKey("habitrain_core:" + modeId);
+        if (language.has(registryKey)) return Component.translatable(registryKey);
+        if (modeId.indexOf(':') < 0) {
+            String sreKey = OptionVoteTexts.optionLangKey("habitrain_core:sre/" + modeId);
+            if (language.has(sreKey)) return Component.translatable(sreKey);
+        }
         return Component.literal(shortId(modeId));
     }
 

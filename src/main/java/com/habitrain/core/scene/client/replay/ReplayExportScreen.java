@@ -35,11 +35,12 @@ final class ReplayExportScreen extends Screen {
     private ReplayExportResolution resolution;
     private boolean compress;
     private final Button[] resolutionButtons = new Button[ReplayExportResolution.values().length];
-    private Button mp4, avi, roofCut, roofFull, start;
+    private Button mp4, avi, roofCut, roofFull, start, folderOrImport;
     private int left, top, panelWidth, panelHeight, spacing;
     private ClientReplayBoard.View view;
     private ReplayVideoExport video;
     private boolean folderFailed;
+    private boolean historyPinned;
     private @Nullable LastMatchReplay secondsFor;
     private double filmSeconds;
 
@@ -50,7 +51,7 @@ final class ReplayExportScreen extends Screen {
         this.history = null;
         this.pos = pos.immutable();
         this.resolution = ReplayExportResolution.fromId(ClientVisualPreferences.getReplayVideoResolution());
-        this.compress = ClientVisualPreferences.isReplayVideoCompress();
+        this.compress = ClientVisualPreferences.isReplayVideoCompress() || !this.resolution.aviSupported();
     }
 
     ReplayExportScreen(Screen parent, java.util.UUID history) {
@@ -60,12 +61,20 @@ final class ReplayExportScreen extends Screen {
         this.parent = parent;
         this.history = history;
         this.resolution = ReplayExportResolution.fromId(ClientVisualPreferences.getReplayVideoResolution());
-        this.compress = ClientVisualPreferences.isReplayVideoCompress();
+        this.compress = ClientVisualPreferences.isReplayVideoCompress() || !this.resolution.aviSupported();
     }
 
     @Override public void onClose() {
         if (parent == null) super.onClose();
         else minecraft.setScreen(parent);
+    }
+
+    @Override public void removed() {
+        if (historyPinned) {
+            ReplayHistoryClient.unpin(history);
+            historyPinned = false;
+        }
+        super.removed();
     }
 
     private static Component tr(String key, Object... args) {
@@ -75,6 +84,10 @@ final class ReplayExportScreen extends Screen {
     // ------------------------------------------------------------------ layout
 
     @Override protected void init() {
+        if (!historyPinned) {
+            ReplayHistoryClient.pin(history);
+            historyPinned = true;
+        }
         panelWidth = Math.min(348, width - 12);
         panelHeight = Math.min(PANEL_HEIGHT, height - 6);
         left = (width - panelWidth) / 2;
@@ -90,7 +103,9 @@ final class ReplayExportScreen extends Screen {
             resolutionButtons[i] = addRenderableWidget(new BrassButton(x + i * (resW + GAP), sectionY(0), resW, 20,
                     value.label(), b -> {
                         resolution = value;
+                        if (!resolution.aviSupported()) compress = true;
                         ClientVisualPreferences.setReplayVideoResolution(value.id);
+                        if (!resolution.aviSupported()) ClientVisualPreferences.setReplayVideoCompress(true);
                         refresh();
                     }));
             resolutionButtons[i].setTooltip(Tooltip.create(tr("export.res_tooltip", value.dimensions())));
@@ -119,17 +134,49 @@ final class ReplayExportScreen extends Screen {
         int third = (inner - GAP * 2) / 3;
         int buttonsY = top + panelHeight - 32;
         start = addRenderableWidget(new BrassButton(x, buttonsY, third, 20, tr("export.start"), b -> toggleExport()));
-        addRenderableWidget(new BrassButton(x + third + GAP, buttonsY, third, 20, tr("controls.folder"), b ->
-                folderFailed = !ReplayVideoExport.openFolder(minecraft)));
+        folderOrImport = addRenderableWidget(new BrassButton(x + third + GAP, buttonsY, third, 20, tr("controls.folder"), b -> {
+            if (needsFfmpegAction()) {
+                ReplayFfmpegManager.startManualImport(minecraft.gameDirectory.toPath());
+            } else {
+                folderFailed = !ReplayVideoExport.openFolder(minecraft);
+            }
+            refresh();
+        }));
         addRenderableWidget(new BrassButton(x + (third + GAP) * 2, buttonsY, inner - (third + GAP) * 2, 20,
                 CommonComponents.GUI_DONE, b -> onClose()));
         refresh();
+    }
+
+    @Override public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (button == 1 && folderOrImport != null && folderOrImport.active
+                && folderOrImport.isMouseOver(mouseX, mouseY) && needsFfmpegAction()) {
+            folderFailed = !ReplayFfmpegManager.openBinFolder(minecraft.gameDirectory.toPath());
+            if (minecraft != null) folderOrImport.playDownSound(minecraft.getSoundManager());
+            refresh();
+            return true;
+        }
+        return super.mouseClicked(mouseX, mouseY, button);
+    }
+
+    private boolean ffmpegReady() {
+        return minecraft != null && ReplayFfmpegManager.isReady(minecraft.gameDirectory.toPath());
+    }
+
+    private boolean needsFfmpegAction() {
+        return !exporting() && compress && !ffmpegReady();
     }
 
     private void toggleExport() {
         var current = ReplayExportClient.current();
         if (current != null && current.running()) {
             current.cancel();
+        } else if (compress && !ffmpegReady()) {
+            if (ReplayFfmpegManager.isInstalling()) {
+                ReplayFfmpegManager.cancelInstall();
+            } else if (!ReplayFfmpegManager.isImporting()) {
+                folderFailed = false;
+                ReplayFfmpegManager.startInstall(minecraft.gameDirectory.toPath());
+            }
         } else {
             folderFailed = false;
             var id = history;
@@ -174,17 +221,45 @@ final class ReplayExportScreen extends Screen {
             resolutionButtons[i].active = !exporting;
             ((BrassButton) resolutionButtons[i]).selected = all[i] == shownRes;
         }
-        mp4.active = avi.active = !exporting;
+        mp4.active = !exporting;
+        avi.active = !exporting && resolution.aviSupported();
         ((BrassButton) mp4).selected = shownCompress;
         ((BrassButton) avi).selected = !shownCompress;
+        avi.setTooltip(Tooltip.create(resolution.aviSupported()
+                ? tr("controls.compress_tooltip_off") : tr("export.avi_2160")));
         boolean full = ReplayBoardLocalState.fullBody();
         roofCut.active = roofFull.active = !exporting;
         ((BrassButton) roofCut).selected = !full;
         ((BrassButton) roofFull).selected = full;
 
-        start.setMessage(exporting ? tr("controls.cancel") : tr("export.start"));
-        ((BrassButton) start).accent = exporting;
-        start.active = exporting || (ReplayExportClient.canStart() && ReplayExportClient.mapReady(view));
+        boolean needFfmpeg = needsFfmpegAction();
+        boolean installing = ReplayFfmpegManager.isInstalling();
+        boolean importing = ReplayFfmpegManager.isImporting();
+        if (exporting) {
+            start.setMessage(tr("controls.cancel"));
+            ((BrassButton) start).accent = true;
+            start.active = true;
+            start.setTooltip(null);
+        } else if (needFfmpeg) {
+            start.setMessage(installing ? tr("export.ffmpeg_cancel") : tr("export.ffmpeg_install"));
+            ((BrassButton) start).accent = installing;
+            start.active = installing || !importing;
+            start.setTooltip(Tooltip.create(tr("export.ffmpeg_install_tip")));
+        } else {
+            start.setMessage(tr("export.start"));
+            ((BrassButton) start).accent = false;
+            start.active = ReplayExportClient.canStart() && ReplayExportClient.mapReady(view);
+            start.setTooltip(null);
+        }
+        if (needFfmpeg) {
+            folderOrImport.setMessage(tr("export.ffmpeg_import"));
+            folderOrImport.active = !installing && !importing;
+            folderOrImport.setTooltip(Tooltip.create(tr("export.ffmpeg_import_tip")));
+        } else {
+            folderOrImport.setMessage(tr("controls.folder"));
+            folderOrImport.active = true;
+            folderOrImport.setTooltip(null);
+        }
     }
 
     // ------------------------------------------------------------------ text
@@ -227,6 +302,7 @@ final class ReplayExportScreen extends Screen {
     private Component exportStatus() {
         if (folderFailed) return tr("controls.folder_error");
         if (video == null) {
+            if (needsFfmpegAction()) return ReplayFfmpegManager.statusText();
             if (history != null && ReplayHistoryClient.voiceUnavailable(history)) return tr("controls.missing_voice_hint");
             if (history != null && !ReplayExportClient.mapReady(view)) return ReplayHistoryScreen.loadStatus(history, view);
             if (view != null && view.presentSections() < view.totalSections()) {
@@ -305,9 +381,12 @@ final class ReplayExportScreen extends Screen {
         int barX = left + 12, barW = panelWidth - 24, barY = sectionY(3) - 5;
         if (video != null) {
             graphics.fill(barX, barY, barX + (int) (barW * video.displayProgress()), barY + 7, 0xFF52C5B9);
+        } else if (needsFfmpegAction() && ReplayFfmpegManager.isInstalling()) {
+            graphics.fill(barX, barY, barX + (int) (barW * ReplayFfmpegManager.progress()), barY + 7, ReplayPalette.BRASS_LIGHT);
         }
         graphics.drawCenteredString(font, font.plainSubstrByWidth(exportStatus().getString(), textW), cx, barY + 12, 0xFFC5D3E2);
         Component note = exporting() ? tr("export.continue_in_background")
+                : needsFfmpegAction() ? tr(resolution.aviSupported() ? "export.ffmpeg_fallback_hint" : "export.ffmpeg_bin_hint")
                 : resolution.highLoad() ? tr("export.warn_high") : null;
         if (note != null && barY + 24 < top + panelHeight - 42) {
             graphics.drawCenteredString(font, font.plainSubstrByWidth(note.getString(), textW), cx, barY + 24,

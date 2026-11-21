@@ -36,8 +36,9 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class ReplayVoicePlugin implements VoicechatPlugin {
     public static final String PLUGIN_ID = "habitrain_core_replay_voice";
 
-    private static final ConcurrentHashMap<UUID, OpusDecoder> DECODERS = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<UUID, DecoderState> DECODERS = new ConcurrentHashMap<>();
     private static volatile @Nullable VoicechatServerApi serverApi;
+    private static volatile boolean acceptingPackets;
 
     @Override
     public String getPluginId() {
@@ -54,7 +55,9 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
         registration.registerEvent(VoicechatServerStartedEvent.class, this::onServerStarted);
         registration.registerEvent(VoicechatServerStoppedEvent.class, this::onServerStopped);
         registration.registerEvent(PlayerDisconnectedEvent.class, this::onDisconnect);
-        registration.registerEvent(MicrophonePacketEvent.class, this::onMic);
+        // Voicechat sorts larger priorities first.  Run after the upstream SRE plugins so their
+        // cancellation decisions are final before a packet can enter the replay recorder.
+        registration.registerEvent(MicrophonePacketEvent.class, this::onMic, Integer.MIN_VALUE);
         HabiTrainCore.LOGGER.info("[ReplayVoice] Simple Voice Chat replay recorder hook registered");
     }
 
@@ -87,7 +90,7 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
                                             byte[] opusData, float maxDistOverride) {
         VoicechatServerApi api = serverApi;
         if (api == null || speaker == null || roundId == null || !MatchVoiceRecorder.isRecording()) return;
-        OpusDecoder decoder = DECODERS.computeIfAbsent(speaker, ignored -> api.createDecoder());
+        DecoderState decoder = DECODERS.computeIfAbsent(speaker, ignored -> new DecoderState(api.createDecoder()));
         if (opusData == null || opusData.length == 0) {
             decoder.resetState();
             return;
@@ -100,25 +103,23 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
 
     private void onServerStarted(VoicechatServerStartedEvent event) {
         serverApi = event.getVoicechat();
+        acceptingPackets = true;
     }
 
     private void onServerStopped(VoicechatServerStoppedEvent event) {
+        acceptingPackets = false;
         serverApi = null;
         clearDecoders();
     }
 
     private void onDisconnect(PlayerDisconnectedEvent event) {
-        OpusDecoder decoder = DECODERS.remove(event.getPlayerUuid());
-        if (decoder != null) {
-            try {
-                decoder.close();
-            } catch (Throwable ignored) {}
-        }
+        DecoderState decoder = DECODERS.remove(event.getPlayerUuid());
+        if (decoder != null) decoder.close();
     }
 
     private void onMic(MicrophonePacketEvent event) {
         try {
-            if (event.isCancelled() || !MatchVoiceRecorder.isRecording()) return;
+            if (!acceptingPackets || event.isCancelled() || !MatchVoiceRecorder.isRecording()) return;
             VoicechatServerApi api = serverApi;
             if (api == null) api = event.getVoicechat();
             VoicechatConnection sender = event.getSenderConnection();
@@ -138,17 +139,27 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
                 return;
             }
 
+            // Radio audio is deliberately routed by the upstream plugin as an additional private
+            // channel, so it is not represented by event cancellation.  A replay must only retain
+            // ordinary proximity speech.
+            if (permissions.isPrivateChannel(speaker)) return;
+
             // Mirror Simple Voice Chat's Server.processMicPacket: closed/normal groups do not emit proximity voice.
             Group group = sender.getGroup();
             if (group != null && group.getType() != Group.Type.OPEN) {
                 return;
             }
 
+            // Another plugin may have cancelled the event after the initial checks when several
+            // voice plugins share the same packet dispatch.  Never decode a packet in that state.
+            if (event.isCancelled()) return;
+
             MicrophonePacket packet = event.getPacket();
             if (packet == null) return;
             byte[] opus = packet.getOpusEncodedData();
             VoicechatServerApi activeApi = api;
-            OpusDecoder decoder = DECODERS.computeIfAbsent(speaker, ignored -> activeApi.createDecoder());
+            DecoderState decoder = DECODERS.computeIfAbsent(speaker,
+                    ignored -> new DecoderState(activeApi.createDecoder()));
             if (opus == null || opus.length == 0) {
                 decoder.resetState();
                 return;
@@ -157,8 +168,11 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
             if (pcm48k == null || pcm48k.length == 0) return;
             float maxDist = resolveMaxDistance(api, packet.isWhispering());
             MatchVoiceRecorder.recordPcm48k(round, speaker, maxDist, pcm48k);
-        } catch (Throwable ignored) {
-            // Soft-fail: never break live voicechat transmission.
+        } catch (RuntimeException failure) {
+            // Soft-fail: never break live voicechat transmission, but keep the failure observable.
+            HabiTrainCore.LOGGER.debug("[ReplayVoice] microphone packet was not captured", failure);
+        } catch (Error failure) {
+            HabiTrainCore.LOGGER.error("[ReplayVoice] decoder failure while capturing microphone packet", failure);
         }
     }
 
@@ -171,11 +185,35 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
     }
 
     private static void clearDecoders() {
-        for (OpusDecoder decoder : DECODERS.values()) {
+        for (DecoderState decoder : DECODERS.values()) decoder.close();
+        DECODERS.clear();
+    }
+
+    private static final class DecoderState {
+        private final OpusDecoder decoder;
+        private boolean closed;
+
+        private DecoderState(OpusDecoder decoder) {
+            this.decoder = decoder;
+        }
+
+        synchronized short[] decode(byte[] opus) {
+            if (closed) return null;
+            return decoder.decode(opus);
+        }
+
+        synchronized void resetState() {
+            if (!closed) decoder.resetState();
+        }
+
+        synchronized void close() {
+            if (closed) return;
+            closed = true;
             try {
                 decoder.close();
-            } catch (Throwable ignored) {}
+            } catch (RuntimeException failure) {
+                HabiTrainCore.LOGGER.debug("[ReplayVoice] could not close an Opus decoder", failure);
+            }
         }
-        DECODERS.clear();
     }
 }

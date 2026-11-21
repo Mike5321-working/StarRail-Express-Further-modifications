@@ -3,6 +3,7 @@ package com.habitrain.core.scene.client.replay;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
 import com.habitrain.core.scene.replay.ReplayFocusPlan;
+import com.habitrain.core.scene.replay.ReplayTrackSampler;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.Minecraft;
@@ -20,7 +21,9 @@ import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Consumer;
 
 /**
@@ -32,6 +35,20 @@ import java.util.function.Consumer;
  * they switch render types per texture.</p>
  */
 final class ReplayFrame {
+    private static class GlintLayers {
+        static final List<RenderType> TYPES = List.of(RenderType.armorEntityGlint(), RenderType.glint(),
+                RenderType.glintTranslucent(), RenderType.entityGlint(), RenderType.entityGlintDirect());
+    }
+
+    static List<RenderType> glintTypes() { return GlintLayers.TYPES; }
+    private static final VertexConsumer SKIP_LAYER = new VertexConsumer() {
+        @Override public VertexConsumer addVertex(float x, float y, float z) { return this; }
+        @Override public VertexConsumer setColor(int red, int green, int blue, int alpha) { return this; }
+        @Override public VertexConsumer setUv(float u, float v) { return this; }
+        @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv2(int u, int v) { return this; }
+        @Override public VertexConsumer setNormal(float x, float y, float z) { return this; }
+    };
     final Minecraft mc;
     final ClientLevel level;
     final Quaternionf rotation;
@@ -51,8 +68,10 @@ final class ReplayFrame {
     final ReplayFocusPlan.Pose focus;
     final ReplayFocusPlan.Sample focusSample;
     final boolean blackout;
-    final boolean hasRound;
+    final boolean loading;
     final int presentSections, totalSections;
+    boolean meshFailed;
+    private ReplayTrackSampler.Pose[] poses;
     private final List<Runnable> models = new ArrayList<>();
     private final List<Runnable> texts = new ArrayList<>();
     private MapScope mapScope;
@@ -60,16 +79,16 @@ final class ReplayFrame {
 
     ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
                 double anim, double ambient, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
-                boolean hasRound, int presentSections, int totalSections,
+                boolean loading, int presentSections, int totalSections,
                 Vector3f right, Vector3f up, Vector3f look) {
-        this(mc, level, rotation, buffers, trayType, anim, ambient, model, frame, hasRound, presentSections, totalSections,
+        this(mc, level, rotation, buffers, trayType, anim, ambient, model, frame, loading, presentSections, totalSections,
                 right, up, look, null);
     }
 
     /** Video export: the director supplies its own act choreography and keeps the map at its natural scale. */
     ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
                 double anim, double ambient, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
-                boolean hasRound, int presentSections, int totalSections,
+                boolean loading, int presentSections, int totalSections,
                 Vector3f right, Vector3f up, Vector3f look,
                 @Nullable ReplayStagePlan.Stage stageOverride) {
         this.mc = mc;
@@ -92,7 +111,7 @@ final class ReplayFrame {
         this.focus = focusSample.pose();
         this.drawingBuffers = buffers;
         this.blackout = model != null && frame != null && frame.phase() == ReplayTimeline.Phase.PLAY && model.blackoutAt(replayTick);
-        this.hasRound = hasRound;
+        this.loading = loading;
         this.presentSections = presentSections;
         this.totalSections = totalSections;
     }
@@ -101,6 +120,13 @@ final class ReplayFrame {
     VertexConsumer fill() { return mapScope == null ? buffers.getBuffer(ReplayDraw.FILL) : mapScope.fill; }
     VertexConsumer tray() { return buffers.getBuffer(trayType); }
     MultiBufferSource modelBuffers() { return drawingBuffers; }
+
+    ReplayTrackSampler.Pose pose(ReplayBoardModel.Actor actor) {
+        if (poses == null) poses = new ReplayTrackSampler.Pose[model.actors.length];
+        var cached = poses[actor.index];
+        if (cached != null) return cached;
+        return poses[actor.index] = actor.track.sample(replayTick);
+    }
 
     /** Clip all map decorations; fixed tray UI and honors are collected outside this scope. */
     MapScope mapScope(ReplayBoardSite site) { return new MapScope(site); }
@@ -130,18 +156,23 @@ final class ReplayFrame {
         }
     }
 
-    /** Flush before switching a dynamic vanilla buffer, which may invalidate its old consumer. */
     private final class ViewportBuffers implements MultiBufferSource, AutoCloseable {
         private final Viewport viewport;
-        private ReplayClippedConsumer current;
+        private final Map<RenderType, ReplayClippedConsumer> layers = new LinkedHashMap<>();
         private ViewportBuffers(Viewport viewport) { this.viewport = viewport; }
         @Override public VertexConsumer getBuffer(RenderType type) {
-            close();
-            current = viewport.wrap(buffers.getBuffer(type));
-            return current;
+            int primitiveSize = switch (type.mode()) {
+                case QUADS -> 4;
+                case TRIANGLES -> 3;
+                case LINES, DEBUG_LINES -> 2;
+                default -> 0;
+            };
+            if (primitiveSize == 0) return SKIP_LAYER;
+            return layers.computeIfAbsent(type, layer -> new ReplayClippedConsumer(() -> buffers.getBuffer(layer),
+                    viewport.inverseBoard(), viewport.hw(), viewport.hd(), primitiveSize));
         }
         @Override public void close() {
-            if (current != null) { current.close(); current = null; }
+            for (var layer : layers.values()) layer.close();
         }
     }
 
@@ -191,6 +222,8 @@ final class ReplayFrame {
     void flushModels() {
         for (Runnable r : models) r.run();
         models.clear();
+        buffers.endLastBatch();
+        for (var type : glintTypes()) buffers.endBatch(type);
     }
 
     void flushTexts() {

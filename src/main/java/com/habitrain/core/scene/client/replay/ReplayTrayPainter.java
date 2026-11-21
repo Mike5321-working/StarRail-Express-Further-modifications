@@ -183,8 +183,8 @@ final class ReplayTrayPainter {
         var model = f.model;
         double idle = f.handoff.idlePlaque();
         double standby = s.fade() * ReplayStagePlan.smoothstep(0.42, 1, idle);
-        boolean loading = model == null && f.hasRound;
-        Component line = standby > 0 ? ReplayBoardTexts.tr(loading ? "loading" : "idle") : Component.empty();
+        boolean loading = f.loading;
+        Component line = standby > 0 ? ReplayBoardTexts.tr(f.meshFailed ? "mesh_failed" : loading ? "loading" : "idle") : Component.empty();
         Component sub = standby > 0 ? ReplayBoardTexts.tr("brand").copy()
                 .append(".".repeat(loading ? (int) (f.ambient * 3) % 4 : 0)) : Component.empty();
         Matrix4f[] faces = new Matrix4f[4];
@@ -217,8 +217,9 @@ final class ReplayTrayPainter {
                 : model.replay.durationTicks() <= 0 ? 1 : Mth.clamp(f.replayTick / model.replay.durationTicks(), 0, 1);
         float barY = -ph / 2 + 0.05f, bx0 = left, bx1 = rightEdge;
         float px = bx0 + (float) ((bx1 - bx0) * progress);
-        boolean showSync = f.totalSections > 0 && f.presentSections < f.totalSections;
-        Component sync = showSync ? ReplayBoardTexts.tr("map_progress", f.presentSections, f.totalSections) : Component.empty();
+        boolean showSync = f.meshFailed || f.totalSections > 0 && f.presentSections < f.totalSections;
+        Component sync = f.meshFailed ? ReplayBoardTexts.tr("mesh_failed")
+                : showSync ? ReplayBoardTexts.tr("map_progress", f.presentSections, f.totalSections) : Component.empty();
         VertexConsumer glow = f.glow();
         float tileW = 0.076f, tileH = 0.094f, gap = 0.009f, cy = -0.065f;
 

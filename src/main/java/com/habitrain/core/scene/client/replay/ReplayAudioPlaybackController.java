@@ -191,10 +191,9 @@ public final class ReplayAudioPlaybackController {
             history.voice = currentVoice;
             history.schedule = ReplaySoundCuePlan.forLinearReplay(replay, currentVoice,
                     file -> mc.getResourceManager().getResource(file).isPresent());
-            history.prevCursor = cursorTicks;
-            history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 0.5);
-            history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), cursorTicks);
-            return;
+            history.prevCursor = Math.max(0.0, cursorTicks - 1.0);
+            history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 1.5);
+            history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), cursorTicks - 1.0);
         }
         if (history.voice != currentVoice) {
             history.voice = currentVoice;
@@ -315,7 +314,7 @@ public final class ReplayAudioPlaybackController {
                     false, 0, relative ? Attenuation.NONE : Attenuation.LINEAR,
                     position.x, position.y, position.z, relative);
             recorded = file == null ? null : new Sound(file.withPath(path -> path.substring(7, path.length() - 4)),
-                    ConstantFloat.of(1f), ConstantFloat.of(1f), 1, Sound.Type.FILE, true, false, 16);
+                    ConstantFloat.of(1f), ConstantFloat.of(1f), 1, Sound.Type.FILE, false, false, 16);
         }
 
         @Override public WeighedSoundEvents resolve(SoundManager manager) {

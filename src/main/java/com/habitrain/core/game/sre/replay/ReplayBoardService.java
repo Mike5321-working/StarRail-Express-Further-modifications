@@ -26,12 +26,15 @@ import java.util.concurrent.*;
 import static com.habitrain.core.network.replay.ReplayPackets.*;
 
 public final class ReplayBoardService {
+    private static final org.slf4j.Logger LOG = LoggerFactory.getLogger(ReplayBoardService.class);
     public static final int VIEW_DISTANCE = 64;
     private static final long PER_PLAYER = 96 * 1024L, GLOBAL = 512 * 1024L;
     private static final int MAX_PENDING = 64;
     private static final SceneBandwidthGovernor BANDWIDTH = new SceneBandwidthGovernor(System::nanoTime, GLOBAL);
     private static final Map<UUID, Transfer> TRANSFERS = new LinkedHashMap<>();
-    private static final Map<UUID, Long> LAST_REQUEST = new HashMap<>();
+    private static final Map<UUID, Transfer> VOICE_TRANSFERS = new LinkedHashMap<>();
+    private static final Map<UUID, Long> LAST_SUMMARY_REQUEST = new HashMap<>();
+    private static final Map<UUID, Long> LAST_SECTION_REQUEST = new HashMap<>();
     private static final Map<UUID, Long> LAST_VOICE_REQUEST = new HashMap<>();
     private static final LinkedHashMap<String, ReplayMapCapture.Result> MAP_CACHE = new LinkedHashMap<>(8, .75f, true);
     private static ThreadPoolExecutor worker;
@@ -51,12 +54,14 @@ public final class ReplayBoardService {
             });
         });
         ServerLifecycleEvents.SERVER_STOPPING.register(s -> {
-            MatchReplayRecorder.reset();
             MatchKillSoundRecorder.resetPending();
+            MatchReplayRecorder.reset();
             server = null;
             latest = null;
             TRANSFERS.clear();
-            LAST_REQUEST.clear();
+            VOICE_TRANSFERS.clear();
+            LAST_SUMMARY_REQUEST.clear();
+            LAST_SECTION_REQUEST.clear();
             LAST_VOICE_REQUEST.clear();
             BANDWIDTH.reset();
             if (worker != null) {
@@ -74,10 +79,19 @@ public final class ReplayBoardService {
         ServerPlayConnectionEvents.JOIN.register((handler, sender, s) -> announce(handler.player));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, s) -> {
             UUID id = handler.player.getUUID();
-            TRANSFERS.remove(id); LAST_REQUEST.remove(id); LAST_VOICE_REQUEST.remove(id); BANDWIDTH.forget(id);
+            TRANSFERS.remove(id);
+            VOICE_TRANSFERS.remove(id);
+            LAST_SUMMARY_REQUEST.remove(id);
+            LAST_SECTION_REQUEST.remove(id);
+            LAST_VOICE_REQUEST.remove(id);
+            BANDWIDTH.forget(id);
         });
         ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register((p, old, next) -> {
             TRANSFERS.remove(p.getUUID());
+            VOICE_TRANSFERS.remove(p.getUUID());
+            LAST_SUMMARY_REQUEST.remove(p.getUUID());
+            LAST_SECTION_REQUEST.remove(p.getUUID());
+            LAST_VOICE_REQUEST.remove(p.getUUID());
             announce(p);
         });
         ServerTickEvents.END_SERVER_TICK.register(ReplayBoardService::tick);
@@ -123,9 +137,20 @@ public final class ReplayBoardService {
         MinecraftServer owner = server;
         if (owner == null) return;
         long finishedAt = System.currentTimeMillis();
-        killSounds.thenAccept(windows -> owner.execute(() -> {
-            if (server == owner) publishReady(owner, summary.withKillSounds(windows), map, voice, finishedAt);
+        killSounds.whenComplete((windows, failure) -> dispatch(owner, () -> {
+            if (server != owner) return;
+            if (failure != null) LOG.warn("Could not prepare kill sounds for replay {}", summary.roundId(), failure);
+            try {
+                publishReady(owner, failure == null ? summary.withKillSounds(windows) : summary, map, voice, finishedAt);
+            } catch (RuntimeException encodingFailure) {
+                LOG.warn("Could not prepare replay {}", summary.roundId(), encodingFailure);
+            }
         }));
+    }
+
+    private static void dispatch(MinecraftServer owner, Runnable task) {
+        if (owner.isSameThread()) task.run();
+        else owner.execute(task);
     }
 
     private static void publishReady(MinecraftServer owner, LastMatchReplay summary,
@@ -134,40 +159,74 @@ public final class ReplayBoardService {
         var data = new ArrayList<List<LastMatchReplay.Sample>>(summary.participants().size() + summary.drones().size());
         summary.participants().forEach(p -> data.add(p.track()));
         summary.drones().forEach(drone -> data.add(drone.track()));
-        var encoded = ReplayTracks.encodeWithStatus(data);
+        var highlights = new HashMap<UUID, NavigableSet<Integer>>();
+        for (var event : summary.events()) {
+            if (!event.highlight() || event.tick() < 0 || event.tick() > summary.durationTicks()) continue;
+            if (event.actor() != null) highlights.computeIfAbsent(event.actor(), ignored -> new TreeSet<>()).add(event.tick());
+            if (event.target() != null) highlights.computeIfAbsent(event.target(), ignored -> new TreeSet<>()).add(event.tick());
+        }
+        var focusTicks = new ArrayList<NavigableSet<Integer>>(data.size());
+        summary.participants().forEach(p -> focusTicks.add(highlights.getOrDefault(p.id(), Collections.emptyNavigableSet())));
+        summary.drones().forEach(d -> focusTicks.add(highlights.getOrDefault(d.owner(), Collections.emptyNavigableSet())));
+        var encoded = ReplayTracks.encodeWithStatus(data, summary.durationTicks(), focusTicks);
         byte[] tracks = encoded.bytes();
-        if (map != null) map.thenAccept(result -> {
-            if (result != null) ReplayArchiveService.archive(owner, makePacket(summary, tracks, result, encoded.thinned()), result, finishedAt, voiceBytes);
-        });
+        if (map != null) map.thenCompose(result -> result == null
+                ? CompletableFuture.<Void>failedFuture(new IOException("No complete replay geometry"))
+                : ReplayArchiveService.archive(owner, makePacket(summary, tracks, result, encoded.thinned()), result, finishedAt, voiceBytes))
+                .whenComplete((saved, failure) -> {
+                    var logger = LoggerFactory.getLogger(ReplayBoardService.class);
+                    if (failure == null) logger.debug("Saved 3D replay {}", summary.roundId());
+                    else logger.warn("3D replay history unavailable for round {}", summary.roundId(), failure);
+                });
         if (latest != null && latest.packet.replay().playbackAnchorTick() > summary.playbackAnchorTick()) return;
-        var resolved = map == null ? null : map.getNow(null);
+        var resolved = map == null || map.isCompletedExceptionally() ? null : map.getNow(null);
         publishRevision(summary, tracks, resolved, true, encoded.thinned(), voiceBytes);
-        if (map != null && !map.isDone()) map.thenAccept(result -> {
+        if (map != null && resolved == null) map.thenAccept(result -> {
             if (result != null) owner.execute(() -> {
                 if (server == owner && latest != null && latest.packet.replay().roundId().equals(summary.roundId())) {
                     publishRevision(summary, tracks, result, false, encoded.thinned(), voiceBytes);
                 }
             });
         });
-        else if (map != null && resolved == null) {
-            // The future may have completed between getNow and isDone.
-            var result = map.getNow(null);
-            if (result != null) publishRevision(summary, tracks, result, false, encoded.thinned(), voiceBytes);
-        }
     }
 
     private static void publishRevision(LastMatchReplay s, byte[] tracks, ReplayMapCapture.Result map, boolean newRound,
                                         boolean tracksThinned, byte[] voiceBytes) {
-        if (newRound) TRANSFERS.clear();
+        Published revision;
+        try {
+            revision = encodeRevision(s, tracks, map, tracksThinned, voiceBytes);
+        } catch (RuntimeException failure) {
+            LOG.warn("Could not encode replay summary {}", s.roundId(), failure);
+            if (!s.killSounds().isEmpty()) {
+                publishRevision(s.withKillSounds(List.of()), tracks, map, newRound, tracksThinned, voiceBytes);
+            } else if (newRound && map != null) {
+                publishRevision(s, tracks, null, true, tracksThinned, voiceBytes);
+            }
+            return;
+        }
+        latest = revision;
+        LAST_SUMMARY_REQUEST.clear();
+        if (newRound) {
+            TRANSFERS.clear();
+            VOICE_TRANSFERS.clear();
+            LAST_VOICE_REQUEST.clear();
+        } else {
+            TRANSFERS.replaceAll((id, transfer) -> transfer.indices == null
+                    ? new Transfer(transfer.board, revision, null, false) : transfer);
+        }
+        for (ServerPlayer p : server.getPlayerList().getPlayers()) announce(p);
+    }
+
+    private static Published encodeRevision(LastMatchReplay s, byte[] tracks, ReplayMapCapture.Result map,
+                                            boolean tracksThinned, byte[] voiceBytes) {
         var packet = makePacket(s, tracks, map, tracksThinned);
         var buffer = new FriendlyByteBuf(Unpooled.buffer());
         try {
             LastMatchSummaryS2C.CODEC.encode(buffer, packet);
-            latest = new Published(packet, buffer.readableBytes(), map, new ReplayTimeline(packet.replay()).cycleTicks(), voiceBytes);
+            return new Published(packet, buffer.readableBytes(), map, new ReplayTimeline(packet.replay()).cycleTicks(), voiceBytes);
         } finally {
             buffer.release();
         }
-        for (ServerPlayer p : server.getPlayerList().getPlayers()) announce(p);
     }
 
     private static LastMatchSummaryS2C makePacket(LastMatchReplay s, byte[] tracks, ReplayMapCapture.Result map, boolean tracksThinned) {
@@ -210,49 +269,54 @@ public final class ReplayBoardService {
     }
 
     public static void request(ServerPlayer p, RequestSummary packet) {
-        if (!allow(p, packet.board()) || !ServerPlayNetworking.canSend(p, LastMatchSummaryS2C.TYPE)) return;
+        if (!canRequest(p, packet.board()) || !ServerPlayNetworking.canSend(p, LastMatchSummaryS2C.TYPE)) return;
+        UUID id = p.getUUID();
+        long tick = server.overworld().getGameTime();
+        Long previous = LAST_SUMMARY_REQUEST.get(id);
+        if (previous != null && tick - previous < 10) return;
+        LAST_SUMMARY_REQUEST.put(id, tick);
         if (latest == null || !latest.packet.replay().roundId().equals(packet.roundId())) {
             announce(p);
             return;
         }
-        if (TRANSFERS.size() >= MAX_PENDING || TRANSFERS.containsKey(p.getUUID())) return;
-        TRANSFERS.put(p.getUUID(), new Transfer(packet.board(), latest, null, false));
+        if (TRANSFERS.size() >= MAX_PENDING || TRANSFERS.containsKey(id)) return;
+        TRANSFERS.put(id, new Transfer(packet.board(), latest, null, false));
     }
 
     public static void request(ServerPlayer p, ReplayMissingSectionsC2S packet) {
-        if (!allow(p, packet.board()) || !ServerPlayNetworking.canSend(p, ReplaySectionPatchS2C.TYPE)) return;
+        if (!canRequest(p, packet.board()) || !ServerPlayNetworking.canSend(p, ReplaySectionPatchS2C.TYPE)) return;
+        UUID id = p.getUUID();
+        long tick = server.overworld().getGameTime();
+        Long previous = LAST_SECTION_REQUEST.get(id);
+        if (previous != null && tick - previous < 10) return;
         Published source = latest;
         BitSet bits = packet.missing();
         if (source == null || source.map == null || !source.packet.replay().roundId().equals(packet.roundId())
                 || bits.isEmpty() || bits.cardinality() > MAX_REQUESTED || bits.length() > source.map.patches().size()
-                || TRANSFERS.size() >= MAX_PENDING || TRANSFERS.containsKey(p.getUUID())) return;
-        TRANSFERS.put(p.getUUID(), new Transfer(packet.board(), source, bits.stream().toArray(), false));
+                || TRANSFERS.size() >= MAX_PENDING || TRANSFERS.containsKey(id)) return;
+        LAST_SECTION_REQUEST.put(id, tick);
+        TRANSFERS.put(id, new Transfer(packet.board(), source, bits.stream().toArray(), false));
     }
 
     public static void request(ServerPlayer p, RequestVoiceC2S packet) {
-        if (server == null || server != p.getServer() || !ServerPlayNetworking.canSend(p, ReplayVoiceChunkS2C.TYPE)) return;
+        if (!canRequest(p, packet.board()) || !ServerPlayNetworking.canSend(p, ReplayVoiceChunkS2C.TYPE)) return;
         long tick = server.overworld().getGameTime();
         Long previous = LAST_VOICE_REQUEST.get(p.getUUID());
         if (previous != null && tick - previous < 10) return;
         LAST_VOICE_REQUEST.put(p.getUUID(), tick);
-        if (!accessible(p, packet.board())) return;
         Published source = latest;
         if (source == null || !source.packet.replay().roundId().equals(packet.roundId())) return;
         if (source.voice.length == 0 || !ServerPlayNetworking.canSend(p, VoiceExportAccessS2C.TYPE)) {
             ServerPlayNetworking.send(p, new ReplayVoiceChunkS2C(packet.roundId(), 0, 0, new byte[0]));
             return;
         }
-        if (TRANSFERS.size() >= MAX_PENDING || TRANSFERS.containsKey(p.getUUID())) return;
-        TRANSFERS.put(p.getUUID(), new Transfer(packet.board(), source, null, true));
+        if (VOICE_TRANSFERS.size() >= MAX_PENDING || VOICE_TRANSFERS.containsKey(p.getUUID())) return;
+        VOICE_TRANSFERS.put(p.getUUID(), new Transfer(packet.board(), source, null, true));
     }
 
-    private static boolean allow(ServerPlayer p, BlockPos board) {
-        if (server == null || server != p.getServer()) return false;
-        long tick = server.overworld().getGameTime();
-        Long previous = LAST_REQUEST.get(p.getUUID());
-        if (previous != null && tick - previous < 10) return false;
-        LAST_REQUEST.put(p.getUUID(), tick);
-        return accessible(p, board);
+    private static boolean canRequest(ServerPlayer p, BlockPos board) {
+        return server != null && server == p.getServer() && server.getPlayerList().getPlayer(p.getUUID()) == p
+                && accessible(p, board);
     }
 
     private static boolean accessible(ServerPlayer p, BlockPos board) {
@@ -263,8 +327,12 @@ public final class ReplayBoardService {
     }
 
     private static void tick(MinecraftServer s) {
-        if (TRANSFERS.isEmpty()) return;
-        var iterator = TRANSFERS.entrySet().iterator();
+        deliver(s, TRANSFERS);
+        deliver(s, VOICE_TRANSFERS);
+    }
+
+    private static void deliver(MinecraftServer s, Map<UUID, Transfer> transfers) {
+        var iterator = transfers.entrySet().iterator();
         while (iterator.hasNext()) {
             var entry = iterator.next();
             var t = entry.getValue();
@@ -274,6 +342,7 @@ public final class ReplayBoardService {
                 iterator.remove();
                 continue;
             }
+            if (t.voice && TRANSFERS.containsKey(entry.getKey())) continue;
             if (t.ready == null) {
                 int size = t.voice ? Math.min(FRAGMENT_BYTES, t.round.voice.length - t.offset) + 32
                         : t.indices == null ? t.round.bytes : Math.min(FRAGMENT_BYTES, t.patch().length - t.offset) + 32;

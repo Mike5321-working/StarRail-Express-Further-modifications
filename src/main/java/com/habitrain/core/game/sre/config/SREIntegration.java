@@ -294,24 +294,20 @@ public final class SREIntegration {
                                               List<String> allMinigameIds,
                                               ConfigRepository repo) {
         if (server == null) return;
-        try {
-            for (var level : server.getAllLevels()) {
-                var areas = AreasWorldComponent.KEY.get(level);
-                if (areas == null) continue;
+        for (var level : server.getAllLevels()) {
+            var areas = AreasWorldComponent.KEY.get(level);
+            if (areas == null) continue;
 
-                areas.areasSettings.minigameQuestEnabled = globalEnabled;
-                String mapName = areas.mapName != null ? areas.mapName : "";
-                areas.availableMinigameIds.clear();
-                for (String mgId : allMinigameIds) {
-                    MinigameConfigEntry entry = repo.getMinigameConfig(mgId);
-                    if (entry == null || (entry.enabled && entry.isAllowedOnMap(mapName))) {
-                        areas.availableMinigameIds.add(mgId);
-                    }
+            areas.areasSettings.minigameQuestEnabled = globalEnabled;
+            String mapName = areas.mapName != null ? areas.mapName : "";
+            areas.availableMinigameIds.clear();
+            for (String mgId : allMinigameIds) {
+                MinigameConfigEntry entry = repo.getMinigameConfig(mgId);
+                if (entry == null || (entry.enabled && entry.isAllowedOnMap(mapName))) {
+                    areas.availableMinigameIds.add(mgId);
                 }
-                areas.sync();
             }
-        } catch (Throwable t) {
-            LOGGER.warn("Failed to apply minigame settings, SRE may not be installed", t);
+            areas.sync();
         }
     }
 }

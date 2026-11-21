@@ -20,13 +20,9 @@ public class SRERoleNameMixin {
         SRERole self = (SRERole) (Object) this;
         CompiledModifyOverlay overlay = RoleOverlayAccessor.currentOverlay(self);
         if (overlay != null && overlay.namePatch() != null) {
-            MinecraftServer server = getServer();
+            MinecraftServer server = RuntimeRoleServer.INSTANCE.server();
             cir.setReturnValue(overlay.namePatch().getName(self, server));
             return;
         }
-    }
-
-    private static MinecraftServer getServer() {
-        return RuntimeRoleServer.INSTANCE.server();
     }
 }

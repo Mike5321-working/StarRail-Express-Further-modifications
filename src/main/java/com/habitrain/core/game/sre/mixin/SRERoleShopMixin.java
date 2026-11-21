@@ -29,7 +29,7 @@ public class SRERoleShopMixin {
         }
         CompiledModifyOverlay overlay = RoleOverlayAccessor.currentOverlay(self);
         if (overlay != null && overlay.shopPatch() != null) {
-            MinecraftServer server = getServer();
+            MinecraftServer server = RuntimeRoleServer.INSTANCE.server();
             try {
                 List<ShopEntry> entries = overlay.shopPatch().getShopEntries(self, server);
                 if (entries != null) {
@@ -41,9 +41,5 @@ public class SRERoleShopMixin {
                         .error("v2 ShopPatch failed for {}", self.identifier(), t);
             }
         }
-    }
-
-    private static MinecraftServer getServer() {
-        return RuntimeRoleServer.INSTANCE.server();
     }
 }

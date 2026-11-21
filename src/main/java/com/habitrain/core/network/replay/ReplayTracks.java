@@ -7,6 +7,8 @@ import net.minecraft.network.FriendlyByteBuf;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.NavigableSet;
+import java.util.Collections;
 
 import static com.habitrain.core.api.match.replay.LastMatchReplay.*;
 
@@ -38,6 +40,10 @@ public final class ReplayTracks {
     }
 
     public static void compact(List<Sample> track) {
+        compact(track, Collections.emptyNavigableSet());
+    }
+
+    private static void compact(List<Sample> track, NavigableSet<Integer> highlights) {
         if (track.size() < 3) return;
         // Preserve transitions and both ends as long as there is space to do so.
         boolean remove = false;
@@ -45,10 +51,16 @@ public final class ReplayTracks {
         for (int i = 1; i < track.size() - 1; i++) {
             Sample p = track.get(i);
             boolean stable = track.get(i - 1).flags() == p.flags() && p.flags() == track.get(i + 1).flags();
-            if (!stable || (remove = !remove)) track.set(write++, p);
+            if (!stable || (p.flags() & BREAK) != 0 || nearHighlight(p, highlights)
+                    || (remove = !remove)) track.set(write++, p);
         }
         track.set(write++, track.getLast());
         track.subList(write, track.size()).clear();
+    }
+
+    private static boolean nearHighlight(Sample point, NavigableSet<Integer> highlights) {
+        Integer next = highlights.ceiling(point.tick() - 10);
+        return next != null && next <= (long) point.tick() + 10;
     }
 
     public record Encoding(byte[] bytes, boolean thinned) {}
@@ -58,9 +70,33 @@ public final class ReplayTracks {
     }
 
     public static Encoding encodeWithStatus(List<? extends List<Sample>> tracks) {
+        return encodeWithStatus(tracks, Integer.MAX_VALUE, Collections.nCopies(tracks.size(), Collections.emptyNavigableSet()));
+    }
+
+    public static Encoding encodeWithStatus(List<? extends List<Sample>> tracks, int duration,
+                                            List<? extends NavigableSet<Integer>> highlights) {
+        if (duration < 0 || tracks.size() > MAX_PLAYERS + MAX_DRONES || highlights.size() != tracks.size()) {
+            throw new IllegalArgumentException("Tracks exceed limits");
+        }
         var work = new ArrayList<List<Sample>>();
-        for (var track : tracks) work.add(new ArrayList<>(track));
         boolean thinned = false;
+        for (var track : tracks) {
+            int previous = 0;
+            for (Sample point : track) {
+                if (point.tick() < previous || point.tick() > duration) throw new IllegalArgumentException("Bad track time");
+                previous = point.tick();
+            }
+            var copy = new ArrayList<>(track);
+            var protectedTicks = highlights.get(work.size());
+            while (copy.size() > MAX_TRACK) {
+                int previousSize = copy.size();
+                compact(copy, protectedTicks);
+                if (copy.size() == previousSize) forceThin(copy, protectedTicks);
+                if (copy.size() == previousSize) forceThin(copy, Collections.emptyNavigableSet());
+                thinned = true;
+            }
+            work.add(copy);
+        }
         while (true) {
             var buf = new FriendlyByteBuf(Unpooled.buffer());
             try {
@@ -85,7 +121,13 @@ public final class ReplayTracks {
             } finally { buf.release(); }
             int prevTotalSamples = totalSamples(work);
             thinned = true;
-            for (var track : work) thin(track);
+            for (int index = 0; index < work.size(); index++) compact(work.get(index), highlights.get(index));
+            if (totalSamples(work) == prevTotalSamples) {
+                for (int index = 0; index < work.size(); index++) forceThin(work.get(index), highlights.get(index));
+            }
+            if (totalSamples(work) == prevTotalSamples) {
+                for (var track : work) forceThin(track, Collections.emptyNavigableSet());
+            }
             if (totalSamples(work) >= prevTotalSamples) {
                 throw new IllegalArgumentException("Replay tracks exceed MAX_BYTES (" + MAX_BYTES + ") after maximum thinning");
             }
@@ -101,18 +143,27 @@ public final class ReplayTracks {
     private static void thin(List<Sample> track) {
         int n = track.size();
         compact(track);
-        if (n > 2 && track.size() == n) {
-            int write = 1;
-            for (int i = 2; i < n; i += 2) {
-                Sample next = track.get(i);
-                if (track.get(i - 1).flags() != next.flags()) {
-                    next = new Sample(next.tick(), next.position(), next.yaw(), (byte) (next.flags() | BREAK));
-                }
-                track.set(write++, next);
+        if (track.size() == n) forceThin(track, Collections.emptyNavigableSet());
+    }
+
+    private static void forceThin(List<Sample> track, NavigableSet<Integer> highlights) {
+        int size = track.size();
+        if (size <= 2) return;
+        int write = 1;
+        boolean discontinuity = false;
+        byte previous = track.getFirst().flags();
+        for (int index = 1; index < size; index++) {
+            Sample next = track.get(index);
+            discontinuity |= previous != next.flags() || (next.flags() & BREAK) != 0;
+            previous = next.flags();
+            if (index % 2 != 0 && index != size - 1 && !nearHighlight(next, highlights)) continue;
+            if (discontinuity) {
+                next = new Sample(next.tick(), next.position(), next.yaw(), (byte) (next.flags() | BREAK));
             }
-            if (n % 2 == 0) track.set(write++, track.getLast());
-            track.subList(write, n).clear();
+            track.set(write++, next);
+            discontinuity = false;
         }
+        track.subList(write, size).clear();
     }
 
     public static List<List<Sample>> decode(byte[] bytes, int players, int duration) {

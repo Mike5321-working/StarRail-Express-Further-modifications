@@ -71,4 +71,15 @@ class SingleMatchGateTest {
         assertNotEquals(previous.serverId(), gate.snapshot().serverId());
         assertTrue(gate.nativeConfirm("a"));
     }
+
+    @Test void lateFinalizationCannotReleaseTheNextRoundInTheSameWorld() {
+        SingleMatchGate gate = new SingleMatchGate();
+        assertTrue(gate.nativeConfirm("world"));
+        var old = gate.snapshot();
+        gate.release(old);
+        assertTrue(gate.nativeConfirm("world"));
+        var next = gate.snapshot();
+        gate.release(old);
+        assertEquals(next, gate.snapshot());
+    }
 }

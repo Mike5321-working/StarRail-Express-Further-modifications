@@ -2,6 +2,7 @@ package com.habitrain.core.client;
 
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 
 /** INIT can run before Minecraft exposes the new play listener through getConnection(). */
@@ -17,4 +18,12 @@ public final class ClientConnectionSession {
         return true;
     }
     public static boolean isDisconnected() { return active == null; }
+
+    public static void executeIfConnected(ClientPlayNetworking.Context context, Runnable task) {
+        var expected = context.player().connection;
+        context.client().execute(() -> {
+            if (isCurrent(expected) && context.client().getConnection() == expected
+                    && expected.getConnection().isConnected()) task.run();
+        });
+    }
 }

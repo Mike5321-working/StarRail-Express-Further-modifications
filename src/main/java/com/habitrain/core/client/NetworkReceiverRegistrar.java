@@ -50,15 +50,7 @@ public class NetworkReceiverRegistrar {
     }
 
     private static void executeIfConnected(ClientPlayNetworking.Context context, Runnable task) {
-        var expected = context.player().connection;
-        context.client().execute(() -> {
-            var connection = context.client().getConnection();
-            if (!ClientConnectionSession.isCurrent(expected)
-                    || connection != expected || !expected.getConnection().isConnected()) {
-                return;
-            }
-            task.run();
-        });
+        ClientConnectionSession.executeIfConnected(context, task);
     }
 
     private void registerReceivers() {
@@ -69,19 +61,26 @@ public class NetworkReceiverRegistrar {
                                 editor.accept(payload);
                             }
                         }));
+        ClientPlayNetworking.registerGlobalReceiver(
+                com.habitrain.core.network.replay.ReplayBoardSettingsPackets.CheckedResult.TYPE, (payload, context) ->
+                        executeIfConnected(context, () -> {
+                            if (context.client().screen instanceof com.habitrain.core.scene.client.replay.ReplayBoardSettingsScreen editor) {
+                                editor.accept(payload);
+                            }
+                        }));
         com.habitrain.core.scene.client.ClientReplayBoard.register();
         ClientPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.Available.TYPE, (payload, context) ->
-                        context.client().execute(() -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
+                        executeIfConnected(context, () -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
         ClientPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.LastMatchSummaryS2C.TYPE, (payload, context) ->
-                        context.client().execute(() -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
+                        executeIfConnected(context, () -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
         ClientPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.ReplaySectionPatchS2C.TYPE, (payload, context) ->
-                        context.client().execute(() -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
+                        executeIfConnected(context, () -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
         ClientPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.ReplayVoiceChunkS2C.TYPE, (payload, context) ->
-                        context.client().execute(() -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
+                        executeIfConnected(context, () -> com.habitrain.core.scene.client.ClientReplayBoard.accept(payload)));
         ClientPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.VoiceExportAccessS2C.TYPE, (payload, context) ->
                         executeIfConnected(context, () ->

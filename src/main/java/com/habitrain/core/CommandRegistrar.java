@@ -35,7 +35,7 @@ import org.slf4j.LoggerFactory;
 import java.util.List;
 
 /**
- * 命令注册器 — 负责注册所有 /instantgroup 和 /habi_api 命令。
+ * 命令注册器 — 负责注册所有 /habi_group、/habi_api 和 /habitrain roleapi 命令。
  * <p>在 {@link HabiTrainCore#onInitialize()} 中调用 {@link #init()}。</p>
  */
 public final class CommandRegistrar {
@@ -50,14 +50,7 @@ public final class CommandRegistrar {
     public static void init() {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) -> {
             if (FabricLoader.getInstance().isModLoaded("voicechat")) {
-                dispatcher.register(Commands.literal("instantgroup")
-                        .requires(source -> source.hasPermission(2))
-                        .executes(ctx -> VoiceGroupService.executeInstantGroup(ctx, 128))
-                        .then(Commands.argument("range", IntegerArgumentType.integer(1, 512))
-                                .executes(ctx -> VoiceGroupService.executeInstantGroup(ctx,
-                                        IntegerArgumentType.getInteger(ctx, "range")))
-                        )
-                );
+                dispatcher.register(habiGroupCommand());
             }
             // /habi_api 命令族（OP：list/vote/mappool/repair/menugate/scene）
             dispatcher.register(Commands.literal("habi_api")
@@ -472,7 +465,17 @@ public final class CommandRegistrar {
               );
             dispatcher.register(roleApiRootCommand());
           });
-        LOGGER.info("命令已注册: /instantgroup, /habi_api list|vote|mappool|repair|menugate, /habitrain roleapi");
+        LOGGER.info("命令已注册: /habi_group, /habi_api list|vote|mappool|repair|menugate, /habitrain roleapi");
+    }
+
+    /** 独立顶层临时语音组命令，避免与 enhancedgroups 的 /instantgroup 参数类型冲突。 */
+    static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> habiGroupCommand() {
+        return Commands.literal("habi_group")
+                .requires(source -> source.hasPermission(2))
+                .executes(ctx -> VoiceGroupService.executeInstantGroup(ctx, 128))
+                .then(Commands.argument("range", IntegerArgumentType.integer(1, 512))
+                        .executes(ctx -> VoiceGroupService.executeInstantGroup(ctx,
+                                IntegerArgumentType.getInteger(ctx, "range"))));
     }
 
     private static int executeSceneStart(CommandSourceStack source, @Nullable String mapArg) {
@@ -735,7 +738,7 @@ public final class CommandRegistrar {
      * /habitrain roleapi 命令树：只读诊断（OP2）+ 角色扩展 v2 配置编辑（OP4）
      * + manifest 摘要（OP2）。
      */
-    private static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> roleApiRootCommand() {
+    static com.mojang.brigadier.builder.LiteralArgumentBuilder<CommandSourceStack> roleApiRootCommand() {
         return Commands.literal("habitrain")
                 .requires(source -> source.hasPermission(2))
                 .then(Commands.literal("roleapi")
@@ -922,11 +925,11 @@ public final class CommandRegistrar {
                                                                             ? "§e已清除 " + targetField + " 的冲突裁决"
                                                                             : "§a" + targetField + " -> §e" + resolved), true);
                                                             return 1;
-                                                        }))))
+                                                        })))))
                         .then(Commands.literal("manifest")
                                 .requires(source -> source.hasPermission(2))
                                 .executes(ctx -> sendLines(ctx.getSource(), RoleConfigCommands.manifest())))
-                ));
+                );
     }
 
     /**

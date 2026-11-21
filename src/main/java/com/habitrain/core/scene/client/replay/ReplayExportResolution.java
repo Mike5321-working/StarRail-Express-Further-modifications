@@ -33,6 +33,11 @@ enum ReplayExportResolution {
         return width >= 2560;
     }
 
+    /** AVI 1.0 has no large-file index support in the bundled writer. */
+    boolean aviSupported() {
+        return this != P2160;
+    }
+
     String dimensions() {
         return width + " × " + height;
     }

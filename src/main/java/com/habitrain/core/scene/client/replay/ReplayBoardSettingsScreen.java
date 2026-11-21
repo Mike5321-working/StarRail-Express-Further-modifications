@@ -18,8 +18,12 @@ import net.minecraft.resources.ResourceLocation;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
+
+import static com.habitrain.core.network.replay.ReplayBoardSettingsPackets.CheckedResult.Status;
 
 /** Non-pausing editor with a local world preview; only Save writes to the server. */
 public final class ReplayBoardSettingsScreen extends Screen {
@@ -31,7 +35,11 @@ public final class ReplayBoardSettingsScreen extends Screen {
     private final EditBox[] fields = new EditBox[5];
     private final List<Button> stepButtons = new ArrayList<>();
     private Button save;
-    private boolean pending;
+    private ReplayBoardSettings baseline;
+    private String[] initialValues;
+    private long replyDeadline;
+    private UUID requestId;
+    private boolean conflicted;
     private Component status;
     private int left, top, panelWidth, panelHeight, rowStep;
 
@@ -40,6 +48,8 @@ public final class ReplayBoardSettingsScreen extends Screen {
         this.dimension = dimension;
         this.pos = pos.immutable();
         setValues(settings);
+        baseline = settings;
+        initialValues = values.clone();
     }
 
     private static Component tr(String key, Object... args) {
@@ -123,29 +133,46 @@ public final class ReplayBoardSettingsScreen extends Screen {
                 valid = Float.isFinite(value) && value >= MIN[i] && value <= MAX[i];
             } catch (NumberFormatException ignored) {}
             fields[i].setTextColor(valid ? 0xFFEAD9B6 : 0xFFFF8888);
-            fields[i].setEditable(!pending);
+            fields[i].setEditable(replyDeadline == 0);
         }
-        for (Button button : stepButtons) button.active = !pending;
-        if (save != null) save.active = !pending && draft() != null && ClientPlayNetworking.canSend(ReplayBoardSettingsPackets.Save.TYPE);
+        for (Button button : stepButtons) button.active = replyDeadline == 0;
+        if (save != null) save.active = replyDeadline == 0 && !conflicted && draft() != null
+                && (ClientPlayNetworking.canSend(ReplayBoardSettingsPackets.CheckedSave.TYPE)
+                    || ClientPlayNetworking.canSend(ReplayBoardSettingsPackets.Save.TYPE));
     }
 
     private void save() {
         ReplayBoardSettings settings = draft();
-        if (pending || settings == null || !ClientPlayNetworking.canSend(ReplayBoardSettingsPackets.Save.TYPE)) return;
-        pending = true;
+        if (replyDeadline != 0 || conflicted || settings == null) return;
+        boolean checked = ClientPlayNetworking.canSend(ReplayBoardSettingsPackets.CheckedSave.TYPE);
+        if (!checked && !ClientPlayNetworking.canSend(ReplayBoardSettingsPackets.Save.TYPE)) return;
+        var request = new ReplayBoardSettingsPackets.Save(dimension, pos, settings);
+        requestId = checked ? UUID.randomUUID() : null;
+        replyDeadline = System.nanoTime() + 5_000_000_000L;
         status = tr("saving");
         refresh();
-        ClientPlayNetworking.send(new ReplayBoardSettingsPackets.Save(dimension, pos, settings));
+        if (checked) ClientPlayNetworking.send(new ReplayBoardSettingsPackets.CheckedSave(requestId, baseline, request));
+        else ClientPlayNetworking.send(request);
     }
 
     public void accept(ReplayBoardSettingsPackets.Result result) {
-        if (!pending || !dimension.equals(result.dimension()) || !pos.equals(result.pos())) return;
-        pending = false;
-        if (result.saved()) {
+        if (replyDeadline == 0 || requestId != null || !dimension.equals(result.dimension()) || !pos.equals(result.pos())) return;
+        finish(result.saved() ? Status.SAVED : Status.REJECTED);
+    }
+
+    public void accept(ReplayBoardSettingsPackets.CheckedResult result) {
+        if (replyDeadline != 0 && result.requestId().equals(requestId)) finish(result.status());
+    }
+
+    private void finish(Status result) {
+        replyDeadline = 0;
+        requestId = null;
+        if (result == Status.SAVED) {
             if (minecraft.player != null) minecraft.player.displayClientMessage(tr("saved"), true);
             onClose();
         } else {
-            status = tr("rejected");
+            conflicted = result == Status.CONFLICT;
+            status = tr(conflicted ? "conflict" : "rejected");
             refresh();
         }
     }
@@ -165,7 +192,29 @@ public final class ReplayBoardSettingsScreen extends Screen {
                 || !minecraft.player.canInteractWithBlock(pos, 1.0)
                 || !minecraft.level.getChunkSource().hasChunk(SectionPos.blockToSectionCoord(pos.getX()),
                         SectionPos.blockToSectionCoord(pos.getZ()))
-                || !minecraft.level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK)) onClose();
+                || !(minecraft.level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) {
+            onClose();
+            return;
+        }
+        if (replyDeadline != 0 && System.nanoTime() - replyDeadline >= 0) {
+            replyDeadline = 0;
+            requestId = null;
+            status = tr("save_timeout");
+            refresh();
+        }
+        if (replyDeadline == 0 && !baseline.equals(marker.settings())) {
+            if (!Arrays.equals(initialValues, values)) {
+                conflicted = true;
+                refresh();
+            } else {
+                baseline = marker.settings();
+                conflicted = false;
+                setValues(baseline);
+                initialValues = values.clone();
+                for (int i = 0; i < fields.length; i++) fields[i].setValue(values[i]);
+                refresh();
+            }
+        }
     }
 
     @Override public boolean isPauseScreen() { return false; }
@@ -180,8 +229,9 @@ public final class ReplayBoardSettingsScreen extends Screen {
         }
         int hintY = top + panelHeight - 63;
         g.drawString(font, tr("hint"), left + 12, hintY, 0xFFBFAE91, false);
-        Component message = status != null ? status : draft() == null ? tr("invalid") : tr("hint_offsets");
-        g.drawString(font, message, left + 12, hintY + 13, draft() == null ? 0xFFFF8888 : 0xFFBFAE91, false);
+        Component message = conflicted ? tr("conflict") : status != null ? status : draft() == null ? tr("invalid") : tr("hint_offsets");
+        g.drawString(font, font.plainSubstrByWidth(message.getString(), panelWidth - 24), left + 12, hintY + 13,
+                conflicted || draft() == null ? 0xFFFF8888 : 0xFFBFAE91, false);
         super.render(g, mouseX, mouseY, delta);
     }
 }

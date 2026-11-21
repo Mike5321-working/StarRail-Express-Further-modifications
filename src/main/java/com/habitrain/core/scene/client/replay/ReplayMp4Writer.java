@@ -1,107 +1,187 @@
 package com.habitrain.core.scene.client.replay;
 
-import org.jcodec.codecs.h264.H264Encoder;
-import org.jcodec.codecs.h264.encode.RateControl;
-import org.jcodec.codecs.h264.io.model.SliceType;
-import org.jcodec.common.AudioFormat;
-import org.jcodec.common.Codec;
-import org.jcodec.common.MuxerTrack;
-import org.jcodec.common.VideoCodecMeta;
-import org.jcodec.common.VideoEncoder;
-import org.jcodec.common.io.NIOUtils;
-import org.jcodec.common.io.SeekableByteChannel;
-import org.jcodec.common.model.ColorSpace;
-import org.jcodec.common.model.Packet;
-import org.jcodec.common.model.Picture;
-import org.jcodec.common.model.Size;
-import org.jcodec.containers.mp4.muxer.MP4Muxer;
+import org.jetbrains.annotations.Nullable;
 
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.nio.ByteBuffer;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 /**
- * Pure-Java H.264 (+ optional AAC-LC stereo audio) / MP4 writer backed by JCodec. Converts OpenGL's
- * bottom-up BGR24 frames directly into {@link ColorSpace#YUV420J} in a single allocation-free pass
- * and encodes with constant quantization so dark starfield and flat UI regions compress cleanly without
- * bitrate bloat.
+ * External FFmpeg H.264 (+ optional AAC-LC stereo audio) / MP4 writer.
+ *
+ * <p>Streams OpenGL's bottom-up {@code bgr24} frames directly into FFmpeg's {@code stdin} with SIMD
+ * vertical flip and BT.709 color-space conversion, while passing pre-mixed 48 kHz 16-bit stereo PCM
+ * via a temporary file to prevent dual-pipe deadlocks and maintain exact A/V sync.</p>
  */
 final class ReplayMp4Writer implements ReplayVideoWriter {
-    private static final int KEY_INTERVAL = 60;
-    private static final int QP_INTRA = 22;
-    private static final int QP_INTER = 25;
+    private static final int AUDIO_SAMPLE_RATE = 48_000;
+    private static final int AUDIO_CHANNELS = 2;
+    private static final int MAX_LOG_BYTES = 16 * 1024;
+    private static final long FINISH_TIMEOUT_SECONDS = 60L;
 
-    private final SeekableByteChannel channel;
-    private final MP4Muxer muxer;
-    private final MuxerTrack track;
-    private final MuxerTrack audioTrack;
-    private final ReplayAacEncoder aacEncoder;
-    private final H264Encoder encoder;
-    private final Picture yuv;
-    private final ByteBuffer packetScratch;
-    private final int width;
-    private final int height;
-    private final int fps;
+    private final Process process;
+    private final OutputStream videoOut;
+    private final Thread logDrainThread;
+    private final ByteArrayOutputStream logBuffer = new ByteArrayOutputStream(1024);
+    private final @Nullable Path tempAudioPcm;
     private final int expectedBytes;
-    private int frameNo;
-    private long aacFrameNo;
+    private boolean finished;
+    private boolean closed;
 
-    ReplayMp4Writer(Path path, int width, int height, int fps) throws IOException {
-        this(path, width, height, fps, false);
+    ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps) throws IOException {
+        this(ffmpegExecutable, path, width, height, fps, null);
     }
 
-    ReplayMp4Writer(Path path, int width, int height, int fps, boolean includeAudio) throws IOException {
+    ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
+                    @Nullable short[] soundtrackStereo48k) throws IOException {
+        Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable");
+        Objects.requireNonNull(path, "path");
         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
             throw new IllegalArgumentException("MP4 dimensions must be positive even integers: " + width + "x" + height);
         }
         if (fps <= 0) {
             throw new IllegalArgumentException("FPS must be positive: " + fps);
         }
-        this.width = width;
-        this.height = height;
-        this.fps = fps;
         this.expectedBytes = Math.multiplyExact(Math.multiplyExact(width, height), 3);
-        this.yuv = Picture.create(width, height, ColorSpace.YUV420J);
-        this.encoder = new H264Encoder(new ConstantQpRateControl(QP_INTRA, QP_INTER));
-        this.encoder.setKeyInterval(KEY_INTERVAL);
-        this.encoder.setMotionSearchRange(width >= 2560 ? 8 : 12);
-        this.packetScratch = ByteBuffer.allocate(encoder.estimateBufferSize(yuv));
 
-        SeekableByteChannel opened = NIOUtils.writableChannel(path.toFile());
+        Path parent = path.toAbsolutePath().normalize().getParent();
+        if (parent != null) Files.createDirectories(parent);
+
+        Path audioTemp = null;
+        Process started = null;
         try {
-            this.muxer = MP4Muxer.createMP4MuxerToChannel(opened);
-            this.track = muxer.addVideoTrack(
-                    Codec.H264,
-                    VideoCodecMeta.createSimpleVideoCodecMeta(new Size(width, height), ColorSpace.YUV420J));
-            if (includeAudio) {
-                this.audioTrack = muxer.addCompressedAudioTrack(Codec.AAC, AudioFormat.STEREO_48K_S16_LE);
-                this.aacEncoder = new ReplayAacEncoder(this::writeAacPacket);
-            } else {
-                this.audioTrack = null;
-                this.aacEncoder = null;
+            if (soundtrackStereo48k != null && soundtrackStereo48k.length >= AUDIO_CHANNELS) {
+                audioTemp = writeTempPcm(parent != null ? parent : Path.of("."), soundtrackStereo48k);
             }
-            this.channel = opened;
-        } catch (IOException | RuntimeException failure) {
-            try {
-                opened.close();
-            } catch (IOException closeFailure) {
-                failure.addSuppressed(closeFailure);
+            List<String> cmd = buildCommand(ffmpegExecutable, path, width, height, fps, audioTemp);
+            started = new ProcessBuilder(cmd)
+                    .redirectErrorStream(true)
+                    .start();
+            this.tempAudioPcm = audioTemp;
+            this.process = started;
+            this.videoOut = new BufferedOutputStream(started.getOutputStream(), 256 * 1024);
+            this.logDrainThread = Thread.ofPlatform().daemon().name("habitrain-ffmpeg-log").start(this::drainOutput);
+        } catch (IOException | RuntimeException | Error failure) {
+            if (started != null) {
+                started.destroyForcibly();
             }
+            deleteQuietly(audioTemp);
             throw failure;
         }
     }
 
-    private void writeAacPacket(ByteBuffer adtsFrame) throws IOException {
-        Packet audioPkt = Packet.createPacket(
-                adtsFrame,
-                aacFrameNo * 1024L,
-                ReplayAacEncoder.SAMPLE_RATE,
-                1024L,
-                aacFrameNo,
-                Packet.FrameType.KEY,
-                null);
-        audioTrack.addFrame(audioPkt);
-        aacFrameNo++;
+    static List<String> buildCommand(Path ffmpegExecutable, Path outputPath, int width, int height, int fps,
+                                     @Nullable Path audioPcmFile) {
+        List<String> cmd = new ArrayList<>(36);
+        cmd.add(ffmpegExecutable.toAbsolutePath().toString());
+        cmd.add("-y");
+        cmd.add("-hide_banner");
+        cmd.add("-loglevel");
+        cmd.add("error");
+        cmd.add("-f");
+        cmd.add("rawvideo");
+        cmd.add("-pix_fmt");
+        cmd.add("bgr24");
+        cmd.add("-s");
+        cmd.add(width + "x" + height);
+        cmd.add("-r");
+        cmd.add(Integer.toString(fps));
+        cmd.add("-i");
+        cmd.add("pipe:0");
+        if (audioPcmFile != null) {
+            cmd.add("-f");
+            cmd.add("s16le");
+            cmd.add("-ar");
+            cmd.add(Integer.toString(AUDIO_SAMPLE_RATE));
+            cmd.add("-ac");
+            cmd.add(Integer.toString(AUDIO_CHANNELS));
+            cmd.add("-i");
+            cmd.add(audioPcmFile.toAbsolutePath().toString());
+        }
+        cmd.add("-vf");
+        cmd.add("vflip,scale=in_range=full:out_color_matrix=bt709:out_range=tv");
+        cmd.add("-c:v");
+        cmd.add("libx264");
+        cmd.add("-preset");
+        cmd.add(width >= 2560 ? "fast" : "medium");
+        cmd.add("-crf");
+        cmd.add("18");
+        cmd.add("-pix_fmt");
+        cmd.add("yuv420p");
+        cmd.add("-colorspace");
+        cmd.add("bt709");
+        cmd.add("-color_primaries");
+        cmd.add("bt709");
+        cmd.add("-color_trc");
+        cmd.add("bt709");
+        cmd.add("-color_range");
+        cmd.add("tv");
+        if (audioPcmFile != null) {
+            cmd.add("-c:a");
+            cmd.add("aac");
+            cmd.add("-b:a");
+            cmd.add("192k");
+            cmd.add("-shortest");
+        }
+        cmd.add("-movflags");
+        cmd.add("+faststart");
+        cmd.add("-f");
+        cmd.add("mp4");
+        cmd.add(outputPath.toAbsolutePath().toString());
+        return cmd;
+    }
+
+    private static Path writeTempPcm(Path directory, short[] interleavedStereo48k) throws IOException {
+        Path temp = Files.createTempFile(directory, ".replay-audio-", ".pcm");
+        int sampleCount = interleavedStereo48k.length & ~1;
+        byte[] chunk = new byte[65536];
+        try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(temp), 65536)) {
+            int offset = 0;
+            while (offset < sampleCount) {
+                int batchSamples = Math.min(chunk.length / 2, sampleCount - offset);
+                for (int i = 0; i < batchSamples; i++) {
+                    short s = interleavedStereo48k[offset + i];
+                    chunk[i * 2] = (byte) (s & 0xFF);
+                    chunk[i * 2 + 1] = (byte) ((s >>> 8) & 0xFF);
+                }
+                out.write(chunk, 0, batchSamples * 2);
+                offset += batchSamples;
+            }
+        } catch (IOException | RuntimeException | Error failure) {
+            deleteQuietly(temp);
+            throw failure;
+        }
+        return temp;
+    }
+
+    private void drainOutput() {
+        byte[] buf = new byte[4096];
+        try (InputStream in = process.getInputStream()) {
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                synchronized (logBuffer) {
+                    int remaining = MAX_LOG_BYTES - logBuffer.size();
+                    if (remaining > 0) {
+                        logBuffer.write(buf, 0, Math.min(n, remaining));
+                    }
+                }
+            }
+        } catch (IOException ignored) {}
+    }
+
+    private String capturedLog() {
+        synchronized (logBuffer) {
+            return logBuffer.toString(StandardCharsets.UTF_8).trim();
+        }
     }
 
     @Override
@@ -109,113 +189,93 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         if (bottomUpBgr.length != expectedBytes) {
             throw new IOException("Unexpected video frame size: " + bottomUpBgr.length + " != " + expectedBytes);
         }
-        bgrBottomUpToYuv420j(bottomUpBgr, width, height,
-                yuv.getPlaneData(0), yuv.getPlaneData(1), yuv.getPlaneData(2));
-
-        packetScratch.clear();
-        VideoEncoder.EncodedFrame encoded = encoder.encodeFrame(yuv, packetScratch);
-        ByteBuffer raw = encoded.getData();
-        // Copy out of packetScratch so SPS/PPS slices retained by the muxer track cannot be aliased by later frames.
-        ByteBuffer packetData = ByteBuffer.allocate(raw.remaining());
-        packetData.put(raw.duplicate());
-        packetData.flip();
-
-        Packet packet = Packet.createPacket(
-                packetData,
-                frameNo,
-                fps,
-                1,
-                frameNo,
-                encoded.isKeyFrame() ? Packet.FrameType.KEY : Packet.FrameType.INTER,
-                null);
-        track.addFrame(packet);
-        frameNo++;
-    }
-
-    @Override
-    public void addAudio(short[] interleavedStereo48k, int stereoFrameOffset, int stereoFrames) throws IOException {
-        if (aacEncoder != null) {
-            aacEncoder.push(interleavedStereo48k, stereoFrameOffset, stereoFrames);
+        try {
+            videoOut.write(bottomUpBgr);
+        } catch (IOException writeFailure) {
+            waitBrieflyForLog();
+            String details = capturedLog();
+            if (!details.isEmpty()) {
+                throw new IOException("FFmpeg pipe failed: " + details, writeFailure);
+            }
+            throw writeFailure;
         }
     }
 
     @Override
     public void finish() throws IOException {
-        if (aacEncoder != null) {
-            aacEncoder.finish();
+        if (finished) return;
+        finished = true;
+        try {
+            videoOut.flush();
+            videoOut.close();
+        } catch (IOException closeFailure) {
+            waitBrieflyForLog();
+            String details = capturedLog();
+            if (!details.isEmpty()) {
+                throw new IOException("FFmpeg input close failed: " + details, closeFailure);
+            }
+            throw closeFailure;
         }
-        muxer.finish();
+        int exitCode;
+        try {
+            if (!process.waitFor(FINISH_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(3, TimeUnit.SECONDS);
+                throw new IOException("Timed out waiting for FFmpeg to finalize MP4");
+            }
+            exitCode = process.exitValue();
+            logDrainThread.join(3000);
+        } catch (InterruptedException interrupted) {
+            process.destroyForcibly();
+            Thread.currentThread().interrupt();
+            throw new IOException("Interrupted while waiting for FFmpeg to finalize MP4", interrupted);
+        }
+        if (exitCode != 0) {
+            String details = capturedLog();
+            throw new IOException("FFmpeg exited with code " + exitCode
+                    + (details.isEmpty() ? "" : ": " + details));
+        }
     }
 
     @Override
     public void close() throws IOException {
-        channel.close();
-    }
-
-    /**
-     * Converts bottom-up 24-bit BGR rows directly into JCodec's {@code -128}-biased JFIF YCbCr 4:2:0 planes.
-     */
-    static void bgrBottomUpToYuv420j(byte[] bottomUpBgr, int width, int height,
-                                     byte[] yPlane, byte[] uPlane, byte[] vPlane) {
-        int rowBytes = width * 3;
-        int halfWidth = width >> 1;
-        for (int y = 0; y < height; y += 2) {
-            int srcRow0 = (height - 1 - y) * rowBytes;
-            int srcRow1 = srcRow0 - rowBytes;
-            int dstY0 = y * width;
-            int dstY1 = dstY0 + width;
-            int uvRow = (y >> 1) * halfWidth;
-
-            for (int x = 0, srcOff = 0, uv = uvRow; x < width; x += 2, srcOff += 6, uv++) {
-                int i00 = srcRow0 + srcOff;
-                int b00 = bottomUpBgr[i00] & 0xFF;
-                int g00 = bottomUpBgr[i00 + 1] & 0xFF;
-                int r00 = bottomUpBgr[i00 + 2] & 0xFF;
-
-                int i01 = i00 + 3;
-                int b01 = bottomUpBgr[i01] & 0xFF;
-                int g01 = bottomUpBgr[i01 + 1] & 0xFF;
-                int r01 = bottomUpBgr[i01 + 2] & 0xFF;
-
-                int i10 = srcRow1 + srcOff;
-                int b10 = bottomUpBgr[i10] & 0xFF;
-                int g10 = bottomUpBgr[i10 + 1] & 0xFF;
-                int r10 = bottomUpBgr[i10 + 2] & 0xFF;
-
-                int i11 = i10 + 3;
-                int b11 = bottomUpBgr[i11] & 0xFF;
-                int g11 = bottomUpBgr[i11 + 1] & 0xFF;
-                int r11 = bottomUpBgr[i11 + 2] & 0xFF;
-
-                yPlane[dstY0 + x] = (byte) (((77 * r00 + 150 * g00 + 29 * b00 + 128) >> 8) - 128);
-                yPlane[dstY0 + x + 1] = (byte) (((77 * r01 + 150 * g01 + 29 * b01 + 128) >> 8) - 128);
-                yPlane[dstY1 + x] = (byte) (((77 * r10 + 150 * g10 + 29 * b10 + 128) >> 8) - 128);
-                yPlane[dstY1 + x + 1] = (byte) (((77 * r11 + 150 * g11 + 29 * b11 + 128) >> 8) - 128);
-
-                int rSum = r00 + r01 + r10 + r11;
-                int gSum = g00 + g01 + g10 + g11;
-                int bSum = b00 + b01 + b10 + b11;
-
-                uPlane[uv] = (byte) Math.clamp((-43 * rSum - 85 * gSum + 128 * bSum + 512) >> 10, -128, 127);
-                vPlane[uv] = (byte) Math.clamp((128 * rSum - 107 * gSum - 21 * bSum + 512) >> 10, -128, 127);
+        if (closed) return;
+        closed = true;
+        try {
+            try {
+                videoOut.close();
+            } catch (IOException ignored) {}
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                try {
+                    process.waitFor(3, TimeUnit.SECONDS);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
+            try {
+                logDrainThread.join(1000);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        } finally {
+            deleteQuietly(tempAudioPcm);
         }
     }
 
-    private record ConstantQpRateControl(int qpIntra, int qpInter) implements RateControl {
-        @Override
-        public int startPicture(Size sz, int maxSize, SliceType sliceType) {
-            return sliceType == SliceType.I ? qpIntra : qpInter;
+    private void waitBrieflyForLog() {
+        try {
+            process.waitFor(1, TimeUnit.SECONDS);
+            logDrainThread.join(500);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
         }
+    }
 
-        @Override
-        public int initialQpDelta() {
-            return 0;
-        }
-
-        @Override
-        public int accept(int bits) {
-            return 0;
-        }
+    private static void deleteQuietly(@Nullable Path path) {
+        if (path == null) return;
+        try {
+            Files.deleteIfExists(path);
+        } catch (IOException ignored) {}
     }
 }

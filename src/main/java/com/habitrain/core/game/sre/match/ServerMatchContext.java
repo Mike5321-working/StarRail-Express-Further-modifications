@@ -11,6 +11,9 @@ public final class ServerMatchContext {
         return level.dimension().location().toString();
     }
     public static void release(ServerLevel level) { GATE.release(dimension(level)); }
+    static SingleMatchGate.Snapshot nativeReservation(ServerLevel level) {
+        return GATE.isNativeMatch() && GATE.owns(dimension(level)) ? GATE.snapshot() : null;
+    }
     public static void tick(net.minecraft.server.MinecraftServer server) {
         var snapshot = GATE.snapshot();
         if (!GATE.isNativeMatch() || snapshot.phase() == SingleMatchGate.Phase.LOBBY) return;

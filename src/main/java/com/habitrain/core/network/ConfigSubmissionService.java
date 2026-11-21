@@ -84,7 +84,7 @@ public final class ConfigSubmissionService {
                         FullConfigSyncPayload.broadcastToAll(server);
                     } catch (RuntimeException error) {
                         com.habitrain.core.HabiTrainCore.LOGGER.error("配置已保存，后续发布失败", error);
-                        result = new ConfigSaveResult(ConfigSaveResult.Status.SAVED, "配置已保存，但发布失败，请查看服务器日志");
+                        result = new ConfigSaveResult(ConfigSaveResult.Status.SAVED, result.message() + "；配置发布失败，请查看服务器日志");
                     }
                 }
             }

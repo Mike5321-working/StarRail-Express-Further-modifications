@@ -35,6 +35,10 @@ public final class C2SReceiverRegistrar {
                         runOnServer(context.server(), () ->
                                 com.habitrain.core.scene.block.ReplayBoardSettingsService.save(context.player(), payload)));
         ServerPlayNetworking.registerGlobalReceiver(
+                com.habitrain.core.network.replay.ReplayBoardSettingsPackets.CheckedSave.TYPE, (payload, context) ->
+                        runOnServer(context.server(), () ->
+                                com.habitrain.core.scene.block.ReplayBoardSettingsService.save(context.player(), payload)));
+        ServerPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayPackets.StartPlayback.TYPE, (payload, context) ->
                         context.server().execute(() ->
                                 com.habitrain.core.game.sre.replay.ReplayBoardService.start(context.player(), payload)));

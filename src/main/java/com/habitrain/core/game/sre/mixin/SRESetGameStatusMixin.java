@@ -2,7 +2,6 @@ package com.habitrain.core.game.sre.mixin;
 
 import com.habitrain.core.HabiTrainCore;
 import com.habitrain.core.game.sre.match.GameEndTransitionCoordinator;
-import com.habitrain.core.game.sre.replay.MatchReplayRecorder;
 import io.wifi.starrailexpress.cca.SREGameWorldComponent;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.Level;
@@ -40,7 +39,6 @@ public abstract class SRESetGameStatusMixin {
                 return;
             }
             if (status == SREGameWorldComponent.GameStatus.STOPPING) {
-                MatchReplayRecorder.stopVoice(serverLevel);
                 GameEndTransitionCoordinator.onStatusStopping(serverLevel);
             } else {
                 // STOPPING → INACTIVE（finalize 完成）等离开 STOPPING 的转换：释放广播标记。

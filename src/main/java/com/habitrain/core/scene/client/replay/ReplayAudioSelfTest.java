@@ -34,13 +34,6 @@ import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.phys.Vec3;
-import net.sourceforge.jaad.aac.Decoder;
-import net.sourceforge.jaad.aac.SampleBuffer;
-import org.jcodec.codecs.aac.ADTSParser;
-import org.jcodec.common.DemuxerTrack;
-import org.jcodec.common.io.NIOUtils;
-import org.jcodec.common.model.Packet;
-import org.jcodec.containers.mp4.demuxer.MP4Demuxer;
 import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -437,39 +430,18 @@ public final class ReplayAudioSelfTest {
         mp4Size = Files.size(mp4Path);
         aviSize = Files.size(aviPath);
 
-        // Verify exported MP4 video + AAC audio alignment.
-        try (var ch = NIOUtils.readableChannel(mp4Path.toFile())) {
-            MP4Demuxer demuxer = MP4Demuxer.createMP4Demuxer(ch);
-            if (demuxer.getVideoTracks().size() != 1 || demuxer.getAudioTracks().size() != 1) {
-                throw new IllegalStateException("MP4 missing expected video+audio tracks");
-            }
-            DemuxerTrack audio = demuxer.getAudioTracks().getFirst();
-            byte[] asc = new byte[audio.getMeta().getCodecPrivate().remaining()];
-            audio.getMeta().getCodecPrivate().duplicate().get(asc);
-            Decoder dec = new Decoder(asc);
-            SampleBuffer sb = new SampleBuffer();
-            short[] mp4Pcm = new short[(script.frames(30) + 1) * 1600 * 2 + 8192];
-            int pos = 0;
-            Packet pkt;
-            while ((pkt = audio.nextFrame()) != null) {
-                ByteBuffer data = pkt.getData();
-                if (ADTSParser.read(data) == null) throw new IllegalStateException("Invalid demuxed ADTS");
-                byte[] frameBytes = new byte[data.remaining()];
-                data.get(frameBytes);
-                dec.decodeFrame(frameBytes, sb);
-                sb.setBigEndian(false);
-                ByteBuffer pcmBuf = ByteBuffer.wrap(sb.getData()).order(ByteOrder.LITTLE_ENDIAN);
-                while (pcmBuf.hasRemaining() && pos < mp4Pcm.length) {
-                    mp4Pcm[pos++] = pcmBuf.getShort();
-                }
-            }
-            mp4IntroRms = windowRms(mp4Pcm, 0.25, 0.90);
-            mp4Beat0Rms = windowRms(mp4Pcm, beat0Time - 0.05, beat0Time + 0.18);
-            mp4Beat1Rms = windowRms(mp4Pcm, beat1Time - 0.05, beat1Time + 0.18);
-            if (mp4Beat0Rms < 1200 || mp4Beat1Rms < 1200 || mp4IntroRms > 150) {
-                throw new IllegalStateException("MP4 audio verification failed: intro=" + mp4IntroRms
-                        + " beat0=" + mp4Beat0Rms + " beat1=" + mp4Beat1Rms);
-            }
+        // Verify exported MP4 video + AAC audio alignment via external FFmpeg.
+        Path ffmpeg = ReplayFfmpegManager.resolveAvailable(mc.gameDirectory.toPath());
+        if (ffmpeg == null) {
+            throw new IllegalStateException("FFmpeg unavailable for MP4 audio verification");
+        }
+        short[] mp4Pcm = decodeMp4Audio48kStereo(ffmpeg, mp4Path);
+        mp4IntroRms = windowRms(mp4Pcm, 0.25, 0.90);
+        mp4Beat0Rms = windowRms(mp4Pcm, beat0Time - 0.05, beat0Time + 0.18);
+        mp4Beat1Rms = windowRms(mp4Pcm, beat1Time - 0.05, beat1Time + 0.18);
+        if (mp4Beat0Rms < 1200 || mp4Beat1Rms < 1200 || mp4IntroRms > 150) {
+            throw new IllegalStateException("MP4 audio verification failed: intro=" + mp4IntroRms
+                    + " beat0=" + mp4Beat0Rms + " beat1=" + mp4Beat1Rms);
         }
 
         // Verify exported AVI video + PCM audio alignment.
@@ -638,6 +610,29 @@ public final class ReplayAudioSelfTest {
             sum += mono * mono;
         }
         return Math.sqrt(sum / (end - start));
+    }
+
+    private static short[] decodeMp4Audio48kStereo(Path ffmpeg, Path mp4) throws IOException, InterruptedException {
+        Process process = new ProcessBuilder(
+                ffmpeg.toAbsolutePath().toString(),
+                "-hide_banner", "-loglevel", "error",
+                "-i", mp4.toAbsolutePath().toString(),
+                "-vn", "-f", "s16le", "-ac", "2", "-ar", "48000", "pipe:1"
+        ).start();
+        byte[] pcmBytes = process.getInputStream().readAllBytes();
+        byte[] errBytes = process.getErrorStream().readAllBytes();
+        boolean finished = process.waitFor(30, TimeUnit.SECONDS);
+        if (!finished) {
+            process.destroyForcibly();
+            throw new IOException("Timed out decoding MP4 audio via FFmpeg");
+        }
+        if (process.exitValue() != 0) {
+            throw new IOException("FFmpeg MP4 audio decode failed: " + new String(errBytes, StandardCharsets.UTF_8));
+        }
+        int samples = pcmBytes.length / 2;
+        short[] out = new short[samples];
+        ByteBuffer.wrap(pcmBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(out);
+        return out;
     }
 
     private static short[] extractAviPcm(byte[] aviBytes) {

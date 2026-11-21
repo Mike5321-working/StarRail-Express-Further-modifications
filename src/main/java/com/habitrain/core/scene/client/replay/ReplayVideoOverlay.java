@@ -295,9 +295,10 @@ final class ReplayVideoOverlay {
                     2.2f * scale * 1.5f, inkSoft, -1, false);
             if (stampK > 0) {
                 double st = ReplayStagePlan.easeOutCubic(stampK);
-                float ss = (float) (0.5 * scale * (2.2 - 1.2 * st));
-                c.art(Tex.STAMP, ox + 515 * scale, oy + 262 * scale, ss, (float) Math.toRadians(-16), argb(0xFFC0303C, 0.85 * Math.min(1, stampK * 2)), false);
-                c.text(tr("ticket.stamp"), ox + 515 * scale, oy + 264 * scale, 2.2f * ss / 0.5f, argb(0xFFC0303C, 0.9 * Math.min(1, stampK * 2)), 0, false);
+                float ss = (float) (0.4 * scale * (1.8 - 0.8 * st));
+                float stampX = ox + 590 * scale, stampY = oy + 52 * scale;
+                c.art(Tex.STAMP, stampX, stampY, ss, (float) Math.toRadians(-16), argb(0xFFC0303C, 0.85 * Math.min(1, stampK * 2)), false);
+                c.text(tr("ticket.stamp"), stampX, stampY + 2 * scale, 2.2f * ss / 0.5f, argb(0xFFC0303C, 0.9 * Math.min(1, stampK * 2)), 0, false);
             }
             c.pose.popMatrix();
         }
@@ -353,7 +354,7 @@ final class ReplayVideoOverlay {
         float tw = c.width(chipText, 1.8f) + 26;
         float cx = x + cw + 16, cy = y + 42;
         c.slab(cx, cy - 13, cx + tw, cy + 13, 8, argb(chipColor, 0.92 * a), argb(scale(chipColor, 0.7), 0.92 * a));
-        c.text(chipText, cx + 13 + 4, cy, 1.8f, argb(NIGHT_0, a), -1, false);
+        c.text(chipText, cx + tw / 2, cy, 1.8f, argb(s.freeze() ? 0xFFFFFFFF : NIGHT_0, a), 0, false);
         if (!s.slow() && !s.freeze() && s.speed() > 3) {
             // Hyper-lapse chevrons.
             for (int i = 0; i < 3; i++) {
@@ -374,7 +375,7 @@ final class ReplayVideoOverlay {
             if (states[i]) alive++;
         }
         float x = w - 44, y = 44;
-        c.text(ReplayVideoCanvas.font(tr("hud.alive"), ReplayVideoCanvas.UI), x, y, 1.8f, argb(TEXT_MUTED, a), 1, false);
+        c.text(tr("hud.alive"), x, y, 1.8f, argb(CHAMPAGNE, a), 1, true);
         c.text(ReplayVideoCanvas.font(Component.literal(alive + "/" + total), ReplayVideoCanvas.BIG), x, y + 38, 3.6f, argb(0xFFFFFFFF, a), 1, true);
         int shown = Math.min(total, 24);
         float px = x - shown * 13 + 3;

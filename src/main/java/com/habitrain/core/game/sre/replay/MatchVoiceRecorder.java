@@ -70,6 +70,11 @@ public final class MatchVoiceRecorder {
         if (round != null && round.level == level) round.stopCapture();
     }
 
+    static void freezePostEventPositions(UUID roundId) {
+        ActiveRound round = active;
+        if (round != null && round.roundId.equals(roundId)) round.freezePostEventPositions();
+    }
+
     static void leave(ServerLevel level, UUID speaker, int tick) {
         ActiveRound round = active;
         if (round != null && round.level == level && round.capturing) round.leave(speaker, tick);
@@ -85,6 +90,10 @@ public final class MatchVoiceRecorder {
         ActiveRound round = active;
         active = null;
         if (round != null) round.stopCapture();
+    }
+
+    static int postEventTicks() {
+        return (POST_EVENT_MS + 49) / 50;
     }
 
     /** Called from {@link ReplayVoicePlugin} on Simple Voice Chat's audio thread. */
@@ -154,7 +163,8 @@ public final class MatchVoiceRecorder {
         }
     }
 
-    private record VoiceFrame(long matchMs, float maxDist, int samples24k, byte[] adpcm24k) {}
+    /** Raw 24 kHz frames stay lossless until each highlight is mixed and encoded once. */
+    private record VoiceFrame(long matchMs, float maxDist, int samples24k, short[] pcm24k) {}
     private record CaptureClock(int tick, long nanos, Set<UUID> speakers) {}
 
     private static final class ActiveRound {
@@ -163,10 +173,12 @@ public final class MatchVoiceRecorder {
         final String dimension;
         final SceneBounds bounds;
         final Map<UUID, ArrayDeque<VoiceFrame>> framesBySpeaker = new HashMap<>();
+        final Map<UUID, Long> lastLiveEndMs = new HashMap<>();
         final Map<UUID, List<PosSample>> posByPlayer = new HashMap<>();
         final Map<LastMatchReplay.Node, Optional<ReplayVoiceData.Clip>> closedWindows = new IdentityHashMap<>();
         volatile boolean capturing;
         volatile CaptureClock clock = new CaptureClock(0, 0, Set.of());
+        volatile boolean postEventTail;
 
         ActiveRound(UUID roundId, @Nullable ServerLevel level, SceneBounds bounds) {
             this.roundId = roundId;
@@ -184,14 +196,30 @@ public final class MatchVoiceRecorder {
             capturing = false;
         }
 
+        synchronized void freezePostEventPositions() {
+            postEventTail = true;
+        }
+
         void recordTick(ServerLevel srvLevel, int matchTick, Set<UUID> deathsAtTick) {
             var game = SREGameWorldComponent.KEY.get(srvLevel);
+            boolean closing = game.getGameStatus() != SREGameWorldComponent.GameStatus.ACTIVE;
+            if (closing && postEventTail) {
+                // Finalization teleports players to the lobby before the next world tick.  Keep
+                // the last in-match positions and roster for the short voice tail instead of
+                // replacing them with those lobby coordinates.
+                clock = new CaptureClock(matchTick, System.nanoTime(), clock.speakers());
+                return;
+            }
             Set<UUID> present = new HashSet<>();
             for (ServerPlayer player : srvLevel.players()) {
                 UUID id = player.getUUID();
-                if (RepairModeManager.isRepairer(id)) continue;
                 SRERole role = game.getRole(player);
-                if (role == null || TMMRoles.DISCOVERY_CIVILIAN.identifier().equals(role.identifier())) continue;
+                // During the one-second post-match voice tail the role component may already be
+                // transitioning to INACTIVE.  Keep the last active speaker roster usable for
+                // proximity checks while retaining the normal role filters during the match.
+                if (!closing && RepairModeManager.isRepairer(id)) continue;
+                if (!closing && (role == null || TMMRoles.DISCOVERY_CIVILIAN.identifier().equals(role.identifier()))) continue;
+                if (closing && !clock.speakers().contains(id)) continue;
                 present.add(id);
                 boolean alive = GameUtils.isPlayerAliveAndSurvival(player) && !deathsAtTick.contains(id);
                 recordPlayerPos(id, matchTick, player.getX(), player.getY(), player.getZ(), alive);
@@ -240,7 +268,10 @@ public final class MatchVoiceRecorder {
         void appendLivePcm48k(UUID speaker, float maxDist, short[] pcm48k) {
             CaptureClock snapshot = clock;
             if (!capturing || !snapshot.speakers().contains(speaker)) return;
-            long subTickMs = Math.clamp((System.nanoTime() - snapshot.nanos()) / 1_000_000L, 0L, 49L);
+            // A voice packet can arrive after the nominal 50 ms server tick on a lagging server.
+            // Keep the wall-clock offset instead of folding it back into the previous tick, then
+            // enforce a per-speaker monotonic end so consecutive 20 ms packets never overlap.
+            long subTickMs = Math.max(0L, (System.nanoTime() - snapshot.nanos()) / 1_000_000L);
             append(speaker, snapshot.tick() * 50L + subTickMs, maxDist, pcm48k, true);
         }
 
@@ -252,12 +283,17 @@ public final class MatchVoiceRecorder {
             if (!capturing || !Float.isFinite(maxDist) || maxDist <= 0.0f) return;
             short[] pcm24k = ReplayVoiceData.downsample48kTo24k(pcm48k);
             if (pcm24k.length == 0) return;
-            VoiceFrame frame = new VoiceFrame(matchMs, maxDist, pcm24k.length, ReplayVoiceData.encodeAdpcm(pcm24k));
+            VoiceFrame frame = new VoiceFrame(matchMs, maxDist, pcm24k.length, pcm24k);
             synchronized (this) {
                 if (!capturing || live && !clock.speakers().contains(speaker)) return;
                 var frames = framesBySpeaker.computeIfAbsent(speaker, ignored -> new ArrayDeque<>());
                 if (frames.size() >= MAX_FRAMES_PER_SPEAKER) frames.removeFirst();
+                long frameMs = matchMs;
+                if (live) frameMs = Math.max(frameMs, lastLiveEndMs.getOrDefault(speaker, Long.MIN_VALUE));
+                if (frameMs != frame.matchMs()) frame = new VoiceFrame(frameMs, frame.maxDist(), frame.samples24k(), frame.pcm24k());
                 frames.addLast(frame);
+                if (live) lastLiveEndMs.put(speaker,
+                        frameMs + frame.samples24k() * 1000L / ReplayVoiceData.SAMPLE_RATE);
             }
         }
 
@@ -358,7 +394,7 @@ public final class MatchVoiceRecorder {
                     float gain = dist <= 2.0 ? 1.0f : Math.clamp(1.0f - (float) (dist / vf.maxDist()), 0.0f, 1.0f);
                     if (gain <= 0.02f) continue;
 
-                    short[] pcm24k = ReplayVoiceData.decodeAdpcm(vf.adpcm24k(), vf.samples24k());
+                    short[] pcm24k = vf.pcm24k();
                     int startSample = (int) Math.round((vf.matchMs() - windowStartMs) * (ReplayVoiceData.SAMPLE_RATE / 1000.0));
                     // Snap contiguous 20ms packets from the same speaker to avoid UDP jitter micro-gaps.
                     if (prevEndSample != Integer.MIN_VALUE && Math.abs(startSample - prevEndSample) <= 288) {

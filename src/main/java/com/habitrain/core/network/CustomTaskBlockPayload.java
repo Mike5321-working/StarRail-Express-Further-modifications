@@ -1,6 +1,7 @@
 package com.habitrain.core.network;
 
-import com.habitrain.core.game.sre.task.CustomTaskBlockCache;
+import com.habitrain.core.game.sre.task.CustomTaskBlockScanner;
+import com.habitrain.core.game.sre.task.TaskBlockIndex;
 import io.netty.buffer.ByteBuf;
 import io.netty.handler.codec.DecoderException;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
@@ -9,7 +10,7 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.ResourceLocation;
-import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 
 import org.slf4j.Logger;
@@ -23,7 +24,7 @@ import java.util.Set;
 public class CustomTaskBlockPayload implements CustomPacketPayload {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("habitrain_core|CustomTaskBlock");
-    private static final int MAX_ENTRIES = CustomTaskBlockCache.MAX_ENTRIES;
+    private static final int MAX_ENTRIES = TaskBlockIndex.MAX_ENTRIES;
     private static final int MAX_TYPE_IDS_PER_ENTRY = 64;
 
     public static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath("habitrain_core", "custom_task_blocks");
@@ -103,16 +104,14 @@ public class CustomTaskBlockPayload implements CustomPacketPayload {
     }
 
     public static void sendToPlayer(ServerPlayer player) {
-        if (player == null) return;
-        ServerPlayNetworking.send(player, new CustomTaskBlockPayload(CustomTaskBlockCache.snapshot()));
+        if (player == null || !ServerPlayNetworking.canSend(player, TYPE)) return;
+        ServerPlayNetworking.send(player, new CustomTaskBlockPayload(CustomTaskBlockScanner.snapshotFor(player.serverLevel())));
     }
 
-    public static void broadcastToAll(MinecraftServer server) {
-        if (server == null) return;
-        var snapshot = CustomTaskBlockCache.snapshot();
-        var payload = new CustomTaskBlockPayload(snapshot);
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            ServerPlayNetworking.send(player, payload);
+    public static void broadcastToLevel(ServerLevel level) {
+        var payload = new CustomTaskBlockPayload(CustomTaskBlockScanner.snapshotFor(level));
+        for (ServerPlayer player : level.players()) {
+            if (ServerPlayNetworking.canSend(player, TYPE)) ServerPlayNetworking.send(player, payload);
         }
     }
 }

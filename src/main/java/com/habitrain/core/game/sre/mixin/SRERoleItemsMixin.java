@@ -24,13 +24,9 @@ public class SRERoleItemsMixin {
         SRERole self = (SRERole) (Object) this;
         CompiledModifyOverlay overlay = RoleOverlayAccessor.currentOverlay(self);
         if (overlay != null && overlay.defaultItemsPatch() != null) {
-            MinecraftServer server = getServer();
+            MinecraftServer server = RuntimeRoleServer.INSTANCE.server();
             cir.setReturnValue(overlay.defaultItemsPatch().getDefaultItems(self, server));
             return;
         }
-    }
-
-    private static MinecraftServer getServer() {
-        return RuntimeRoleServer.INSTANCE.server();
     }
 }

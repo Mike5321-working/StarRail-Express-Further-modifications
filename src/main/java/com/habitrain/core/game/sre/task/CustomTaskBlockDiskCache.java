@@ -77,7 +77,8 @@ public final class CustomTaskBlockDiskCache {
 
         Optional<Map<BlockPos, Set<Integer>>> validated(CustomTaskBlockScanKey expected) {
             if (schemaVersion != SCHEMA_VERSION || !"COMPLETE".equals(status)
-                    || expected == null || !expected.equals(context) || entries == null) return Optional.empty();
+                    || expected == null || !expected.equals(context) || entries == null
+                    || entries.size() > TaskBlockIndex.MAX_ENTRIES) return Optional.empty();
             Map<BlockPos, Set<Integer>> result = new HashMap<>();
             for (Entry entry : entries) {
                 if (entry == null || entry.types == null || entry.types.isEmpty()
@@ -86,9 +87,9 @@ public final class CustomTaskBlockDiskCache {
                         || entry.z < expected.minZ() || entry.z > expected.maxZ()
                         || entry.types.stream().anyMatch(t -> t == null || t < CustomTaskBlockIndexLimits.CUSTOM_OVERLAY_MIN_TYPE_ID))
                     return Optional.empty();
-                result.put(new BlockPos(entry.x, entry.y, entry.z), new HashSet<>(entry.types));
+                result.put(new BlockPos(entry.x, entry.y, entry.z), Set.copyOf(entry.types));
             }
-            return Optional.of(result);
+            return Optional.of(Map.copyOf(result));
         }
 
         public Map<BlockPos, Set<Integer>> toMap() {
@@ -130,15 +131,15 @@ public final class CustomTaskBlockDiskCache {
     }
 
     static boolean save(ServerLevel level, CustomTaskBlockScanKey context, Map<BlockPos, Set<Integer>> snapshot) {
-        if (level == null || context == null || context.mapName().isBlank() || snapshot == null) {
+        return context != null && save(getCacheFile(level, context.mapName()), context, snapshot);
+    }
+
+    static boolean save(File file, CustomTaskBlockScanKey context, Map<BlockPos, Set<Integer>> snapshot) {
+        if (file == null || context == null || context.mapName().isBlank() || snapshot == null) {
             return false;
         }
         String mapName = context.mapName();
         try {
-            File file = getCacheFile(level, mapName);
-            if (file == null) {
-                return false;
-            }
             File parent = file.getParentFile();
             if (!parent.exists()) {
                 parent.mkdirs();
@@ -167,17 +168,18 @@ public final class CustomTaskBlockDiskCache {
     }
 
     static Optional<Map<BlockPos, Set<Integer>>> loadValidated(ServerLevel level, CustomTaskBlockScanKey context) {
-        if (level == null || context == null || context.mapName().isBlank()) return Optional.empty();
-        String mapName = context.mapName();
-        File file = getCacheFile(level, mapName);
-        if (file == null || !file.exists() || !file.isFile()) {
+        return context == null ? Optional.empty() : loadValidated(getCacheFile(level, context.mapName()), context);
+    }
+
+    static Optional<Map<BlockPos, Set<Integer>>> loadValidated(File file, CustomTaskBlockScanKey context) {
+        if (file == null || !file.isFile()) {
             return Optional.empty();
         }
         try (var reader = Files.newBufferedReader(file.toPath(), StandardCharsets.UTF_8)) {
             CacheFileModel model = GSON.fromJson(reader, CacheFileModel.class);
             return model == null ? Optional.empty() : model.validated(context);
         } catch (Exception e) {
-            LOGGER.error("[CustomTaskBlockDiskCache] 读取地图 {} 磁盘缓存失败: {}", mapName, file.getAbsolutePath(), e);
+            LOGGER.error("[CustomTaskBlockDiskCache] 读取地图 {} 磁盘缓存失败: {}", context.mapName(), file.getAbsolutePath(), e);
             return Optional.empty();
         }
     }

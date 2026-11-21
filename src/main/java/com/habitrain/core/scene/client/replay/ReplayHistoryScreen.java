@@ -31,6 +31,7 @@ public final class ReplayHistoryScreen extends Screen {
     private BlockPos nearest;
     private double cursor, yaw = .72, pitch = .61, zoom = 1;
     private boolean playing, previewFailed;
+    private boolean roundPinned;
 
     private ReplayHistoryScreen(Screen parent, UUID id) {
         super(text("title"));
@@ -62,6 +63,10 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     @Override protected void init() {
+        if (!roundPinned) {
+            ReplayHistoryClient.pin(id);
+            roundPinned = true;
+        }
         int w = Math.max(1, Math.min(600, width - 20));
         left = (width - w) / 2;
         right = left + w;
@@ -141,6 +146,10 @@ public final class ReplayHistoryScreen extends Screen {
     @Override public boolean isPauseScreen() { return false; }
     @Override public void onClose() { minecraft.setScreen(parent); }
     @Override public void removed() {
+        if (roundPinned) {
+            ReplayHistoryClient.unpin(id);
+            roundPinned = false;
+        }
         ReplayAudioPlaybackController.stopHistory(minecraft);
         target.close();
         super.removed();

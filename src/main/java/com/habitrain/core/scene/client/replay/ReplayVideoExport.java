@@ -51,6 +51,7 @@ final class ReplayVideoExport {
 
     final ReplayExportResolution resolution;
     final boolean compress;
+    private final @Nullable Path ffmpegExecutable;
     private final boolean fullBody;
     private final UUID roundId;
     private final int frameBytes;
@@ -60,6 +61,7 @@ final class ReplayVideoExport {
     private ReplayVideoScript script;
     private ReplayVideoFx fx;
     private ReplayVideoOverlay overlay;
+    private Map<UUID, net.minecraft.resources.ResourceLocation> exportSkins = Map.of();
     private ReplayVideoCamera.Subjects subjects;
     private ReplayVideoCamera.Stage cameraStage;
     private TextureTarget target;
@@ -74,12 +76,14 @@ final class ReplayVideoExport {
     private boolean cancelled;
     private boolean voiceUnavailable;
 
-    ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution, boolean compress) {
+    ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution,
+                      boolean compress, @Nullable Path ffmpegExecutable) {
         this.snapshot = snapshot;
         this.roundId = Objects.requireNonNull(snapshot.replay(), "replay").roundId();
         this.fullBody = fullBody;
         this.resolution = Objects.requireNonNull(resolution, "resolution");
         this.compress = compress;
+        this.ffmpegExecutable = compress ? Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable") : null;
         this.frameBytes = resolution.frameBytes();
         if (snapshot.asset() != null) ReplayDioramaMesh.retry(snapshot.asset().fingerprint);
     }
@@ -92,7 +96,7 @@ final class ReplayVideoExport {
         try {
             Util.getPlatform().openFile(Files.createDirectories(directory(client)).toFile());
             return true;
-        } catch (IOException | RuntimeException failure) {
+        } catch (IOException | RuntimeException | OutOfMemoryError failure) {
             LOGGER.warn("Could not open replay video directory", failure);
             return false;
         }
@@ -153,12 +157,14 @@ final class ReplayVideoExport {
             }
             // The original map remains available when the table unloads or the next match replaces it.
             // A world switch or resource reload can invalidate the GPU mesh, so rebuild it from that map.
-            ReplayDioramaMesh.update(view.asset(), view.presentSections(), view.totalSections());
-            if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(view.asset().fingerprint, view.totalSections()))) {
+            var asset = view.asset();
+            if (asset == null) throw new IOException("Replay map asset unavailable");
+            ReplayDioramaMesh.update(asset, view.presentSections(), view.totalSections());
+            if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(asset.fingerprint, view.totalSections()))) {
                 throw new IOException("Could not build the complete replay map");
             }
             var key = ReplayDioramaMesh.builtKey();
-            if (key == null || key.present() != view.totalSections() || !ReplayDioramaMesh.matches(view.asset())) {
+            if (key == null || key.present() != view.totalSections() || !ReplayDioramaMesh.matches(asset)) {
                 long now = System.nanoTime();
                 if (meshDeadline == 0) meshDeadline = now + PREPARE_LIMIT_NS;
                 if (now - meshDeadline >= 0) throw new IOException("Timed out preparing the replay map");
@@ -176,6 +182,7 @@ final class ReplayVideoExport {
                 if (waitingForVoiceAccess() || waitingForVoice()) return;
                 if (audioTask == null) {
                     model = new ReplayBoardModel(view.replay(), view.timeline());
+                    for (var actor : model.actors) ReplayHeadSkins.texture(actor.p.id());
                     script = new ReplayVideoScript(view.replay());
                     fx = new ReplayVideoFx(script, model);
                     overlay = new ReplayVideoOverlay(script, model, compress);
@@ -194,8 +201,10 @@ final class ReplayVideoExport {
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
                 catch (java.util.concurrent.ExecutionException failure) { throw new IOException("Could not prepare replay audio", failure.getCause()); }
                 audioTask = null;
+                exportSkins = ReplayHeadSkins.snapshot(model);
                 pixels = MemoryUtil.memAlloc(frameBytes);
-                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress, script.frames(FPS), soundtrack);
+                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress,
+                        ffmpegExecutable, script.frames(FPS), soundtrack);
                 encoder.thread.start();
             }
 
@@ -234,7 +243,7 @@ final class ReplayVideoExport {
         var projection = RenderSystem.getProjectionMatrix();
         var sorting = RenderSystem.getVertexSorting();
         var modelView = RenderSystem.getModelViewStack().pushMatrix();
-        try (var state = ClientRenderState.capture()) {
+        try (var state = ClientRenderState.capture(); var skins = new ReplayHeadSkins.ExportScope(exportSkins)) {
             if (target == null) {
                 target = new TextureTarget(exportWidth, exportHeight, true, Minecraft.ON_OSX);
                 target.setClearColor(0.016f, 0.024f, 0.06f, 1);
@@ -289,6 +298,16 @@ final class ReplayVideoExport {
         return cancelled;
     }
 
+    void shutdown() {
+        cancel();
+        if (encoder == null) return;
+        try {
+            encoder.thread.join(1000);
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     void releaseRenderResources() {
         if (audioTask != null) { audioTask.cancel(true); audioTask = null; }
         snapshot = null;
@@ -296,6 +315,7 @@ final class ReplayVideoExport {
         script = null;
         fx = null;
         overlay = null;
+        exportSkins = Map.of();
         subjects = null;
         cameraStage = null;
         if (target != null) {
@@ -405,6 +425,7 @@ final class ReplayVideoExport {
         final int frames;
         final ReplayExportResolution resolution;
         final boolean compress;
+        final @Nullable Path ffmpegExecutable;
         short[] soundtrack;
         final Path directory, output;
         final ArrayBlockingQueue<VideoFrame> pool;
@@ -413,11 +434,14 @@ final class ReplayVideoExport {
         volatile int written;
         volatile boolean failed, cancelled;
         volatile Path saved;
+        private boolean committing;
 
-        Encoder(Path directory, UUID round, ReplayExportResolution resolution, boolean compress, int frames, short[] soundtrack) {
+        Encoder(Path directory, UUID round, ReplayExportResolution resolution, boolean compress,
+                @Nullable Path ffmpegExecutable, int frames, short[] soundtrack) {
             this.directory = directory;
             this.resolution = resolution;
             this.compress = compress;
+            this.ffmpegExecutable = ffmpegExecutable;
             this.frames = frames;
             this.soundtrack = soundtrack == null ? new short[0] : soundtrack;
             int poolSize = resolution.highLoad() ? 2 : 3;
@@ -429,12 +453,11 @@ final class ReplayVideoExport {
                     + "-" + resolution.id + "-" + UUID.randomUUID().toString().substring(0, 8) + ext);
             int frameBytes = resolution.frameBytes();
             for (int i = 0; i < poolSize; i++) pool.add(new VideoFrame(frameBytes));
-            // Let the worker remove its temporary file on ordinary client shutdown.
-            thread.setDaemon(false);
+            thread.setDaemon(true);
         }
 
         synchronized boolean cancel() {
-            if (saved != null || failed) return false;
+            if (committing || saved != null || failed) return false;
             cancelled = true;
             thread.interrupt();
             return true;
@@ -444,21 +467,23 @@ final class ReplayVideoExport {
             Path temp = null;
             int width = resolution.width;
             int height = resolution.height;
-            byte[] row = new byte[width * 3];
             try {
+                byte[] row = new byte[width * 3];
                 Files.createDirectories(directory);
                 temp = Files.createTempFile(directory, ".replay-", ".part");
                 try (ReplayVideoWriter writer = compress
-                        ? new ReplayMp4Writer(temp, width, height, FPS, true)
+                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, soundtrack)
                         : new ReplayAviWriter(temp, width, height, FPS, true)) {
                     while (written < frames && !cancelled) {
                         VideoFrame frame = pending.poll(250, TimeUnit.MILLISECONDS);
                         if (frame == null) continue;
                         if (frame.aberration > 0.02f) aberrate(frame.data, row, width, height, frame.aberration);
                         writer.add(frame.data);
-                        writer.addAudio(soundtrack,
-                                written * ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME,
-                                ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME);
+                        if (!compress) {
+                            writer.addAudio(soundtrack,
+                                    written * ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME,
+                                    ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME);
+                        }
                         written++;
                         pool.offer(frame);
                     }
@@ -466,20 +491,16 @@ final class ReplayVideoExport {
                     writer.finish();
                 }
                 synchronized (this) {
-                    if (!cancelled) {
-                        Files.move(temp, output);
-                        saved = output;
-                    }
+                    if (cancelled) return;
+                    committing = true;
                 }
+                Files.move(temp, output);
+                saved = output;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
-            } catch (IOException | RuntimeException failure) {
-                synchronized (this) {
-                    if (!cancelled) {
-                        failed = true;
-                        LOGGER.warn("Could not write replay video", failure);
-                    }
-                }
+                recordFailure(interrupted);
+            } catch (IOException | RuntimeException | Error failure) {
+                recordFailure(failure);
             } finally {
                 soundtrack = null;
                 pool.clear();
@@ -494,6 +515,13 @@ final class ReplayVideoExport {
                         if (wasInterrupted) Thread.currentThread().interrupt();
                     }
                 }
+            }
+        }
+
+        private synchronized void recordFailure(Throwable failure) {
+            if (!cancelled) {
+                failed = true;
+                LOGGER.warn("Could not write replay video", failure);
             }
         }
     }

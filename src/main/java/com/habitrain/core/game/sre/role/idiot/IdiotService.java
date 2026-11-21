@@ -60,6 +60,9 @@ public final class IdiotService {
         IdiotEffectPayload.register();
         MatchEvents.STARTED.register(level -> reset(level.getServer()));
         MatchEvents.ROUND_ENDED.register((level, settlement) -> reset(level.getServer()));
+        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, published) -> {
+            if (!published) reset(level.getServer());
+        });
         ServerTickEvents.END_SERVER_TICK.register(IdiotService::tick);
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> clearPlayer(handler.player));
         ServerLifecycleEvents.SERVER_STOPPING.register(IdiotService::reset);

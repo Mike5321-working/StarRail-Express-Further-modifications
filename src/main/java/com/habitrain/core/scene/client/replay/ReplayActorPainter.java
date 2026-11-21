@@ -35,11 +35,12 @@ final class ReplayActorPainter {
         float elemScale = s.scale() * (float) f.focus.zoom();
         VertexConsumer glow = f.glow();
         float[] tmp = new float[3];
+        Vector3f trailPoint = new Vector3f();
         for (ReplayBoardModel.Actor actor : model.actors) {
-            trails(f, d, actor, t, alpha, stage.history(), review, elemScale);
-            ReplayTrackSampler.Pose pose = actor.track.sample(t);
+            ReplayTrackSampler.Pose pose = f.pose(actor);
+            if (pose.visible()) model.project(pose.x(), pose.y(), pose.z(), tmp);
+            trails(f, d, actor, t, alpha, stage.history(), review, elemScale, pose, tmp, trailPoint, s.detail());
             if (!pose.visible()) continue;
-            model.project(pose.x(), pose.y(), pose.z(), tmp);
             float size = heads.size(actor.p.id(), tmp[0], tmp[1], tmp[2]);
             if (size <= 0) continue;
             float x = tmp[0], y = tmp[1] + 0.006f, z = tmp[2];
@@ -100,7 +101,7 @@ final class ReplayActorPainter {
             }
             ReplayDraw.billboard(glow, c, f.right, f.up, size * 0.95f * elemScale, size * 0.95f * elemScale, ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.18 * alpha));
         }
-        if (s.detail()) {
+        if (s.detail() && !f.video) {
             Vector3f top = d.transformPosition(x, hy + size * 0.9f, z, new Vector3f());
             float dist = top.length();
             float distScale = Math.max(1f, s.scale());
@@ -199,7 +200,8 @@ final class ReplayActorPainter {
     // ------------------------------------------------------------------ trails
 
     private static void trails(ReplayFrame f, Matrix4f d, ReplayBoardModel.Actor actor, double t, double alpha,
-                               double history, boolean review, float elemScale) {
+                               double history, boolean review, float elemScale, ReplayTrackSampler.Pose live,
+                               float[] livePosition, Vector3f tmp, boolean detail) {
         ReplayTrackSampler track = actor.track;
         int last = track.indexAt(t);
         if (last < 0) return;
@@ -208,19 +210,19 @@ final class ReplayActorPainter {
         double cometStart = t - model.comet;
         double baseA = alpha * (0.13 + 0.32 * history) * (review ? 1.2 : 1);
         int base = actor.color;
-        Vector3f tmp = new Vector3f();
-        // live head position closes the trail exactly under the avatar
-        ReplayTrackSampler.Pose live = track.sample(t);
         boolean appendLive = live.state() == ReplayTrackSampler.State.ALIVE;
-        float[] lp = new float[3];
-        if (appendLive) model.project(live.x(), live.y(), live.z(), lp);
+        int recent = Math.max(0, track.indexAt(cometStart));
+        int first = detail ? 0 : recent;
+        int stride = f.video ? 1 : Math.max(1, (recent + 95) / 96);
         int n = 0;
         int cap = widths.length - 1;
-        for (int i = 0; i <= last; i++) {
-            if (i > 0 && !track.connects(i)) {
+        for (int i = first; i <= last; i++) {
+            boolean startsSegment = i == first || !track.connects(i);
+            if (startsSegment) {
                 if (n >= 2) emit(glow, n);
                 n = 0;
             }
+            if (!startsSegment && i < recent && i % stride != 0 && track.connects(i + 1)) continue;
             if (n >= cap) {
                 emit(glow, n);
                 int o = (n - 1) * 3;
@@ -232,7 +234,7 @@ final class ReplayActorPainter {
             put(n++, tmp, track.tick(i), cometStart, t, baseA, base, alpha, elemScale);
         }
         if (appendLive && n >= 1) {
-            d.transformPosition(lp[0], lp[1] + 0.012f, lp[2], tmp);
+            d.transformPosition(livePosition[0], livePosition[1] + 0.012f, livePosition[2], tmp);
             put(n++, tmp, t, cometStart, t, baseA, base, alpha, elemScale);
         }
         if (n >= 2) emit(glow, n);

@@ -67,6 +67,9 @@ public final class SceneRuntimeCoordinator implements SceneRuntimeBridge {
     public void init() {
         MatchEvents.STARTED.register(this::onMatchStarted);
         MatchEvents.ROUND_ENDED.register((level, settlement) -> onMatchEnded(level));
+        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, published) -> {
+            if (!published) onMatchEnded(level);
+        });
         ServerTickEvents.END_WORLD_TICK.register(level -> updateLobby(level, false));
         ServerTickEvents.END_SERVER_TICK.register(server -> {
             if (server.getTickCount() % 20 == 0) collectRetiredAssets();

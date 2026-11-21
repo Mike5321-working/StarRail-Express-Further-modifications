@@ -891,13 +891,16 @@ public final class RoleEventDispatcher {
             dispatchAfterWinnersFinalized(level, new WinOutcome(metadata.status(),
                     List.copyOf(settlement.winners()), metadata.reason()));
         });
-        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, settlement) -> {
+        com.habitrain.core.game.sre.match.MatchEventBridge.CLEANUP.register((level, published) -> {
             try {
                 dispatchOnGameEndAll(level);
             } finally {
-                resetState(null, null, ResetCause.ROUND_END);
-                RoleSnapshotManager.INSTANCE.endRound();
-                RoleSnapshotManager.INSTANCE.scheduleActivatePendingNextTick();
+                lastAppliedWinPatch = null;
+                try { resetState(null, null, ResetCause.ROUND_END); }
+                finally {
+                    RoleSnapshotManager.INSTANCE.endRound();
+                    RoleSnapshotManager.INSTANCE.scheduleActivatePendingNextTick();
+                }
             }
         });
 

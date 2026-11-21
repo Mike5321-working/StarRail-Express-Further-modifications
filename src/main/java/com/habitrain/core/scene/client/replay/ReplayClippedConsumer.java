@@ -4,12 +4,15 @@ import com.mojang.blaze3d.vertex.VertexConsumer;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 
+import java.util.function.Supplier;
+
 /** Clips replay quads against the four vertical tray walls, preserving all vertex attributes. */
 final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
     private static final int ATTRIBUTES = 18;
-    private final VertexConsumer output;
+    private final Supplier<VertexConsumer> output;
     private final Matrix4f inverseBoard;
     private final float hw, hd;
+    private final int primitiveSize;
     private final float[][] quad = new float[4][ATTRIBUTES];
     private final float[][][] polygons = new float[2][12][ATTRIBUTES];
     private final Vector3f local = new Vector3f();
@@ -17,14 +20,19 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
     private float[] vertex;
 
     ReplayClippedConsumer(VertexConsumer output, Matrix4f inverseBoard, float hw, float hd) {
+        this(() -> output, inverseBoard, hw, hd, 4);
+    }
+
+    ReplayClippedConsumer(Supplier<VertexConsumer> output, Matrix4f inverseBoard, float hw, float hd, int primitiveSize) {
         this.output = output;
         this.inverseBoard = inverseBoard;
         this.hw = hw;
         this.hd = hd;
+        this.primitiveSize = primitiveSize;
     }
 
     @Override public VertexConsumer addVertex(float x, float y, float z) {
-        if (count == 4) flush();
+        if (count == primitiveSize) flush();
         vertex = quad[count++];
         vertex[0] = x; vertex[1] = y; vertex[2] = z;
         inverseBoard.transformPosition(x, y, z, local);
@@ -63,20 +71,22 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
     }
 
     private void flush() {
-        if (count == 0) return;
-        if (count != 4) throw new IllegalStateException("Replay clipping requires complete quads");
+        if (count != primitiveSize) return;
         boolean inside = true;
-        for (float[] v : quad) inside &= Math.abs(v[16]) <= hw && Math.abs(v[17]) <= hd;
+        for (int index = 0; index < count; index++) inside &= Math.abs(quad[index][16]) <= hw && Math.abs(quad[index][17]) <= hd;
         if (inside) {
-            for (float[] v : quad) emit(v);
+            VertexConsumer target = output.get();
+            for (int index = 0; index < count; index++) emit(target, quad[index]);
+        } else if (primitiveSize == 2) {
+            clipLine();
         } else {
             for (int plane = 0; plane < 4; plane++) {
                 boolean outside = true;
-                for (float[] v : quad) outside &= distance(v, plane) < 0;
+                for (int index = 0; index < count; index++) outside &= distance(quad[index], plane) < 0;
                 if (outside) { count = fields = 0; return; }
             }
-            for (int i = 0; i < 4; i++) System.arraycopy(quad[i], 0, polygons[0][i], 0, ATTRIBUTES);
-            int n = 4, source = 0;
+            for (int i = 0; i < count; i++) System.arraycopy(quad[i], 0, polygons[0][i], 0, ATTRIBUTES);
+            int n = count, source = 0;
             for (int plane = 0; plane < 4 && n > 0; plane++) {
                 float[][] input = polygons[source], result = polygons[1 - source];
                 int written = 0;
@@ -88,7 +98,7 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
                     if ((dp >= 0) != (dn >= 0)) {
                         float t = dp / (dp - dn);
                         float[] intersection = result[written++];
-                        for (int a = 0; a < ATTRIBUTES; a++) intersection[a] = previous[a] + (next[a] - previous[a]) * t;
+                        interpolate(previous, next, t, intersection);
                     }
                     if (dn >= 0) System.arraycopy(next, 0, result[written++], 0, ATTRIBUTES);
                     previous = next;
@@ -97,13 +107,38 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
                 n = written;
                 source = 1 - source;
             }
-            // A triangle fan represented by degenerate quads fits vanilla QUADS render types.
-            for (int i = 1; i < n - 1; i++) {
-                emit(polygons[source][0]); emit(polygons[source][i]);
-                emit(polygons[source][i + 1]); emit(polygons[source][i + 1]);
+            if (n >= 3) {
+                VertexConsumer target = output.get();
+                for (int i = 1; i < n - 1; i++) {
+                    emit(target, polygons[source][0]);
+                    emit(target, polygons[source][i]);
+                    emit(target, polygons[source][i + 1]);
+                    if (primitiveSize == 4) emit(target, polygons[source][i + 1]);
+                }
             }
         }
         count = fields = 0;
+    }
+
+    private void clipLine() {
+        float start = 0, end = 1;
+        for (int plane = 0; plane < 4; plane++) {
+            float left = distance(quad[0], plane), right = distance(quad[1], plane);
+            if (left < 0 && right < 0) return;
+            if (left < 0) start = Math.max(start, left / (left - right));
+            else if (right < 0) end = Math.min(end, left / (left - right));
+        }
+        if (start >= end) return;
+        VertexConsumer target = output.get();
+        float[] endpoint = polygons[0][0];
+        interpolate(quad[0], quad[1], start, endpoint);
+        emit(target, endpoint);
+        interpolate(quad[0], quad[1], end, endpoint);
+        emit(target, endpoint);
+    }
+
+    private static void interpolate(float[] from, float[] to, float fraction, float[] result) {
+        for (int index = 0; index < ATTRIBUTES; index++) result[index] = from[index] + (to[index] - from[index]) * fraction;
     }
 
     private float distance(float[] v, int plane) {
@@ -115,13 +150,13 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
         };
     }
 
-    private void emit(float[] v) {
-        output.addVertex(v[0], v[1], v[2]);
-        if ((fields & 1) != 0) output.setColor(Math.round(v[3]), Math.round(v[4]), Math.round(v[5]), Math.round(v[6]));
-        if ((fields & 2) != 0) output.setUv(v[7], v[8]);
-        if ((fields & 4) != 0) output.setUv1(Math.round(v[9]), Math.round(v[10]));
-        if ((fields & 8) != 0) output.setUv2(Math.round(v[11]), Math.round(v[12]));
-        if ((fields & 16) != 0) output.setNormal(v[13], v[14], v[15]);
+    private void emit(VertexConsumer target, float[] v) {
+        target.addVertex(v[0], v[1], v[2]);
+        if ((fields & 1) != 0) target.setColor(Math.round(v[3]), Math.round(v[4]), Math.round(v[5]), Math.round(v[6]));
+        if ((fields & 2) != 0) target.setUv(v[7], v[8]);
+        if ((fields & 4) != 0) target.setUv1(Math.round(v[9]), Math.round(v[10]));
+        if ((fields & 8) != 0) target.setUv2(Math.round(v[11]), Math.round(v[12]));
+        if ((fields & 16) != 0) target.setNormal(v[13], v[14], v[15]);
     }
 
     @Override public void close() { flush(); }

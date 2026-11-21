@@ -203,7 +203,12 @@ public final class ReplayPackets {
         return new StreamCodec<>() {
             @Override public T decode(FriendlyByteBuf b) {
                 if (b.readableBytes() > max) throw new DecoderException("Replay packet exceeds " + max);
-                T result = read.apply(b);
+                T result;
+                try {
+                    result = read.apply(b);
+                } catch (IllegalArgumentException | IndexOutOfBoundsException malformed) {
+                    throw new DecoderException("Invalid replay packet", malformed);
+                }
                 if (b.isReadable()) throw new DecoderException("Trailing replay packet bytes");
                 return result;
             }

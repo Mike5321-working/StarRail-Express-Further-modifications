@@ -40,6 +40,7 @@ public final class ClientVisualPreferences {
     private static int idiotParticles = 2;
     private static String replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
     private static boolean replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
+    private static String replayVideoFfmpegPath = "";
     private static int requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
     private static int maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
     private static int diskCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB;
@@ -122,6 +123,7 @@ public final class ClientVisualPreferences {
                 : new JsonObject();
         replayVideoResolution = normalizeReplayResolution(readString(replayVideo, "resolution", DEFAULT_REPLAY_RESOLUTION));
         replayVideoCompress = readBoolean(replayVideo, "compress", DEFAULT_REPLAY_COMPRESS);
+        replayVideoFfmpegPath = readString(replayVideo, "ffmpegPath", "").trim();
     }
 
     private static void applyDefaults() {
@@ -132,6 +134,7 @@ public final class ClientVisualPreferences {
         customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
         replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
         replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
+        replayVideoFfmpegPath = "";
         requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
         maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
         diskCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB;
@@ -410,6 +413,9 @@ public final class ClientVisualPreferences {
         JsonObject replayVideo = new JsonObject();
         replayVideo.addProperty("resolution", replayVideoResolution);
         replayVideo.addProperty("compress", replayVideoCompress);
+        if (!replayVideoFfmpegPath.isBlank()) {
+            replayVideo.addProperty("ffmpegPath", replayVideoFfmpegPath);
+        }
         root.add(REPLAY_VIDEO, replayVideo);
         boolean saved = AtomicJsonFiles.writeJson(file(), root, GSON, true);
         if (!saved) {
@@ -463,6 +469,20 @@ public final class ClientVisualPreferences {
         replayVideoCompress = compress;
         if (save()) return true;
         replayVideoCompress = previous;
+        return false;
+    }
+
+    public static synchronized String getReplayVideoFfmpegPath() {
+        load();
+        return replayVideoFfmpegPath;
+    }
+
+    public static synchronized boolean setReplayVideoFfmpegPath(String path) {
+        load();
+        String previous = replayVideoFfmpegPath;
+        replayVideoFfmpegPath = path == null ? "" : path.trim();
+        if (save()) return true;
+        replayVideoFfmpegPath = previous;
         return false;
     }
 }

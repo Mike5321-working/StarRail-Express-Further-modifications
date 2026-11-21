@@ -30,12 +30,14 @@ import static com.habitrain.core.network.replay.ReplayPackets.*;
 public final class ClientReplayBoard {
     private static final ClientMatchMapSectionCache LOCAL = new ClientMatchMapSectionCache();
     private static final long RETRY_NS = 8_000_000_000L, VIEW_NS = 1_500_000_000L;
+    private static final int MAX_VOICE_ATTEMPTS = 4;
     private static Available available = new Available(EMPTY, false);
     private static LastMatchReplay replay;
     private static ReplayTimeline timeline;
     private static MapData map;
     private static ReplayVoiceData voice = ReplayVoiceData.EMPTY;
     private static boolean voiceReady;
+    private static int voiceAttempts;
     private static @Nullable UUID voiceRound;
     private static byte @Nullable [] voiceBuffer;
     private static @Nullable BitSet voiceHave;
@@ -51,11 +53,16 @@ public final class ClientReplayBoard {
 
     public record View(@Nullable LastMatchReplay replay, @Nullable ReplayTimeline timeline,
                        @Nullable SceneAssetCodec.AssetData asset, int presentSections, int totalSections,
-                       boolean hasRound, ReplayVoiceData voice, boolean voiceReady) {
+                       boolean hasRound, ReplayVoiceData voice, boolean voiceReady, boolean mapFailed) {
         public View(@Nullable LastMatchReplay replay, @Nullable ReplayTimeline timeline,
                     @Nullable SceneAssetCodec.AssetData asset, int presentSections, int totalSections,
                     boolean hasRound) {
-            this(replay, timeline, asset, presentSections, totalSections, hasRound, ReplayVoiceData.EMPTY, true);
+            this(replay, timeline, asset, presentSections, totalSections, hasRound, ReplayVoiceData.EMPTY, true, false);
+        }
+        public View(@Nullable LastMatchReplay replay, @Nullable ReplayTimeline timeline,
+                    @Nullable SceneAssetCodec.AssetData asset, int presentSections, int totalSections,
+                    boolean hasRound, ReplayVoiceData voice, boolean voiceReady) {
+            this(replay, timeline, asset, presentSections, totalSections, hasRound, voice, voiceReady, false);
         }
     }
 
@@ -101,7 +108,24 @@ public final class ClientReplayBoard {
         board = pos.immutable(); boardLevel = client.level; lastView = System.nanoTime();
         return new View(replay, timeline, map == null ? null : map.asset(),
                 map == null ? 0 : map.parts.size(), map == null ? 0 : map.manifest.sections().size(),
-                !available.roundId().equals(EMPTY), voice, voiceReady);
+                !available.roundId().equals(EMPTY), voice, voiceReady, map != null && map.failed());
+    }
+
+    /**
+     * Returns the replay shown by a board, including a historical round shared to that board.
+     * Controls opened from a shared board must use the board's round instead of the globally
+     * available latest round.
+     */
+    public static View viewForBoard(BlockPos pos) {
+        var client = Minecraft.getInstance();
+        if (client.level != null && client.level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker) {
+            var playback = marker.playback();
+            if (playback != null && playback.pendingOrPlaying(client.level.getGameTime())
+                    && (playback.shared() || !playback.roundId().equals(available.roundId()))) {
+                return ReplayHistoryClient.watch(playback.roundId());
+            }
+        }
+        return viewAt(pos);
     }
 
     public static UUID availableRound() { return available.roundId(); }
@@ -129,11 +153,13 @@ public final class ClientReplayBoard {
         if (!available.roundId().equals(s.roundId()) || !looking(Minecraft.getInstance())) return;
         if (replay != null && replay.roundId().equals(s.roundId()) && replay.manifest() != null && s.manifest() == null) return;
         try {
-            replay = expand(payload);
-            timeline = new ReplayTimeline(replay);
+            var expanded = expand(payload);
+            var nextTimeline = new ReplayTimeline(expanded);
             if (s.manifest() != null && (map == null || !map.manifest.hash().equals(s.manifest().hash()))) {
                 map = loadMap(s.manifest());
             }
+            replay = expanded;
+            timeline = nextTimeline;
         } catch (RuntimeException malformed) {
             org.slf4j.LoggerFactory.getLogger(ClientReplayBoard.class).warn("Rejected replay data", malformed);
         }
@@ -167,6 +193,8 @@ public final class ClientReplayBoard {
                     if (asset != null) {
                         for (int i = 0; i < asset.sections.size(); i++) state.add(i, asset.sections.get(i));
                         state.saved = true;
+                    } else {
+                        state.persistIfComplete();
                     }
                 }));
         return state;
@@ -179,7 +207,6 @@ public final class ClientReplayBoard {
     public static void accept(ReplayVoiceChunkS2C chunk) {
         if (replay == null || !replay.roundId().equals(chunk.roundId())) return;
         if (voiceReady && chunk.roundId().equals(voiceRound)) return;
-        nextVoiceRequest = System.nanoTime() + RETRY_NS;
         if (chunk.total() == 0) {
             voice = ReplayVoiceData.EMPTY;
             voiceReady = true;
@@ -196,6 +223,8 @@ public final class ClientReplayBoard {
         }
         int part = chunk.offset() / FRAGMENT_BYTES;
         if (voiceHave.get(part)) return;
+        nextVoiceRequest = System.nanoTime() + RETRY_NS;
+        voiceAttempts = 0;
         System.arraycopy(chunk.bytes(), 0, voiceBuffer, chunk.offset(), chunk.bytes().length);
         voiceHave.set(part);
         int totalParts = (chunk.total() + FRAGMENT_BYTES - 1) / FRAGMENT_BYTES;
@@ -206,11 +235,11 @@ public final class ClientReplayBoard {
         voiceHave = null;
         try {
             voice = ReplayVoiceData.fromBytes(assembled);
-            voiceReady = true;
         } catch (RuntimeException malformed) {
             org.slf4j.LoggerFactory.getLogger(ClientReplayBoard.class).warn("Rejected replay voice data", malformed);
             voice = ReplayVoiceData.EMPTY;
         }
+        voiceReady = true;
     }
 
     private static void tick(Minecraft client) {
@@ -239,6 +268,7 @@ public final class ClientReplayBoard {
             return;
         }
         if (map != null) {
+            if (!map.complete() && map.stalled(now)) map.markFailed(now);
             map.step(now, missing -> {
                 if (!ClientPlayNetworking.canSend(ReplayMissingSectionsC2S.TYPE)) return false;
                 ClientPlayNetworking.send(new ReplayMissingSectionsC2S(board, replay.roundId(), missing));
@@ -248,10 +278,16 @@ public final class ClientReplayBoard {
         } else if (available.mapReady()) {
             return;
         }
-        if (!voiceReady && (nextVoiceRequest == 0 || now - nextVoiceRequest >= 0)
-                && ClientPlayNetworking.canSend(RequestVoiceC2S.TYPE)) {
-            nextVoiceRequest = now + 2_000_000_000L;
-            ClientPlayNetworking.send(new RequestVoiceC2S(board, replay.roundId()));
+        if (!voiceReady && (nextVoiceRequest == 0 || now - nextVoiceRequest >= 0)) {
+            if (voiceAttempts >= MAX_VOICE_ATTEMPTS || !ClientPlayNetworking.canSend(RequestVoiceC2S.TYPE)) {
+                voiceBuffer = null;
+                voiceHave = null;
+                voiceReady = true;
+            } else {
+                voiceAttempts++;
+                nextVoiceRequest = now + RETRY_NS;
+                ClientPlayNetworking.send(new RequestVoiceC2S(board, replay.roundId()));
+            }
         }
     }
 
@@ -269,6 +305,7 @@ public final class ClientReplayBoard {
 
         board = null; boardLevel = null; nextSummary = 0; nextVoiceRequest = 0;
         replay = null; timeline = null; map = null;
+        voiceAttempts = 0;
         voice = ReplayVoiceData.EMPTY; voiceReady = false; voiceRound = null; voiceBuffer = null; voiceHave = null;
     }
 
@@ -286,7 +323,10 @@ public final class ClientReplayBoard {
         BitSet requested = new BitSet();
         final long localDeadline = System.nanoTime() + 1_000_000_000L;
         long retryAt, nextBatch;
+        private int attemptsWithoutProgress;
         boolean diskLoading = true, saved;
+        boolean failed;
+        long retryAfter;
         SceneAssetCodec.AssetData assembled;
 
         MapData(ReplayMapManifest manifest) { this(manifest, new TreeMap<>()); }
@@ -295,7 +335,10 @@ public final class ClientReplayBoard {
             this.parts = parts;
         }
         void add(int index, SceneAssetCodec.SectionData s) {
-            if (parts.putIfAbsent(index, s) == null) assembled = null;
+            if (parts.putIfAbsent(index, s) == null) {
+                assembled = null;
+                attemptsWithoutProgress = 0;
+            }
         }
         SceneAssetCodec.AssetData asset() {
             if (parts.isEmpty()) return null;
@@ -304,9 +347,21 @@ public final class ClientReplayBoard {
         }
         boolean complete() { return parts.size() == manifest.sections().size(); }
 
+        boolean stalled(long now) {
+            return !failed && attemptsWithoutProgress >= 4 && decoding.isEmpty() && now - retryAt >= 0;
+        }
+
+        void markFailed(long now) {
+            failed = true;
+            retryAfter = now + 5_000_000_000L;
+            requested.clear();
+            partial.clear();
+        }
+
+        boolean failed() { return failed; }
+
         void accept(ReplaySectionPatchS2C patch) {
             if (patch.index() >= manifest.sections().size() || !requested.get(patch.index())) return;
-            retryAt = System.nanoTime() + RETRY_NS;
             Fragment fragments = partial.get(patch.index());
             if (fragments == null || fragments.data.length != patch.total()) {
                 if (patch.offset() != 0) return;
@@ -315,6 +370,7 @@ public final class ClientReplayBoard {
             }
             int part = patch.offset() / FRAGMENT_BYTES;
             if (fragments.have.get(part)) return;
+            retryAt = System.nanoTime() + RETRY_NS;
             System.arraycopy(patch.bytes(), 0, fragments.data, patch.offset(), patch.bytes().length);
             fragments.have.set(part);
             if (fragments.have.cardinality() != (patch.total() + FRAGMENT_BYTES - 1) / FRAGMENT_BYTES) return;
@@ -331,6 +387,16 @@ public final class ClientReplayBoard {
 
         void step(long now, java.util.function.Predicate<BitSet> send) {
             if (complete()) { persistIfComplete(); return; }
+            if (failed) {
+                if (now - retryAfter < 0) return;
+                failed = false;
+                attemptsWithoutProgress = 0;
+                retryAfter = 0;
+                retryAt = 0;
+                nextBatch = 0;
+                requested.clear();
+                partial.clear();
+            }
             var entries = manifest.sections();
             BitSet missing = new BitSet(entries.size());
             for (int i = 0; i < entries.size(); i++) {
@@ -351,13 +417,14 @@ public final class ClientReplayBoard {
             }
             if (send.test(missing)) {
                 requested = (BitSet) missing.clone();
+                attemptsWithoutProgress++;
                 retryAt = now + RETRY_NS;
                 nextBatch = now + 600_000_000L;
             }
         }
 
         private void persistIfComplete() {
-            if (saved || diskLoading || parts.isEmpty()) return;
+            if (saved || diskLoading || !complete() || parts.isEmpty()) return;
             saved = true;
             SceneAssetCache.getInstance().writeReplayMap(manifest, asset());
         }

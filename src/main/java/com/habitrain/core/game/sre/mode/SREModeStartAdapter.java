@@ -3,7 +3,13 @@ package com.habitrain.core.game.sre.mode;
 import com.habitrain.core.HabiTrainCore;
 import com.habitrain.core.api.GameMode;
 import com.habitrain.core.api.GameModeRegistry;
+import com.habitrain.core.game.sre.match.ServerMatchContext;
+import com.habitrain.core.internal.FailurePolicy;
+import io.wifi.starrailexpress.api.SREGameModes;
 import io.wifi.starrailexpress.cca.ParticipationComponent;
+import io.wifi.starrailexpress.cca.SREGameWorldComponent;
+import io.wifi.starrailexpress.game.GameConstants;
+import io.wifi.starrailexpress.game.GameUtils;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -37,8 +43,8 @@ public final class SREModeStartAdapter {
     public static boolean isSreGameBlocking(ServerLevel level) {
         try {
             boolean starting = io.wifi.starrailexpress.game.GameUtils.isStartingGame;
-            var gw = io.wifi.starrailexpress.cca.SREGameWorldComponent.KEY.get(level);
-            boolean running = gw != null && gw.isRunning();
+            var gw = SREGameWorldComponent.KEY.get(level);
+            boolean running = gw != null && (gw.isRunning() || isCountingDown(gw.getGameStatus()));
             return blockingFrom(starting, running, false);
         } catch (Throwable t) {
             HabiTrainCore.LOGGER.error(
@@ -53,14 +59,18 @@ public final class SREModeStartAdapter {
             boolean starting = io.wifi.starrailexpress.game.GameUtils.isStartingGame
                     && com.habitrain.core.game.sre.match.ServerMatchContext.GATE.owns(
                     com.habitrain.core.game.sre.match.ServerMatchContext.dimension(level));
-            var gw = io.wifi.starrailexpress.cca.SREGameWorldComponent.KEY.get(level);
-            boolean running = gw != null && gw.isRunning();
-            return startedFrom(starting, running, false);
+            var gw = SREGameWorldComponent.KEY.get(level);
+            boolean accepted = gw != null && (isCountingDown(gw.getGameStatus()) || gw.isRunning());
+            return startedFrom(starting, accepted, false);
         } catch (Throwable t) {
             HabiTrainCore.LOGGER.error(
                     "[SREModeStartAdapter] post-start SRE probe failed; treat as not started", t);
             return startedFrom(false, false, true);
         }
+    }
+
+    static boolean isCountingDown(SREGameWorldComponent.GameStatus status) {
+        return status == SREGameWorldComponent.GameStatus.STARTING;
     }
 
     public static List<String> getAvailableMaps(ServerLevel level) {
@@ -88,50 +98,13 @@ public final class SREModeStartAdapter {
             return false;
         }
         try {
-            if (!isModeAvailable(registryFullId)) return false;
-            if (!com.habitrain.core.game.sre.match.ServerMatchContext.GATE.canStartRequest(
-                    com.habitrain.core.game.sre.match.ServerMatchContext.dimension(level))) return false;
-            // murder
-            if (registryFullId.contains("sre:murder")) {
-                var mode = io.wifi.starrailexpress.api.SREGameModes.MURDER;
-                int ticks = io.wifi.starrailexpress.game.GameConstants.getInTicks(mode.defaultStartTime, 0);
-                forceReadyParticipants(level);
-                io.wifi.starrailexpress.game.GameUtils.startGame(level, mode, ticks);
-                boolean started = isSreGameStarted(level);
-                if (!started) {
-                    ForcedReadyJoinGate.clear();
-                }
-                return started;
-            }
-            // repair
-            if (registryFullId.contains("sre:repair")) {
-                var mode = io.wifi.starrailexpress.api.SREGameModes.REPAIR_ESCAPE_MODE;
-                int ticks = io.wifi.starrailexpress.game.GameConstants.getInTicks(mode.defaultStartTime, 0);
-                forceReadyParticipants(level);
-                io.wifi.starrailexpress.game.GameUtils.startGame(level, mode, ticks);
-                boolean started = isSreGameStarted(level);
-                if (!started) {
-                    ForcedReadyJoinGate.clear();
-                }
-                return started;
-            }
-            // Original SRE modes bridged as thin proxies (wifi:tnt_tag, wifi:lover, …)
             GameMode registered = GameModeRegistry.get(registryFullId);
-            if (registered instanceof SreOriginalModeProxy proxy) {
-                return startSreModeById(level, proxy.getSreId());
-            }
-            // generic explicit registry start
-            if (GameModeRegistry.isRegistered(registryFullId)) {
-                GameModeRegistry.start(registryFullId, level);
-                return GameModeRegistry.isActiveInLevel(level);
-            }
-            return false;
+            if (registered == null) return false;
+            if (requestNativeStart(registered, level, true)) return true;
+            GameModeRegistry.start(registryFullId, level);
+            return GameModeRegistry.hasExplicitActiveMode(level);
         } catch (Throwable t) {
-            try {
-                io.wifi.starrailexpress.game.GameUtils.clearForcedReadyPlayers();
-            } catch (Throwable ignored) {
-            }
-            ForcedReadyJoinGate.clear();
+            FailurePolicy.rethrowIfFatal(t);
             HabiTrainCore.LOGGER.error("startMode failed: {}", registryFullId, t);
             return false;
         }
@@ -142,28 +115,41 @@ public final class SREModeStartAdapter {
         GameMode mode = GameModeRegistry.get(fullId);
         if (mode == null) return false;
         if (mode instanceof SreOriginalModeProxy proxy) {
-            return io.wifi.starrailexpress.api.SREGameModes.GAME_MODES.containsKey(proxy.getSreId());
+            return SREGameModes.GAME_MODES.containsKey(proxy.getSreId());
         }
         return true;
     }
 
-    private static boolean startSreModeById(ServerLevel level, ResourceLocation sreId) {
-        if (sreId == null) {
+    public static boolean requestNativeStart(GameMode mode, ServerLevel level, boolean fromVote) {
+        var nativeMode = switch (mode) {
+            case SREMurderMode ignored -> SREGameModes.MURDER;
+            case SRERepairMode ignored -> SREGameModes.REPAIR_ESCAPE_MODE;
+            case SreOriginalModeProxy proxy -> SREGameModes.GAME_MODES.get(proxy.getSreId());
+            default -> null;
+        };
+        if (nativeMode == null) {
+            if (mode instanceof SreOriginalModeProxy proxy) {
+                throw new IllegalStateException("Upstream mode unavailable: " + proxy.getSreId());
+            }
             return false;
         }
-        var sreMode = io.wifi.starrailexpress.api.SREGameModes.GAME_MODES.get(sreId);
-        if (sreMode == null) {
-            HabiTrainCore.LOGGER.warn("SRE mode not found in GAME_MODES: {}", sreId);
-            return false;
+        if (!ServerMatchContext.GATE.canStartRequest(ServerMatchContext.dimension(level))
+                || isSreGameBlocking(level)) {
+            throw new IllegalStateException("Another match already owns this server");
         }
-        int ticks = io.wifi.starrailexpress.game.GameConstants.getInTicks(sreMode.defaultStartTime, 0);
-        forceReadyParticipants(level);
-        io.wifi.starrailexpress.game.GameUtils.startGame(level, sreMode, ticks);
-        boolean started = isSreGameStarted(level);
-        if (!started) {
-            ForcedReadyJoinGate.clear();
+        boolean accepted = false;
+        try {
+            if (fromVote) forceReadyParticipants(level);
+            GameUtils.startGame(level, nativeMode, GameConstants.getInTicks(nativeMode.defaultStartTime, 0));
+            accepted = isSreGameStarted(level);
+            if (!accepted) throw new IllegalStateException("SRE did not accept start for " + nativeMode.identifier);
+            return true;
+        } finally {
+            if (fromVote && !accepted) {
+                ForcedReadyJoinGate.clear();
+                GameUtils.clearForcedReadyPlayers();
+            }
         }
-        return started;
     }
 
     /**

@@ -138,8 +138,11 @@ public class GameModeRegistry {
      * when {@code ACTIVE_MODES} is empty (passive fallback). {@link #tickAll} only
      * ticks {@code ACTIVE_MODES} entries; it does not tick passive SRE games.
      *
-     * @throws IllegalStateException if {@code ACTIVE_MODES} already has this level
-     *     or SRE occupancy is blocking
+     * <p>For built-in SRE modes and native proxies this requests an upstream start, not a
+     * Core-owned session. Wait for {@link MatchEvents#STARTED} to observe an actual start.</p>
+     *
+     * @throws IllegalStateException if {@code ACTIVE_MODES} already has this level,
+     *     another match owns the server, or SRE declines a native start
      * @throws IllegalArgumentException if {@code fullId} is not registered
      */
     public static void start(String fullId, ServerLevel level) {
@@ -157,6 +160,7 @@ public class GameModeRegistry {
             throw new IllegalStateException(
                     "An SRE game is already running or starting in " + levelKey.location());
         }
+        if (CoreSpi.startNativeMode(mode, level)) return;
         if (!CoreSpi.reserveMatch(level)) throw new IllegalStateException("Another match already owns this server");
         GameMode existing = ACTIVE_MODES.putIfAbsent(levelKey, mode);
         if (existing != null) {
@@ -202,8 +206,8 @@ public class GameModeRegistry {
     }
 
     /**
-     * Stop the active GameMode in the given level. Calls onEnd + onCleanup.
-     * No-op if no mode is active.
+     * Stop the active Core-owned GameMode in the given level. Calls onEnd + onCleanup.
+     * Native SRE matches are ended by SRE instead.
      *
      * @throws NullPointerException {@code level} 为 {@code null}（审核 A-07：动作式方法显式判空）
      */

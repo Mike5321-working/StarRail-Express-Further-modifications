@@ -68,8 +68,7 @@ public final class SingleMatchGate {
     }
     /** A cancelled session must never release a replacement round created by its callback. */
     public synchronized void releaseVote(Snapshot reservation) {
-        if (reservation != null && snapshot.serverId().equals(reservation.serverId())
-                && snapshot.roundId() == reservation.roundId()) releaseVote(reservation.dimension());
+        if (isCurrent(reservation)) releaseVote(reservation.dimension());
     }
     public synchronized void abortPreparing(String dimension) {
         if (owns(dimension) && (snapshot.phase() == Phase.VOTING || snapshot.phase() == Phase.LOADING
@@ -80,6 +79,13 @@ public final class SingleMatchGate {
         phase(Phase.CLEANUP);
         nativeClaimed = nativeConfirmed = false;
         snapshot = new Snapshot(serverId, snapshot.roundId(), "", Phase.LOBBY);
+    }
+    public synchronized void release(Snapshot reservation) {
+        if (isCurrent(reservation)) release(reservation.dimension());
+    }
+    private boolean isCurrent(Snapshot reservation) {
+        return reservation != null && snapshot.serverId().equals(reservation.serverId())
+                && snapshot.roundId() == reservation.roundId() && owns(reservation.dimension());
     }
     private void begin(String dimension, Phase phase) {
         snapshot = new Snapshot(serverId, ++sequence, dimension, phase);

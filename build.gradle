@@ -50,7 +50,6 @@ dependencies {
     modCompileOnly "com.terraformersmc:modmenu:11.0.3"
     modLocalRuntime "com.terraformersmc:modmenu:11.0.3"
     include modImplementation("dev.kosmx.player-anim:player-animation-lib-fabric:2.0.4+1.21.1")
-    include implementation("org.jcodec:jcodec:0.2.5")
     // 开发环境必须使用上游的 named dev JAR；成品 intermediary JAR 在 Loom 中会漏映射
     // 继承的静态方法调用（例如 Block.simpleCodec），导致 runClient NoSuchMethodError。
     implementation files("libs/star_rail_express-4.3.0-dev.jar")
@@ -255,6 +254,7 @@ tasks.register("verifyProductionMixins", JavaExec) {
     doFirst {
         def runtimeDir = providers.gradleProperty("s0RuntimeDir").orNull
         if (runtimeDir == null) throw new GradleException("Supply -Ps0RuntimeDir=<isolated run directory>")
-        args(tasks.named("remapJar").get().archiveFile.get().asFile.absolutePath, file(runtimeDir).absolutePath)
+        args(tasks.named("remapJar").get().archiveFile.get().asFile.absolutePath, file(runtimeDir).absolutePath,
+                providers.gradleProperty("s0Dedicated").getOrElse("false"))
     }
 }

@@ -22,17 +22,18 @@ final class ReplayArchiveSettingsScreen extends Screen {
     private EditBox limit;
     private Button save, copy, refresh, voiceRecording;
     private long sentAt, voiceSentAt;
+    private boolean refreshOnOpen;
+    private boolean limitConflict;
     private String draft = "";
     private int left, panelWidth, top;
 
     ReplayArchiveSettingsScreen(Screen parent) {
         super(tr("title"));
         this.parent = parent;
-        if (ReplayHistoryClient.supported()) {
-            sentAgainst = ReplayHistoryClient.settings();
-            sentAt = System.nanoTime();
-            ReplayHistoryClient.requestSettings(0);
-        }
+        shown = ReplayHistoryClient.settings();
+        voiceShown = ReplayHistoryClient.voiceSettings();
+        if (shown != null) draft = size(shown.limit());
+        refreshOnOpen = ReplayHistoryClient.supported();
     }
 
     private static Component tr(String key, Object... args) {
@@ -53,16 +54,15 @@ final class ReplayArchiveSettingsScreen extends Screen {
                 .bounds(left + w * 2 + 12, top + 148, w, 20).build());
         limit = addRenderableWidget(new EditBox(font, left, top + 84, panelWidth - w - 6, 20, tr("limit")));
         limit.setMaxLength(15);
-        limit.setFilter(s -> s.matches("[0-9]{0,4}([.,][0-9]{0,5})?"));
+        limit.setFilter(s -> s.matches("[0-9]{0,4}([.,][0-9]{0,10})?"));
         limit.setValue(draft);
         limit.setResponder(s -> draft = s);
         save = addRenderableWidget(Button.builder(tr("save"), b -> submit(bytes(draft)))
                 .bounds(left + panelWidth - w, top + 84, w, 20).build());
         voiceRecording = addRenderableWidget(Button.builder(tr("voice_loading"), b -> {
-            if (voiceShown == null) return;
+            if (voiceShown == null || !ReplayHistoryClient.setVoiceRecording(!voiceShown.enabled())) return;
             voiceSentAgainst = voiceShown;
             voiceSentAt = System.nanoTime();
-            ReplayHistoryClient.setVoiceRecording(!voiceShown.enabled());
             tick();
         }).bounds(left, top + 122, panelWidth - w - 6, 20).build());
         var clearCache = addRenderableWidget(Button.builder(tr("clear_local"), b -> ReplayHistoryClient.clearDiskCache())
@@ -82,26 +82,33 @@ final class ReplayArchiveSettingsScreen extends Screen {
     }
 
     private static String size(long value) {
-        return BigDecimal.valueOf(value).divide(BigDecimal.valueOf(GIB), 5, RoundingMode.HALF_UP)
+        return BigDecimal.valueOf(value).divide(BigDecimal.valueOf(GIB), 10, RoundingMode.HALF_UP)
                 .stripTrailingZeros().toPlainString();
     }
 
     private void submit(long value) {
-        if (value < 0) return;
+        if (value < 0 || value > 0 && (shown == null || limitConflict)
+                || !ReplayHistoryClient.requestSettings(value, shown == null ? 0 : shown.limit())) return;
         sentAgainst = shown;
         sentAt = System.nanoTime();
-        ReplayHistoryClient.requestSettings(value);
-        tick();
     }
 
     private boolean pending() {
-        return sentAt != 0 && System.nanoTime() - sentAt < 5_000_000_000L && sentAgainst == shown;
+        return refreshOnOpen || sentAt != 0 && System.nanoTime() - sentAt < 5_000_000_000L && sentAgainst == shown;
     }
 
     @Override public void tick() {
         Settings incoming = ReplayHistoryClient.settings();
         if (shown != incoming) {
-            if (incoming != null && (shown == null || incoming.ok())) limit.setValue(size(incoming.limit()));
+            if (incoming != null && (incoming.ok() || !incoming.path().isEmpty())) {
+                boolean dirty = shown != null && !draft.equals(size(shown.limit()));
+                if (!dirty || bytes(draft) == incoming.limit()) {
+                    limit.setValue(size(incoming.limit()));
+                    limitConflict = false;
+                } else if (shown.limit() != incoming.limit()) {
+                    limitConflict = true;
+                }
+            }
             shown = incoming;
             sentAt = 0;
         }
@@ -110,21 +117,27 @@ final class ReplayArchiveSettingsScreen extends Screen {
             voiceShown = incomingVoice;
             voiceSentAt = 0;
         }
+        if (refreshOnOpen && ReplayHistoryClient.canRequestSettings(0)) {
+            refreshOnOpen = false;
+            submit(0);
+        }
         boolean voicePending = voiceSentAt != 0 && System.nanoTime() - voiceSentAt < 5_000_000_000L
                 && voiceSentAgainst == voiceShown;
         boolean voiceSupported = ReplayHistoryClient.canSetVoiceRecording();
-        voiceRecording.active = voiceSupported && voiceShown != null && voiceShown.editable() && !voicePending;
+        voiceRecording.active = ReplayHistoryClient.canRequestVoiceRecording() && voiceShown != null
+                && voiceShown.editable() && !voicePending && !pending();
         String voiceKey;
         if (!voiceSupported) voiceKey = "voice_unavailable";
-        else if (voicePending || voiceShown == null && pending()) voiceKey = "voice_loading";
+        else if (voicePending || pending()) voiceKey = "voice_loading";
         else if (voiceShown == null || voiceSentAt != 0 || !voiceShown.ok()) voiceKey = "voice_failed";
         else voiceKey = voiceShown.enabled() ? "voice_enabled" : "voice_disabled";
         voiceRecording.setMessage(tr(voiceKey));
-        refresh.active = ReplayHistoryClient.supported() && !pending() && !voicePending;
+        refresh.active = ReplayHistoryClient.canRequestSettings(0) && !pending() && !voicePending;
         copy.active = shown != null && !shown.path().isEmpty();
         limit.setEditable(shown != null && shown.editable() && !pending());
         long value = bytes(draft);
-        save.active = shown != null && shown.editable() && !pending() && value > 0 && value != shown.limit();
+        save.active = shown != null && shown.editable() && !pending() && !voicePending && !limitConflict
+                && value > 0 && value != shown.limit() && ReplayHistoryClient.canRequestSettings(value);
     }
 
     @Override public void renderBackground(GuiGraphics g, int mx, int my, float delta) {
@@ -151,6 +164,7 @@ final class ReplayArchiveSettingsScreen extends Screen {
         Component status;
         if (!ReplayHistoryClient.supported()) status = tr("connect");
         else if (pending() || shown == null && sentAt == 0) status = tr("loading");
+        else if (limitConflict) status = tr("conflict");
         else if (shown == null || sentAt != 0 || !shown.ok()) status = tr("failed");
         else if (!shown.editable()) status = tr("admin");
         else if (bytes(draft) < 0) status = tr("range");

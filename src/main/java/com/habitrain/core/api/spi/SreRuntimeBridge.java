@@ -25,6 +25,9 @@ import java.util.Optional;
  * 内部并无 try/catch）以及 CoreSpi 的兜底策略都不一致，会误导第三方实现者以为异常会被吞掉。
  */
 public interface SreRuntimeBridge {
+    /** Returns false for Core-owned modes; requests an upstream start or throws for native modes. */
+    default boolean startNativeMode(GameMode mode, ServerLevel level) { return false; }
+
     /** Reserve the single server match before invoking mode callbacks. Default preserves third-party bridges. */
     default boolean reserveMatch(ServerLevel level) { return true; }
     default void releaseMatch(ServerLevel level) {}

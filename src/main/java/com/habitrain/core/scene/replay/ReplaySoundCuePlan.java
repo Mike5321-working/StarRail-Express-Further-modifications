@@ -22,6 +22,7 @@ import java.util.function.Predicate;
 public final class ReplaySoundCuePlan {
     private static final double TICKS_PER_SECOND = 20.0;
     private static final double MIN_VOICE_GAP_SECONDS = 0.08;
+    private static final double RECORDED_CORE_WINDOW_SECONDS = 0.75;
 
     private ReplaySoundCuePlan() {}
 
@@ -143,7 +144,7 @@ public final class ReplaySoundCuePlan {
             }
 
             addSounds(soundCues, recorded, primaryIdx, beat.node(), pairedShot, beat.impact(), 1.0,
-                    Math.max(0.05, actionStart - (recorded.containsKey(primaryIdx) ? 2.0 : .15)),
+                    actionStart,
                     soundEnd, soundEnd, 1f, pan);
 
             ReplayVoiceData.Clip clip = findClipForBeat(primaryIdx, pairedShot == null ? -1 : indexMap.getOrDefault(pairedShot, -1), clipByEvent);
@@ -311,6 +312,7 @@ public final class ReplaySoundCuePlan {
                                            Predicate<ResourceLocation> availableSound) {
         if (replay == null) return Schedule.EMPTY;
         List<LastMatchReplay.Node> events = replay.events();
+        Map<LastMatchReplay.Node, Integer> indexMap = identityIndices(events);
         Map<Integer, LastMatchReplay.Node> pairedGunshots = findPairedGunshots(events);
         Map<Integer, ReplayVoiceData.Clip> clipByEvent = indexVoiceClips(voice);
         var recorded = indexKillSounds(replay, availableSound);
@@ -331,7 +333,8 @@ public final class ReplaySoundCuePlan {
             LastMatchReplay.Node pairedShot = findPairedShotForKill(events, i, node);
             addSounds(soundCues, recorded, i, node, pairedShot, node.tick(), TICKS_PER_SECOND,
                     0, duration, duration + ReplayKillSounds.AFTER_MS / 50.0, 1f, 0f);
-            ReplayVoiceData.Clip clip = findClipForBeat(i, pairedShot == null ? -1 : i - 1, clipByEvent);
+            ReplayVoiceData.Clip clip = findClipForBeat(i,
+                    pairedShot == null ? -1 : indexMap.getOrDefault(pairedShot, -1), clipByEvent);
             if (clip != null && clip.sampleCount() > 0) {
                 double rawStart = node.tick() + clip.offsetMs() / 50.0;
                 double rawEnd = rawStart + clip.durationSeconds() * TICKS_PER_SECOND;
@@ -365,19 +368,24 @@ public final class ReplaySoundCuePlan {
                                   double impact, double unitsPerSecond, double start, double end, double recordedEnd,
                                   float fallbackGain, float pan) {
         var window = recorded.get(index);
+        boolean hasRecordedCoreCue = false;
         if (window != null) {
-            int before = output.size();
             for (var cue : window) {
                 double at = impact + cue.offsetMs() * unitsPerSecond / 1000.0;
                 if (at >= start && at <= recordedEnd + 1e-6) {
                     output.add(new SoundCue(at, index, List.of(), cue.volume(), cue.pitch(), pan, cue.file()));
                 }
+                if (at >= start && at <= recordedEnd + 1e-6
+                        && Math.abs(at - impact) <= RECORDED_CORE_WINDOW_SECONDS * unitsPerSecond) {
+                    hasRecordedCoreCue = true;
+                }
             }
-            if (output.size() != before) return;
         }
-        for (var cue : resolveEventSounds(node, pairedShot)) {
-            double at = Math.clamp(impact + cue.offsetSeconds() * unitsPerSecond, start, end);
-            output.add(new SoundCue(at, index, cue.candidates(), cue.volume() * fallbackGain, cue.pitch(), pan));
+        if (!hasRecordedCoreCue) {
+            for (var cue : resolveEventSounds(node, pairedShot)) {
+                double at = Math.clamp(impact + cue.offsetSeconds() * unitsPerSecond, start, end);
+                output.add(new SoundCue(at, index, cue.candidates(), cue.volume() * fallbackGain, cue.pitch(), pan));
+            }
         }
     }
 

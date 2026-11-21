@@ -204,7 +204,7 @@ public final class LifecycleEventsRegistrar {
         cleanup.run("dlc task tracker", com.habitrain.core.game.sre.task.DlcTaskTracker::clearAll);
         cleanup.run("clearable handlers", ClearableHandlerRegistry::clearAll);
         cleanup.run("game lifecycle state", GameLifecycleHandler::resetLifecycleState);
-        cleanup.run("active modes", GameModeRegistry::clearActiveModes);
+        cleanup.run("active modes", () -> CoreLifecycleScope.run(GameModeRegistry::clearActiveModes));
         cleanup.run("task registry lifecycle", () -> CoreLifecycleScope.run(TaskRegistry::resetLifecycle));
         cleanup.run("mode registry lifecycle", () -> CoreLifecycleScope.run(GameModeRegistry::resetLifecycle));
         // CORE-02：清理 RoleSnapshotManager（含 round/lobby/pending/settlement）与 RoleSnapshotArchive，
@@ -356,6 +356,7 @@ public final class LifecycleEventsRegistrar {
                         destination == null ? (player.level() == null ? null : player.level().dimension())
                                 : destination.dimension();
                 LAST_VIEW.put(id, new TrackedView(cam, dim));
+                CustomTaskBlockPayload.sendToPlayer(player);
                 sendCurrentRoleState(player);
                 if (dim != null) {
                     var sceneSessions = com.habitrain.core.scene.server.SceneSelectionSessionManager.getInstance();

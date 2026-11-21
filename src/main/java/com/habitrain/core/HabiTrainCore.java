@@ -32,7 +32,7 @@ import org.slf4j.LoggerFactory;
  *   <li>{@link CommandRegistrar} — 命令注册</li>
  *   <li>{@link LifecycleEventsRegistrar} — 生命周期事件</li>
  *   <li>{@link C2SReceiverRegistrar} — C2S 数据包接收器</li>
- *   <li>{@link VoiceGroupService} — 语音群组服务（/instantgroup）</li>
+ *   <li>{@link VoiceGroupService} — 语音群组服务（/habi_group）</li>
  * </ul>
  */
 public class HabiTrainCore implements ModInitializer {
@@ -213,7 +213,7 @@ public class HabiTrainCore implements ModInitializer {
         // 按角色能力填充警长/杀手商店目录（canUseKiller=杀手商店, isVigilanteTeam=警长商店）
         // 3. 网络包类型注册
         NetworkRegistrar.init();
-        // 4. 命令注册（/instantgroup, /habi_api）
+        // 4. 命令注册（/habi_group, /habi_api）
         CommandRegistrar.init();
         // 5. 生命周期事件注册（SERVER_STARTED/STOPPING/JOIN/DISCONNECT）
         LifecycleEventsRegistrar.init();
@@ -224,6 +224,7 @@ public class HabiTrainCore implements ModInitializer {
         MvpScoreTracker.init();
         com.habitrain.core.game.sre.replay.ReplayBoardService.register();
         com.habitrain.core.game.sre.replay.ReplayArchiveService.register();
+        com.habitrain.core.game.sre.task.CustomTaskBlockScanner.register();
         // 6. C2S 接收器注册
         C2SReceiverRegistrar.init();
         EliminatedRestAreaService.init();

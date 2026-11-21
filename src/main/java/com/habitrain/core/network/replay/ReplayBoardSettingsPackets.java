@@ -10,6 +10,8 @@ import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.resources.ResourceLocation;
 
+import java.util.UUID;
+
 /** Editing requests and acknowledgement; vanilla block-entity updates broadcast saved settings. */
 public final class ReplayBoardSettingsPackets {
     private ReplayBoardSettingsPackets() {}
@@ -45,8 +47,32 @@ public final class ReplayBoardSettingsPackets {
         @Override public Type<Result> type() { return TYPE; }
     }
 
+    public record CheckedSave(UUID requestId, ReplayBoardSettings expected, Save save) implements CustomPacketPayload {
+        public static final Type<CheckedSave> TYPE = new Type<>(HabiTrainCore.id("replay_board_settings_checked_save"));
+        public static final StreamCodec<FriendlyByteBuf, CheckedSave> CODEC = StreamCodec.of((buf, value) -> {
+            buf.writeUUID(value.requestId);
+            var settings = value.expected;
+            buf.writeFloat(settings.mapSize()); buf.writeFloat(settings.height());
+            buf.writeFloat(settings.offsetX()); buf.writeFloat(settings.offsetZ()); buf.writeFloat(settings.rotation());
+            Save.CODEC.encode(buf, value.save);
+        }, buf -> new CheckedSave(buf.readUUID(), new ReplayBoardSettings(buf.readFloat(), buf.readFloat(),
+                buf.readFloat(), buf.readFloat(), buf.readFloat()), Save.CODEC.decode(buf)));
+        @Override public Type<CheckedSave> type() { return TYPE; }
+    }
+
+    public record CheckedResult(UUID requestId, Status status) implements CustomPacketPayload {
+        public enum Status { REJECTED, SAVED, CONFLICT }
+        public static final Type<CheckedResult> TYPE = new Type<>(HabiTrainCore.id("replay_board_settings_checked_result"));
+        public static final StreamCodec<FriendlyByteBuf, CheckedResult> CODEC = StreamCodec.of(
+                (buf, value) -> { buf.writeUUID(value.requestId); buf.writeEnum(value.status); },
+                buf -> new CheckedResult(buf.readUUID(), buf.readEnum(Status.class)));
+        @Override public Type<CheckedResult> type() { return TYPE; }
+    }
+
     public static void register() {
         PayloadTypeRegistry.playC2S().register(Save.TYPE, Save.CODEC);
         PayloadTypeRegistry.playS2C().register(Result.TYPE, Result.CODEC);
+        PayloadTypeRegistry.playC2S().register(CheckedSave.TYPE, CheckedSave.CODEC);
+        PayloadTypeRegistry.playS2C().register(CheckedResult.TYPE, CheckedResult.CODEC);
     }
 }
