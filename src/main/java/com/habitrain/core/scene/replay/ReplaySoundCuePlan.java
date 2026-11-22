@@ -23,6 +23,12 @@ public final class ReplaySoundCuePlan {
     private static final double TICKS_PER_SECOND = 20.0;
     private static final double MIN_VOICE_GAP_SECONDS = 0.08;
     private static final double RECORDED_CORE_WINDOW_SECONDS = 0.75;
+    public static final List<String> VIDEO_MATCH_START_SOUNDS = List.of(
+            "starrailexpress:ambient.train.horn", "wathe:ambient.train.horn");
+    public static final List<String> VIDEO_MATCH_END_SOUNDS = List.of(
+            "starrailexpress:ui.piano_win", "wathe:ui.piano_win");
+    private static final float VIDEO_MATCH_START_VOLUME = 0.85f;
+    private static final float VIDEO_MATCH_END_VOLUME = 1.50f;
 
     private ReplaySoundCuePlan() {}
 
@@ -123,10 +129,15 @@ public final class ReplaySoundCuePlan {
 
         List<SoundCue> soundCues = new ArrayList<>();
         List<VoiceCue> voiceCues = new ArrayList<>();
+        double titleStart = script.actStart(ReplayVideoScript.Act.TITLE);
         double actionStart = script.actStart(ReplayVideoScript.Act.ACTION);
         double reviewStart = script.actStart(ReplayVideoScript.Act.REVIEW);
+        double victoryStart = script.actStart(ReplayVideoScript.Act.VICTORY);
         double soundEnd = Math.max(actionStart, reviewStart - 0.05);
         double lastVoiceEnd = actionStart;
+
+        soundCues.add(new SoundCue(titleStart, -1, VIDEO_MATCH_START_SOUNDS, VIDEO_MATCH_START_VOLUME, 1.0f, 0f));
+        soundCues.add(new SoundCue(victoryStart, -1, VIDEO_MATCH_END_SOUNDS, VIDEO_MATCH_END_VOLUME, 1.0f, 0f));
 
         List<ReplayVideoScript.Beat> beats = script.beats();
         Set<Integer> handledEvents = new HashSet<>();

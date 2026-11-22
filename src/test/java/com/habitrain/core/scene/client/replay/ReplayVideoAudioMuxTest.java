@@ -1,6 +1,8 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
+import com.habitrain.core.scene.replay.ReplayVideoScript;
+import com.habitrain.core.scene.replay.ReplayVideoScriptTest;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
@@ -87,6 +89,42 @@ class ReplayVideoAudioMuxTest {
         int peak = 0;
         for (short sample : pcm) peak = Math.max(peak, Math.abs((int) sample));
         assertTrue(peak > 17_000 && peak <= Math.round(.60f * Short.MAX_VALUE), "Replay peak: " + peak);
+    }
+
+    @Test
+    void videoMatchStartAndEndCuesRenderAtExactTitleAndVictoryTimestamps() {
+        var replay = ReplayVideoScriptTest.replay(600, List.of(), List.of());
+        var script = new ReplayVideoScript(replay);
+        var schedule = ReplaySoundCuePlan.forVideo(replay, script, null);
+        int rate = ReplayVideoAudioRenderer.SAMPLE_RATE;
+
+        float[] hornSamples = new float[rate / 2]; // 0.5s
+        float[] winSamples = new float[rate / 2];  // 0.5s
+        for (int i = 0; i < hornSamples.length; i++) {
+            hornSamples[i] = (float) (0.7 * Math.sin(2.0 * Math.PI * 220.0 * i / rate));
+            winSamples[i] = (float) (0.2 * Math.sin(2.0 * Math.PI * 660.0 * i / rate));
+        }
+
+        short[] pcm = ReplayVideoAudioRenderer.renderSchedule(schedule, keys -> {
+            if (keys.contains("starrailexpress:ambient.train.horn")) {
+                return new ReplayVideoAudioRenderer.DecodedSound(hornSamples, 1, rate, 1f, 1f);
+            }
+            if (keys.contains("starrailexpress:ui.piano_win")) {
+                return new ReplayVideoAudioRenderer.DecodedSound(winSamples, 1, rate, 1f, 1f);
+            }
+            return null;
+        }, script.frames(ReplayVideoExport.FPS));
+
+        double victoryStart = script.actStart(ReplayVideoScript.Act.VICTORY);
+        double titleRms = channelRms(pcm, 0, (int) (0.05 * rate), (int) (0.45 * rate));
+        double quietBeforeVictory = channelRms(pcm, 0, (int) ((victoryStart - 0.5) * rate), (int) ((victoryStart - 0.05) * rate));
+        double victoryRms = channelRms(pcm, 0, (int) ((victoryStart + 0.05) * rate), (int) ((victoryStart + 0.45) * rate));
+        double quietAfterVictory = channelRms(pcm, 0, (int) ((victoryStart + 0.6) * rate), (int) ((victoryStart + 1.0) * rate));
+
+        assertTrue(titleRms > 3000, "Expected match-start train horn at TITLE start, got " + titleRms);
+        assertEquals(0.0, quietBeforeVictory, 1e-6, "Expected silence before VICTORY");
+        assertTrue(victoryRms > 1500, "Expected match-end victory piano at VICTORY start, got " + victoryRms);
+        assertEquals(0.0, quietAfterVictory, 1e-6, "Expected silence after victory cue ends");
     }
 
     @Test

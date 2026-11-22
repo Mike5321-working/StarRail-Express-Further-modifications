@@ -153,15 +153,17 @@ class ReplayVoiceCodecAndSyncTest {
         var live = ReplaySoundCuePlan.forLinearReplay(replay, null).sounds();
         var table = ReplaySoundCuePlan.forBoard(replay, board, null).sounds();
         var export = ReplaySoundCuePlan.forVideo(replay, video, null).sounds();
+        var exportEventCues = export.stream().filter(cue -> cue.eventIndex() >= 0).toList();
         assertEquals(1, live.size());
         assertEquals(1, table.size());
-        assertEquals(1, export.size());
+        assertEquals(3, export.size());
+        assertEquals(1, exportEventCues.size());
         assertEquals(privateSound, live.getFirst().recordedFile());
         assertEquals(96.0, live.getFirst().time(), 1e-6);
         assertEquals(board.actionTickAt(100) - 4, table.getFirst().time(), 1e-6);
-        assertEquals(video.beats().getFirst().impact() - .2, export.getFirst().time(), 1e-6);
-        assertEquals(.35f, export.getFirst().volume());
-        assertEquals(1.3f, export.getFirst().pitch());
+        assertEquals(video.beats().getFirst().impact() - .2, exportEventCues.getFirst().time(), 1e-6);
+        assertEquals(.35f, exportEventCues.getFirst().volume());
+        assertEquals(1.3f, exportEventCues.getFirst().pitch());
 
         var silent = replay.withKillSounds(List.of(new ReplayKillSounds.Window(0, List.of())));
         assertFalse(ReplaySoundCuePlan.forLinearReplay(silent, null).sounds().isEmpty());
@@ -190,6 +192,34 @@ class ReplayVoiceCodecAndSyncTest {
         double tail = sounds.getLast().time();
         assertEquals(impact + 20, tail, 1e-6);
         assertEquals(ReplayTimeline.Phase.REVIEW, timeline.atElapsed(ReplayTimeline.INTRO + tail).phase());
+    }
+
+    @Test
+    void videoScheduleIncludesUpstreamMatchStartAndEndSoundCues() {
+        var replay = replayWithKills(600);
+        var script = new ReplayVideoScript(replay);
+        var timeline = new ReplayTimeline(replay);
+
+        var videoSounds = ReplaySoundCuePlan.forVideo(replay, script, null).sounds();
+        assertEquals(2, videoSounds.size());
+
+        var startCue = videoSounds.getFirst();
+        assertEquals(script.actStart(ReplayVideoScript.Act.TITLE), startCue.time(), 1e-6);
+        assertEquals(0.0, startCue.time(), 1e-6);
+        assertEquals(-1, startCue.eventIndex());
+        assertEquals(ReplaySoundCuePlan.VIDEO_MATCH_START_SOUNDS, startCue.candidates());
+        assertEquals(0f, startCue.pan());
+        assertNull(startCue.recordedFile());
+
+        var endCue = videoSounds.getLast();
+        assertEquals(script.actStart(ReplayVideoScript.Act.VICTORY), endCue.time(), 1e-6);
+        assertEquals(-1, endCue.eventIndex());
+        assertEquals(ReplaySoundCuePlan.VIDEO_MATCH_END_SOUNDS, endCue.candidates());
+        assertEquals(0f, endCue.pan());
+        assertNull(endCue.recordedFile());
+
+        assertTrue(ReplaySoundCuePlan.forBoard(replay, timeline, null).sounds().isEmpty());
+        assertTrue(ReplaySoundCuePlan.forLinearReplay(replay, null).sounds().isEmpty());
     }
 
     @Test
