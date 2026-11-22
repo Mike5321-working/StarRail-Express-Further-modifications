@@ -195,13 +195,13 @@ class ReplayVoiceCodecAndSyncTest {
     }
 
     @Test
-    void videoScheduleIncludesUpstreamMatchStartAndEndSoundCues() {
+    void videoScheduleIncludesUpstreamMatchStartSoundCueWithoutVictoryPiano() {
         var replay = replayWithKills(600);
         var script = new ReplayVideoScript(replay);
         var timeline = new ReplayTimeline(replay);
 
-        var videoSounds = ReplaySoundCuePlan.forVideo(replay, script, null).sounds();
-        assertEquals(2, videoSounds.size());
+        var videoSounds = ReplaySoundCuePlan.forVideo(replay, script, null, file -> true, false).sounds();
+        assertEquals(1, videoSounds.size());
 
         var startCue = videoSounds.getFirst();
         assertEquals(script.actStart(ReplayVideoScript.Act.TITLE), startCue.time(), 1e-6);
@@ -210,13 +210,6 @@ class ReplayVoiceCodecAndSyncTest {
         assertEquals(ReplaySoundCuePlan.VIDEO_MATCH_START_SOUNDS, startCue.candidates());
         assertEquals(0f, startCue.pan());
         assertNull(startCue.recordedFile());
-
-        var endCue = videoSounds.getLast();
-        assertEquals(script.actStart(ReplayVideoScript.Act.VICTORY), endCue.time(), 1e-6);
-        assertEquals(-1, endCue.eventIndex());
-        assertEquals(ReplaySoundCuePlan.VIDEO_MATCH_END_SOUNDS, endCue.candidates());
-        assertEquals(0f, endCue.pan());
-        assertNull(endCue.recordedFile());
 
         assertTrue(ReplaySoundCuePlan.forBoard(replay, timeline, null).sounds().isEmpty());
         assertTrue(ReplaySoundCuePlan.forLinearReplay(replay, null).sounds().isEmpty());

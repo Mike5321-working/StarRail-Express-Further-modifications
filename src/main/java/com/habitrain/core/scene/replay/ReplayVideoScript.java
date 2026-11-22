@@ -2,6 +2,7 @@ package com.habitrain.core.scene.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
+import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -19,9 +20,19 @@ import java.util.UUID;
  * every featured beat (kills, revivals, explosions ...), a full-match overview, the victory card, the MVP
  * showcase and a passenger-list outro. Match time is remapped through a monotone cubic spline, so
  * speed ramps are smooth and a freeze frame holds exactly on the event tick.</p>
+ *
+ * <p>The whole film sits on one musical grid of {@link #BPM}: every act starts on a beat, every act except the
+ * last lasts whole bars, every highlight impact lands on a beat and every slow-motion aftermath lasts whole
+ * beats. The flexible fast-forward stretches and approaches absorb the rounding, preferring whole bars between
+ * consecutive highlights, so the soundtrack never has to change its tempo.</p>
  */
 public final class ReplayVideoScript {
-    public static final double TITLE = 3.6, REVIEW = 4.2, VICTORY = 4.0, MVP = 5.6, OUTRO = 6.4, TAIL = 0.9;
+    /** Tempo of the film. One beat is half a second, one bar two seconds. */
+    public static final double BPM = 120;
+    public static final double BEAT = 60.0 / BPM, BAR = 4 * BEAT;
+    public static final double TITLE = 2 * BAR, REVIEW = 2 * BAR, VICTORY = 2 * BAR, MVP = 3 * BAR, OUTRO = 6.4, TAIL = 0.9;
+    public static final int OUTRO_PAGE_SIZE = 9;
+    public static final double OUTRO_PAGE_HOLD = 3.1;
     /** Half length of the slab wipe around each act boundary. */
     public static final double WIPE = 0.3;
     public static final int MAX_BEATS = 10;
@@ -29,14 +40,30 @@ public final class ReplayVideoScript {
     public static final int STREAK_TICKS = 600;
     private static final int CLUSTER_TICKS = 40;
     private static final double REAL = 20;
+    private static final double MIN_TAIL = 0.5;
+    /** Match ticks kept after a focused player's final elimination so the death aftermath finishes cleanly. */
+    public static final int ELIMINATION_TAIL_TICKS = 20;
 
     public enum Act { TITLE, ACTION, REVIEW, VICTORY, MVP, OUTRO }
 
+    /**
+     * Highlight kinds. {@code freeze + slow} always equals {@code beats} grid beats, so the groove re-enters on the
+     * grid when the aftermath ends.
+     */
     public enum BeatType {
-        KILL(0.55, 1.6, 0.30), REVIVAL(0.4, 1.3, 0.32), EXPLOSION(0.42, 1.3, 0.32),
-        DEFUSE(0.32, 1.1, 0.35), SHIELD(0.26, 1.0, 0.38), HIT(0.22, 0.9, 0.4);
+        KILL(0.5, 4, 0.30), REVIVAL(0.42, 4, 0.32), EXPLOSION(0.45, 4, 0.32),
+        DEFUSE(0.34, 3, 0.35), SHIELD(0.26, 2, 0.38), HIT(0.22, 2, 0.4);
         public final double freeze, slow, slowRate;
-        BeatType(double freeze, double slow, double slowRate) { this.freeze = freeze; this.slow = slow; this.slowRate = slowRate; }
+        public final int beats;
+        BeatType(double freeze, int beats, double slowRate) {
+            this.freeze = freeze;
+            this.beats = beats;
+            this.slow = beats * BEAT - freeze;
+            this.slowRate = slowRate;
+        }
+
+        /** Freeze plus slow motion, exactly {@link #beats} beats. */
+        public double aftermath() { return beats * BEAT; }
     }
 
     /**
@@ -67,9 +94,11 @@ public final class ReplayVideoScript {
     }
 
     private final LastMatchReplay replay;
+    private final @Nullable UUID focusPlayer;
     private final int duration;
+    private final int actionEndTick;
     private final boolean mvpAct;
-    private final double actionStart, actionLength, reviewStart, victoryStart, mvpStart, outroStart, total;
+    private final double actionStart, actionLength, reviewStart, victoryStart, mvpStart, outroStart, outroLength, total;
     private final double[] kv, kt, km, kw;
     private final List<Beat> beats;
     private final List<Feed> feeds;
@@ -77,11 +106,17 @@ public final class ReplayVideoScript {
     private final double fastSpeed;
 
     public ReplayVideoScript(LastMatchReplay replay) {
+        this(replay, null);
+    }
+
+    public ReplayVideoScript(LastMatchReplay replay, @Nullable UUID focusPlayer) {
         this.replay = replay;
+        this.focusPlayer = resolveFocusPlayer(replay, focusPlayer);
         this.duration = Math.max(0, replay.durationTicks());
+        this.actionEndTick = resolveActionEndTick(replay, duration, this.focusPlayer);
         this.mvpAct = replay.mvp() != null || replay.participants().stream().anyMatch(LastMatchReplay.Participant::winner);
 
-        List<Cluster> chosen = chooseBeats(replay, duration);
+        List<Cluster> chosen = chooseBeats(replay, actionEndTick, this.focusPlayer);
         // ---- knots of the action act: (video seconds since action start, match tick)
         List<double[]> knots = new ArrayList<>();
         knots.add(new double[]{0, 0});
@@ -92,46 +127,86 @@ public final class ReplayVideoScript {
             int tb = c.tick;
             int start = Math.min(tb, Math.max(cursor, tb - 13));
             int slowTicks = (int) Math.round(c.type.slow * REAL * c.type.slowRate);
-            int end = Math.min(duration, tb + slowTicks);
+            int end = Math.min(actionEndTick, tb + slowTicks);
             gaps.add(new int[]{cursor, start});
             plan.add(new double[]{start, end});
             cursor = end;
         }
-        gaps.add(new int[]{cursor, duration});
-        double fastTarget = Math.clamp(duration / REAL / 13.0, 7, 26);
-        double speed = solveSpeed(gaps, fastTarget);
+        gaps.add(new int[]{cursor, actionEndTick});
+        double fastTarget = Math.clamp(actionEndTick / REAL / 13.0, 7, 26);
+        // Single-player perspectives filter out other players' highlights and often have only 0-1 beats;
+        // keeping the global 5.5 s per-gap cap would crush a 4-minute match into a single 5.5 s ultra-fast stretch.
+        // Leaving maxGap unbounded for single-player lets solveSpeed pick a single uniform hyper-lapse rate matching fastTarget.
+        double maxGap = this.focusPlayer != null ? Double.POSITIVE_INFINITY : 5.5;
+        double speed = solveSpeed(gaps, fastTarget, maxGap);
         this.fastSpeed = speed / REAL;
 
-        double v = 0;
+        // v: video seconds since the action start; anchor: the last on-grid time (action start or previous impact).
+        double v = 0, anchor = 0;
         List<Beat> built = new ArrayList<>();
         for (int i = 0; i < chosen.size(); i++) {
             Cluster c = chosen.get(i);
-            v = gap(knots, v, gaps.get(i), speed);
+            int[] gap = gaps.get(i);
+            int gapTicks = Math.max(0, gap[1] - gap[0]);
+            double g = gapTicks > 0 ? gapSeconds(gapTicks, speed, maxGap) : 0;
+            double gMin = gapTicks > 0 ? Math.min(0.35, gapTicks / REAL) : 0;
             int start = (int) plan.get(i)[0], end = (int) plan.get(i)[1];
-            double approachAt = v;
             int approachTicks = c.tick - start;
-            if (approachTicks > 0) {
-                v += Math.max(0.45, 1.15 * approachTicks / 13.0);
-                knots.add(new double[]{v, c.tick});
-            } else if (built.isEmpty() && v == 0) {
-                // A highlight on the very first tick still gets a short establishing beat.
-                v += 0.6;
-                knots.add(new double[]{v, c.tick});
+            // A highlight on the very first tick still gets a short establishing beat.
+            boolean establish = approachTicks <= 0 && built.isEmpty() && v == 0;
+            double a = approachTicks > 0 ? Math.max(0.45, 1.15 * approachTicks / 13.0) : establish ? 0.6 : 0;
+            double aMin = approachTicks > 0 ? 0.45 : establish ? 0.4 : 0;
+
+            // Snap the impact onto the beat grid; the fast-forward (or else the approach) absorbs the difference.
+            double fixed = v - anchor;
+            double impact = anchor + fitBeats(fixed + g + a, fixed + gMin + aMin) * BEAT;
+            double extra = impact - (v + g + a);
+            if (extra >= 0) {
+                if (gapTicks > 0) g += extra;
+                else a += extra;
+            } else {
+                double cut = Math.min(-extra, g - gMin);
+                g -= cut;
+                a = Math.max(0, a - (-extra - cut));
             }
-            double impact = v;
-            v += c.type.freeze;
-            knots.add(new double[]{v, c.tick});
-            double release = v;
+            if (gapTicks > 0) {
+                v += g;
+                knots.add(new double[]{v, gap[1]});
+            }
+            double approachAt = v;
+            if (a > 1e-9 && impact - v > 1e-9) knots.add(new double[]{impact, c.tick});
+            double release = impact + c.type.freeze;
+            knots.add(new double[]{release, c.tick});
+            v = release;
             if (end > c.tick) {
-                v += c.type.slow;
+                v = impact + c.type.aftermath();
                 knots.add(new double[]{v, end});
             }
-            built.add(new Beat(built.size(), c.type, c.primary, c.tick, approachAt, impact, release, v,
+            built.add(new Beat(built.size(), c.type, c.primary, c.tick, Math.min(approachAt, impact), impact, release, v,
                     c.streak, c.firstBlood, c.finalBlow, c.kills));
+            anchor = impact;
         }
-        v = gap(knots, v, gaps.getLast(), speed);
-        v += TAIL;
-        knots.add(new double[]{v, duration});
+        // The review starts on the grid too; the closing fast-forward and the tail hold absorb the rounding.
+        int[] last = gaps.getLast();
+        int lastTicks = Math.max(0, last[1] - last[0]);
+        double g = lastTicks > 0 ? gapSeconds(lastTicks, speed, maxGap) : 0;
+        double gMin = lastTicks > 0 ? Math.min(0.35, lastTicks / REAL) : 0;
+        double tail = TAIL;
+        double fixed = v - anchor;
+        double finish = anchor + fitBeats(fixed + g + tail, fixed + gMin + MIN_TAIL) * BEAT;
+        double extra = finish - (v + g + tail);
+        if (extra >= 0) {
+            tail += extra;
+        } else {
+            double cut = Math.min(-extra, tail - MIN_TAIL);
+            tail -= cut;
+            g = Math.max(gMin, g - (-extra - cut));
+        }
+        if (lastTicks > 0) {
+            v += g;
+            knots.add(new double[]{v, last[1]});
+        }
+        knots.add(new double[]{finish, actionEndTick});
 
         int n = knots.size();
         kv = new double[n];
@@ -151,7 +226,9 @@ public final class ReplayVideoScript {
         victoryStart = reviewStart + REVIEW;
         mvpStart = victoryStart + VICTORY;
         outroStart = mvpStart + (mvpAct ? MVP : 0);
-        total = outroStart + OUTRO;
+        int outroPages = Math.max(1, (replay.participants().size() + OUTRO_PAGE_SIZE - 1) / OUTRO_PAGE_SIZE);
+        outroLength = outroPages <= 1 ? OUTRO : 1.1 + outroPages * OUTRO_PAGE_HOLD + 0.9;
+        total = outroStart + outroLength;
 
         List<Beat> shifted = new ArrayList<>(built.size());
         for (Beat b : built) {
@@ -162,7 +239,7 @@ public final class ReplayVideoScript {
 
         List<Feed> feed = new ArrayList<>();
         for (LastMatchReplay.Node node : replay.events()) {
-            if (!feedable(node)) continue;
+            if (!feedable(node) || node.tick() > actionEndTick) continue;
             boolean featured = false;
             for (Beat b : beats) if (b.node() == node) { featured = true; break; }
             if (featured) continue;
@@ -171,7 +248,8 @@ public final class ReplayVideoScript {
         feeds = List.copyOf(feed);
         List<SpanWindow> windows = new ArrayList<>();
         for (LastMatchReplay.Span span : replay.spans()) {
-            double s = videoTimeOf(span.startTick()), e = videoTimeOf(Math.min(span.endTick(), duration));
+            if (span.startTick() >= actionEndTick) continue;
+            double s = videoTimeOf(span.startTick()), e = videoTimeOf(Math.min(span.endTick(), actionEndTick));
             if (e > s) windows.add(new SpanWindow(span, s, e));
         }
         spans = List.copyOf(windows);
@@ -180,6 +258,7 @@ public final class ReplayVideoScript {
     // ------------------------------------------------------------------ public queries
 
     public LastMatchReplay replay() { return replay; }
+    public @Nullable UUID focusPlayer() { return focusPlayer; }
     public double total() { return total; }
     public int frames(int fps) { return (int) Math.ceil(total * fps); }
     public List<Beat> beats() { return beats; }
@@ -188,6 +267,7 @@ public final class ReplayVideoScript {
     public boolean hasMvpAct() { return mvpAct; }
     public double fastSpeed() { return fastSpeed; }
     public int duration() { return duration; }
+    public int actionEndTick() { return actionEndTick; }
 
     public double actStart(Act act) {
         return switch (act) {
@@ -207,7 +287,7 @@ public final class ReplayVideoScript {
             case REVIEW -> REVIEW;
             case VICTORY -> VICTORY;
             case MVP -> mvpAct ? MVP : 0;
-            case OUTRO -> OUTRO;
+            case OUTRO -> outroLength;
         };
     }
 
@@ -230,6 +310,14 @@ public final class ReplayVideoScript {
         boolean freeze = act == Act.ACTION && speed < 0.02;
         boolean slow = act == Act.ACTION && !freeze && speed < 0.75;
         return new Sample(act, t, actTime, actLength(act), tick, speed, slow, freeze, world, wipe(t));
+    }
+
+    /** Featured events use the cut's impact, even when the match clock is already on their tick. */
+    public double eventTime(LastMatchReplay.Node node) {
+        for (Beat beat : beats) {
+            if (beat.node() == node) return beat.impact();
+        }
+        return videoTimeOf(node.tick());
     }
 
     /** Earliest video time at which the match clock reaches {@code tick}. */
@@ -369,31 +457,42 @@ public final class ReplayVideoScript {
         return m;
     }
 
-    private static double gap(List<double[]> knots, double v, int[] gap, double speed) {
-        int ticks = gap[1] - gap[0];
-        if (ticks <= 0) return v;
-        v += gapSeconds(ticks, speed);
-        knots.add(new double[]{v, gap[1]});
-        return v;
+    /**
+     * Number of grid beats for a span of {@code raw} seconds that must last at least {@code min} seconds: close to
+     * {@code raw}, preferring whole bars, then half bars, so the music between two anchors rarely ends on a broken bar.
+     */
+    static int fitBeats(double raw, double min) {
+        int lo = Math.max(1, (int) Math.ceil(min / BEAT - 1e-9));
+        int hi = Math.max(lo, (int) Math.ceil(raw / BEAT)) + 4;
+        int best = lo;
+        double bestCost = Double.MAX_VALUE;
+        for (int n = lo; n <= hi; n++) {
+            double cost = Math.abs(n * BEAT - raw) + (n % 4 == 0 ? 0 : n % 2 == 0 ? 0.35 : 0.6);
+            if (cost < bestCost - 1e-9) {
+                bestCost = cost;
+                best = n;
+            }
+        }
+        return best;
     }
 
-    private static double gapSeconds(int ticks, double speed) {
-        return Math.clamp(ticks / speed, Math.min(0.35, ticks / REAL), 5.5);
+    private static double gapSeconds(int ticks, double speed, double maxGap) {
+        return Math.clamp(ticks / speed, Math.min(0.35, ticks / REAL), maxGap);
     }
 
-    private static double solveSpeed(List<int[]> gaps, double target) {
+    private static double solveSpeed(List<int[]> gaps, double target, double maxGap) {
         double lo = REAL, hi = REAL * 400;
-        if (sum(gaps, lo) <= target) return lo;
+        if (sum(gaps, lo, maxGap) <= target) return lo;
         for (int i = 0; i < 60; i++) {
             double mid = Math.sqrt(lo * hi);
-            if (sum(gaps, mid) > target) lo = mid; else hi = mid;
+            if (sum(gaps, mid, maxGap) > target) lo = mid; else hi = mid;
         }
         return hi;
     }
 
-    private static double sum(List<int[]> gaps, double speed) {
+    private static double sum(List<int[]> gaps, double speed, double maxGap) {
         double total = 0;
-        for (int[] g : gaps) if (g[1] > g[0]) total += gapSeconds(g[1] - g[0], speed);
+        for (int[] g : gaps) if (g[1] > g[0]) total += gapSeconds(g[1] - g[0], speed, maxGap);
         return total;
     }
 
@@ -437,12 +536,73 @@ public final class ReplayVideoScript {
         return result;
     }
 
-    private static List<Cluster> chooseBeats(LastMatchReplay replay, int duration) {
+    private static @Nullable UUID resolveFocusPlayer(LastMatchReplay replay, @Nullable UUID focusPlayer) {
+        if (focusPlayer == null) return null;
+        for (var p : replay.participants()) {
+            if (focusPlayer.equals(p.id())) return focusPlayer;
+        }
+        return null;
+    }
+
+    /**
+     * When exporting a single player's perspective, cuts the ACTION act shortly after their final elimination
+     * (or departure) if they are never revived afterwards.
+     */
+    private static int resolveActionEndTick(LastMatchReplay replay, int duration, @Nullable UUID focusPlayer) {
+        if (focusPlayer == null || duration <= 0) return duration;
+        LastMatchReplay.Participant target = null;
+        for (var p : replay.participants()) {
+            if (focusPlayer.equals(p.id())) {
+                target = p;
+                break;
+            }
+        }
+        if (target == null) return duration;
+        List<LastMatchReplay.Sample> track = target.track();
+        if (!track.isEmpty()) {
+            LastMatchReplay.Sample last = track.getLast();
+            if ((last.flags() & LastMatchReplay.ALIVE) != 0) return duration;
+            int runStart = track.size() - 1;
+            while (runStart > 0 && (track.get(runStart - 1).flags() & LastMatchReplay.ALIVE) == 0) {
+                runStart--;
+            }
+            int finalInactiveTick = track.get(runStart).tick();
+            int lastAliveTick = runStart > 0 ? track.get(runStart - 1).tick() : -1;
+            int endTick = finalInactiveTick;
+            for (LastMatchReplay.Node e : replay.events()) {
+                if (e.kind() == LastMatchReplay.Kind.KILL && focusPlayer.equals(e.target()) && e.tick() >= lastAliveTick) {
+                    endTick = Math.max(endTick, e.tick());
+                }
+            }
+            return Math.clamp(endTick + ELIMINATION_TAIL_TICKS, 0, duration);
+        }
+        int lastDeath = -1;
+        int lastRevive = -1;
+        for (LastMatchReplay.Node e : replay.events()) {
+            if (e.kind() == LastMatchReplay.Kind.KILL && focusPlayer.equals(e.target())) {
+                lastDeath = Math.max(lastDeath, e.tick());
+            } else if (e.kind() == LastMatchReplay.Kind.PLAYER_REVIVAL
+                    && (focusPlayer.equals(e.target()) || focusPlayer.equals(e.actor()))) {
+                lastRevive = Math.max(lastRevive, e.tick());
+            }
+        }
+        if (lastDeath >= 0 && lastDeath > lastRevive) {
+            return Math.clamp(lastDeath + ELIMINATION_TAIL_TICKS, 0, duration);
+        }
+        return duration;
+    }
+
+    private static boolean involves(LastMatchReplay.Node node, UUID player) {
+        return player.equals(node.actor()) || player.equals(node.target());
+    }
+
+    private static List<Cluster> chooseBeats(LastMatchReplay replay, int actionEndTick, @Nullable UUID focusPlayer) {
         LastMatchReplay.Node first = replay.firstKill(), lastKill = replay.lastKill();
         long kills = replay.events().stream().filter(e -> e.kind() == LastMatchReplay.Kind.KILL).count();
         Map<LastMatchReplay.Node, Integer> streaks = streaks(replay);
         List<LastMatchReplay.Node> candidates = replay.events().stream()
-                .filter(e -> classify(e) != null && e.tick() >= 0 && e.tick() <= duration)
+                .filter(e -> classify(e) != null && e.tick() >= 0 && e.tick() <= actionEndTick
+                        && (focusPlayer == null || involves(e, focusPlayer)))
                 .sorted(Comparator.comparingInt(LastMatchReplay.Node::tick)).toList();
         List<Cluster> clusters = new ArrayList<>();
         Cluster current = null;

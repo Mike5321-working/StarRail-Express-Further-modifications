@@ -93,8 +93,8 @@ public final class ReplayAudioSelfTest {
     private static Set<Path> filesBeforeCancellation;
     private static Path mp4Path;
     private static Path aviPath;
-    private static double mp4IntroRms, mp4Beat0Rms, mp4Beat1Rms, mp4VictoryRms;
-    private static double aviIntroRms, aviBeat0Rms, aviBeat1Rms, aviVictoryRms;
+    private static double mp4IntroRms, mp4Beat0Rms, mp4Beat1Rms;
+    private static double aviIntroRms, aviBeat0Rms, aviBeat1Rms;
     private static long mp4Size, aviSize;
 
     private ReplayAudioSelfTest() {}
@@ -348,9 +348,8 @@ public final class ReplayAudioSelfTest {
         if (ReplayAudioPlaybackController.resolveSound(mc, List.of("starrailexpress:item.revolver.shoot")) != null) resolvedModSounds++;
         if (ReplayAudioPlaybackController.resolveSound(mc, List.of("starrailexpress:item.knife.stab")) != null) resolvedModSounds++;
         if (ReplayAudioPlaybackController.resolveSound(mc, List.of("starrailexpress:ambient.train.horn")) != null) resolvedModSounds++;
-        if (ReplayAudioPlaybackController.resolveSound(mc, List.of("starrailexpress:ui.piano_win")) != null) resolvedModSounds++;
-        if (resolvedModSounds < 4) {
-            throw new IllegalStateException("Expected starrailexpress revolver, knife, train horn & piano_win sounds resolved on client SoundManager");
+        if (resolvedModSounds < 3) {
+            throw new IllegalStateException("Expected starrailexpress revolver, knife & train horn sounds resolved on client SoundManager");
         }
 
         ReplayVideoScript dummyScript = new ReplayVideoScript(view.replay());
@@ -428,7 +427,6 @@ public final class ReplayAudioSelfTest {
         if (script.beats().size() < 2) throw new IllegalStateException("Expected 2 scripted beats");
         double beat0Time = script.beats().get(0).impact();
         double beat1Time = script.beats().get(1).impact();
-        double victoryTime = script.actStart(ReplayVideoScript.Act.VICTORY);
 
         mp4Size = Files.size(mp4Path);
         aviSize = Files.size(aviPath);
@@ -443,11 +441,9 @@ public final class ReplayAudioSelfTest {
         double mp4PreActionQuiet = windowRms(mp4Pcm, 2.80, 3.40);
         mp4Beat0Rms = windowRms(mp4Pcm, beat0Time - 0.05, beat0Time + 0.18);
         mp4Beat1Rms = windowRms(mp4Pcm, beat1Time - 0.05, beat1Time + 0.18);
-        mp4VictoryRms = windowRms(mp4Pcm, victoryTime, victoryTime + 1.00);
-        if (mp4IntroRms < 500 || mp4PreActionQuiet > 150 || mp4Beat0Rms < 1200 || mp4Beat1Rms < 1200 || mp4VictoryRms < 250) {
+        if (mp4IntroRms < 500 || mp4PreActionQuiet > 150 || mp4Beat0Rms < 1200 || mp4Beat1Rms < 1200) {
             throw new IllegalStateException("MP4 audio verification failed: intro=" + mp4IntroRms
-                    + " quiet=" + mp4PreActionQuiet + " beat0=" + mp4Beat0Rms + " beat1=" + mp4Beat1Rms
-                    + " victory=" + mp4VictoryRms);
+                    + " quiet=" + mp4PreActionQuiet + " beat0=" + mp4Beat0Rms + " beat1=" + mp4Beat1Rms);
         }
 
         // Verify exported AVI video + PCM audio alignment.
@@ -456,11 +452,9 @@ public final class ReplayAudioSelfTest {
         double aviPreActionQuiet = windowRms(aviPcm, 2.80, 3.40);
         aviBeat0Rms = windowRms(aviPcm, beat0Time - 0.05, beat0Time + 0.18);
         aviBeat1Rms = windowRms(aviPcm, beat1Time - 0.05, beat1Time + 0.18);
-        aviVictoryRms = windowRms(aviPcm, victoryTime, victoryTime + 1.00);
-        if (aviIntroRms < 500 || aviPreActionQuiet > 150 || aviBeat0Rms < 1200 || aviBeat1Rms < 1200 || aviVictoryRms < 250) {
+        if (aviIntroRms < 500 || aviPreActionQuiet > 150 || aviBeat0Rms < 1200 || aviBeat1Rms < 1200) {
             throw new IllegalStateException("AVI audio verification failed: intro=" + aviIntroRms
-                    + " quiet=" + aviPreActionQuiet + " beat0=" + aviBeat0Rms + " beat1=" + aviBeat1Rms
-                    + " victory=" + aviVictoryRms);
+                    + " quiet=" + aviPreActionQuiet + " beat0=" + aviBeat0Rms + " beat1=" + aviBeat1Rms);
         }
 
         Files.deleteIfExists(mp4Path);
@@ -474,7 +468,8 @@ public final class ReplayAudioSelfTest {
 
     private static ReplayVideoExport startExport(boolean compress) {
         return Objects.requireNonNull(ReplayExportClient.start(ClientReplayBoard.viewAt(boardPos), true,
-                ReplayExportResolution.P480, compress, () -> ClientReplayBoard.viewAt(boardPos)));
+                ReplayExportResolution.P480, compress, com.habitrain.core.scene.replay.ReplayMusicPlan.Level.OFF,
+                () -> ClientReplayBoard.viewAt(boardPos)));
     }
 
     private static void pressEscape(Minecraft mc) {
@@ -546,12 +541,10 @@ public final class ReplayAudioSelfTest {
         report.put("mp4IntroRms", mp4IntroRms);
         report.put("mp4Beat0Rms", mp4Beat0Rms);
         report.put("mp4Beat1Rms", mp4Beat1Rms);
-        report.put("mp4VictoryRms", mp4VictoryRms);
         report.put("aviSize", aviSize);
         report.put("aviIntroRms", aviIntroRms);
         report.put("aviBeat0Rms", aviBeat0Rms);
         report.put("aviBeat1Rms", aviBeat1Rms);
-        report.put("aviVictoryRms", aviVictoryRms);
         report.put("escapeClosedReplayScreensWithoutCancelling", true);
         report.put("backgroundExportCancelled", true);
         report.put("escapePauseRestoredAfterCancellation", true);

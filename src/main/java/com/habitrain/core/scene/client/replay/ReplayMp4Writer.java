@@ -38,13 +38,19 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
     private boolean closed;
 
     ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps) throws IOException {
-        this(ffmpegExecutable, path, width, height, fps, null);
+        this(ffmpegExecutable, path, width, height, fps, null, ReplayExportQuality.DEFAULT);
     }
 
     ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
                     @Nullable short[] soundtrackStereo48k) throws IOException {
+        this(ffmpegExecutable, path, width, height, fps, soundtrackStereo48k, ReplayExportQuality.DEFAULT);
+    }
+
+    ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
+                    @Nullable short[] soundtrackStereo48k, ReplayExportQuality quality) throws IOException {
         Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable");
         Objects.requireNonNull(path, "path");
+        ReplayExportQuality effectiveQuality = quality == null ? ReplayExportQuality.DEFAULT : quality;
         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
             throw new IllegalArgumentException("MP4 dimensions must be positive even integers: " + width + "x" + height);
         }
@@ -62,7 +68,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
             if (soundtrackStereo48k != null && soundtrackStereo48k.length >= AUDIO_CHANNELS) {
                 audioTemp = writeTempPcm(parent != null ? parent : Path.of("."), soundtrackStereo48k);
             }
-            List<String> cmd = buildCommand(ffmpegExecutable, path, width, height, fps, audioTemp);
+            List<String> cmd = buildCommand(ffmpegExecutable, path, width, height, fps, audioTemp, effectiveQuality);
             started = new ProcessBuilder(cmd)
                     .redirectErrorStream(true)
                     .start();
@@ -81,7 +87,13 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
 
     static List<String> buildCommand(Path ffmpegExecutable, Path outputPath, int width, int height, int fps,
                                      @Nullable Path audioPcmFile) {
-        List<String> cmd = new ArrayList<>(36);
+        return buildCommand(ffmpegExecutable, outputPath, width, height, fps, audioPcmFile, ReplayExportQuality.DEFAULT);
+    }
+
+    static List<String> buildCommand(Path ffmpegExecutable, Path outputPath, int width, int height, int fps,
+                                     @Nullable Path audioPcmFile, ReplayExportQuality quality) {
+        ReplayExportQuality q = quality == null ? ReplayExportQuality.DEFAULT : quality;
+        List<String> cmd = new ArrayList<>(44);
         cmd.add(ffmpegExecutable.toAbsolutePath().toString());
         cmd.add("-y");
         cmd.add("-hide_banner");
@@ -114,7 +126,20 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         cmd.add("-preset");
         cmd.add(width >= 2560 ? "fast" : "medium");
         cmd.add("-crf");
-        cmd.add("18");
+        cmd.add(Integer.toString(q.crf));
+        if (q.darkSceneAq) {
+            cmd.add("-aq-mode");
+            cmd.add("3");
+            cmd.add("-aq-strength");
+            cmd.add("0.85");
+        }
+        int maxrateKbps = q.maxrateKbps(width, height);
+        if (maxrateKbps > 0) {
+            cmd.add("-maxrate");
+            cmd.add(maxrateKbps + "k");
+            cmd.add("-bufsize");
+            cmd.add(q.bufsizeKbps(width, height) + "k");
+        }
         cmd.add("-pix_fmt");
         cmd.add("yuv420p");
         cmd.add("-colorspace");
@@ -129,7 +154,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
             cmd.add("-c:a");
             cmd.add("aac");
             cmd.add("-b:a");
-            cmd.add("192k");
+            cmd.add(q.audioBitrateKbps + "k");
             cmd.add("-shortest");
         }
         cmd.add("-movflags");

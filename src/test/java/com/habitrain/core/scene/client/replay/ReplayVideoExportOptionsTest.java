@@ -37,6 +37,109 @@ class ReplayVideoExportOptionsTest {
     }
 
     @Test
+    void qualityPresetsDefaultToBalancedAndBuildExpectedFfmpegFlags() {
+        assertEquals(ReplayExportQuality.BALANCED, ReplayExportQuality.DEFAULT);
+        assertEquals(ReplayExportQuality.BALANCED, ReplayExportQuality.fromId(null));
+        assertEquals(ReplayExportQuality.BALANCED, ReplayExportQuality.fromId(""));
+        assertEquals(ReplayExportQuality.BALANCED, ReplayExportQuality.fromId("unknown"));
+        assertEquals(ReplayExportQuality.LIGHT, ReplayExportQuality.fromId("  LIGHT "));
+        assertEquals(ReplayExportQuality.ORIGINAL, ReplayExportQuality.fromId("original"));
+
+        ReplayExportQuality q = ReplayExportQuality.LIGHT;
+        for (int i = 0; i < ReplayExportQuality.values().length; i++) {
+            assertEquals(q, q.next().previous());
+            assertEquals(q, ReplayExportQuality.fromId(q.id));
+            q = q.next();
+        }
+        assertEquals(ReplayExportQuality.LIGHT, q);
+
+        assertTrue(ReplayExportQuality.LIGHT.maxrateKbps(1920, 1080)
+                < ReplayExportQuality.BALANCED.maxrateKbps(1920, 1080));
+        assertTrue(ReplayExportQuality.BALANCED.maxrateKbps(1280, 720)
+                < ReplayExportQuality.BALANCED.maxrateKbps(1920, 1080));
+        assertEquals(0, ReplayExportQuality.ORIGINAL.maxrateKbps(1920, 1080));
+        assertEquals(0.0, ReplayExportQuality.LIGHT.mp4GrainAlpha);
+        assertEquals(0.0, ReplayExportQuality.BALANCED.mp4GrainAlpha);
+        assertTrue(ReplayExportQuality.ORIGINAL.mp4GrainAlpha > 0.0);
+
+        Path ffmpeg = Path.of("ffmpeg");
+        Path out = Path.of("out.mp4");
+        Path audio = Path.of("audio.pcm");
+
+        var lightCmd = ReplayMp4Writer.buildCommand(ffmpeg, out, 1920, 1080, 30, audio, ReplayExportQuality.LIGHT);
+        assertTrue(lightCmd.contains("25"));
+        assertTrue(lightCmd.contains("-aq-mode"));
+        assertTrue(lightCmd.contains("-maxrate"));
+        assertTrue(lightCmd.contains("128k"));
+
+        var balancedCmd = ReplayMp4Writer.buildCommand(ffmpeg, out, 1920, 1080, 30, audio, ReplayExportQuality.BALANCED);
+        assertTrue(balancedCmd.contains("23"));
+        assertTrue(balancedCmd.contains("-aq-mode"));
+        assertTrue(balancedCmd.contains("-maxrate"));
+        assertTrue(balancedCmd.contains("160k"));
+
+        var originalCmd = ReplayMp4Writer.buildCommand(ffmpeg, out, 1920, 1080, 30, audio, ReplayExportQuality.ORIGINAL);
+        assertTrue(originalCmd.contains("18"));
+        assertFalse(originalCmd.contains("-maxrate"));
+        assertTrue(originalCmd.contains("192k"));
+    }
+
+    @Test
+    void exportOptionsAndStatusFitShortGuiHeights() {
+        for (int panelHeight : new int[]{174, 210, 232, 268, 298, 334}) {
+            var main = ReplayExportScreen.ExportLayout.forMain(panelHeight);
+            assertTrue(main.sectionY(0) + main.optionHeight() <= main.sectionY(1) - 10,
+                    "main section 0 overlaps section 1 at panelHeight " + panelHeight);
+            assertTrue(main.sectionY(1) + main.optionHeight() <= main.sectionY(ReplayExportScreen.MAIN_PROGRESS_SECTION) - 6,
+                    "main section 1 overlaps progress bar at panelHeight " + panelHeight);
+            assertTrue(main.sectionY(ReplayExportScreen.MAIN_PROGRESS_SECTION) + 7 + 9 <= main.buttonsY(),
+                    "progress status overlaps bottom buttons at panelHeight " + panelHeight);
+            assertTrue(main.buttonsY() + 20 <= panelHeight,
+                    "main bottom buttons overflow panelHeight " + panelHeight);
+
+            var settings = ReplayExportScreen.ExportLayout.forSettings(panelHeight);
+            for (int i = 0; i < ReplayExportScreen.SETTINGS_SECTION_COUNT - 1; i++) {
+                assertTrue(settings.sectionY(i) + settings.optionHeight() <= settings.sectionY(i + 1) - 10,
+                        "settings section " + i + " overlaps at panelHeight " + panelHeight);
+            }
+            int last = ReplayExportScreen.SETTINGS_SECTION_COUNT - 1;
+            assertTrue(settings.sectionY(last) + settings.optionHeight() <= settings.buttonsY() - 6,
+                    "last settings section overlaps collapse button at panelHeight " + panelHeight);
+            assertTrue(settings.buttonsY() + 20 <= panelHeight,
+                    "settings collapse button overflows panelHeight " + panelHeight);
+        }
+    }
+
+    @Test
+    void focusPlayerFileSlugSanitizesUnsafeCharacters() {
+        assertNull(ReplayVideoExport.sanitizeFileSlug(null));
+        assertNull(ReplayVideoExport.sanitizeFileSlug("   "));
+        assertNull(ReplayVideoExport.sanitizeFileSlug("///"));
+        assertEquals("Steve_01", ReplayVideoExport.sanitizeFileSlug(" Steve/01 "));
+        assertEquals("玩家A", ReplayVideoExport.sanitizeFileSlug("玩家A:test").substring(0, 3));
+        assertEquals(24, ReplayVideoExport.sanitizeFileSlug("abcdefghijklmnopqrstuvwxyz123456").length());
+    }
+
+    @Test
+    void clusterPicksOneBlastAndDoesNotDimAnotherFloor() {
+        var kill = com.habitrain.core.api.match.replay.LastMatchReplay.Kind.KILL;
+        var explosion = com.habitrain.core.api.match.replay.LastMatchReplay.Kind.GRENADE_EXPLOSION;
+        var bursts = java.util.List.of(
+                new ReplayVideoFx.Burst(0, 1.0, 0, 0, 10, kill),
+                new ReplayVideoFx.Burst(1, 1.1, 0, 0, 10, explosion),
+                new ReplayVideoFx.Burst(2, 1.2, 0, 0, 10, explosion),
+                new ReplayVideoFx.Burst(3, 1.1, 0, 0, 13, kill));
+        float[] intensity = new float[4];
+        boolean[] primary = new boolean[4];
+        ReplayVideoFx.clusterBursts(bursts, intensity, primary);
+        assertArrayEquals(new boolean[]{false, true, false, true}, primary);
+        assertTrue(intensity[0] < 1f);
+        assertEquals(intensity[0], intensity[1]);
+        assertEquals(intensity[1], intensity[2]);
+        assertEquals(1f, intensity[3]);
+    }
+
+    @Test
     void mp4WriterPreservesNonMacroblockDimensionsVerticalFlipAndMultiGopStream(@TempDir Path tempDir) throws Exception {
         Path ffmpeg = ReplayFfmpegManager.resolveAvailable(null, null);
         Assumptions.assumeTrue(ffmpeg != null, "FFmpeg is required to test external MP4 export");
@@ -101,31 +204,49 @@ class ReplayVideoExportOptionsTest {
         int w = 640, h = 360;
         byte[] frame = new byte[w * h * 3];
         byte[] referenceFrame15 = new byte[w * h * 3];
-        Path mp4 = tempDir.resolve("compressed.mp4");
+        Path mp4Light = tempDir.resolve("light.mp4");
+        Path mp4Balanced = tempDir.resolve("balanced.mp4");
+        Path mp4Original = tempDir.resolve("original.mp4");
         Path avi = tempDir.resolve("uncompressed.avi");
 
-        try (ReplayVideoWriter mp4Writer = new ReplayMp4Writer(ffmpeg, mp4, w, h, 30);
+        try (ReplayVideoWriter lightWriter = new ReplayMp4Writer(ffmpeg, mp4Light, w, h, 30, null, ReplayExportQuality.LIGHT);
+             ReplayVideoWriter balancedWriter = new ReplayMp4Writer(ffmpeg, mp4Balanced, w, h, 30, null, ReplayExportQuality.BALANCED);
+             ReplayVideoWriter originalWriter = new ReplayMp4Writer(ffmpeg, mp4Original, w, h, 30, null, ReplayExportQuality.ORIGINAL);
              ReplayVideoWriter aviWriter = new ReplayAviWriter(avi, w, h, 30)) {
             for (int f = 0; f < 30; f++) {
                 populateSceneFrame(frame, w, h, f);
                 if (f == 15) System.arraycopy(frame, 0, referenceFrame15, 0, frame.length);
-                mp4Writer.add(frame);
+                lightWriter.add(frame);
+                balancedWriter.add(frame);
+                originalWriter.add(frame);
                 aviWriter.add(frame);
             }
-            mp4Writer.finish();
+            lightWriter.finish();
+            balancedWriter.finish();
+            originalWriter.finish();
             aviWriter.finish();
         }
 
-        long mp4Bytes = Files.size(mp4);
+        long lightBytes = Files.size(mp4Light);
+        long balancedBytes = Files.size(mp4Balanced);
+        long originalBytes = Files.size(mp4Original);
         long aviBytes = Files.size(avi);
-        assertTrue(mp4Bytes > 0 && aviBytes > 0);
-        assertTrue(mp4Bytes * 3 < aviBytes,
-                "Expected H.264 MP4 (" + mp4Bytes + " B) to be < 1/3 of MJPG AVI (" + aviBytes + " B)");
+        assertTrue(lightBytes > 0 && balancedBytes > 0 && originalBytes > 0 && aviBytes > 0);
+        assertTrue(lightBytes < balancedBytes,
+                "Expected LIGHT (" + lightBytes + " B) < BALANCED (" + balancedBytes + " B)");
+        assertTrue(balancedBytes < originalBytes,
+                "Expected BALANCED (" + balancedBytes + " B) < ORIGINAL (" + originalBytes + " B)");
+        assertTrue(balancedBytes * 3 < aviBytes,
+                "Expected H.264 MP4 (" + balancedBytes + " B) to be < 1/3 of MJPG AVI (" + aviBytes + " B)");
 
-        byte[] decoded15 = decodeSingleFrameRgb24(ffmpeg, mp4, 15);
-        assertEquals(w * h * 3, decoded15.length);
-        double psnr = computeTopDownRgbVsBottomUpBgrPsnr(decoded15, referenceFrame15, w, h);
-        assertTrue(psnr > 34.0, "Expected sharp H.264 output with PSNR > 34 dB, got " + psnr + " dB");
+        byte[] decodedBalanced15 = decodeSingleFrameRgb24(ffmpeg, mp4Balanced, 15);
+        assertEquals(w * h * 3, decodedBalanced15.length);
+        double balancedPsnr = computeTopDownRgbVsBottomUpBgrPsnr(decodedBalanced15, referenceFrame15, w, h);
+        assertTrue(balancedPsnr > 34.0, "Expected sharp BALANCED H.264 output with PSNR > 34 dB, got " + balancedPsnr + " dB");
+
+        byte[] decodedLight15 = decodeSingleFrameRgb24(ffmpeg, mp4Light, 15);
+        double lightPsnr = computeTopDownRgbVsBottomUpBgrPsnr(decodedLight15, referenceFrame15, w, h);
+        assertTrue(lightPsnr > 32.0, "Expected clean LIGHT H.264 output with PSNR > 32 dB, got " + lightPsnr + " dB");
     }
 
     @Test
@@ -143,6 +264,27 @@ class ReplayVideoExportOptionsTest {
         ReplayVideoExport.aberrate(bgr2560, row2560, 2560, 2, 1.0f);
         // At 2560 width (2x), shift = 14 -> proportional visual offset
         assertEquals((byte) 255, bgr2560[(1280 - 14) * 3 + 2]);
+
+        // Verify branchless fast aberrate matches exact reference formula across left, middle, and right clamp zones.
+        int w = 1280, h = 3;
+        byte[] actual = new byte[w * h * 3];
+        byte[] expected = new byte[w * h * 3];
+        for (int i = 0; i < actual.length; i++) {
+            actual[i] = expected[i] = (byte) ((i * 37 + 11) & 0xFF);
+        }
+        ReplayVideoExport.aberrate(actual, new byte[w * 3], w, h, 1.0f);
+        int shift = 7, stride = w * 3;
+        byte[] refRow = new byte[stride];
+        for (int y = 0; y < h; y++) {
+            int base = y * stride;
+            System.arraycopy(expected, base, refRow, 0, stride);
+            for (int x = 0; x < w; x++) {
+                int red = Math.min(w - 1, x + shift), blue = Math.max(0, x - shift);
+                expected[base + x * 3 + 2] = refRow[red * 3 + 2];
+                expected[base + x * 3] = refRow[blue * 3];
+            }
+        }
+        assertArrayEquals(expected, actual);
     }
 
     private static byte[] decodeSingleFrameRgb24(Path ffmpeg, Path mp4, int frameIndex) throws IOException, InterruptedException {

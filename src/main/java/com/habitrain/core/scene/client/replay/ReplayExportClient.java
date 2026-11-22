@@ -1,9 +1,11 @@
 package com.habitrain.core.scene.client.replay;
 
+import com.habitrain.core.client.config.ClientVisualPreferences;
 import com.habitrain.core.network.replay.ReplayPackets.RequestVoiceExportC2S;
 import com.habitrain.core.network.replay.ReplayPackets.VoiceExportAccessS2C;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.client.ReplayHistoryClient;
+import com.habitrain.core.scene.replay.ReplayMusicPlan;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
@@ -41,6 +43,27 @@ public final class ReplayExportClient {
 
     static @Nullable ReplayVideoExport start(ClientReplayBoard.View view, boolean fullBody, ReplayExportResolution resolution,
                                              boolean compress, Supplier<ClientReplayBoard.View> source) {
+        return start(view, fullBody, resolution, compress,
+                ReplayExportQuality.fromId(ClientVisualPreferences.getReplayVideoQuality()),
+                ReplayMusicPlan.Level.fromId(ClientVisualPreferences.getReplayVideoMusic()), null, source);
+    }
+
+    static @Nullable ReplayVideoExport start(ClientReplayBoard.View view, boolean fullBody, ReplayExportResolution resolution,
+                                             boolean compress, ReplayMusicPlan.Level music, Supplier<ClientReplayBoard.View> source) {
+        return start(view, fullBody, resolution, compress,
+                ReplayExportQuality.fromId(ClientVisualPreferences.getReplayVideoQuality()), music, null, source);
+    }
+
+    static @Nullable ReplayVideoExport start(ClientReplayBoard.View view, boolean fullBody, ReplayExportResolution resolution,
+                                             boolean compress, ReplayMusicPlan.Level music,
+                                             @Nullable java.util.UUID focusPlayer, Supplier<ClientReplayBoard.View> source) {
+        return start(view, fullBody, resolution, compress,
+                ReplayExportQuality.fromId(ClientVisualPreferences.getReplayVideoQuality()), music, focusPlayer, source);
+    }
+
+    static @Nullable ReplayVideoExport start(ClientReplayBoard.View view, boolean fullBody, ReplayExportResolution resolution,
+                                             boolean compress, ReplayExportQuality quality, ReplayMusicPlan.Level music,
+                                             @Nullable java.util.UUID focusPlayer, Supplier<ClientReplayBoard.View> source) {
         if (!canStart() || !mapReady(view) || (!compress && !resolution.aviSupported())) return null;
         java.nio.file.Path ffmpeg = null;
         if (compress) {
@@ -50,7 +73,7 @@ public final class ReplayExportClient {
             if (ffmpeg == null) return null;
         }
         releasePinnedRound();
-        video = new ReplayVideoExport(view, fullBody, resolution, compress, ffmpeg);
+        video = new ReplayVideoExport(view, fullBody, resolution, compress, quality, ffmpeg, music, focusPlayer);
         pinnedRound = view.replay().roundId();
         ReplayHistoryClient.pin(pinnedRound);
         voiceSource = view.voiceReady() ? null : source;

@@ -1,11 +1,14 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.scene.asset.SceneAssetCodec;
 import com.habitrain.core.client.render.ClientRenderState;
+import com.habitrain.core.scene.replay.ReplayRoofCutaway;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.client.ReplayHistoryClient;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import com.habitrain.core.scene.client.SceneMeshSet;
+import com.habitrain.core.scene.replay.ReplayMusicPlan;
 import com.habitrain.core.scene.replay.ReplayTrackSampler;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
 import com.mojang.blaze3d.pipeline.TextureTarget;
@@ -20,6 +23,8 @@ import org.jetbrains.annotations.Nullable;
 import org.joml.Vector3f;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
+import org.lwjgl.opengl.GL15;
+import org.lwjgl.opengl.GL21;
 import org.lwjgl.opengl.GL30;
 import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
@@ -52,12 +57,16 @@ final class ReplayVideoExport {
 
     final ReplayExportResolution resolution;
     final boolean compress;
+    final ReplayExportQuality quality;
+    final ReplayMusicPlan.Level music;
+    final @Nullable UUID focusPlayer;
     private final @Nullable Path ffmpegExecutable;
     private final boolean fullBody;
     private final UUID roundId;
     private final int frameBytes;
     private ClientReplayBoard.View snapshot;
     private long meshDeadline;
+    private @Nullable SceneAssetCodec.AssetData reviewAsset;
     private ReplayBoardModel model;
     private ReplayVideoScript script;
     private ReplayVideoFx fx;
@@ -65,10 +74,16 @@ final class ReplayVideoExport {
     private Map<UUID, net.minecraft.resources.ResourceLocation> exportSkins = Map.of();
     private ReplayVideoCamera.Subjects subjects;
     private ReplayVideoCamera.Stage cameraStage;
+    private static final int PBO_COUNT = 2;
     private TextureTarget target;
     private ByteBuffer pixels;
+    private int @Nullable [] pbos;
+    private boolean pboUnavailable;
+    private int pendingPbo = -1;
+    private float pendingAberration;
     private Encoder encoder;
     private java.util.concurrent.FutureTask<short[]> audioTask;
+    private int submitted;
     private int captured;
     private final long voiceDeadline = System.nanoTime() + PREPARE_LIMIT_NS;
     private @Nullable Boolean voiceExportAllowed;
@@ -79,11 +94,31 @@ final class ReplayVideoExport {
 
     ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution,
                       boolean compress, @Nullable Path ffmpegExecutable) {
+        this(snapshot, fullBody, resolution, compress, ffmpegExecutable, ReplayMusicPlan.Level.OFF, null);
+    }
+
+    ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution,
+                      boolean compress, @Nullable Path ffmpegExecutable, ReplayMusicPlan.Level music) {
+        this(snapshot, fullBody, resolution, compress, ffmpegExecutable, music, null);
+    }
+
+    ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution,
+                      boolean compress, @Nullable Path ffmpegExecutable, ReplayMusicPlan.Level music,
+                      @Nullable UUID focusPlayer) {
+        this(snapshot, fullBody, resolution, compress, ReplayExportQuality.DEFAULT, ffmpegExecutable, music, focusPlayer);
+    }
+
+    ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution,
+                      boolean compress, ReplayExportQuality quality, @Nullable Path ffmpegExecutable,
+                      ReplayMusicPlan.Level music, @Nullable UUID focusPlayer) {
         this.snapshot = snapshot;
         this.roundId = Objects.requireNonNull(snapshot.replay(), "replay").roundId();
         this.fullBody = fullBody;
         this.resolution = Objects.requireNonNull(resolution, "resolution");
         this.compress = compress;
+        this.quality = quality == null ? ReplayExportQuality.DEFAULT : quality;
+        this.music = music == null ? ReplayMusicPlan.Level.OFF : music;
+        this.focusPlayer = focusPlayer;
         this.ffmpegExecutable = compress ? Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable") : null;
         this.frameBytes = resolution.frameBytes();
         if (snapshot.asset() != null) ReplayDioramaMesh.retry(snapshot.asset().fingerprint);
@@ -163,6 +198,9 @@ final class ReplayVideoExport {
             // A world switch or resource reload can invalidate the GPU mesh, so rebuild it from that map.
             var asset = view.asset();
             if (asset == null) throw new IOException("Replay map asset unavailable");
+            if (reviewAsset != null && script.sample(submitted / (double) FPS).act() == ReplayVideoScript.Act.REVIEW) {
+                asset = reviewAsset;
+            }
             ReplayDioramaMesh.update(asset, view.presentSections(), view.totalSections());
             if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(asset.fingerprint, view.totalSections()))) {
                 throw new IOException("Could not build the complete replay map");
@@ -186,15 +224,22 @@ final class ReplayVideoExport {
                 if (waitingForVoiceAccess() || waitingForVoice()) return;
                 if (audioTask == null) {
                     model = new ReplayBoardModel(view.replay(), view.timeline());
+                    if (!fullBody && model.roofCutLayer > 0) {
+                        var cut = ReplayRoofCutaway.apply(asset, model.roofCutLayer);
+                        if (cut != asset && !cut.sections.isEmpty()) {
+                            reviewAsset = cut;
+                            ReplayDioramaMesh.retry(cut.fingerprint);
+                        }
+                    }
                     for (var actor : model.actors) ReplayHeadSkins.texture(actor.p.id());
-                    script = new ReplayVideoScript(view.replay());
+                    script = new ReplayVideoScript(view.replay(), focusPlayer);
                     fx = new ReplayVideoFx(script, model);
-                    overlay = new ReplayVideoOverlay(script, model, compress);
+                    overlay = new ReplayVideoOverlay(script, model, compress, quality);
                     subjects = new ModelSubjects(model);
                     cameraStage = new ReplayVideoCamera.Stage(ReplayBoardRenderer.trayHalfSize(model), model.mapW, model.mapD, model.mapH,
                             (float) Math.max(model.mapH, mesh.replayCeiling() * model.scale), ReplayActorSizing.baseSize(model.scale));
                     ReplayVoiceData voice = voiceExportRestricted() ? ReplayVoiceData.EMPTY : view.voice();
-                    var audio = ReplayVideoAudioRenderer.prepare(client, view.replay(), script, voice, script.frames(FPS));
+                    var audio = ReplayVideoAudioRenderer.prepare(client, view.replay(), script, voice, script.frames(FPS), music);
                     audioTask = new java.util.concurrent.FutureTask<>(audio::get);
                     Thread.ofPlatform().daemon().name("habitrain-replay-audio-mix").start(audioTask);
                     return;
@@ -206,19 +251,57 @@ final class ReplayVideoExport {
                 catch (java.util.concurrent.ExecutionException failure) { throw new IOException("Could not prepare replay audio", failure.getCause()); }
                 audioTask = null;
                 exportSkins = ReplayHeadSkins.snapshot(model);
-                pixels = MemoryUtil.memAlloc(frameBytes);
-                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress,
-                        ffmpegExecutable, script.frames(FPS), soundtrack);
+                var focusData = model.participantData(script.focusPlayer());
+                String focusSlug = focusData == null ? null : sanitizeFileSlug(focusData.name());
+                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress, quality,
+                        ffmpegExecutable, script.frames(FPS), soundtrack, focusSlug);
                 encoder.thread.start();
             }
 
-            VideoFrame frame = encoder.pool.poll();
-            if (frame == null) return; // The encoder can never build an unbounded backlog.
-            capture(client, mesh, captured, frame);
-            if (!encoder.pending.offer(frame)) throw new IllegalStateException("Video frame queue full");
-            captured++;
-            if (captured >= encoder.frames) {
-                releaseRenderResources();
+            if (pendingPbo >= 0) {
+                VideoFrame ready = encoder.pool.poll();
+                if (ready == null) return; // The encoder can never build an unbounded backlog.
+                try {
+                    drainPbo(pbos[pendingPbo], ready);
+                } catch (IOException | RuntimeException failure) {
+                    disablePbos(failure);
+                    // The export framebuffer still holds this frame, even if its PBO was corrupted.
+                    readPixels(0, ready);
+                }
+                ready.aberration = pendingAberration;
+                pendingPbo = -1;
+                if (!encoder.pending.offer(ready)) throw new IllegalStateException("Video frame queue full");
+                captured++;
+                if (captured >= encoder.frames) {
+                    releaseRenderResources();
+                    return;
+                }
+            }
+
+            if (submitted < encoder.frames) {
+                ensurePbos();
+                if (!pboUnavailable && pbos != null) {
+                    int slot = submitted % PBO_COUNT;
+                    try {
+                        pendingAberration = capture(client, mesh, submitted, null, pbos[slot]);
+                        pendingPbo = slot;
+                        submitted++;
+                    } catch (PboReadException failure) {
+                        disablePbos(failure);
+                        // No frame was submitted. Capture this index through the fallback below.
+                    }
+                }
+                if (pboUnavailable) {
+                    VideoFrame frame = encoder.pool.poll();
+                    if (frame == null) return; // The encoder can never build an unbounded backlog.
+                    frame.aberration = capture(client, mesh, submitted, frame, 0);
+                    if (!encoder.pending.offer(frame)) throw new IllegalStateException("Video frame queue full");
+                    submitted++;
+                    captured++;
+                    if (captured >= encoder.frames) {
+                        releaseRenderResources();
+                    }
+                }
             }
         } catch (IOException | RuntimeException failure) {
             failed = true;
@@ -228,7 +311,109 @@ final class ReplayVideoExport {
         }
     }
 
-    private void capture(Minecraft client, SceneMeshSet mesh, int index, VideoFrame output) {
+    private void ensurePbos() {
+        if (pbos != null || pboUnavailable) return;
+        int prevPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        int[] created = new int[PBO_COUNT];
+        try {
+            clearGlErrors();
+            GL15.glGenBuffers(created);
+            checkGl("generate pixel pack buffers");
+            for (int id : created) {
+                if (id == 0) {
+                    GL15.glDeleteBuffers(created);
+                    pboUnavailable = true;
+                    return;
+                }
+                GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, id);
+                GL15.glBufferData(GL21.GL_PIXEL_PACK_BUFFER, frameBytes, GL15.GL_STREAM_READ);
+                checkGl("allocate pixel pack buffer");
+            }
+            pbos = created;
+        } catch (IOException | RuntimeException failure) {
+            GL15.glDeleteBuffers(created);
+            pboUnavailable = true;
+            LOGGER.debug("Falling back to synchronous replay readback after PBO setup failure", failure);
+        } finally {
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, prevPackBuffer);
+        }
+    }
+
+    private void drainPbo(int pboId, VideoFrame output) throws IOException {
+        int prevPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        try {
+            clearGlErrors();
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pboId);
+            checkGl("bind pending pixel pack buffer");
+            ByteBuffer mapped = GL30.glMapBufferRange(GL21.GL_PIXEL_PACK_BUFFER, 0L, frameBytes, GL30.GL_MAP_READ_BIT);
+            if (mapped == null) throw new IOException("Could not map pending pixel pack buffer");
+            boolean valid;
+            try {
+                mapped.get(0, output.data);
+            } finally {
+                valid = GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
+            }
+            if (!valid) throw new IOException("Pending pixel pack buffer was corrupted");
+            checkGl("read pending pixel pack buffer");
+        } finally {
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, prevPackBuffer);
+        }
+    }
+
+    private static void clearGlErrors() {
+        for (int i = 0; i < 16 && GL11.glGetError() != GL11.GL_NO_ERROR; i++) {
+            // Isolate the following operation without looping indefinitely after context loss.
+        }
+    }
+
+    private static void checkGl(String operation) throws IOException {
+        int error = GL11.glGetError();
+        if (error != GL11.GL_NO_ERROR) throw new IOException(operation + " failed (GL 0x" + Integer.toHexString(error) + ")");
+    }
+
+    private static final class PboReadException extends IOException {
+        PboReadException(Exception cause) { super(cause); }
+    }
+
+    private void readPixels(int pboId, @Nullable VideoFrame output) throws IOException {
+        int read = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+        int prevPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        int packAlignment = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT);
+        int rowLength = GL11.glGetInteger(GL11.GL_PACK_ROW_LENGTH);
+        int skipRows = GL11.glGetInteger(GL11.GL_PACK_SKIP_ROWS);
+        int skipPixels = GL11.glGetInteger(GL11.GL_PACK_SKIP_PIXELS);
+        try {
+            clearGlErrors();
+            GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, target.frameBufferId);
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pboId);
+            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
+            GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH, 0);
+            GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS, 0);
+            GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS, 0);
+            checkGl("prepare replay readback");
+            if (pboId != 0) {
+                GL11.glReadPixels(0, 0, resolution.width, resolution.height, GL12.GL_BGR, GL11.GL_UNSIGNED_BYTE, 0L);
+            } else {
+                if (pixels == null) pixels = MemoryUtil.memAlloc(frameBytes);
+                pixels.clear();
+                GL11.glReadPixels(0, 0, resolution.width, resolution.height, GL12.GL_BGR, GL11.GL_UNSIGNED_BYTE, pixels);
+            }
+            checkGl("read replay pixels");
+            if (output != null) pixels.get(0, output.data);
+        } catch (IOException | RuntimeException failure) {
+            if (pboId != 0) throw new PboReadException(failure);
+            throw failure;
+        } finally {
+            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, packAlignment);
+            GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH, rowLength);
+            GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS, skipRows);
+            GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS, skipPixels);
+            GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, prevPackBuffer);
+            GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, read);
+        }
+    }
+
+    private float capture(Minecraft client, SceneMeshSet mesh, int index, @Nullable VideoFrame output, int pboId) throws IOException {
         int exportWidth = resolution.width;
         int exportHeight = resolution.height;
         double time = index / (double) FPS;
@@ -243,7 +428,6 @@ final class ReplayVideoExport {
         GL11.glGetIntegerv(GL11.GL_VIEWPORT, viewport);
         float fogStart = RenderSystem.getShaderFogStart(), fogEnd = RenderSystem.getShaderFogEnd();
         int lightTexture = RenderSystem.getShaderTexture(2);
-        int packAlignment = GL11.glGetInteger(GL11.GL_PACK_ALIGNMENT);
         var projection = RenderSystem.getProjectionMatrix();
         var sorting = RenderSystem.getVertexSorting();
         var modelView = RenderSystem.getModelViewStack().pushMatrix();
@@ -270,23 +454,19 @@ final class ReplayVideoExport {
             RenderSystem.defaultBlendFunc();
             FogRenderer.setupNoFog();
             client.gameRenderer.lightTexture().turnOnLightLayer();
-            var heads = ReplayBoardRenderer.drawVideoFrame(client, model, frame, stage, sample.world(), shot, mesh, fullBody, fx);
+            var heads = ReplayBoardRenderer.drawVideoFrame(client, model, frame, stage, sample.world(), shot, mesh, fullBody, fx,
+                    script.focusPlayer());
 
             canvas.begin();
             overlay.foreground(canvas, time, sample, shot, index, heads);
             RenderSystem.enableDepthTest();
 
-            GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, target.frameBufferId);
-            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
-            pixels.clear();
-            GL11.glReadPixels(0, 0, exportWidth, exportHeight, GL12.GL_BGR, GL11.GL_UNSIGNED_BYTE, pixels);
-            pixels.get(0, output.data);
-            output.aberration = (float) overlay.aberration(time);
+            readPixels(pboId, output);
+            return (float) overlay.aberration(time);
         } finally {
             GlStateManager._glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, draw);
             GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, read);
             RenderSystem.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, packAlignment);
             modelView.popMatrix();
             RenderSystem.applyModelViewMatrix();
             RenderSystem.setProjectionMatrix(projection, sorting);
@@ -315,6 +495,7 @@ final class ReplayVideoExport {
     void releaseRenderResources() {
         if (audioTask != null) { audioTask.cancel(true); audioTask = null; }
         snapshot = null;
+        reviewAsset = null;
         model = null;
         script = null;
         fx = null;
@@ -334,7 +515,29 @@ final class ReplayVideoExport {
                 GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, read == removed ? 0 : read);
             }
         }
+        pendingPbo = -1;
+        deletePbos();
         if (pixels != null) { MemoryUtil.memFree(pixels); pixels = null; }
+    }
+
+    private void disablePbos(Exception failure) {
+        pboUnavailable = true;
+        deletePbos();
+        LOGGER.debug("Falling back to synchronous replay readback", failure);
+    }
+
+    private void deletePbos() {
+        if (pbos != null) {
+            int prevPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+            boolean rebound = false;
+            for (int id : pbos) if (id != 0 && id == prevPackBuffer) { rebound = true; break; }
+            if (rebound) GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
+            try {
+                GL15.glDeleteBuffers(pbos);
+            } finally {
+                pbos = null;
+            }
+        }
     }
 
     /** Board-frame positions of the match's subjects for the camera crew. */
@@ -412,23 +615,49 @@ final class ReplayVideoExport {
     /** Lateral RGB split for impact frames, on bottom-up BGR rows. */
     static void aberrate(byte[] bgr, byte[] row, int width, int height, float strength) {
         int shift = Math.round(strength * 7f * width / ReplayVideoCanvas.DESIGN_WIDTH);
-        if (shift <= 0) return;
+        if (shift <= 0 || width <= 0 || height <= 0) return;
         int stride = width * 3;
+        int clampedShift = Math.min(shift, width - 1);
+        int byteShift = clampedShift * 3;
+        int rightStart = width - clampedShift;
+        int leftLimit = Math.min(clampedShift, rightStart);
+        int lastRedOffset = stride - 1;
         for (int y = 0; y < height; y++) {
             int base = y * stride;
             System.arraycopy(bgr, base, row, 0, stride);
-            for (int x = 0; x < width; x++) {
-                int red = Math.min(width - 1, x + shift), blue = Math.max(0, x - shift);
-                bgr[base + x * 3 + 2] = row[red * 3 + 2];
-                bgr[base + x * 3] = row[blue * 3];
+            byte firstBlue = row[0];
+            byte lastRed = row[lastRedOffset];
+            int dst = base;
+            for (int x = 0; x < leftLimit; x++, dst += 3) {
+                bgr[dst] = firstBlue;
+                bgr[dst + 2] = row[(x + clampedShift) * 3 + 2];
+            }
+            int midSrcBlue = 0;
+            int midSrcRed = byteShift * 2 + 2;
+            for (int x = leftLimit; x < rightStart; x++, dst += 3, midSrcBlue += 3, midSrcRed += 3) {
+                bgr[dst] = row[midSrcBlue];
+                bgr[dst + 2] = row[midSrcRed];
+            }
+            for (int x = rightStart; x < width; x++, dst += 3) {
+                int blueIdx = x >= shift ? (x - shift) * 3 : 0;
+                bgr[dst] = row[blueIdx];
+                bgr[dst + 2] = lastRed;
             }
         }
+    }
+
+    static @Nullable String sanitizeFileSlug(@Nullable String raw) {
+        if (raw == null || raw.isBlank()) return null;
+        String cleaned = raw.trim().replaceAll("[\\\\/:*?\"<>|\\s]+", "_").replaceAll("^_+|_+$", "");
+        if (cleaned.isEmpty()) return null;
+        return cleaned.length() > 24 ? cleaned.substring(0, 24) : cleaned;
     }
 
     private static final class Encoder implements Runnable {
         final int frames;
         final ReplayExportResolution resolution;
         final boolean compress;
+        final ReplayExportQuality quality;
         final @Nullable Path ffmpegExecutable;
         short[] soundtrack;
         final Path directory, output;
@@ -441,20 +670,23 @@ final class ReplayVideoExport {
         private boolean committing;
 
         Encoder(Path directory, UUID round, ReplayExportResolution resolution, boolean compress,
-                @Nullable Path ffmpegExecutable, int frames, short[] soundtrack) {
+                ReplayExportQuality quality, @Nullable Path ffmpegExecutable, int frames,
+                short[] soundtrack, @Nullable String focusSlug) {
             this.directory = directory;
             this.resolution = resolution;
             this.compress = compress;
+            this.quality = quality == null ? ReplayExportQuality.DEFAULT : quality;
             this.ffmpegExecutable = ffmpegExecutable;
             this.frames = frames;
             this.soundtrack = soundtrack == null ? new short[0] : soundtrack;
-            int poolSize = resolution.highLoad() ? 2 : 3;
+            int poolSize = resolution.highLoad() ? 2 : 4;
             this.pool = new ArrayBlockingQueue<>(poolSize);
             this.pending = new ArrayBlockingQueue<>(poolSize);
             String date = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
             String ext = compress ? ".mp4" : ".avi";
+            String focusPart = focusSlug == null || focusSlug.isBlank() ? "" : "-" + focusSlug;
             output = directory.resolve("replay-" + date + "-" + round.toString().substring(0, 8)
-                    + "-" + resolution.id + "-" + UUID.randomUUID().toString().substring(0, 8) + ext);
+                    + focusPart + "-" + resolution.id + "-" + UUID.randomUUID().toString().substring(0, 8) + ext);
             int frameBytes = resolution.frameBytes();
             for (int i = 0; i < poolSize; i++) pool.add(new VideoFrame(frameBytes));
             thread.setDaemon(true);
@@ -476,7 +708,7 @@ final class ReplayVideoExport {
                 Files.createDirectories(directory);
                 temp = Files.createTempFile(directory, ".replay-", ".part");
                 try (ReplayVideoWriter writer = compress
-                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, soundtrack)
+                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, soundtrack, quality)
                         : new ReplayAviWriter(temp, width, height, FPS, true)) {
                     while (written < frames && !cancelled) {
                         VideoFrame frame = pending.poll(250, TimeUnit.MILLISECONDS);

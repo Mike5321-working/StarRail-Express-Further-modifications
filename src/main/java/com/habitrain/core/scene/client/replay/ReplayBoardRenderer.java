@@ -351,6 +351,12 @@ public final class ReplayBoardRenderer {
 
     static ReplayActorSizing drawVideoFrame(Minecraft mc, ReplayBoardModel current, ReplayTimeline.Frame frame, ReplayStagePlan.Stage stage,
                                double anim, ReplayVideoCamera.Shot shot, SceneMeshSet mesh, boolean fullBody, ReplayVideoFx fx) {
+        return drawVideoFrame(mc, current, frame, stage, anim, shot, mesh, fullBody, fx, null);
+    }
+
+    static ReplayActorSizing drawVideoFrame(Minecraft mc, ReplayBoardModel current, ReplayTimeline.Frame frame, ReplayStagePlan.Stage stage,
+                               double anim, ReplayVideoCamera.Shot shot, SceneMeshSet mesh, boolean fullBody, ReplayVideoFx fx,
+                               @Nullable java.util.UUID focusPlayer) {
         var buffers = buffers();
         var eye = shot.eye();
         var board = new Matrix4f().translation(-eye.x, -eye.y, -eye.z);
@@ -360,7 +366,7 @@ public final class ReplayBoardRenderer {
         Quaternionf rotation = shot.rotation();
         var f = new ReplayFrame(mc, mc.level, rotation, buffers, trayType, anim, anim, current,
                 frame, false, 0, 0, rotation.transform(new Vector3f(1, 0, 0)),
-                rotation.transform(new Vector3f(0, 1, 0)), shot.look(), stage);
+                rotation.transform(new Vector3f(0, 1, 0)), shot.look(), stage, focusPlayer);
         Matrix4f diorama = diorama(f, site);
         var heads = new ReplayActorSizing(current.scale, 1, diorama, shot.view(), shot.projection(), shot::emphasis, true);
         // Same pass order as the board, minus the in-world briefing and honors panel: the video draws

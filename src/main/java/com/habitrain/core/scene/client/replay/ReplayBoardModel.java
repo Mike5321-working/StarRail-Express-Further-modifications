@@ -7,6 +7,7 @@ import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.scene.replay.ReplayDeathIcons;
 import com.habitrain.core.scene.replay.ReplayFocusPlan;
+import com.habitrain.core.scene.replay.ReplayRoofCutaway;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
 import com.habitrain.core.scene.replay.ReplayTrackSampler;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -41,6 +42,7 @@ final class ReplayBoardModel {
     final SceneBounds source;
     final boolean rotated;
     final float scale, mapW, mapD, mapH;
+    final int roofCutLayer;
     final Actor[] actors;
     final List<Drone> drones;
     final List<LastMatchReplay.Span> sortedSpans;
@@ -65,6 +67,7 @@ final class ReplayBoardModel {
         this.mapW = (rotated ? source.sizeZ() : source.sizeX()) * scale;
         this.mapD = (rotated ? source.sizeX() : source.sizeZ()) * scale;
         this.mapH = source.sizeY() * scale;
+        this.roofCutLayer = ReplayRoofCutaway.cutLayer(ReplayProjection.roofHint(replay), source.sizeY());
         this.rate = ReplayStagePlan.playbackRate(replay.durationTicks(), timeline.cycleTicks());
         this.comet = ReplayStagePlan.cometTicks(rate);
 

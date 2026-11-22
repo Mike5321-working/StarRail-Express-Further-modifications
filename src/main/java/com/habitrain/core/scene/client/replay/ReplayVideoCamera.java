@@ -26,6 +26,10 @@ final class ReplayVideoCamera {
     /** Clearance between the near plane and the tallest emitted vertex while above the map footprint. */
     static final float SAFE_GAP = 0.32f;
     static final float ASPECT = 16f / 9f;
+    private static final double FOLLOW_HALF_WINDOW = 0.75;
+    private static final double FOLLOW_SIGMA = 0.34;
+    private static final double OVERVIEW_HALF_WINDOW = 1.2;
+    private static final double OVERVIEW_SIGMA = 0.55;
 
     record Shot(Vector3f eye, Vector3f look, Quaternionf rotation, Matrix4f view, Matrix4f projection,
                 Map<UUID, Double> focusedActors) {
@@ -98,7 +102,13 @@ final class ReplayVideoCamera {
                 rig.roll = lerp(-0.06, 0, e);
             }
             case ACTION -> {
-                overview(rig, script, subjects, stage, time, fit);
+                UUID focusPlayer = script.focusPlayer();
+                if (focusPlayer != null) {
+                    followPlayer(rig, script, subjects, stage, time, fit, focusPlayer);
+                    focusedActors.put(focusPlayer, 0.7);
+                } else {
+                    overview(rig, script, subjects, stage, time, fit);
+                }
                 for (var beat : script.beats()) {
                     double w = ReplayVideoScript.influence(beat, time, 0.8, 0.95);
                     if (w <= 0) continue;
@@ -110,11 +120,12 @@ final class ReplayVideoCamera {
                     var node = beat.node();
                     if (node.actor() != null) focusedActors.merge(node.actor(), w, Double::sum);
                     if (node.target() != null && !node.target().equals(node.actor())) focusedActors.merge(node.target(), w, Double::sum);
+                    if (focusPlayer != null) focusedActors.merge(focusPlayer, 0.7, Math::max);
                 }
             }
             case REVIEW -> {
                 double e = ReplayStagePlan.easeInOutQuart(k);
-                rig.set(0, base + stage.mapH() * 0.1, 0, lerp(-0.55, 0.42, e), lerp(0.6, 1.14, e), fit * lerp(0.92, 1.06, k), 34, 0);
+                rig.set(0, base + stage.mapH() * 0.1, 0, lerp(-0.55, 0.42, e), lerp(0.72, 1.18, e), fit * lerp(0.76, 0.88, k), 34, 0);
             }
             case VICTORY -> {
                 var w = subjects.winners();
@@ -139,20 +150,74 @@ final class ReplayVideoCamera {
         return build(rig, stage, Map.copyOf(focusedActors));
     }
 
+    private static void followPlayer(Rig rig, ReplayVideoScript script, Subjects subjects, Stage stage, double time, float fit,
+                                     UUID focusPlayer) {
+        double actionStart = script.actStart(ReplayVideoScript.Act.ACTION);
+        double actionLength = script.actLength(ReplayVideoScript.Act.ACTION);
+        double actionEnd = Math.max(actionStart, script.actStart(ReplayVideoScript.Act.REVIEW) - 1.0e-3);
+        // Sample densely enough in both video time (<= 0.02 s, finer than 1 frame at 30 fps) and match ticks
+        // (<= 2.5 ticks, Nyquist for the 5-tick track recorder) with a C1-smooth Hann-Gaussian kernel so
+        // turns, pauses and sprint-jumps never alias into periodic camera stepping. Tap count is constant per
+        // script so density never switches between frames.
+        double fastTicksPerSec = Math.max(20.0, Math.max(script.fastSpeed() * 20.0,
+                script.actionEndTick() / Math.max(1.0, actionLength)));
+        int halfTaps = Math.clamp((int) Math.ceil(Math.max(FOLLOW_HALF_WINDOW / 0.02,
+                FOLLOW_HALF_WINDOW * fastTicksPerSec / 2.5)), 32, 96);
+        double step = FOLLOW_HALF_WINDOW / halfTaps;
+        double px = 0, py = 0, pz = 0, weight = 0;
+        for (int i = -halfTaps + 1; i < halfTaps; i++) {
+            double dt = i * step;
+            double w = smoothKernelWeight(dt, FOLLOW_HALF_WINDOW, FOLLOW_SIGMA);
+            if (w <= 0) continue;
+            var s = script.sample(Math.clamp(time + dt, actionStart, actionEnd));
+            var p = subjects.actor(focusPlayer, s.replayTick());
+            if (p == null) continue;
+            px += p.x * w; py += p.y * w; pz += p.z * w; weight += w;
+        }
+        if (weight <= 0) {
+            var direct = subjects.actor(focusPlayer, script.sample(time).replayTick());
+            if (direct == null) {
+                overview(rig, script, subjects, stage, time, fit);
+                return;
+            }
+            px = direct.x; py = direct.y; pz = direct.z;
+        } else {
+            px /= weight; py /= weight; pz /= weight;
+        }
+        double t = time - actionStart;
+        double dist = Math.clamp(fit * 0.34, 1.55, 2.75);
+        rig.set(px, py + ReplayActorSizing.centerOffset(stage.headSize()) * 1.25, pz,
+                overviewYaw(script, time), 0.56 + 0.03 * Math.sin(t * 0.11), dist, 33, 0);
+    }
+
     private static void overview(Rig rig, ReplayVideoScript script, Subjects subjects, Stage stage, double time, float fit) {
-        // Track the crowd, averaged over ~2.4 s of video so hyper-lapse never jitters the frame.
-        float cx = 0, cz = 0, weight = 0;
-        for (int i = -3; i <= 3; i++) {
-            var s = script.sample(Math.clamp(time + i * 0.4, script.actStart(ReplayVideoScript.Act.ACTION),
-                    script.actStart(ReplayVideoScript.Act.REVIEW) - 1.0e-3));
+        // Track the crowd, averaged smoothly over ~2.4 s of video so hyper-lapse never jitters the frame.
+        double actionStart = script.actStart(ReplayVideoScript.Act.ACTION);
+        double actionEnd = Math.max(actionStart, script.actStart(ReplayVideoScript.Act.REVIEW) - 1.0e-3);
+        int halfTaps = 16;
+        double step = OVERVIEW_HALF_WINDOW / halfTaps;
+        double cx = 0, cz = 0, weight = 0;
+        for (int i = -halfTaps + 1; i < halfTaps; i++) {
+            double dt = i * step;
+            double w = smoothKernelWeight(dt, OVERVIEW_HALF_WINDOW, OVERVIEW_SIGMA);
+            if (w <= 0) continue;
+            var s = script.sample(Math.clamp(time + dt, actionStart, actionEnd));
             var c = subjects.centroid(s.replayTick());
-            float w = 4 - Math.abs(i);
             cx += c.x * w; cz += c.z * w; weight += w;
         }
         cx /= weight; cz /= weight;
-        double t = time - script.actStart(ReplayVideoScript.Act.ACTION);
+        double t = time - actionStart;
         rig.set(cx * 0.6, ReplayBoardSite.MAP_BASE + stage.mapH() * 0.25, cz * 0.4,
                 overviewYaw(script, time), 0.6 + 0.04 * Math.sin(t * 0.09), fit * 0.86, 34, 0);
+    }
+
+    /** Hann-windowed Gaussian: vanishes with zero derivative at +/-halfWindow so entering/leaving samples never step. */
+    private static double smoothKernelWeight(double offset, double halfWindow, double sigma) {
+        double u = offset / halfWindow;
+        if (Math.abs(u) >= 1.0) return 0.0;
+        double hann = 0.5 * (1.0 + Math.cos(Math.PI * u));
+        double norm = offset / sigma;
+        return hann * Math.exp(-0.5 * norm * norm);
     }
 
     private static double overviewYaw(ReplayVideoScript script, double time) {

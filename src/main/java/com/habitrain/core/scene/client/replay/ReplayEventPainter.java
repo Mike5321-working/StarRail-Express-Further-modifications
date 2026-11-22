@@ -39,7 +39,9 @@ final class ReplayEventPainter {
             if (age < 0) continue;
             double window = window(e.node.kind(), model.rate);
             if (play && age <= window) {
-                live(f, s, d, glow, e, age, window, a, emphasis, elemScale);
+                // Exported videos render dedicated video-clock 3D effects in ReplayVideoFx;
+                // skipping board live effects here avoids double beams/rings and giant frozen weapons.
+                if (!f.video) live(f, s, d, glow, e, age, window, a, emphasis, elemScale);
             } else if (stage.history() > 0.01 || age > window) {
                 marker(f, d, glow, e, a * (play ? 0.35 : stage.history()), elemScale);
             }
@@ -181,13 +183,16 @@ final class ReplayEventPainter {
         float x = e.tx, y = e.ty + 0.008f, z = e.tz;
         switch (e.node.kind()) {
             case KILL -> {
-                float r = 0.035f;
-                int c = ReplayPalette.alpha(ReplayPalette.RUBY, 0.95 * a);
-                ReplayDraw.segment(glow, d, x - r, y, z - r, x + r, y, z + r, 0.014f * elemScale, c, c);
-                ReplayDraw.segment(glow, d, x - r, y, z + r, x + r, y, z - r, 0.014f * elemScale, c, c);
-                ReplayDraw.ring(glow, d, x, y, z, 0.05f, 0.008f, 16, ReplayPalette.alpha(ReplayPalette.RUBY, 0.5 * a),
+                boolean overview = f.video && f.frame != null && f.frame.phase() == ReplayTimeline.Phase.REVIEW;
+                float r = overview ? 0.058f : 0.035f;
+                float w = (overview ? 0.020f : 0.014f) * elemScale;
+                int c = ReplayPalette.alpha(ReplayPalette.RUBY, (overview ? 1.0 : 0.95) * a);
+                ReplayDraw.segment(glow, d, x - r, y, z - r, x + r, y, z + r, w, c, c);
+                ReplayDraw.segment(glow, d, x - r, y, z + r, x + r, y, z - r, w, c, c);
+                ReplayDraw.ring(glow, d, x, y, z, overview ? 0.082f : 0.05f, overview ? 0.014f : 0.008f, 18,
+                        ReplayPalette.alpha(ReplayPalette.RUBY, (overview ? 0.78 : 0.5) * a),
                         ReplayPalette.alpha(ReplayPalette.RUBY, 0.1 * a));
-                if (a > 0.5) weapon(f, d, e, x, y + 0.14f, z, 0.08f, a * 0.8, elemScale);
+                if (a > 0.5 && !f.video) weapon(f, d, e, x, y + 0.14f, z, 0.08f, a * 0.8, elemScale);
             }
             case GUNSHOT -> ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.006f * elemScale,
                     ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.35 * a), ReplayPalette.alpha(e.has(HIT) ? ReplayPalette.RUBY : ReplayPalette.LAMP, 0.35 * a));
@@ -220,7 +225,7 @@ final class ReplayEventPainter {
         }
     }
 
-    private static void warning(ReplayFrame f, VertexConsumer glow, Vector3f at, double a, float elemScale) {
+    static void warning(ReplayFrame f, VertexConsumer glow, Vector3f at, double a, float elemScale) {
         Vector3f top = new Vector3f(at).add(new Vector3f(f.up).mul(0.05f * elemScale));
         Vector3f left = new Vector3f(at).sub(new Vector3f(f.right).mul(0.045f * elemScale)).sub(new Vector3f(f.up).mul(0.03f * elemScale));
         Vector3f right = new Vector3f(at).add(new Vector3f(f.right).mul(0.045f * elemScale)).sub(new Vector3f(f.up).mul(0.03f * elemScale));

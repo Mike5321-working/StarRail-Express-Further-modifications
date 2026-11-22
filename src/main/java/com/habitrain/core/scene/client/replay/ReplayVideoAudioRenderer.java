@@ -1,6 +1,7 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.scene.replay.ReplayMusicPlan;
 import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
@@ -57,13 +58,19 @@ final class ReplayVideoAudioRenderer {
         if (replay == null || script == null || totalVideoFrames <= 0) {
             return new short[Math.max(0, totalVideoFrames) * SAMPLES_PER_VIDEO_FRAME * CHANNELS];
         }
-        return prepare(client, replay, script, voice, totalVideoFrames).get();
+        return prepare(client, replay, script, voice, totalVideoFrames, ReplayMusicPlan.Level.OFF).get();
     }
 
     static Supplier<short[]> prepare(Minecraft client, LastMatchReplay replay, ReplayVideoScript script,
                                      ReplayVoiceData voice, int frames) {
+        return prepare(client, replay, script, voice, frames, ReplayMusicPlan.Level.OFF);
+    }
+
+    static Supplier<short[]> prepare(Minecraft client, LastMatchReplay replay, ReplayVideoScript script,
+                                     ReplayVoiceData voice, int frames, ReplayMusicPlan.Level music) {
+        var level = music == null ? ReplayMusicPlan.Level.OFF : music;
         var schedule = ReplaySoundCuePlan.forVideo(replay, script, voice,
-                file -> client != null && client.getResourceManager().getResource(file).isPresent());
+                file -> client != null && client.getResourceManager().getResource(file).isPresent(), !level.enabled());
         var assets = new HashMap<List<String>, List<SoundAsset>>();
         var random = RandomSource.create(0x5245504C4159L);
         if (client != null) for (var cue : schedule.sounds()) {
@@ -71,13 +78,29 @@ final class ReplayVideoAudioRenderer {
                     : client.getResourceManager().getResource(cue.recordedFile())
                             .map(resource -> List.of(new SoundAsset(cue.recordedFile(), resource, 1f, 1f))).orElseGet(List::of));
         }
-        return () -> renderSchedule(schedule, keys -> decode(assets.getOrDefault(keys, List.of())), frames);
+        return () -> {
+            ReplayMusicPlan.Score score = null;
+            if (level.enabled()) {
+                score = ReplayMusicPlan.compose(script, schedule);
+                LOGGER.info("Replay soundtrack: {} notes, {} synced hits, tracks {}", score.notes().size(),
+                        score.hits().size(), score.tracks().stream().map(track -> track.id).toList());
+            }
+            return renderSchedule(schedule, keys -> decode(assets.getOrDefault(keys, List.of())), frames, score, level.gain);
+        };
     }
 
     static short[] renderSchedule(ReplaySoundCuePlan.Schedule schedule, SoundResolver resolver, int totalVideoFrames) {
+        return renderSchedule(schedule, resolver, totalVideoFrames, null, 0f);
+    }
+
+    /** Mixes the sound cues and voices, plus the procedural soundtrack {@code music} at {@code musicGain} when present. */
+    static short[] renderSchedule(ReplaySoundCuePlan.Schedule schedule, SoundResolver resolver, int totalVideoFrames,
+                                  @Nullable ReplayMusicPlan.Score music, float musicGain) {
         int totalStereoFrames = Math.max(0, totalVideoFrames * SAMPLES_PER_VIDEO_FRAME);
         short[] pcm = new short[totalStereoFrames * CHANNELS];
         if (totalStereoFrames == 0 || schedule == null) return pcm;
+        var musicBus = music == null || music.notes().isEmpty() || musicGain <= 0 ? null
+                : new ReplayMusicSynth.Bus(music, musicGain, totalStereoFrames);
 
         float[] mixL = new float[Math.min(SAMPLE_RATE, totalStereoFrames)];
         float[] mixR = new float[mixL.length];
@@ -114,6 +137,7 @@ final class ReplayVideoAudioRenderer {
                 short[] samples = voices.computeIfAbsent(cue.clip(), ReplayVoiceData.Clip::decode48k);
                 nextAllowedVoiceSample = mixVoiceCue(mixL, mixR, totalStereoFrames, offset, cue, nextAllowedVoiceSample, samples);
             }
+            if (musicBus != null) musicBus.mix(mixL, mixR, offset, Math.min(mixL.length, totalStereoFrames - offset));
             masterFinalize(mixL, mixR, pcm, totalStereoFrames, offset);
         }
         return pcm;

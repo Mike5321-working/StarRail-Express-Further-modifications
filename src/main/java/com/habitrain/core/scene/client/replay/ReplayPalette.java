@@ -30,6 +30,10 @@ final class ReplayPalette {
     static final int PASSENGER = 0xFF7FD1FF;
     static final int KILLER = 0xFFFF4A52;
     static final int NEUTRAL = 0xFFC9A0FF;
+    /** Highlighted light-red trail colour for single-player perspective video exports. */
+    static final int FOCUS_TRAIL = 0xFFFF7A85;
+    static final int FOCUS_TRAIL_HEAD = 0xFFFFAEB5;
+    static final int FOCUS_TRAIL_GLOW = 0xFFFF98A2;
 
     /** Replaces the alpha channel. */
     static int alpha(int color, double alpha01) {

@@ -92,7 +92,7 @@ class ReplayVideoAudioMuxTest {
     }
 
     @Test
-    void videoMatchStartAndEndCuesRenderAtExactTitleAndVictoryTimestamps() {
+    void videoWithoutSoundtrackKeepsBothUpstreamCues() {
         var replay = ReplayVideoScriptTest.replay(600, List.of(), List.of());
         var script = new ReplayVideoScript(replay);
         var schedule = ReplaySoundCuePlan.forVideo(replay, script, null);
@@ -119,12 +119,14 @@ class ReplayVideoAudioMuxTest {
         double titleRms = channelRms(pcm, 0, (int) (0.05 * rate), (int) (0.45 * rate));
         double quietBeforeVictory = channelRms(pcm, 0, (int) ((victoryStart - 0.5) * rate), (int) ((victoryStart - 0.05) * rate));
         double victoryRms = channelRms(pcm, 0, (int) ((victoryStart + 0.05) * rate), (int) ((victoryStart + 0.45) * rate));
-        double quietAfterVictory = channelRms(pcm, 0, (int) ((victoryStart + 0.6) * rate), (int) ((victoryStart + 1.0) * rate));
 
         assertTrue(titleRms > 3000, "Expected match-start train horn at TITLE start, got " + titleRms);
         assertEquals(0.0, quietBeforeVictory, 1e-6, "Expected silence before VICTORY");
-        assertTrue(victoryRms > 1500, "Expected match-end victory piano at VICTORY start, got " + victoryRms);
-        assertEquals(0.0, quietAfterVictory, 1e-6, "Expected silence after victory cue ends");
+        // 0.2-amplitude sine, 1.5 cue volume, mixer gain and center pan, then PCM scaling.
+        double expectedVictoryRms = 0.2 * 1.5 * 0.85 * ReplayAudioPlaybackController.REPLAY_GAIN * Short.MAX_VALUE / 2;
+        assertEquals(expectedVictoryRms, victoryRms, 2.0, "Expected victory piano at VICTORY start");
+        var scored = ReplaySoundCuePlan.forVideo(replay, script, null, file -> true, false);
+        assertFalse(scored.sounds().stream().anyMatch(cue -> cue.candidates().equals(ReplaySoundCuePlan.VIDEO_MATCH_END_SOUNDS)));
     }
 
     @Test

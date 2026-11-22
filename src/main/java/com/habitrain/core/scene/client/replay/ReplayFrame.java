@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.function.Consumer;
 
 /**
@@ -64,6 +65,8 @@ final class ReplayFrame {
     final ReplayStagePlan.Handoff handoff;
     /** Directed video export frame (its own effects replace some board-only decorations). */
     final boolean video;
+    /** Optional single-player perspective target during video export; null for global view. */
+    final @Nullable UUID focusPlayer;
     final double replayTick;
     final ReplayFocusPlan.Pose focus;
     final ReplayFocusPlan.Sample focusSample;
@@ -82,7 +85,7 @@ final class ReplayFrame {
                 boolean loading, int presentSections, int totalSections,
                 Vector3f right, Vector3f up, Vector3f look) {
         this(mc, level, rotation, buffers, trayType, anim, ambient, model, frame, loading, presentSections, totalSections,
-                right, up, look, null);
+                right, up, look, null, null);
     }
 
     /** Video export: the director supplies its own act choreography and keeps the map at its natural scale. */
@@ -91,6 +94,15 @@ final class ReplayFrame {
                 boolean loading, int presentSections, int totalSections,
                 Vector3f right, Vector3f up, Vector3f look,
                 @Nullable ReplayStagePlan.Stage stageOverride) {
+        this(mc, level, rotation, buffers, trayType, anim, ambient, model, frame, loading, presentSections, totalSections,
+                right, up, look, stageOverride, null);
+    }
+
+    ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
+                double anim, double ambient, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
+                boolean loading, int presentSections, int totalSections,
+                Vector3f right, Vector3f up, Vector3f look,
+                @Nullable ReplayStagePlan.Stage stageOverride, @Nullable UUID focusPlayer) {
         this.mc = mc;
         this.level = level;
         this.rotation = rotation;
@@ -105,6 +117,7 @@ final class ReplayFrame {
         this.frame = frame;
         this.stage = stageOverride != null ? stageOverride : frame == null ? null : ReplayStagePlan.boardStage(frame);
         this.video = stageOverride != null;
+        this.focusPlayer = video ? focusPlayer : null;
         this.handoff = video ? ReplayStagePlan.REPLAY : frame == null ? ReplayStagePlan.IDLE : ReplayStagePlan.boardHandoff(frame);
         this.replayTick = frame == null ? 0 : frame.replayTick();
         this.focusSample = video || model == null ? ReplayFocusPlan.UNFOCUSED : model.focus.sample(frame);

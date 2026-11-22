@@ -117,6 +117,11 @@ public final class ReplaySoundCuePlan {
 
     public static Schedule forVideo(LastMatchReplay replay, ReplayVideoScript script, @Nullable ReplayVoiceData voice,
                                     Predicate<ResourceLocation> availableSound) {
+        return forVideo(replay, script, voice, availableSound, true);
+    }
+
+    public static Schedule forVideo(LastMatchReplay replay, ReplayVideoScript script, @Nullable ReplayVoiceData voice,
+                                    Predicate<ResourceLocation> availableSound, boolean includeVictoryCue) {
         if (replay == null || script == null) return Schedule.EMPTY;
         List<LastMatchReplay.Node> events = replay.events();
         Map<LastMatchReplay.Node, Integer> indexMap = identityIndices(events);
@@ -132,12 +137,14 @@ public final class ReplaySoundCuePlan {
         double titleStart = script.actStart(ReplayVideoScript.Act.TITLE);
         double actionStart = script.actStart(ReplayVideoScript.Act.ACTION);
         double reviewStart = script.actStart(ReplayVideoScript.Act.REVIEW);
-        double victoryStart = script.actStart(ReplayVideoScript.Act.VICTORY);
         double soundEnd = Math.max(actionStart, reviewStart - 0.05);
         double lastVoiceEnd = actionStart;
 
         soundCues.add(new SoundCue(titleStart, -1, VIDEO_MATCH_START_SOUNDS, VIDEO_MATCH_START_VOLUME, 1.0f, 0f));
-        soundCues.add(new SoundCue(victoryStart, -1, VIDEO_MATCH_END_SOUNDS, VIDEO_MATCH_END_VOLUME, 1.0f, 0f));
+        if (includeVictoryCue) {
+            soundCues.add(new SoundCue(script.actStart(ReplayVideoScript.Act.VICTORY), -1,
+                    VIDEO_MATCH_END_SOUNDS, VIDEO_MATCH_END_VOLUME, 1.0f, 0f));
+        }
 
         List<ReplayVideoScript.Beat> beats = script.beats();
         Set<Integer> handledEvents = new HashSet<>();
@@ -177,9 +184,11 @@ public final class ReplaySoundCuePlan {
         }
 
         // Also add non-featured kill/explosion/shot weapon cues along the spline clock so secondary kills never go silent.
+        int actionEndTick = script.actionEndTick();
         for (int i = 0; i < events.size(); i++) {
             if (handledEvents.contains(i) || suppressedGunshots.contains(i)) continue;
             LastMatchReplay.Node node = events.get(i);
+            if (node.tick() > actionEndTick) continue;
             ReplayVideoScript.BeatType type = ReplayVideoScript.classify(node);
             if (type == null) continue;
             if (node.kind() == LastMatchReplay.Kind.GUNSHOT && (node.flags() & (LastMatchReplay.HIT | LastMatchReplay.BACKFIRE)) == 0) {
@@ -192,7 +201,7 @@ public final class ReplaySoundCuePlan {
                     actionStart, soundEnd, soundEnd, .72f, pan);
         }
 
-        addUnfeaturedKillVoices(voiceCues, replay, clipByEvent, script::videoTimeOf, 1.0, actionStart, reviewStart);
+        addUnfeaturedKillVoices(voiceCues, replay, clipByEvent, script::videoTimeOf, 1.0, actionStart, reviewStart, actionEndTick);
         soundCues.sort(Comparator.comparingDouble(SoundCue::time));
         voiceCues.sort(Comparator.comparingDouble(VoiceCue::startTime));
         return new Schedule(List.copyOf(soundCues), List.copyOf(voiceCues));
@@ -404,6 +413,13 @@ public final class ReplaySoundCuePlan {
                                                  Map<Integer, ReplayVoiceData.Clip> clips,
                                                  IntToDoubleFunction timeline,
                                                  double unitsPerSecond, double start, double end) {
+        addUnfeaturedKillVoices(output, replay, clips, timeline, unitsPerSecond, start, end, Integer.MAX_VALUE);
+    }
+
+    private static void addUnfeaturedKillVoices(List<VoiceCue> output, LastMatchReplay replay,
+                                                 Map<Integer, ReplayVoiceData.Clip> clips,
+                                                 IntToDoubleFunction timeline,
+                                                 double unitsPerSecond, double start, double end, int maxTick) {
         if (clips.isEmpty()) return;
         var byStart = Comparator.comparingDouble(VoiceCue::startTime);
         output.sort(byStart);
@@ -411,7 +427,7 @@ public final class ReplaySoundCuePlan {
         for (int index = 0; index < replay.events().size(); index++) {
             var node = replay.events().get(index);
             var clip = clips.get(index);
-            if (clip == null || node.kind() != LastMatchReplay.Kind.KILL
+            if (clip == null || node.kind() != LastMatchReplay.Kind.KILL || node.tick() > maxTick
                     || output.stream().anyMatch(cue -> cue.clip() == clip)) continue;
             double impact = timeline.applyAsDouble(node.tick());
             double clipStart = impact + clip.offsetMs() * unitsPerSecond / 1000.0;

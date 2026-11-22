@@ -5,6 +5,7 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import com.habitrain.core.HabiTrainCore;
 import com.habitrain.core.persist.AtomicJsonFiles;
+import com.habitrain.core.scene.replay.ReplayMusicPlan;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.loader.api.FabricLoader;
@@ -30,6 +31,8 @@ public final class ClientVisualPreferences {
     private static final String REPLAY_VIDEO = "replayVideo";
     private static final String DEFAULT_REPLAY_RESOLUTION = "720p";
     private static final boolean DEFAULT_REPLAY_COMPRESS = true;
+    private static final String DEFAULT_REPLAY_QUALITY = "balanced";
+    private static final String DEFAULT_REPLAY_MUSIC = ReplayMusicPlan.Level.MEDIUM.id;
 
     private static boolean loaded;
     private static boolean customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
@@ -40,6 +43,8 @@ public final class ClientVisualPreferences {
     private static int idiotParticles = 2;
     private static String replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
     private static boolean replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
+    private static String replayVideoQuality = DEFAULT_REPLAY_QUALITY;
+    private static String replayVideoMusic = DEFAULT_REPLAY_MUSIC;
     private static String replayVideoFfmpegPath = "";
     private static int requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
     private static int maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
@@ -123,6 +128,8 @@ public final class ClientVisualPreferences {
                 : new JsonObject();
         replayVideoResolution = normalizeReplayResolution(readString(replayVideo, "resolution", DEFAULT_REPLAY_RESOLUTION));
         replayVideoCompress = readBoolean(replayVideo, "compress", DEFAULT_REPLAY_COMPRESS);
+        replayVideoQuality = normalizeReplayQuality(readString(replayVideo, "quality", DEFAULT_REPLAY_QUALITY));
+        replayVideoMusic = ReplayMusicPlan.Level.fromId(readString(replayVideo, "music", DEFAULT_REPLAY_MUSIC)).id;
         replayVideoFfmpegPath = readString(replayVideo, "ffmpegPath", "").trim();
     }
 
@@ -134,6 +141,8 @@ public final class ClientVisualPreferences {
         customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
         replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
         replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
+        replayVideoQuality = DEFAULT_REPLAY_QUALITY;
+        replayVideoMusic = DEFAULT_REPLAY_MUSIC;
         replayVideoFfmpegPath = "";
         requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
         maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
@@ -163,6 +172,14 @@ public final class ClientVisualPreferences {
         return switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
             case "480p", "720p", "1080p", "1440p", "2160p" -> raw.trim().toLowerCase(java.util.Locale.ROOT);
             default -> DEFAULT_REPLAY_RESOLUTION;
+        };
+    }
+
+    private static String normalizeReplayQuality(String raw) {
+        if (raw == null) return DEFAULT_REPLAY_QUALITY;
+        return switch (raw.trim().toLowerCase(java.util.Locale.ROOT)) {
+            case "light", "balanced", "original" -> raw.trim().toLowerCase(java.util.Locale.ROOT);
+            default -> DEFAULT_REPLAY_QUALITY;
         };
     }
 
@@ -413,6 +430,8 @@ public final class ClientVisualPreferences {
         JsonObject replayVideo = new JsonObject();
         replayVideo.addProperty("resolution", replayVideoResolution);
         replayVideo.addProperty("compress", replayVideoCompress);
+        replayVideo.addProperty("quality", replayVideoQuality);
+        replayVideo.addProperty("music", replayVideoMusic);
         if (!replayVideoFfmpegPath.isBlank()) {
             replayVideo.addProperty("ffmpegPath", replayVideoFfmpegPath);
         }
@@ -469,6 +488,36 @@ public final class ClientVisualPreferences {
         replayVideoCompress = compress;
         if (save()) return true;
         replayVideoCompress = previous;
+        return false;
+    }
+
+    /** Replay video MP4 quality preset id: {@code light}, {@code balanced} or {@code original}. */
+    public static synchronized String getReplayVideoQuality() {
+        load();
+        return replayVideoQuality;
+    }
+
+    public static synchronized boolean setReplayVideoQuality(String qualityId) {
+        load();
+        String previous = replayVideoQuality;
+        replayVideoQuality = normalizeReplayQuality(qualityId);
+        if (save()) return true;
+        replayVideoQuality = previous;
+        return false;
+    }
+
+    /** Replay video soundtrack level id: {@code off}, {@code low}, {@code medium} or {@code high}. */
+    public static synchronized String getReplayVideoMusic() {
+        load();
+        return replayVideoMusic;
+    }
+
+    public static synchronized boolean setReplayVideoMusic(String levelId) {
+        load();
+        String previous = replayVideoMusic;
+        replayVideoMusic = ReplayMusicPlan.Level.fromId(levelId).id;
+        if (save()) return true;
+        replayVideoMusic = previous;
         return false;
     }
 

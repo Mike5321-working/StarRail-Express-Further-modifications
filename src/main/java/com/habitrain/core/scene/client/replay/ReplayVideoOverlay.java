@@ -1,5 +1,6 @@
 package com.habitrain.core.scene.client.replay;
 
+import com.habitrain.core.api.GameModeIds;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
 import com.habitrain.core.scene.replay.ReplayTrackSampler;
@@ -37,6 +38,7 @@ final class ReplayVideoOverlay {
     private final ReplayVideoScript script;
     private final ReplayBoardModel model;
     private final boolean compress;
+    private final ReplayExportQuality quality;
     private final Map<LastMatchReplay.Node, ReplayBoardModel.EventMark> marks = new IdentityHashMap<>();
     private final List<ReplayBoardModel.Actor> ranking;
     private final String date, trainNo;
@@ -44,13 +46,18 @@ final class ReplayVideoOverlay {
     private float w, h;
 
     ReplayVideoOverlay(ReplayVideoScript script, ReplayBoardModel model) {
-        this(script, model, false);
+        this(script, model, false, ReplayExportQuality.DEFAULT);
     }
 
     ReplayVideoOverlay(ReplayVideoScript script, ReplayBoardModel model, boolean compress) {
+        this(script, model, compress, ReplayExportQuality.DEFAULT);
+    }
+
+    ReplayVideoOverlay(ReplayVideoScript script, ReplayBoardModel model, boolean compress, ReplayExportQuality quality) {
         this.script = script;
         this.model = model;
         this.compress = compress;
+        this.quality = quality == null ? ReplayExportQuality.DEFAULT : quality;
         for (var mark : model.events) marks.put(mark.node, mark);
         List<ReplayBoardModel.Actor> rank = new ArrayList<>(List.of(model.actors));
         rank.sort(Comparator.comparing((ReplayBoardModel.Actor a) -> !a.p.winner()).thenComparing(a -> a != model.mvp)
@@ -70,6 +77,13 @@ final class ReplayVideoOverlay {
 
     private static Component tr(String key, Object... args) {
         return Component.translatable("habitrain_core.replay_video." + key, args);
+    }
+
+    static Component ticketMode(@Nullable String modeId, Component fallback) {
+        if (modeId != null && !modeId.isBlank() && GameModeIds.isMurder(modeId.trim().replace('/', ':'))) {
+            return tr("ticket.mode.murder");
+        }
+        return fallback.getString().isBlank() ? Component.literal("-") : fallback;
     }
 
     // =================================================================== background (behind the model)
@@ -145,7 +159,9 @@ final class ReplayVideoOverlay {
         impacts(c, t, s, shot);
         letterbox(c, t, s);
         if (compress) {
-            c.tile(Tex.GRAIN, 0, 0, w, h, 1.0f, 0.13f, 0.37f, argb(0xFFFFFFFF, 0.028));
+            if (quality.mp4GrainAlpha > 0) {
+                c.tile(Tex.GRAIN, 0, 0, w, h, 1.0f, 0.13f, 0.37f, argb(0xFFFFFFFF, quality.mp4GrainAlpha));
+            }
         } else {
             c.tile(Tex.GRAIN, 0, 0, w, h, 1.0f, ReplayVideoFx.rnd(frame, 1), ReplayVideoFx.rnd(frame, 2), argb(0xFFFFFFFF, 0.075));
         }
@@ -218,28 +234,34 @@ final class ReplayVideoOverlay {
     }
 
     private void impacts(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot) {
+        double bestFlash = 0;
+        int bestFlashColor = RUBY;
         for (Beat b : script.beats()) {
             double u = b.local(t);
             if (u < 0 || u > 1.6) continue;
             int color = beatColor(b);
             double flash = ReplayVideoScript.impulse(u, 11) * switch (b.type()) {
-                case EXPLOSION -> 0.75;
-                case KILL -> 0.42;
-                case REVIVAL -> 0.5;
-                default -> 0.3;
+                case EXPLOSION -> 0.48;
+                case KILL -> 0.30;
+                case REVIVAL -> 0.38;
+                default -> 0.24;
             };
-            if (flash > 0.01) {
-                c.rect(0, 0, w, h, argb(color, flash * 0.55));
-                c.sprite(Tex.GLOW, w / 2, h / 2, w * 1.6f, h * 1.6f, 0, argb(0xFFFFFFFF, flash * 0.5), true);
+            if (flash > bestFlash) {
+                bestFlash = flash;
+                bestFlashColor = color;
             }
             if (b.type() == BeatType.KILL || b.type() == BeatType.EXPLOSION || b.type() == BeatType.REVIVAL) {
                 Vector3f p = subjectPoint(b);
                 Vector3f sp = p == null ? new Vector3f(w / 2, h / 2, 1) : shot.toScreen(p, w, h);
                 if (sp.z <= 0) sp.set(w / 2, h / 2, 1);
-                double lines = ReplayVideoScript.impulse(u, 2.6) * (b.type() == BeatType.REVIVAL ? 0.35 : 0.55);
+                double lines = ReplayVideoScript.impulse(u, 2.6) * (b.type() == BeatType.REVIVAL ? 0.32 : 0.45);
                 int lc = b.type() == BeatType.REVIVAL ? CHAMPAGNE : 0xFFFFFFFF;
                 c.sprite(Tex.SPEEDLINES, sp.x, sp.y, w * 1.7f, w * 1.7f, (float) (u * 0.4), argb(lc, lines), b.type() == BeatType.REVIVAL);
             }
+        }
+        if (bestFlash > 0.01) {
+            c.rect(0, 0, w, h, argb(bestFlashColor, bestFlash * 0.42));
+            c.sprite(Tex.GLOW, w / 2, h / 2, w * 1.5f, h * 1.5f, 0, argb(0xFFFFFFFF, bestFlash * 0.30), true);
         }
     }
 
@@ -252,7 +274,10 @@ final class ReplayVideoOverlay {
         };
         if (s.act() == Act.ACTION) for (Beat b : script.beats()) lb = Math.max(lb, ReplayVideoScript.influence(b, t, 0.6, 0.6));
         if (lb <= 0.01) return;
-        float bar = (float) (h * 0.095 * ReplayStagePlan.easeInOutQuart(lb));
+        // Pull ACTION letterbox slightly further inward so top/bottom HUD rows sit cleanly inside
+        // the black bars without the brass border slicing across them.
+        float ratio = s.act() == Act.ACTION ? 0.148f : 0.095f;
+        float bar = (float) (h * ratio * ReplayStagePlan.easeInOutQuart(lb));
         c.rect(0, 0, w, bar, 0xFF000000);
         c.rect(0, h - bar, w, h, 0xFF000000);
         c.rect(0, bar, w, bar + 2, argb(BRASS, 0.5 * lb), argb(BRASS, 0));
@@ -281,9 +306,9 @@ final class ReplayVideoOverlay {
             float ox = -tw / 2 + 24 * scale, oy = -th / 2 + 24 * scale;
             int ink = 0xFF1B1A24, inkSoft = 0xFF4A4038;
             c.textFit(ReplayVideoCanvas.font(Component.literal(model.replay.mapName()), ReplayVideoCanvas.BIG),
-                    ox + 40 * scale, oy + 140 * scale, 4.6f * scale * 1.6f, 540 * scale, ink, -1, false);
-            // (destination spans the main field; the stamp sits on the barcode strip below)
-            Component mode = model.modeLabel.getString().isBlank() ? Component.literal("-") : model.modeLabel;
+                    ox + 40 * scale, oy + 140 * scale, 4.6f * scale * 1.6f, 405 * scale, ink, -1, false);
+            // (destination sits on the left; the stamp lands on the clean cream paper right of it)
+            Component mode = ticketMode(model.replay.modeId(), model.modeLabel);
             c.textFit(mode, ox + 40 * scale, oy + 238 * scale, 2.0f * scale * 1.5f, 190 * scale, inkSoft, -1, false);
             c.textFit(ReplayVideoCanvas.font(Component.literal(date), ReplayVideoCanvas.UI), ox + 250 * scale, oy + 238 * scale, 2.2f * scale * 1.5f,
                     170 * scale, inkSoft, -1, false);
@@ -296,9 +321,13 @@ final class ReplayVideoOverlay {
             if (stampK > 0) {
                 double st = ReplayStagePlan.easeOutCubic(stampK);
                 float ss = (float) (0.4 * scale * (1.8 - 0.8 * st));
-                float stampX = ox + 590 * scale, stampY = oy + 52 * scale;
-                c.art(Tex.STAMP, stampX, stampY, ss, (float) Math.toRadians(-16), argb(0xFFC0303C, 0.85 * Math.min(1, stampK * 2)), false);
-                c.text(tr("ticket.stamp"), stampX, stampY + 2 * scale, 2.2f * ss / 0.5f, argb(0xFFC0303C, 0.9 * Math.min(1, stampK * 2)), 0, false);
+                float stampX = ox + 505 * scale, stampY = oy + 146 * scale;
+                double sa = Math.min(1, stampK * 2);
+                c.pose.pushMatrix();
+                c.pose.translate(stampX, stampY, 0).rotateZ((float) Math.toRadians(-16));
+                c.art(Tex.STAMP, 0, 0, ss, 0, argb(0xFFC0303C, 0.88 * sa), false);
+                c.text(tr("ticket.stamp"), 0, 4 * scale, 2.1f * ss / 0.5f, argb(0xFFC0303C, 0.94 * sa), 0, false);
+                c.pose.popMatrix();
             }
             c.pose.popMatrix();
         }
@@ -321,8 +350,8 @@ final class ReplayVideoOverlay {
         double hud = ReplayStagePlan.easeOutCubic((k - 0.2) / 0.5) * (1 - ReplayStagePlan.smoothstep(s.actLength() - 0.4, s.actLength(), k));
         double cinematic = 0;
         for (Beat b : script.beats()) cinematic = Math.max(cinematic, ReplayVideoScript.influence(b, t, 0.6, 0.6));
-        double hudA = hud * (1 - 0.55 * cinematic);
-        hudClock(c, t, s, hudA);
+        double hudA = hud * (1 - 0.12 * cinematic);
+        hudClock(c, t, s, hudA, hud);
         alive(c, s, hudA);
         timeline(c, s, hudA);
         feed(c, t, s, hud);
@@ -336,15 +365,22 @@ final class ReplayVideoOverlay {
         }
     }
 
-    private void hudClock(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, double a) {
+    private void hudClock(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, double a, double chipAlpha) {
         if (a <= 0.01) return;
-        float x = 44, y = 44;
+        float x = 44, y = 26;
         boolean blink = (t % 1.0) < 0.6;
         c.disc(x + 6, y, 6, argb(RUBY, (blink ? 1 : 0.35) * a), argb(RUBY, (blink ? 0.6 : 0.2) * a), 16);
-        c.text(ReplayVideoCanvas.font(Component.literal("REPLAY"), ReplayVideoCanvas.UI), x + 20, y, 2f, argb(CHAMPAGNE, 0.9 * a), -1, false);
+        Component replayTag = ReplayVideoCanvas.font(Component.literal("REPLAY"), ReplayVideoCanvas.UI);
+        c.text(replayTag, x + 20, y, 2f, argb(CHAMPAGNE, 0.92 * a), -1, false);
+        var focusActor = model.participant(script.focusPlayer());
+        if (focusActor != null) {
+            float px = x + 32 + c.width(replayTag, 2f);
+            c.disc(px + 4, y, 4.5f, argb(FOCUS_TRAIL, 0.95 * a), argb(FOCUS_TRAIL_GLOW, 0.4 * a), 12);
+            c.textFit(tr("hud.pov", focusActor.name), px + 16, y, 1.8f, 340, argb(FOCUS_TRAIL_HEAD, 0.95 * a), -1, true);
+        }
         String clock = ReplayStagePlan.clock(s.replayTick());
-        c.text(ReplayVideoCanvas.font(Component.literal(clock), ReplayVideoCanvas.BIG), x - 2, y + 42, 4.2f, argb(0xFFFFFFFF, a), -1, true);
-        float cw = c.width(ReplayVideoCanvas.font(Component.literal(clock), ReplayVideoCanvas.BIG), 4.2f);
+        c.text(ReplayVideoCanvas.font(Component.literal(clock), ReplayVideoCanvas.BIG), x - 2, y + 40, 4.0f, argb(0xFFFFFFFF, a), -1, true);
+        float cw = c.width(ReplayVideoCanvas.font(Component.literal(clock), ReplayVideoCanvas.BIG), 4.0f);
         Component chip;
         int chipColor;
         if (s.freeze()) { chip = tr("hud.freeze"); chipColor = RUBY; }
@@ -352,9 +388,10 @@ final class ReplayVideoOverlay {
         else { chip = Component.literal(String.format(Locale.ROOT, "×%.1f", s.speed())); chipColor = BRASS; }
         Component chipText = ReplayVideoCanvas.font(chip, ReplayVideoCanvas.UI);
         float tw = c.width(chipText, 1.8f) + 26;
-        float cx = x + cw + 16, cy = y + 42;
-        c.slab(cx, cy - 13, cx + tw, cy + 13, 8, argb(chipColor, 0.92 * a), argb(scale(chipColor, 0.7), 0.92 * a));
-        c.text(chipText, cx + tw / 2, cy, 1.8f, argb(s.freeze() ? 0xFFFFFFFF : NIGHT_0, a), 0, false);
+        float cx = x + cw + 16, cy = y + 40;
+        double ca = s.freeze() || s.slow() ? chipAlpha : a;
+        c.slab(cx, cy - 13, cx + tw, cy + 13, 8, argb(chipColor, 0.96 * ca), argb(scale(chipColor, 0.72), 0.96 * ca));
+        c.text(chipText, cx + tw / 2, cy, 1.8f, argb(s.freeze() ? 0xFFFFFFFF : NIGHT_0, ca), 0, false);
         if (!s.slow() && !s.freeze() && s.speed() > 3) {
             // Hyper-lapse chevrons.
             for (int i = 0; i < 3; i++) {
@@ -374,14 +411,14 @@ final class ReplayVideoOverlay {
             states[i] = model.actors[i].track.sample(s.replayTick()).state() == ReplayTrackSampler.State.ALIVE;
             if (states[i]) alive++;
         }
-        float x = w - 44, y = 44;
+        float x = w - 44, y = 22;
         c.text(tr("hud.alive"), x, y, 1.8f, argb(CHAMPAGNE, a), 1, true);
-        c.text(ReplayVideoCanvas.font(Component.literal(alive + "/" + total), ReplayVideoCanvas.BIG), x, y + 38, 3.6f, argb(0xFFFFFFFF, a), 1, true);
+        c.text(ReplayVideoCanvas.font(Component.literal(alive + "/" + total), ReplayVideoCanvas.BIG), x, y + 32, 3.4f, argb(0xFFFFFFFF, a), 1, true);
         int shown = Math.min(total, 24);
         float px = x - shown * 13 + 3;
         for (int i = 0; i < shown; i++) {
             var actor = model.actors[i];
-            float xx = px + i * 13, yy = y + 70;
+            float xx = px + i * 13, yy = y + 58;
             int col = actor.factionColor();
             if (states[i]) c.rect(xx, yy, xx + 10, yy + 10, argb(col, a), argb(scale(col, 0.7), a));
             else {
@@ -395,7 +432,7 @@ final class ReplayVideoOverlay {
     private void timeline(ReplayVideoCanvas c, ReplayVideoScript.Sample s, double a) {
         if (a <= 0.01) return;
         float x0 = 230, x1 = w - 360, y = h - 46;
-        int duration = Math.max(1, model.replay.durationTicks());
+        int duration = Math.max(1, script.actionEndTick());
         c.rect(x0, y - 3, x1, y + 3, argb(0xFF070B18, 0.75 * a));
         for (var span : script.spans()) {
             if (span.span().kind() != LastMatchReplay.SpanKind.BLACKOUT) continue;
@@ -417,12 +454,12 @@ final class ReplayVideoOverlay {
     }
 
     private void departure(ReplayVideoCanvas c, double k) {
-        if (k > 2.0) return;
-        double in = back(k / 0.3), out = 1 - ReplayStagePlan.smoothstep(1.4, 1.9, k);
-        double a = Math.min(1, k / 0.12) * out;
+        if (k > 1.25) return;
+        double in = back(k / 0.22), out = 1 - ReplayStagePlan.smoothstep(0.85, 1.22, k);
+        double a = Math.min(1, k / 0.1) * out;
         if (a <= 0.01) return;
         float y = h * 0.2f;
-        float len = (float) (w * 0.32 * ReplayStagePlan.easeOutCubic(k / 0.6));
+        float len = (float) (w * 0.32 * ReplayStagePlan.easeOutCubic(k / 0.45));
         c.line(w / 2 - 190 - len, y, w / 2 - 190, y, 3, argb(BRASS, 0), argb(BRASS_LIGHT, a));
         c.line(w / 2 + 190, y, w / 2 + 190 + len, y, 3, argb(BRASS_LIGHT, a), argb(BRASS, 0));
         c.art(Tex.T_DEPARTURE, w / 2, y, (float) (0.5 * (1 + 0.6 * (1 - in))), 0, argb(0xFFFFFFFF, a), false);
@@ -464,7 +501,7 @@ final class ReplayVideoOverlay {
         double slam = back(u / 0.24), out = ReplayStagePlan.easeInOutQuart((u - 2.15) / 0.45);
         double a = Math.min(1, u / 0.06) * (1 - out);
         if (a <= 0.01) return;
-        float y = h * 0.2f - (float) out * 40;
+        float y = h * 0.24f - (float) out * 40;
         int color = beatColor(b);
         float scale = (float) (0.56 * (1 + 0.9 * (1 - slam)));
         // Brush banner wipes in behind the title.
@@ -486,40 +523,42 @@ final class ReplayVideoOverlay {
         double in = back((u - 0.12) / 0.38), out = ReplayStagePlan.easeInOutQuart((u - 2.6) / 0.45);
         double a = Math.min(1, (u - 0.1) / 0.1) * (1 - out);
         if (a <= 0.01) return;
-        float cw = 520, ch = 78;
-        float x = 44 - (float) (1 - in) * 600 - (float) out * 600, y = h - 210;
+        float cw = 528, ch = 88;
+        float x = 44 - (float) (1 - in) * 600 - (float) out * 600, y = h - 216;
         int accent = beatColor(b);
         var node = b.node();
-        c.slab(x, y, x + cw, y + ch, 14, argb(NIGHT_2, 0.94 * a), argb(NIGHT_0, 0.94 * a));
+        c.slab(x, y, x + cw, y + ch, 14, argb(NIGHT_2, 0.95 * a), argb(NIGHT_0, 0.95 * a));
         c.slab(x - 6, y, x + 6, y + ch, 14, argb(accent, a), argb(accent, a));
-        c.line(x + 14, y + 1, x + cw + 14, y + 1, 2, argb(BRASS, 0.8 * a), argb(BRASS, 0.1 * a));
+        c.line(x + 14, y + 1, x + cw + 14, y + 1, 2, argb(BRASS, 0.85 * a), argb(BRASS, 0.15 * a));
         float cy = y + ch / 2;
+        int subText = lerp(TEXT_MUTED, TEXT, 0.55);
         if (b.type() == BeatType.KILL) {
             ReplayBoardModel.Actor killer = model.participant(node.actor()), victim = model.participant(node.target());
             float fx = x + 26;
             if (killer != null) {
                 c.face(killer.p.id(), fx, cy - 22, 44, argb(0xFFFFFFFF, a));
-                c.textFit(killer.name, fx + 54, cy - 10, 2f, 140, argb(killer.color, a), -1, true);
-                c.textFit(killer.role, fx + 54, cy + 14, 1.4f, 140, argb(TEXT_MUTED, a), -1, false);
+                c.textFit(killer.name, fx + 54, cy - 11, 2f, 145, argb(lerp(killer.color, 0xFFFFFFFF, 0.18), a), -1, true);
+                c.textFit(killer.role, fx + 54, cy + 14, 1.45f, 145, argb(subText, a), -1, true);
             } else {
-                c.icon(ReplayVideoCanvas.SKULL, fx + 22, cy, 40, argb(TEXT_MUTED, a));
-                c.textFit(ReplayBoardTexts.tr("environment"), fx + 54, cy, 2f, 140, argb(TEXT_MUTED, a), -1, true);
+                c.icon(ReplayVideoCanvas.SKULL, fx + 22, cy, 40, argb(subText, a));
+                c.textFit(ReplayBoardTexts.tr("environment"), fx + 54, cy, 2f, 145, argb(subText, a), -1, true);
             }
-            float wx = x + cw / 2 + 24;
-            c.sprite(Tex.GLOW, wx, cy, 90, 90, 0, argb(accent, 0.55 * a), true);
+            float wx = x + cw / 2 + 20, wy = cy - 6;
+            c.sprite(Tex.GLOW, wx, wy, 88, 88, 0, argb(accent, 0.5 * a), true);
+            c.disc(wx, wy, 23, argb(0xFFFFFFFF, 0.18 * a), argb(0xFFFFFFFF, 0.02 * a), 24);
             var mark = marks.get(node);
-            if (mark != null) c.item(mark.item(), wx, cy, 40);
-            else c.icon(ReplayVideoCanvas.CROSSHAIR, wx, cy, 36, argb(accent, a));
-            c.textFit(ReplayBoardTexts.weapon(node), wx, cy + 30, 1.2f, 110, argb(TEXT_MUTED, a), 0, false);
+            if (mark != null) c.item(mark.item(), wx, wy, 38);
+            else c.icon(ReplayVideoCanvas.CROSSHAIR, wx, wy, 34, argb(accent, a));
+            c.textFit(ReplayBoardTexts.weapon(node), wx, cy + 28, 1.35f, 128, argb(CHAMPAGNE, 0.92 * a), 0, true);
             if (victim != null) {
                 float vx = x + cw - 70;
                 c.face(victim.p.id(), vx, cy - 22, 44, argb(0xFFB06060, a));
                 c.line(vx + 4, cy - 18, vx + 40, cy + 18, 4, argb(RUBY, a), argb(RUBY, a));
                 c.line(vx + 40, cy - 18, vx + 4, cy + 18, 4, argb(RUBY, a), argb(RUBY, a));
-                c.textFit(victim.name, vx - 10, cy - 10, 2f, 120, argb(TEXT, a), 1, true);
-                float nw = Math.min(120, c.width(victim.name, 2f));
-                c.line(vx - 10 - nw, cy - 9, vx - 10, cy - 9, 2, argb(RUBY, 0.9 * a), argb(RUBY, 0.9 * a));
-                c.textFit(victim.role, vx - 10, cy + 14, 1.4f, 120, argb(victim.color, a), 1, false);
+                c.textFit(victim.name, vx - 10, cy - 11, 2f, 125, argb(TEXT, a), 1, true);
+                float nw = Math.min(125, c.width(victim.name, 2f));
+                c.line(vx - 10 - nw, cy - 10, vx - 10, cy - 10, 2, argb(RUBY, 0.9 * a), argb(RUBY, 0.9 * a));
+                c.textFit(victim.role, vx - 10, cy + 14, 1.45f, 125, argb(lerp(victim.color, 0xFFFFFFFF, 0.22), a), 1, true);
             }
         } else {
             ReplayBoardModel.Actor subject = model.participant(b.type() == BeatType.SHIELD && node.target() != null ? node.target()
@@ -541,8 +580,8 @@ final class ReplayVideoOverlay {
                 case SHIELD -> tr("card.shield", name);
                 default -> name;
             };
-            c.textFit(line, fx + 56, cy - 8, 2f, cw - 150, argb(TEXT, a), -1, true);
-            if (subject != null) c.textFit(subject.role, fx + 56, cy + 16, 1.4f, cw - 150, argb(subject.color, a), -1, false);
+            c.textFit(line, fx + 56, cy - 10, 2f, cw - 150, argb(TEXT, a), -1, true);
+            if (subject != null) c.textFit(subject.role, fx + 56, cy + 16, 1.45f, cw - 150, argb(lerp(subject.color, 0xFFFFFFFF, 0.22), a), -1, true);
             c.sprite(Tex.GLOW, x + cw - 50, cy, 80, 80, 0, argb(accent, 0.5 * a), true);
             c.icon(icon, x + cw - 50, cy, 38, argb(accent, a));
         }
@@ -617,7 +656,7 @@ final class ReplayVideoOverlay {
                 String.valueOf((int) Math.round(model.actors.length * count)),
                 String.valueOf((int) Math.round(script.beats().size() * count))};
         int[] colors = {BRASS_LIGHT, RUBY, PASSENGER, LAMP};
-        float bw = 210, gap = 22, total = bw * 4 + gap * 3, x = (w - total) / 2, by = h - 150;
+        float bw = 196, gap = 18, total = bw * 4 + gap * 3, x = (w - total) / 2 - 48, by = h - 144;
         for (int i = 0; i < 4; i++) {
             double ia = back((k - 0.3 - i * 0.12) / 0.45);
             double ba = Math.min(1, Math.max(0, (k - 0.3 - i * 0.12) / 0.15)) * a;
@@ -625,7 +664,7 @@ final class ReplayVideoOverlay {
             float bx = x + i * (bw + gap), oy = (float) (1 - ia) * 40;
             c.slab(bx, by + oy, bx + bw, by + 84 + oy, 10, argb(NIGHT_2, 0.9 * ba), argb(NIGHT_0, 0.9 * ba));
             c.rect(bx, by + oy, bx + bw + 10, by + 3 + oy, argb(colors[i], ba));
-            c.text(tr(labels[i]), bx + bw / 2 + 5, by + 20 + oy, 1.6f, argb(TEXT_MUTED, ba), 0, false);
+            c.text(tr(labels[i]), bx + bw / 2 + 5, by + 20 + oy, 1.6f, argb(lerp(TEXT_MUTED, TEXT, 0.45), ba), 0, true);
             c.text(ReplayVideoCanvas.font(Component.literal(values[i]), ReplayVideoCanvas.BIG), bx + bw / 2 + 5, by + 56 + oy, 4f,
                     argb(colors[i], ba), 0, true);
         }
@@ -705,38 +744,51 @@ final class ReplayVideoOverlay {
         double k = s.actTime();
         double out = ReplayStagePlan.smoothstep(s.actLength() - 0.45, s.actLength(), k);
         double a = Math.min(1, k / 0.2) * (1 - out);
-        float px = w * 0.62f, py = h * 0.4f;
+        // Right-side cinematic scrim and Art Deco backdrop card so stats remain crisp over the 3D diorama.
+        c.rectH(w * 0.36f, 0, w, h, argb(NIGHT_0, 0), argb(NIGHT_0, 0.86 * a));
+        float cardX0 = w * 0.46f, cardX1 = w - 34, cardY0 = 96, cardY1 = h - 96;
+        double panelOpen = ReplayStagePlan.easeOutCubic(k / 0.38);
+        float panelLeft = cardX1 - (cardX1 - cardX0) * (float) panelOpen;
+        c.rect(panelLeft, cardY0, cardX1, cardY1, argb(NIGHT_1, 0.86 * a), argb(NIGHT_0, 0.92 * a));
+        c.rect(panelLeft, cardY0, cardX1, cardY0 + 2, argb(BRASS, 0.9 * a));
+        c.rect(panelLeft, cardY1 - 2, cardX1, cardY1, argb(BRASS, 0.9 * a));
+        corners(c, panelLeft, cardY0, cardX1, cardY1, argb(BRASS_LIGHT, 0.9 * a));
+
+        float px = w * 0.59f, py = h * 0.46f;
         // Portrait medallion.
         double pop = back((k - 0.15) / 0.45);
-        float ps = (float) (0.95 + 0.25 * (1 - pop));
-        c.sprite(Tex.RAYS, px, py, 420 * ps, 420 * ps, (float) (t * 0.25), argb(BRASS_LIGHT, 0.45 * a), true);
-        c.sprite(Tex.GLOW, px, py, 360 * ps, 360 * ps, 0, argb(BRASS, 0.5 * a), true);
-        c.art(Tex.LAUREL, px, py + 24 * ps, 0.86f * ps, 0, argb(0xFFFFFFFF, a), false);
-        float face = 104 * ps;
+        float ps = (float) (0.92 + 0.22 * (1 - pop));
+        c.sprite(Tex.RAYS, px, py, 400 * ps, 400 * ps, (float) (t * 0.25), argb(BRASS_LIGHT, 0.42 * a), true);
+        c.sprite(Tex.GLOW, px, py, 340 * ps, 340 * ps, 0, argb(BRASS, 0.46 * a), true);
+        c.art(Tex.LAUREL, px, py + 22 * ps, 0.82f * ps, 0, argb(0xFFFFFFFF, a), false);
+        float face = 100 * ps;
         c.rect(px - face / 2 - 4, py - face / 2 - 4, px + face / 2 + 4, py + face / 2 + 4, argb(NIGHT_0, a));
         c.face(mvp.p.id(), px - face / 2, py - face / 2, face, argb(0xFFFFFFFF, a));
-        c.art(Tex.HEX_FRAME, px, py, 0.8f * ps, (float) Math.toRadians(0), argb(0xFFFFFFFF, a), false);
-        c.art(Tex.CROWN, px, py - 128 * ps + (float) Math.sin(t * 2.2) * 4, 0.55f * ps, (float) Math.sin(t * 1.7) * 0.05f, argb(0xFFFFFFFF, a), false);
+        c.art(Tex.HEX_FRAME, px, py, 0.77f * ps, (float) Math.toRadians(0), argb(0xFFFFFFFF, a), false);
+        c.art(Tex.CROWN, px, py - 122 * ps + (float) Math.sin(t * 2.2) * 4, 0.52f * ps, (float) Math.sin(t * 1.7) * 0.05f, argb(0xFFFFFFFF, a), false);
         for (int i = 0; i < 12; i++) {
             double ang = t * 0.6 + i * Math.PI / 6;
-            float rr = 150 + 14 * (float) Math.sin(t * 2 + i);
+            float rr = 144 + 14 * (float) Math.sin(t * 2 + i);
             double tw = 0.5 + 0.5 * Math.sin(t * 4 + i * 1.3);
             c.sprite(Tex.GLOW, px + (float) Math.cos(ang) * rr, py + (float) Math.sin(ang) * rr * 0.8f, 18, 18, 0, argb(CHAMPAGNE, tw * a), true);
         }
         // Title and stats column.
-        float tx = w * 0.62f + 170;
+        float tx = w * 0.59f + 160;
+        float colRight = cardX1 - 24;
         double ta = back((k - 0.35) / 0.35);
-        c.art(Tex.T_MVP, tx + 70, h * 0.22f, (float) (0.62 * (1 + 0.6 * (1 - ta))), (float) Math.toRadians(-3),
+        c.art(Tex.T_MVP, (tx + colRight) * 0.5f, h * 0.24f, (float) (0.58 * (1 + 0.6 * (1 - ta))), (float) Math.toRadians(-3),
                 argb(0xFFFFFFFF, a * Math.min(1, Math.max(0, (k - 0.35) / 0.1))), false);
         double na = ReplayStagePlan.easeOutCubic((k - 0.6) / 0.4) * a;
-        c.text(tr("mvp.subtitle"), tx, h * 0.33f, 1.6f, argb(BRASS_LIGHT, na), -1, false);
-        c.textFit(mvp.name, tx, h * 0.39f, 3f, w - tx - 40, argb(CHAMPAGNE, na), -1, true);
-        c.textFit(mvp.role, tx, h * 0.45f, 1.8f, w - tx - 40, argb(mvp.color, na), -1, true);
+        c.text(tr("mvp.subtitle"), tx, h * 0.34f, 1.6f, argb(BRASS_LIGHT, na), -1, true);
+        c.textFit(mvp.name, tx, h * 0.40f, 3f, colRight - tx, argb(CHAMPAGNE, na), -1, true);
+        c.textFit(mvp.role, tx, h * 0.46f, 1.8f, colRight - tx, argb(lerp(mvp.color, 0xFFFFFFFF, 0.22), na), -1, true);
+        c.rect(tx, h * 0.495f, colRight, h * 0.495f + 1.5f, argb(BRASS_DIM, 0.75 * na));
         var p = mvp.p;
         String[] labels = {"mvp.score", "mvp.kills", "mvp.survival", "mvp.items"};
         double[] ratios = {p.score() / (double) maxScore, p.kills() / (double) maxKills, p.survivalSeconds() / (double) maxSurvival,
                 p.itemUses() / (double) maxItems};
         int[] colors = {BRASS_LIGHT, RUBY, PASSENGER, LAMP};
+        int labelCol = lerp(TEXT_MUTED, TEXT, 0.55);
         for (int i = 0; i < 4; i++) {
             double ra = ReplayStagePlan.easeOutCubic((k - 0.9 - i * 0.12) / 0.4) * a;
             if (ra <= 0.01) continue;
@@ -747,18 +799,12 @@ final class ReplayVideoOverlay {
                 case 2 -> ReplayStagePlan.clock(p.survivalSeconds() * 20.0 * count);
                 default -> String.valueOf((int) Math.round(p.itemUses() * count));
             };
-            float ry = h * 0.53f + i * 44;
-            c.text(tr(labels[i]), tx, ry, 1.6f, argb(TEXT_MUTED, ra), -1, false);
-            c.text(ReplayVideoCanvas.font(Component.literal(value), ReplayVideoCanvas.BIG), w - 50, ry, 3f, argb(colors[i], ra), 1, true);
-            float bx0 = tx, bx1 = w - 130;
-            c.rect(bx0, ry + 14, bx1, ry + 18, argb(0xFF1A2440, 0.9 * ra));
-            c.rectH(bx0, ry + 14, bx0 + (bx1 - bx0) * (float) (Math.clamp(ratios[i], 0.04, 1) * count), ry + 18, argb(scale(colors[i], 0.6), ra), argb(colors[i], ra));
-        }
-        // A tag anchored to the champion on the model.
-        Vector3f m = actorPoint(mvp, script.duration());
-        if (m != null) {
-            Vector3f sp = shot.toScreen(m.add(0, headSize(heads, mvp, m) * 2.4f, 0), w, h);
-            if (onScreen(sp) && k > 0.8) callout(c, sp.x, sp.y, Component.literal("MVP"), BRASS_LIGHT, a, k - 0.8);
+            float ry = h * 0.545f + i * 48;
+            c.text(tr(labels[i]), tx, ry, 1.65f, argb(labelCol, ra), -1, true);
+            c.text(ReplayVideoCanvas.font(Component.literal(value), ReplayVideoCanvas.BIG), colRight, ry, 3f, argb(colors[i], ra), 1, true);
+            float bx0 = tx, bx1 = colRight - 82;
+            c.rect(bx0, ry + 15, bx1, ry + 20, argb(0xFF1A2440, 0.95 * ra));
+            c.rectH(bx0, ry + 15, bx0 + (bx1 - bx0) * (float) (Math.clamp(ratios[i], 0.04, 1) * count), ry + 20, argb(scale(colors[i], 0.65), ra), argb(colors[i], ra));
         }
     }
 
@@ -783,17 +829,59 @@ final class ReplayVideoOverlay {
         int[] align = {0, -1, -1, 0, 0, 1};
         for (int i = 0; i < heads.length; i++) c.text(tr(heads[i]), cols[i], hy, 1.4f, argb(TEXT_MUTED, a), align[i], false);
         c.rect(x0 + 20, hy + 12, x1 - 20, hy + 13, argb(BRASS_DIM, 0.8 * a));
-        int rows = Math.min(ranking.size(), 9);
-        float rh = Math.min(42, (y1 - hy - 70) / Math.max(1, rows));
-        for (int i = 0; i < rows; i++) {
-            var actor = ranking.get(i);
-            double ra = ReplayStagePlan.easeOutCubic((k - 0.5 - i * 0.07) / 0.3) * a;
+
+        int pageSize = ReplayVideoScript.OUTRO_PAGE_SIZE;
+        int totalPages = Math.max(1, (ranking.size() + pageSize - 1) / pageSize);
+        int rowsPerLayout = Math.min(ranking.size(), pageSize);
+        float rh = Math.min(42, (y1 - hy - 74) / Math.max(1, rowsPerLayout));
+
+        int page = 0;
+        double pageAlpha = 1.0;
+        float pageSlideX = 0f;
+        boolean initialEntry = true;
+        if (totalPages > 1) {
+            // Let page 1 settle and hold so viewers can read it comfortably before flipping pages.
+            double contentStart = 0.45;
+            double usable = Math.max(2.0, s.actLength() - 0.85 - contentStart);
+            double slot = usable / totalPages;
+            double elapsed = Math.max(0, k - contentStart);
+            int rawPage = Math.min(totalPages - 1, (int) (elapsed / slot));
+            double inSlot = elapsed - rawPage * slot;
+            double flipDur = Math.min(0.40, slot * 0.16);
+            double halfFlip = flipDur * 0.5;
+            page = rawPage;
+            initialEntry = rawPage == 0;
+            if (rawPage > 0 && inSlot < halfFlip) {
+                double pIn = ReplayStagePlan.easeOutCubic(inSlot / halfFlip);
+                pageAlpha = pIn;
+                pageSlideX = (float) ((1 - pIn) * 44);
+            } else if (rawPage < totalPages - 1 && inSlot > slot - halfFlip) {
+                double pOut = ReplayStagePlan.easeInOutQuart((inSlot - (slot - halfFlip)) / halfFlip);
+                pageAlpha = 1 - pOut;
+                pageSlideX = (float) (-pOut * 44);
+            }
+        }
+
+        int startIdx = page * pageSize;
+        int endIdx = Math.min(ranking.size(), startIdx + pageSize);
+        for (int slotIdx = 0; slotIdx < endIdx - startIdx; slotIdx++) {
+            int rankIdx = startIdx + slotIdx;
+            var actor = ranking.get(rankIdx);
+            double rowEnter = initialEntry ? ReplayStagePlan.easeOutCubic((k - 0.5 - slotIdx * 0.06) / 0.28) : 1.0;
+            double ra = rowEnter * pageAlpha * a;
             if (ra <= 0.01) continue;
-            float y = hy + 22 + rh * (i + 0.5f), off = (float) (1 - ra) * 60;
-            if (actor.p.winner()) c.rectH(x0 + 20 + off, y - rh / 2 + 2, x1 - 20, y + rh / 2 - 2, argb(BRASS, 0.18 * ra), argb(BRASS, 0.02 * ra));
-            if (actor.p.winner()) c.rect(x0 + 20 + off, y - rh / 2 + 2, x0 + 23 + off, y + rh / 2 - 2, argb(BRASS_LIGHT, ra));
-            c.text(ReplayVideoCanvas.font(Component.literal(String.valueOf(i + 1)), ReplayVideoCanvas.BIG), cols[0] + off, y, 2.4f,
-                    argb(i == 0 ? BRASS_LIGHT : TEXT_MUTED, ra), 0, false);
+            float y = hy + 22 + rh * (slotIdx + 0.5f);
+            float off = (float) ((1 - rowEnter) * 56) + pageSlideX;
+            boolean isFocus = script.focusPlayer() != null && script.focusPlayer().equals(actor.p.id());
+            if (isFocus) {
+                c.rectH(x0 + 20 + off, y - rh / 2 + 2, x1 - 20, y + rh / 2 - 2, argb(FOCUS_TRAIL, 0.22 * ra), argb(FOCUS_TRAIL, 0.03 * ra));
+                c.rect(x0 + 20 + off, y - rh / 2 + 2, x0 + 24 + off, y + rh / 2 - 2, argb(FOCUS_TRAIL, ra));
+            } else if (actor.p.winner()) {
+                c.rectH(x0 + 20 + off, y - rh / 2 + 2, x1 - 20, y + rh / 2 - 2, argb(BRASS, 0.18 * ra), argb(BRASS, 0.02 * ra));
+                c.rect(x0 + 20 + off, y - rh / 2 + 2, x0 + 23 + off, y + rh / 2 - 2, argb(BRASS_LIGHT, ra));
+            }
+            c.text(ReplayVideoCanvas.font(Component.literal(String.valueOf(rankIdx + 1)), ReplayVideoCanvas.BIG), cols[0] + off, y, 2.4f,
+                    argb(rankIdx == 0 ? BRASS_LIGHT : TEXT_MUTED, ra), 0, false);
             float fs = Math.min(28, rh - 8);
             c.face(actor.p.id(), cols[1] + off, y - fs / 2, fs, argb(actor.p.winner() ? 0xFFFFFFFF : 0xFFAAAAAA, ra));
             c.textFit(actor.name, cols[1] + fs + 10 + off, y, 1.6f, cols[2] - cols[1] - fs - 24, argb(actor.p.winner() ? CHAMPAGNE : TEXT, ra), -1, true);
@@ -804,16 +892,25 @@ final class ReplayVideoOverlay {
             c.text(ReplayVideoCanvas.font(Component.literal(ReplayStagePlan.clock(actor.p.survivalSeconds() * 20.0)), ReplayVideoCanvas.UI),
                     cols[5] + off, y, 1.6f, argb(TEXT, ra), 1, false);
         }
-        if (ranking.size() > rows) {
-            c.text(tr("outro.more", ranking.size() - rows), (x0 + x1) / 2, y1 - 52, 1.4f, argb(TEXT_FAINT, a), 0, false);
+        if (totalPages > 1) {
+            float midX = (x0 + x1) / 2, indY = y1 - 50;
+            float dotGap = 16;
+            float dotsStart = midX - (totalPages - 1) * dotGap * 0.5f;
+            for (int p = 0; p < totalPages; p++) {
+                boolean active = p == page;
+                float dx = dotsStart + p * dotGap;
+                c.diamond(dx, indY, active ? 5.5f : 3.5f, argb(active ? BRASS_LIGHT : TEXT_MUTED, (active ? 1.0 : 0.55) * a));
+            }
+            c.text(ReplayVideoCanvas.font(Component.literal((page + 1) + " / " + totalPages), ReplayVideoCanvas.UI),
+                    dotsStart + (totalPages - 1) * dotGap + 24, indY, 1.45f, argb(CHAMPAGNE, 0.85 * a), -1, false);
         }
         Component kills;
         if (model.firstKill == null) kills = ReplayBoardTexts.tr("no_kill");
         else if (model.lastKill == null || model.lastKill == model.firstKill) kills = ReplayBoardTexts.killLine("first_kill", model.firstKill, model);
         else kills = Component.empty().append(ReplayBoardTexts.killLine("first_kill", model.firstKill, model)).append("   ")
                     .append(ReplayBoardTexts.killLine("last_kill", model.lastKill, model));
-        double fa = ReplayStagePlan.easeOutCubic((k - 1.4) / 0.5) * a;
-        c.textFit(kills, (x0 + x1) / 2, y1 - 26, 1.3f, x1 - x0 - 40, argb(TEXT_MUTED, fa), 0, false);
+        double fa = ReplayStagePlan.easeOutCubic((k - 1.2) / 0.5) * a;
+        c.textFit(kills, (x0 + x1) / 2, y1 - 24, 1.35f, x1 - x0 - 40, argb(lerp(TEXT_MUTED, TEXT, 0.35), fa), 0, false);
         // Brand sign-off bottom left.
         double ba = ReplayStagePlan.easeOutCubic((k - 0.8) / 0.6);
         c.art(Tex.BRAND, 60 + Tex.BRAND.w * 0.2f, h - 70, 0.4f, 0, argb(0xFFFFFFFF, ba), false);

@@ -24,6 +24,8 @@ final class ReplayActorPainter {
     private static float[] points = new float[3 * 512];
     private static float[] widths = new float[512];
     private static int[] colors = new int[512];
+    private static float[] haloWidths = new float[512];
+    private static int[] haloColors = new int[512];
 
     static void paint(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayActorSizing heads) {
         ReplayBoardModel model = f.model;
@@ -36,10 +38,14 @@ final class ReplayActorPainter {
         VertexConsumer glow = f.glow();
         float[] tmp = new float[3];
         Vector3f trailPoint = new Vector3f();
+        boolean singleFocus = f.focusPlayer != null;
         for (ReplayBoardModel.Actor actor : model.actors) {
             ReplayTrackSampler.Pose pose = f.pose(actor);
             if (pose.visible()) model.project(pose.x(), pose.y(), pose.z(), tmp);
-            trails(f, d, actor, t, alpha, stage.history(), review, elemScale, pose, tmp, trailPoint, s.detail());
+            boolean focusedTrail = singleFocus && f.focusPlayer.equals(actor.p.id());
+            if (!singleFocus || focusedTrail) {
+                trails(f, d, actor, t, alpha, stage.history(), review, elemScale, pose, tmp, trailPoint, s.detail(), focusedTrail);
+            }
             if (!pose.visible()) continue;
             float size = heads.size(actor.p.id(), tmp[0], tmp[1], tmp[2]);
             if (size <= 0) continue;
@@ -50,6 +56,11 @@ final class ReplayActorPainter {
             if (review && actor.p.winner()) ringColor = ReplayPalette.BRASS_LIGHT;
             ReplayDraw.ring(glow, d, x, y, z, size * 0.58f, size * 0.12f, 20, ReplayPalette.alpha(ringColor, ringA * alpha),
                     ReplayPalette.alpha(ringColor, ringA * 0.25 * alpha));
+            if (focusedTrail) {
+                ReplayDraw.ring(glow, d, x, y + 0.002f, z, size * 0.82f, size * 0.11f, 24,
+                        ReplayPalette.alpha(ReplayPalette.FOCUS_TRAIL, 0.9 * alpha),
+                        ReplayPalette.alpha(ReplayPalette.FOCUS_TRAIL_GLOW, 0.25 * alpha));
+            }
             ReplayDraw.disc(glow, d, x, y - 0.001f, z, size * 0.5f, 16, ReplayPalette.alpha(ringColor, 0.18 * alpha),
                     ReplayPalette.alpha(ringColor, 0));
             if (alive) aliveActor(f, s, d, actor, pose, x, y, z, alpha, elemScale, size);
@@ -201,43 +212,58 @@ final class ReplayActorPainter {
 
     private static void trails(ReplayFrame f, Matrix4f d, ReplayBoardModel.Actor actor, double t, double alpha,
                                double history, boolean review, float elemScale, ReplayTrackSampler.Pose live,
-                               float[] livePosition, Vector3f tmp, boolean detail) {
+                               float[] livePosition, Vector3f tmp, boolean detail, boolean focused) {
         ReplayTrackSampler track = actor.track;
         int last = track.indexAt(t);
         if (last < 0) return;
         ReplayBoardModel model = f.model;
         VertexConsumer glow = f.glow();
+        VertexConsumer fill = focused ? f.fill() : null;
         double cometStart = t - model.comet;
-        double baseA = alpha * (0.13 + 0.32 * history) * (review ? 1.2 : 1);
+        boolean videoReview = f.video && f.frame != null && f.frame.phase() == ReplayTimeline.Phase.REVIEW;
+        double baseA = alpha * (videoReview ? 0.22 + 0.58 * history : (0.13 + 0.32 * history) * (review ? 1.2 : 1));
         int base = actor.color;
         boolean appendLive = live.state() == ReplayTrackSampler.State.ALIVE;
         int recent = Math.max(0, track.indexAt(cometStart));
-        int first = detail ? 0 : recent;
+        int first = detail || focused ? 0 : recent;
         int stride = f.video ? 1 : Math.max(1, (recent + 95) / 96);
+        float trailScale = focused ? (videoReview ? elemScale * 1.45f : elemScale) : (videoReview ? elemScale * 1.65f : elemScale);
+        float yLift = focused ? 0.014f : 0.012f;
         int n = 0;
         int cap = widths.length - 1;
         for (int i = first; i <= last; i++) {
             boolean startsSegment = i == first || !track.connects(i);
             if (startsSegment) {
-                if (n >= 2) emit(glow, n);
+                if (n >= 2) emitTrail(fill, glow, n, focused);
                 n = 0;
             }
             if (!startsSegment && i < recent && i % stride != 0 && track.connects(i + 1)) continue;
             if (n >= cap) {
-                emit(glow, n);
+                emitTrail(fill, glow, n, focused);
                 int o = (n - 1) * 3;
                 points[0] = points[o]; points[1] = points[o + 1]; points[2] = points[o + 2];
                 widths[0] = widths[n - 1]; colors[0] = colors[n - 1];
+                if (focused) {
+                    haloWidths[0] = haloWidths[n - 1]; haloColors[0] = haloColors[n - 1];
+                }
                 n = 1;
             }
-            d.transformPosition(actor.xs[i], actor.ys[i] + 0.012f, actor.zs[i], tmp);
-            put(n++, tmp, track.tick(i), cometStart, t, baseA, base, alpha, elemScale);
+            d.transformPosition(actor.xs[i], actor.ys[i] + yLift, actor.zs[i], tmp);
+            if (focused) {
+                putFocused(n++, tmp, track.tick(i), cometStart, t, alpha, videoReview, trailScale);
+            } else {
+                put(n++, tmp, track.tick(i), cometStart, t, baseA, base, alpha, trailScale);
+            }
         }
         if (appendLive && n >= 1) {
-            d.transformPosition(livePosition[0], livePosition[1] + 0.012f, livePosition[2], tmp);
-            put(n++, tmp, t, cometStart, t, baseA, base, alpha, elemScale);
+            d.transformPosition(livePosition[0], livePosition[1] + yLift, livePosition[2], tmp);
+            if (focused) {
+                putFocused(n++, tmp, t, cometStart, t, alpha, videoReview, trailScale);
+            } else {
+                put(n++, tmp, t, cometStart, t, baseA, base, alpha, trailScale);
+            }
         }
-        if (n >= 2) emit(glow, n);
+        if (n >= 2) emitTrail(fill, glow, n, focused);
     }
 
     private static void put(int index, Vector3f p, double tick, double cometStart, double t, double baseA, int color,
@@ -251,7 +277,27 @@ final class ReplayActorPainter {
         widths[index] = (float) (0.010 + 0.022 * comet) * elemScale;
     }
 
-    private static void emit(VertexConsumer glow, int n) {
-        ReplayDraw.ribbon(glow, points, n, widths, colors);
+    /** Bold light-red trail (alpha-blended core + soft additive halo) for single-player perspective export. */
+    private static void putFocused(int index, Vector3f p, double tick, double cometStart, double t,
+                                   double alpha, boolean videoReview, float elemScale) {
+        int o = index * 3;
+        points[o] = p.x; points[o + 1] = p.y; points[o + 2] = p.z;
+        double comet = tick >= cometStart ? (tick - cometStart) / Math.max(1, t - cometStart) : 0;
+        double coreAlpha = (videoReview ? 0.85 : 0.72) + comet * comet * 0.23;
+        int coreColor = ReplayPalette.lerp(ReplayPalette.FOCUS_TRAIL, ReplayPalette.FOCUS_TRAIL_HEAD, comet * 0.65);
+        colors[index] = ReplayPalette.alpha(coreColor, Math.min(1.0, coreAlpha) * alpha);
+        widths[index] = (float) (0.026 + 0.024 * comet) * elemScale;
+        double haloAlpha = (videoReview ? 0.32 : 0.26) + comet * comet * 0.34;
+        haloColors[index] = ReplayPalette.alpha(ReplayPalette.FOCUS_TRAIL_GLOW, Math.min(1.0, haloAlpha) * alpha);
+        haloWidths[index] = (float) (0.042 + 0.032 * comet) * elemScale;
+    }
+
+    private static void emitTrail(@org.jetbrains.annotations.Nullable VertexConsumer fill, VertexConsumer glow, int n, boolean focused) {
+        if (focused && fill != null) {
+            ReplayDraw.ribbon(fill, points, n, widths, colors);
+            ReplayDraw.ribbon(glow, points, n, haloWidths, haloColors);
+        } else {
+            ReplayDraw.ribbon(glow, points, n, widths, colors);
+        }
     }
 }
