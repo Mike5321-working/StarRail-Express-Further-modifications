@@ -80,6 +80,7 @@
         "RepairAmbientLoopMixin",
         "MapIntroReceiveMixin",
         "MapIntroduceScreenMixin",
+        "RoundWelcomeHudMixin",
         "StarRailLoadingOverlayMixin",
         "SREReceivingLevelScreenMixin",
         "TrainLoadingScreenMixin"
