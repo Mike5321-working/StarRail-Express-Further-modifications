@@ -72,6 +72,46 @@ class ReplayFrontendTest {
         assertEquals(-1, sampler.indexAt(-0.5));
     }
 
+    @Test void limbImpulsesAdvanceThroughConsecutiveSamplesAndAllowNewActions() {
+        int mainAndHurt = ACT_SWING_MAIN | ACT_HURT_FLASH;
+        var sampler = new ReplayTrackSampler(List.of(
+                actionSample(0, ALIVE, 0), actionSample(10, ALIVE, mainAndHurt),
+                actionSample(11, ALIVE, mainAndHurt), actionSample(12, ALIVE, mainAndHurt | ACT_SWING_OFF),
+                actionSample(13, ALIVE, ACT_HURT_FLASH | ACT_SWING_OFF), actionSample(14, ALIVE, 0),
+                actionSample(18, ALIVE, ACT_SWING_MAIN), actionSample(20, (byte) (ALIVE | BREAK), 0)));
+
+        assertEquals(0f, sampler.limbMotionAt(9.9).mainSwing());
+        assertTrue(sampler.limbMotionAt(11).mainSwing() > sampler.limbMotionAt(10.9).mainSwing());
+        var midSwing = sampler.limbMotionAt(13.5);
+        assertEquals(3.5 / 6, midSwing.mainSwing(), 1e-6);
+        assertEquals(1.5 / 6, midSwing.offSwing(), 1e-6);
+        assertEquals(0.65, midSwing.hurtFlash(), 1e-6);
+        assertEquals(0f, sampler.limbMotionAt(16).mainSwing());
+        assertEquals(1.0 / 6, sampler.limbMotionAt(19).mainSwing(), 1e-6);
+        assertEquals(0f, sampler.limbMotionAt(20).mainSwing());
+        assertEquals(midSwing, sampler.limbMotionAt(13.5));
+    }
+
+    @Test void gaitIsContinuousAtSprintChangesAndIgnoresJumpsAndTeleports() {
+        var sampler = new ReplayTrackSampler(List.of(
+                sample(0, 0, 0, ALIVE), new Sample(2, new Position((short) 0, (short) 16, (short) 0), (byte) 0, ALIVE),
+                sample(8, 0, 0, ALIVE), sample(10, 4, 0, ALIVE),
+                sample(12, 12, 0, (byte) (ALIVE | SPRINT)), sample(14, 20, 0, ALIVE),
+                sample(16, 200, 0, (byte) (ALIVE | BREAK)), sample(40, 200, 0, ALIVE)));
+        assertEquals(0.0, sampler.limbMotionAt(2).speed(), 1e-9);
+        assertEquals(0.0, sampler.limbMotionAt(2).distance(), 1e-9);
+        assertEquals(sampler.limbMotionAt(11.999).distance(), sampler.limbMotionAt(12).distance(), 0.001);
+        assertEquals(sampler.limbMotionAt(9.999).speed(), sampler.limbMotionAt(10).speed(), 0.001);
+        assertEquals(1.25, sampler.limbMotionAt(15.9).distance(), 1e-9);
+        assertEquals(0.0, sampler.limbMotionAt(16).speed(), 1e-9);
+        assertEquals(0.0, sampler.limbMotionAt(16).distance(), 1e-9);
+    }
+
+    private static Sample actionSample(int tick, byte flags, int actions) {
+        return new Sample(tick, new Position((short) 0, (short) 0, (short) 0), (byte) 0, flags,
+                (byte) 0, (byte) 0, actions, 0, "", "", null);
+    }
+
     @Test void yawTakesTheShortestArc() {
         assertEquals(0f, ReplayTrackSampler.lerpYaw(350f, 10f, 0.5f) % 360f, 1e-4f);
         assertEquals(0f, ReplayTrackSampler.lerpYaw(10f, 350f, 0.5f) % 360f, 1e-4f);

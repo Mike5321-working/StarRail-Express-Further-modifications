@@ -14,7 +14,7 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
     private final float hw, hd;
     private final int primitiveSize;
     private final float[][] quad = new float[4][ATTRIBUTES];
-    private final float[][][] polygons = new float[2][12][ATTRIBUTES];
+    private float[][][] polygons;
     private final Vector3f local = new Vector3f();
     private int count, fields;
     private float[] vertex;
@@ -70,6 +70,39 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
         return this;
     }
 
+    /** A circle fits the clip when the four corners of its enclosing square fit. */
+    VertexConsumer horizontalArea(Matrix4f transform, float x, float y, float z, float radius) {
+        if (primitiveSize != 4 || count != 0 && count != 4) return this;
+        if (!inside(transform, x - radius, y, z - radius)
+                || !inside(transform, x + radius, y, z - radius)
+                || !inside(transform, x + radius, y, z + radius)
+                || !inside(transform, x - radius, y, z + radius)) return this;
+        if (count != 0) flush();
+        return output.get();
+    }
+
+    private boolean inside(Matrix4f transform, float x, float y, float z) {
+        transform.transformPosition(x, y, z, local);
+        return inside(local.x, local.y, local.z);
+    }
+
+    private boolean inside(float x, float y, float z) {
+        inverseBoard.transformPosition(x, y, z, local);
+        // Keep a small margin so interpolation and matrix round-off at the tray rim use the full clip path.
+        return Math.abs(local.x) < hw - 0.0001f && Math.abs(local.z) < hd - 0.0001f;
+    }
+
+    void ribbonQuad(float ax, float ay, float az, float bx, float by, float bz,
+                    float cx, float cy, float cz, float dx, float dy, float dz, int startColor, int endColor) {
+        VertexConsumer target = this;
+        if (primitiveSize == 4 && (count == 0 || count == 4)
+                && inside(ax, ay, az) && inside(bx, by, bz) && inside(cx, cy, cz) && inside(dx, dy, dz)) {
+            if (count != 0) flush();
+            target = output.get();
+        }
+        ReplayDraw.ribbonQuad(target, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, startColor, endColor);
+    }
+
     private void flush() {
         if (count != primitiveSize) return;
         boolean inside = true;
@@ -85,6 +118,7 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
                 for (int index = 0; index < count; index++) outside &= distance(quad[index], plane) < 0;
                 if (outside) { count = fields = 0; return; }
             }
+            if (polygons == null) polygons = new float[2][12][ATTRIBUTES];
             for (int i = 0; i < count; i++) System.arraycopy(quad[i], 0, polygons[0][i], 0, ATTRIBUTES);
             int n = count, source = 0;
             for (int plane = 0; plane < 4 && n > 0; plane++) {
@@ -130,6 +164,7 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
         }
         if (start >= end) return;
         VertexConsumer target = output.get();
+        if (polygons == null) polygons = new float[1][1][ATTRIBUTES];
         float[] endpoint = polygons[0][0];
         interpolate(quad[0], quad[1], start, endpoint);
         emit(target, endpoint);
@@ -159,5 +194,12 @@ final class ReplayClippedConsumer implements VertexConsumer, AutoCloseable {
         if ((fields & 16) != 0) target.setNormal(v[13], v[14], v[15]);
     }
 
-    @Override public void close() { flush(); }
+    @Override public void close() {
+        try {
+            flush();
+        } finally {
+            count = fields = 0;
+            vertex = null;
+        }
+    }
 }

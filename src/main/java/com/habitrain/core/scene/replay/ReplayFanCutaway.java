@@ -9,12 +9,19 @@ import org.joml.Vector3f;
 public final class ReplayFanCutaway {
     public static final int MAX_FANS = LastMatchReplay.MAX_PLAYERS;
     public static final float HALF_ANGLE_TANGENT = (float) Math.tan(Math.toRadians(40));
+    public static final float EDGE_WIDTH = 0.55f;
     // Four vec4 anchors per mat4: Minecraft's uniform loader supports matrix arrays directly.
     public static final int PACKED_FLOATS = MAX_FANS * 4;
 
     private final float[] anchors = new float[PACKED_FLOATS];
+    private final float[] projected = new float[PACKED_FLOATS];
+    private final float[] selected = new float[PACKED_FLOATS];
     private int count;
     private float directionX, directionZ = 1;
+    private boolean projectionDirty = true;
+
+    /** Shader upload view. Consume immediately, before selecting another batch. */
+    public record ShaderFans(float[] anchors, int count, float directionX, float directionZ) {}
 
     public void clear() { count = 0; }
     public int count() { return count; }
@@ -37,6 +44,7 @@ public final class ReplayFanCutaway {
 
     /** Direction from the replay avatars towards the viewer, expressed in source-map axes. */
     public void direction(double x, double z) {
+        projectionDirty = true;
         double length = Math.hypot(x, z);
         if (!Double.isFinite(length) || length < 1.0e-5) {
             directionX = 0;
@@ -55,13 +63,52 @@ public final class ReplayFanCutaway {
         double z = origin.minZ() - source.minZ() + pose.z();
         if (!Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(z)) return;
         int offset = count++ * 4;
+        projectionDirty = true;
         anchors[offset] = (float) x;
         anchors[offset + 1] = (float) y;
         anchors[offset + 2] = (float) z;
         anchors[offset + 3] = (float) coreRadius;
     }
 
-    /** Mirrors the shader's voxel-centre predicate. The supporting floor stays below the opening. */
+    public ShaderFans shaderFans() {
+        projectAnchors();
+        return new ShaderFans(projected, count, directionX, directionZ);
+    }
+
+    /** Conservatively reject openings which cannot reach any fragment in this batch. */
+    public ShaderFans shaderFans(double minX, double minZ, double maxX, double maxY, double maxZ) {
+        projectAnchors();
+        // The fragment shader moves its XZ sample halfway towards the owning voxel centre.
+        double cx = (minX + maxX) * 0.5, cz = (minZ + maxZ) * 0.5;
+        double hx = (maxX - minX) * 0.5 + 0.26, hz = (maxZ - minZ) * 0.5 + 0.26;
+        double forwardMax = cx * directionX + cz * directionZ + hx * Math.abs(directionX) + hz * Math.abs(directionZ);
+        double side = cx * directionZ - cz * directionX;
+        double sideExtent = hx * Math.abs(directionZ) + hz * Math.abs(directionX);
+        int kept = 0;
+        for (int i = 0; i < count * 4; i += 4) {
+            if (maxY + 0.51 <= projected[i + 1] + 0.01) continue;
+            double radius = projected[i + 3] + EDGE_WIDTH;
+            double forward = forwardMax - projected[i];
+            double sideways = Math.abs(side - projected[i + 2]) - sideExtent;
+            if (forward < -radius || sideways > radius + Math.max(0, forward) * HALF_ANGLE_TANGENT) continue;
+            System.arraycopy(projected, i, selected, kept++ * 4, 4);
+        }
+        return new ShaderFans(selected, kept, directionX, directionZ);
+    }
+
+    private void projectAnchors() {
+        if (!projectionDirty) return;
+        for (int i = 0; i < count * 4; i += 4) {
+            float x = anchors[i], z = anchors[i + 2];
+            projected[i] = x * directionX + z * directionZ;
+            projected[i + 1] = anchors[i + 1];
+            projected[i + 2] = x * directionZ - z * directionX;
+            projected[i + 3] = anchors[i + 3];
+        }
+        projectionDirty = false;
+    }
+
+    /** Voxel-centre cutoff used by the separate dynamic block model pass. */
     public boolean removes(double x, double y, double z) {
         for (int i = 0; i < count; i++) {
             int offset = i * 4;

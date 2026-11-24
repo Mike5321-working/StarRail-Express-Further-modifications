@@ -6,7 +6,11 @@ import com.habitrain.core.api.scene.SceneLimits;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.scene.server.SceneCaptureService;
 import net.minecraft.SharedConstants;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import net.minecraft.util.Mth;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainer;
@@ -40,16 +44,20 @@ public final class ReplaySectionGeometry {
 
     public record Snapshot(SceneAssetCodec.SectionData data, int crc, SceneBounds occupied) {}
 
-    /** World section coordinates go in; its cell order is y/z/x, clipped to the exact play bounds. */
     public static @Nullable Snapshot capture(LevelChunk chunk, int sy, SceneBounds clip) {
         int index = chunk.getSectionIndexFromSectionY(sy);
         if (index < 0 || index >= chunk.getSections().length) return null;
         LevelChunkSection section = chunk.getSections()[index];
         if (section.hasOnlyAir()) return null;
-        return capture(chunk.getPos().x, sy, chunk.getPos().z, section.getStates(), clip);
+        return capture(chunk.getPos().x, sy, chunk.getPos().z, section.getStates(), clip, chunk.getLevel());
     }
 
     public static @Nullable Snapshot capture(int sx, int sy, int sz, PalettedContainer<BlockState> states, SceneBounds clip) {
+        return capture(sx, sy, sz, states, clip, null);
+    }
+
+    public static @Nullable Snapshot capture(int sx, int sy, int sz, PalettedContainer<BlockState> states,
+                                             SceneBounds clip, @Nullable Level level) {
         int x0 = sx << 4, y0 = sy << 4, z0 = sz << 4;
         int xMin = 16, yMin = 16, zMin = 16, xMax = 0, yMax = 0, zMax = 0;
         var ids = new IdentityHashMap<BlockState, Short>();
@@ -74,10 +82,42 @@ public final class ReplaySectionGeometry {
             }
         }
         if (ids.isEmpty()) return null;
-        byte[] sky = new byte[2048];
-        Arrays.fill(sky, (byte) 0xff);
-        var data = new SceneAssetCodec.SectionData(sx, sy, sz, List.copyOf(palette), cells, sky, null);
+        byte[] sky;
+        byte[] block;
+        if (level == null) {
+            sky = new byte[2048];
+            Arrays.fill(sky, (byte) 0xff);
+            block = new byte[2048];
+        } else {
+            SectionPos sectionPos = SectionPos.of(sx, sy, sz);
+            sky = captureLight(level, LightLayer.SKY, sectionPos);
+            block = captureLight(level, LightLayer.BLOCK, sectionPos);
+        }
+        var data = new SceneAssetCodec.SectionData(sx, sy, sz, List.copyOf(palette), cells, sky, block);
         return new Snapshot(data, crc(data), new SceneBounds(x0 + xMin, y0 + yMin, z0 + zMin, x0 + xMax, y0 + yMax, z0 + zMax));
+    }
+
+    private static byte[] captureLight(Level level, LightLayer layer, SectionPos section) {
+        var data = level.getLightEngine().getLayerListener(layer).getDataLayerData(section);
+        if (data != null) return data.copy().getData();
+
+        byte[] values = new byte[2048];
+        if (layer == LightLayer.SKY && level.dimensionType().hasSkyLight()) {
+            var position = new BlockPos.MutableBlockPos();
+            for (int cell = 0; cell < 4096; cell++) {
+                position.set(section.minBlockX() + (cell & 15), section.minBlockY() + (cell >> 8),
+                        section.minBlockZ() + ((cell >> 4) & 15));
+                values[cell >> 1] |= (byte) ((level.getBrightness(layer, position) & 15) << ((cell & 1) * 4));
+            }
+        }
+        return values;
+    }
+
+    public static boolean hasRecordedLight(SceneAssetCodec.SectionData section) {
+        if (section.skyLight.length != 2048) return false;
+        for (byte sky : section.skyLight) if (sky != (byte) 0xff) return true;
+        for (byte block : section.blockLight) if (block != 0) return true;
+        return false;
     }
 
     public static int crc(SceneAssetCodec.SectionData data) {
@@ -89,6 +129,10 @@ public final class ReplaySectionGeometry {
         for (short cell : data.blockIndices) {
             crc.update(cell & 255);
             crc.update((cell >>> 8) & 255);
+        }
+        if (hasRecordedLight(data)) {
+            crc.update(data.skyLight);
+            crc.update(data.blockLight);
         }
         return (int) crc.getValue();
     }

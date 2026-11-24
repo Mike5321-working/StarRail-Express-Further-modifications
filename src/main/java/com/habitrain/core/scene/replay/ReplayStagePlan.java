@@ -14,6 +14,11 @@ public final class ReplayStagePlan {
     public static final double FADE_START = 48.0, FADE_END = 64.0;
     /** Below this distance the board submits fine detail (name plates, briefings, rivets). */
     public static final double DETAIL_DISTANCE = 24.0;
+    /** Transition durations (ticks) for the interactive linear board session. */
+    public static final int LINEAR_INTRO_TICKS = 36;
+    public static final int LINEAR_EXIT_TICKS = 24;
+    /** Minimum headroom (board blocks) above the highest diorama vertex for floating overlays/feeds. */
+    public static final float DEFAULT_FEED_CLEARANCE = 0.34f;
 
     /**
      * @param trayGlow    brass lamp strip brightness 0..1
@@ -91,6 +96,85 @@ public final class ReplayStagePlan {
                         p * ReplayTimeline.HONORS / 20.0);
             }
         };
+    }
+
+    /**
+     * Handoff between the idle crystal cube sculpture and an active linear replay session.
+     *
+     * <p>Unlike the legacy auto-looping {@link #boardHandoff}, reaching the end of the match never
+     * folds back to idle; {@code exitProgress > 0} is driven strictly by an explicit session end.</p>
+     */
+    public static Handoff linearHandoff(double buildProgress, double exitProgress) {
+        double exit = clamp01(exitProgress);
+        if (exit > 0) {
+            return new Handoff(
+                    smoothstep(0.32, 1.0, exit),
+                    smoothstep(0.24, 0.92, exit),
+                    smoothstep(0.06, 0.44, exit) * (1 - smoothstep(0.44, 0.94, exit)),
+                    1 - smoothstep(0.06, 0.86, exit));
+        }
+        double build = clamp01(buildProgress);
+        if (build < 1) {
+            return new Handoff(
+                    1 - smoothstep(0.0, 0.36, build),
+                    1 - smoothstep(0.10, 0.50, build),
+                    smoothstep(0.06, 0.32, build) * (1 - smoothstep(0.32, 0.68, build)),
+                    smoothstep(0.18, 0.68, build));
+        }
+        return REPLAY;
+    }
+
+    /**
+     * Choreography for the linear interactive table player.
+     *
+     * <p>At the end of the match ({@code replayTick >= durationTicks}), the diorama stays fully
+     * revealed in final-review state ({@code scan = 1, actors = 1, mapSink = 0, honors = 0, history -> 1})
+     * so spectators can keep scrubbing and inspecting paths; only {@code exitProgress > 0} retracts
+     * the diorama back to the idle sculpture.</p>
+     */
+    public static Stage linearStage(double replayTick, int durationTicks, double buildProgress,
+                                    double reviewProgress, double exitProgress) {
+        double exit = clamp01(exitProgress);
+        if (exit > 0) {
+            double retract = smoothstep(0.06, 0.82, exit);
+            double actors = 1 - smoothstep(0.0, 0.58, exit);
+            double glow = 1 - 0.25 * smoothstep(0.35, 1.0, exit);
+            return new Stage(glow, 1 - retract, 1 - smoothstep(0.2, 0.85, exit),
+                    actors, -1, (1 - retract) * clamp01(reviewProgress), retract * 0.45, 0, 0);
+        }
+        double build = clamp01(buildProgress);
+        if (build < 1) {
+            double lamp = 0.75 + 0.25 * smoothstep(0.0, 0.50, build);
+            double scan = smoothstep(0.22, 0.94, build);
+            double flip = easeOutCubic(clamp01((build - 0.40) / 0.50));
+            double actors = easeOutCubic(clamp01((build - 0.72) / 0.28));
+            return new Stage(lamp, scan, flip, actors, -1, 0, 0, 0, 0);
+        }
+        boolean atEnd = durationTicks <= 0 || replayTick >= durationTicks - 1e-4;
+        if (atEnd) {
+            double rp = clamp01(reviewProgress);
+            double wave = rp < 0.62 ? easeInOutQuart(rp / 0.62) : -1;
+            double history = easeOutCubic(clamp01((rp - 0.05) / 0.45));
+            return new Stage(1, 1, 1, 1, wave, Math.max(0.35, history), 0, 0, 0);
+        }
+        return new Stage(1, 1, 1, 1, -1, 0, 0, 0, 0);
+    }
+
+    /**
+     * Pure anti-occlusion height envelope for floating table HUD / kill-feed panels.
+     *
+     * <p>Accounts for both the nominal bounding height ({@code mapH}) and the actual highest rendered
+     * vertex ({@code meshReplayCeiling * mapScale}, covering multi-story stations and tall mod props),
+     * multiplied by {@code currentFocusZoom} (up to {@code 2.4x}) plus safety clearance.</p>
+     */
+    public static float effectiveFeedTop(float mapBase, float mapH, double meshReplayCeiling,
+                                         float mapScale, double focusZoom, float clearance) {
+        double meshTop = (Double.isFinite(meshReplayCeiling) && meshReplayCeiling > 0 && mapScale > 0)
+                ? meshReplayCeiling * mapScale : 0.0;
+        double effectiveMapH = Math.max(Math.max(0.20, Double.isFinite(mapH) ? mapH : 0.0), meshTop);
+        double zoom = Math.max(1.0, Double.isFinite(focusZoom) ? focusZoom : 1.0);
+        double pad = Math.max(0.22, Double.isFinite(clearance) ? clearance : DEFAULT_FEED_CLEARANCE);
+        return (float) (mapBase + effectiveMapH * zoom + pad);
     }
 
     /** Opacity multiplier from the camera distance: 1 inside {@link #FADE_START}, 0 beyond {@link #FADE_END}. */

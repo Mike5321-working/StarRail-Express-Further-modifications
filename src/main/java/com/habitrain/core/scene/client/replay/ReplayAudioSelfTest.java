@@ -11,6 +11,7 @@ import com.habitrain.core.game.sre.replay.ReplayVoicePlugin;
 import com.habitrain.core.game.sre.voice.VoiceChatPresence;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.client.ClientReplayBoard;
+import com.habitrain.core.scene.replay.ReplayCinemaDirector;
 import com.habitrain.core.scene.replay.ReplayMapCapture;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
 import io.wifi.starrailexpress.client.gui.screen.ingame.LimitedInventoryScreen;
@@ -423,10 +424,10 @@ public final class ReplayAudioSelfTest {
         ReplayAudioPlaybackController.reset();
 
         ClientReplayBoard.View view = ClientReplayBoard.viewAt(boardPos);
-        ReplayVideoScript script = new ReplayVideoScript(view.replay());
-        if (script.beats().size() < 2) throw new IllegalStateException("Expected 2 scripted beats");
-        double beat0Time = script.beats().get(0).impact();
-        double beat1Time = script.beats().get(1).impact();
+        ReplayCinemaDirector.DirectedFilm film = ReplayCinemaDirector.direct(view.replay(), view.voice(), mp4Export.options);
+        if (film.beats().size() < 2) throw new IllegalStateException("Expected 2 directed beats");
+        double beat0Time = film.beats().get(0).impact();
+        double beat1Time = film.beats().get(1).impact();
 
         mp4Size = Files.size(mp4Path);
         aviSize = Files.size(aviPath);

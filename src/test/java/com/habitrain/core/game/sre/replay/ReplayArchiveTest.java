@@ -83,7 +83,7 @@ class ReplayArchiveTest {
         assertNull(store.summary(tooLarge));
     }
 
-    @Test void unreadableArchivePreservesItsRoundVoiceAndPotentialMap() throws Exception {
+    @Test void unreadableArchiveQuarantinesCorruptedFilesAndUnblocksMapCleanup() throws Exception {
         Path root = world.resolve("archive");
         var store = new ReplayArchive(root);
         UUID round = UUID.randomUUID();
@@ -95,13 +95,20 @@ class ReplayArchiveTest {
 
         var reopened = new ReplayArchive(root);
         assertNull(reopened.summary(round));
+        assertEquals(1, reopened.quarantinedCount());
+        assertEquals(unknownFormat.length + 1L, reopened.quarantinedBytes());
+        assertEquals(0, reopened.roundCount());
         assertFalse(reopened.save(round, 2, map, new byte[]{10}, List.of(new byte[]{2}), new byte[]{3}));
-        assertArrayEquals(unknownFormat, Files.readAllBytes(roundFile));
-        assertArrayEquals(new byte[]{3}, Files.readAllBytes(root.resolve("voice").resolve(round + ".voice")));
-        assertTrue(Files.isRegularFile(root.resolve("maps").resolve(map + ".map")));
+        assertFalse(Files.exists(roundFile));
+        assertFalse(Files.exists(root.resolve("voice").resolve(round + ".voice")));
+        assertArrayEquals(unknownFormat, Files.readAllBytes(reopened.quarantineDir().resolve(round + ".round")));
+        assertArrayEquals(new byte[]{3}, Files.readAllBytes(reopened.quarantineDir().resolve(round + ".voice")));
+        // Defect #13 fix: quarantining the corrupted round unblocks orphan .map cleanup.
+        assertFalse(Files.exists(root.resolve("maps").resolve(map + ".map")));
+        assertEquals(0L, reopened.used());
     }
 
-    @Test void impossibleQuotaDoesNotEvictReadableRounds() throws Exception {
+    @Test void corruptedOversizedRoundIsQuarantinedSoQuotaAndNewSavesStayUnblocked() throws Exception {
         Path root = world.resolve("archive");
         UUID readable = UUID.randomUUID();
         UUID unreadable = UUID.randomUUID();
@@ -112,8 +119,13 @@ class ReplayArchiveTest {
 
         var reopened = new ReplayArchive(root);
         reopened.setLimit(1L << 20);
+        assertEquals(1, reopened.quarantinedCount());
+        assertEquals(800 * 1024L, reopened.quarantinedBytes());
         assertArrayEquals(new byte[]{1}, reopened.summary(readable));
-        assertFalse(reopened.save(UUID.randomUUID(), 2, map, new byte[]{2}, sections, new byte[0]));
+        UUID fresh = UUID.randomUUID();
+        assertTrue(reopened.save(fresh, 2, map, new byte[]{2}, sections, new byte[0]));
+        assertArrayEquals(new byte[]{2}, reopened.summary(fresh));
+        assertTrue(reopened.used() <= reopened.limit());
     }
 
     @Test void blockedQuotaCleanupKeepsOldRoundReadableAndNewSaveSuccessful() throws Exception {

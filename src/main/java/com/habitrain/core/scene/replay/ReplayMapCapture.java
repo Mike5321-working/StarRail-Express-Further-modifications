@@ -46,6 +46,12 @@ public final class ReplayMapCapture {
     }
 
     public ReplayMapCapture(ServerLevel level, SceneBounds clip, String map) {
+        this(level, clip, map, (chunk, section) -> {});
+    }
+
+    private final java.util.function.ObjIntConsumer<LevelChunk> initial;
+    public ReplayMapCapture(ServerLevel level, SceneBounds clip, String map, java.util.function.ObjIntConsumer<LevelChunk> initial) {
+        this.initial = initial;
         this.level = level;
         this.clip = clip;
         this.map = map;
@@ -82,8 +88,10 @@ public final class ReplayMapCapture {
                 continue;
             }
             remaining.remove(key);
+            var liveChunk = chunk != null ? chunk : level.getChunkSource().getChunkNow(work.pos.x, work.pos.z);
+            if (liveChunk != null) initial.accept(liveChunk, work.y);
             original.remove(key);
-            var section = frozen != null ? ReplaySectionGeometry.capture(work.pos.x, work.y, work.pos.z, frozen, clip)
+            var section = frozen != null ? ReplaySectionGeometry.capture(work.pos.x, work.y, work.pos.z, frozen, clip, level)
                     : ReplaySectionGeometry.capture(chunk, work.y, clip);
             work.y++;
             if (section != null) snapshots.add(section);
@@ -170,6 +178,10 @@ public final class ReplayMapCapture {
             for (short cell : rel.blockIndices) {
                 digest.update((byte) cell);
                 digest.update((byte) (cell >>> 8));
+            }
+            if (ReplaySectionGeometry.hasRecordedLight(rel)) {
+                digest.update(rel.skyLight);
+                digest.update(rel.blockLight);
             }
             relative.add(rel);
         }

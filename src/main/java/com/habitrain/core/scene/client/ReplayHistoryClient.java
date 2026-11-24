@@ -1,17 +1,23 @@
 package com.habitrain.core.scene.client;
 
+import com.habitrain.core.api.client.replay.MatchReplayClientApi;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.client.ClientConnectionSession;
 import com.habitrain.core.network.replay.ReplayArchiveData;
 import com.habitrain.core.network.replay.ReplayArchivePackets.*;
 import com.habitrain.core.network.replay.ReplayPackets;
+import com.habitrain.core.scene.block.SettlementSummaryBoard;
+import com.habitrain.core.scene.client.replay.ReplayHistoryScreen;
+import com.habitrain.core.scene.replay.ReplayBoardSessionState;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.core.BlockPos;
+import org.jetbrains.annotations.Nullable;
 
 import java.io.IOException;
 import java.nio.file.*;
@@ -46,10 +52,11 @@ public final class ReplayHistoryClient {
         final UUID id;
         long watched, requested, voiceRequested;
         int attempts;
-        Path path, voicePath;
+        Path path;
         byte[] cached, voiceBuffer;
         BitSet voiceHave;
-        boolean reading = true, readingVoice = true, voiceReady, voiceUnavailable;
+        int voiceReceivedParts, voiceTotalParts;
+        boolean reading = true, voiceReady, voiceUnavailable;
         int voiceAttempts;
         int pins;
         Phase phase = Phase.LOADING;
@@ -63,8 +70,39 @@ public final class ReplayHistoryClient {
 
     static void register() {
         maintainCache(ReplayRoundCache.LIMIT);
-        com.habitrain.core.api.client.replay.MatchReplayClientApi.install(
-                com.habitrain.core.scene.client.replay.ReplayHistoryScreen::open);
+        MatchReplayClientApi.install(ReplayHistoryScreen::open);
+        MatchReplayClientApi.installNearbyTableBridge(new MatchReplayClientApi.NearbyTableBridge() {
+            @Override
+            public Screen openWithFocus(Screen parent, String matchId, boolean export, @Nullable UUID focusPlayer) {
+                return ReplayHistoryScreen.open(parent, matchId, export, focusPlayer);
+            }
+
+            @Override
+            public @Nullable MatchReplayClientApi.NearbyTableInfo nearestActiveTable(double maxDistance) {
+                return ReplayHistoryClient.nearestActiveTable(maxDistance);
+            }
+
+            @Override
+            public boolean controlNearestTable(double maxDistance, String action, double numericArg,
+                                               @Nullable UUID uuidArg, boolean flagArg) {
+                var table = ReplayHistoryClient.nearestActiveTable(maxDistance);
+                return table != null && ReplayHistoryClient.controlTable(table.pos(), action, numericArg, uuidArg, flagArg);
+            }
+
+            @Override
+            public @Nullable Screen openNearbyTableExport(Screen parent, double maxDistance) {
+                var table = ReplayHistoryClient.nearestActiveTable(maxDistance);
+                if (table == null || table.roundId().isEmpty()) return null;
+                return ReplayHistoryScreen.open(parent, table.roundId(), true, table.followPlayerUuid());
+            }
+
+            @Override
+            public @Nullable Screen openNearbyTablePreview(Screen parent, double maxDistance) {
+                var table = ReplayHistoryClient.nearestActiveTable(maxDistance);
+                if (table == null || table.roundId().isEmpty()) return null;
+                return ReplayHistoryScreen.openSynced(parent, table.roundId());
+            }
+        });
         ClientPlayNetworking.registerGlobalReceiver(Reply.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> onReply(r)));
         ClientPlayNetworking.registerGlobalReceiver(Summary.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> onSummary(r.data())));
         ClientPlayNetworking.registerGlobalReceiver(Section.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> {
@@ -154,6 +192,18 @@ public final class ReplayHistoryClient {
         return round != null && round.voiceUnavailable;
     }
 
+    /**
+     * Returns voice download progress in {@code [0, 1]} while streaming multi-track HRVC v2 voice,
+     * {@code 1.0f} once ready, or {@code -1.0f} if unavailable or not yet started.
+     */
+    public static float voiceProgress(UUID id) {
+        var round = rounds.get(id);
+        if (round == null || round.voiceUnavailable) return -1.0f;
+        if (round.voiceReady) return 1.0f;
+        if (round.voiceTotalParts <= 0) return -1.0f;
+        return Math.clamp(round.voiceReceivedParts / (float) round.voiceTotalParts, 0.0f, 1.0f);
+    }
+
     private static Path cacheDirectory() {
         return Minecraft.getInstance().gameDirectory.toPath().resolve("habitrain-cache").resolve("replay-rounds-v1");
     }
@@ -167,6 +217,7 @@ public final class ReplayHistoryClient {
             catch (IOException failure) { org.slf4j.LoggerFactory.getLogger(ReplayHistoryClient.class).warn("Replay cache cleanup failed", failure); }
         });
     }
+
     public static Phase phase(UUID id) {
         var r = rounds.get(id);
         return r == null ? Phase.LOADING : r.phase;
@@ -198,7 +249,6 @@ public final class ReplayHistoryClient {
         Minecraft mc = Minecraft.getInstance();
         Path dir = cacheDirectory();
         r.path = dir.resolve(r.id + ".bin");
-        r.voicePath = dir.resolve(r.id + ".voice");
         CACHE_IO.execute(() -> {
             byte[] contents = null;
             try {
@@ -209,49 +259,11 @@ public final class ReplayHistoryClient {
                     }
                 }
             } catch (IOException ignored) { }
-            ReplayVoiceData cachedVoice = null;
-            boolean hasVoiceCache = false;
-            try {
-                if (Files.isRegularFile(r.voicePath, LinkOption.NOFOLLOW_LINKS)) {
-                    try (var input = Files.newInputStream(r.voicePath, LinkOption.NOFOLLOW_LINKS)) {
-                        byte[] raw = input.readNBytes(ReplayVoiceData.MAX_VOICE_BYTES + 1);
-                        if (raw.length == 0 || (raw.length >= 12 && raw.length <= ReplayVoiceData.MAX_VOICE_BYTES)) {
-                            cachedVoice = ReplayVoiceData.fromBytes(raw);
-                            hasVoiceCache = true;
-                        }
-                    } catch (RuntimeException ignored) { }
-                }
-            } catch (IOException ignored) { }
             byte[] found = contents;
-            ReplayVoiceData voiceData = cachedVoice;
-            boolean voiceOk = hasVoiceCache;
             mc.execute(() -> {
                 r.cached = found;
                 r.reading = false;
-                if (voiceOk && voiceData != null) {
-                    r.voice = voiceData;
-                    r.voiceReady = true;
-                }
-                r.readingVoice = false;
             });
-        });
-    }
-
-    private static void saveVoice(Round r, byte[] data) {
-        if (r.voicePath == null || data == null) return;
-        CACHE_IO.execute(() -> {
-            Path tmp = null;
-            try {
-                Files.createDirectories(r.voicePath.getParent());
-                tmp = Files.createTempFile(r.voicePath.getParent(), "voice-", ".part");
-                Files.write(tmp, data);
-                Files.move(tmp, r.voicePath, StandardCopyOption.REPLACE_EXISTING);
-                ReplayRoundCache.prune(r.voicePath.getParent(), ReplayRoundCache.LIMIT, System.currentTimeMillis());
-            } catch (IOException | RuntimeException ignored) {
-                // A read-only client directory should not prevent playback.
-            } finally {
-                if (tmp != null) try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
-            }
         });
     }
 
@@ -281,26 +293,34 @@ public final class ReplayHistoryClient {
             r.voiceReady = true;
             r.voiceBuffer = null;
             r.voiceHave = null;
-            saveVoice(r, ReplayVoiceData.EMPTY.toBytes());
+            r.voiceReceivedParts = 0;
+            r.voiceTotalParts = 0;
             return;
         }
+        if (chunk.total() < 0 || chunk.total() > ReplayVoiceData.MAX_VOICE_BYTES
+                || chunk.offset() < 0 || chunk.offset() + chunk.bytes().length > chunk.total()) {
+            return;
+        }
+        int totalParts = (chunk.total() + ReplayPackets.FRAGMENT_BYTES - 1) / ReplayPackets.FRAGMENT_BYTES;
         if (r.voiceBuffer == null || r.voiceBuffer.length != chunk.total()) {
             if (chunk.offset() != 0) return;
             r.voiceBuffer = new byte[chunk.total()];
-            r.voiceHave = new BitSet();
+            r.voiceHave = new BitSet(totalParts);
+            r.voiceReceivedParts = 0;
+            r.voiceTotalParts = totalParts;
         }
         int part = chunk.offset() / ReplayPackets.FRAGMENT_BYTES;
         if (r.voiceHave.get(part)) return;
         System.arraycopy(chunk.bytes(), 0, r.voiceBuffer, chunk.offset(), chunk.bytes().length);
         r.voiceHave.set(part);
-        int totalParts = (chunk.total() + ReplayPackets.FRAGMENT_BYTES - 1) / ReplayPackets.FRAGMENT_BYTES;
-        if (r.voiceHave.cardinality() != totalParts) return;
+        r.voiceReceivedParts = r.voiceHave.cardinality();
+        if (r.voiceReceivedParts != totalParts) return;
         byte[] assembled = r.voiceBuffer;
         r.voiceBuffer = null;
         r.voiceHave = null;
         try {
             r.voice = ReplayVoiceData.fromBytes(assembled);
-            saveVoice(r, assembled);
+            if (r.voice.truncated()) ClientReplayBoard.notifyVoiceTruncated();
             r.voiceReady = true;
         } catch (RuntimeException malformed) {
             r.voice = ReplayVoiceData.EMPTY;
@@ -379,7 +399,7 @@ public final class ReplayHistoryClient {
                 } else {
                     r.map.step(now, bits -> send(Request.sections(r.id, bits), now));
                 }
-            } else if (r.phase == Phase.READY && !r.voiceReady && !r.voiceUnavailable && !r.readingVoice
+            } else if (r.phase == Phase.READY && !r.voiceReady && !r.voiceUnavailable
                     && (r.voiceRequested == 0 || now - r.voiceRequested >= RETRY_NS)) {
                 if (r.voiceAttempts >= 12) { stopVoiceRequests(r); continue; }
                 if (send(Request.voice(r.id), now)) {
@@ -395,22 +415,223 @@ public final class ReplayHistoryClient {
         lastReady.entrySet().removeIf(e -> now - e.getValue() > 3_000_000_000L);
         for (BlockPos pos : ClientReplayBoard.loadedBoards()) {
             if (mc.player.distanceToSqr(pos.getX() + .5, pos.getY() + .5, pos.getZ() + .5) > 48 * 48
-                    || !(mc.level.getBlockEntity(pos) instanceof com.habitrain.core.scene.block.SettlementSummaryBoard.Marker marker)) continue;
-            var playback = marker.playback();
-            if (playback == null || !playback.preparing()) continue;
-            watch(playback.roundId());
-            var key = new PreparingBoard(pos, playback.roundId());
-            if (phase(playback.roundId()).finishedLoading() && !lastReady.containsKey(key)) {
-                ClientPlayNetworking.send(Request.boardReady(playback.roundId(), pos));
+                    || !(mc.level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) continue;
+            UUID preparingRound = preparingRoundOf(marker);
+            if (preparingRound == null) continue;
+            watch(preparingRound);
+            var key = new PreparingBoard(pos, preparingRound);
+            if (phase(preparingRound).finishedLoading() && !lastReady.containsKey(key)) {
+                ClientPlayNetworking.send(Request.boardReady(preparingRound, pos));
                 lastReady.put(key, now);
             }
         }
+    }
+
+    private static @Nullable UUID preparingRoundOf(SettlementSummaryBoard.Marker marker) {
+        ReplayBoardSessionState session = ClientReplayBoard.boardSession(marker.getBlockPos(), marker);
+        if (session != null) {
+            return session.preparing() && !session.endedToIdle() ? session.roundId() : null;
+        }
+        var playback = marker.playback();
+        return playback != null && playback.preparing() ? playback.roundId() : null;
+    }
+
+    /** Finds the nearest lobby replay table (idle or active) within {@code maxDistance} blocks. */
+    public static @Nullable BlockPos nearestBoardPos(double maxDistance) {
+        ClientReplayBoard.NearbyBoard nearby = ClientReplayBoard.nearestBoard(maxDistance);
+        return nearby == null ? null : nearby.pos();
+    }
+
+    /**
+     * Probes the nearest active (preparing, playing, paused, or final-review-held) lobby replay table
+     * within {@code maxDistance} blocks (16 blocks by default for backpack sync).
+     */
+    public static @Nullable MatchReplayClientApi.NearbyTableInfo nearestActiveTable(double maxDistance) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null || mc.player.isSpectator() || mc.level == null) return null;
+        long gameTime = mc.level.getGameTime();
+        float partial = mc.getTimer().getGameTimeDeltaPartialTick(true);
+
+        ClientReplayBoard.NearbyBoard nearby = ClientReplayBoard.nearestActiveBoard(maxDistance);
+        if (nearby != null && nearby.session() != null && nearby.session().active()) {
+            ReplayBoardSessionState session = nearby.session();
+            LastMatchReplay replay = nearby.replay();
+            if (replay == null) {
+                ClientReplayBoard.View view = resolveBoardView(nearby.pos(), session.roundId());
+                if (view != null) replay = view.replay();
+            }
+            String mapName = replay == null ? "" : replay.mapName();
+            int durationTicks = replay == null ? 0 : replay.durationTicks();
+            double curTick = session.currentReplayTick(gameTime, partial, durationTicks);
+            boolean finished = durationTicks > 0 && session.isFinishedHold(gameTime, partial, durationTicks);
+            String followName = resolvePlayerName(replay, session.followPlayerUuid());
+            return new MatchReplayClientApi.NearbyTableInfo(
+                    nearby.pos(),
+                    session.roundId().toString(),
+                    mapName,
+                    curTick,
+                    durationTicks,
+                    session.speed(),
+                    session.paused(),
+                    session.preparing(),
+                    finished,
+                    session.followPlayerUuid(),
+                    followName,
+                    session.killCloseupEnabled(),
+                    session.roofCutaway(),
+                    nearby.distance()
+            );
+        }
+
+        // Legacy Playback fallback for older servers without BoardSessionSyncS2C
+        double bestDistSq = maxDistance * maxDistance;
+        BlockPos bestPos = null;
+        SettlementSummaryBoard.Marker.Playback bestPlayback = null;
+        for (BlockPos pos : ClientReplayBoard.loadedBoards()) {
+            if (!(mc.level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) continue;
+            double distSq = mc.player.distanceToSqr(pos.getX() + .5, pos.getY() + .5, pos.getZ() + .5);
+            if (distSq > bestDistSq) continue;
+            var playback = marker.playback();
+            if (playback != null && playback.pendingOrPlaying(gameTime)) {
+                bestDistSq = distSq;
+                bestPos = pos;
+                bestPlayback = playback;
+            }
+        }
+        if (bestPos == null) return null;
+
+        UUID roundId = bestPlayback.roundId();
+        ClientReplayBoard.View view = resolveBoardView(bestPos, roundId);
+        LastMatchReplay replay = view == null ? null : view.replay();
+        String mapName = replay == null ? "" : replay.mapName();
+        int durationTicks = replay == null ? 0 : replay.durationTicks();
+        boolean preparing = bestPlayback.preparing();
+        double elapsed = !preparing && gameTime >= bestPlayback.startTick()
+                ? (gameTime - bestPlayback.startTick() + partial) : 0.0;
+        double curTick = durationTicks > 0 ? Math.clamp(elapsed, 0.0, durationTicks) : 0.0;
+        return new MatchReplayClientApi.NearbyTableInfo(
+                bestPos,
+                roundId.toString(),
+                mapName,
+                curTick,
+                durationTicks,
+                1.0f,
+                false,
+                preparing,
+                false,
+                null,
+                "",
+                false,
+                true,
+                Math.sqrt(bestDistSq)
+        );
+    }
+
+    private static @Nullable ClientReplayBoard.View resolveBoardView(BlockPos pos, UUID roundId) {
+        if (roundId != null && !roundId.equals(ClientReplayBoard.availableRound())) {
+            Round cached = rounds.get(roundId);
+            if (cached != null && cached.replay != null) {
+                return watch(roundId);
+            }
+        }
+        ClientReplayBoard.View boardView = ClientReplayBoard.viewForBoard(pos);
+        if (boardView != null && boardView.replay() != null && roundId.equals(boardView.replay().roundId())) {
+            return boardView;
+        }
+        return supported() ? watch(roundId) : boardView;
+    }
+
+    private static String resolvePlayerName(@Nullable LastMatchReplay replay, @Nullable UUID playerUuid) {
+        if (playerUuid == null) return "";
+        if (replay != null) {
+            for (var p : replay.participants()) {
+                if (playerUuid.equals(p.id())) {
+                    return p.name() == null || p.name().isBlank() ? playerUuid.toString().substring(0, 8) : p.name();
+                }
+            }
+        }
+        return playerUuid.toString().substring(0, 8);
+    }
+
+    /** Sends a remote session control command to a nearby lobby replay table. */
+    public static boolean controlTable(BlockPos pos, String action, double numericArg,
+                                       @Nullable UUID uuidArg, boolean flagArg) {
+        if (pos == null || action == null || !ClientPlayNetworking.canSend(ReplayPackets.BoardSessionControlC2S.TYPE)) {
+            return false;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || !(mc.level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) {
+            return false;
+        }
+        ReplayBoardSessionState session = ClientReplayBoard.boardSession(pos);
+        ReplayPackets.BoardSessionControlC2S packet = switch (action.toLowerCase(Locale.ROOT)) {
+            case "play" -> ReplayPackets.BoardSessionControlC2S.play(pos);
+            case "pause" -> ReplayPackets.BoardSessionControlC2S.pause(pos);
+            case "toggle_pause" -> ReplayPackets.BoardSessionControlC2S.togglePause(pos);
+            case "seek" -> ReplayPackets.BoardSessionControlC2S.seek(pos, Math.max(0.0, numericArg));
+            case "step" -> ReplayPackets.BoardSessionControlC2S.step(pos, numericArg);
+            case "speed" -> ReplayPackets.BoardSessionControlC2S.setSpeed(pos, (float) numericArg);
+            case "cycle_speed" -> {
+                float cur = session == null ? ReplayBoardSessionState.DEFAULT_SPEED : session.speed();
+                float next = nextSpeed(cur);
+                yield ReplayPackets.BoardSessionControlC2S.setSpeed(pos, next);
+            }
+            case "follow" -> ReplayPackets.BoardSessionControlC2S.setFollow(pos, uuidArg);
+            case "cycle_follow" -> {
+                int delta = numericArg < 0 ? -1 : 1;
+                UUID nextFollow = nextFollowTarget(pos, session, delta);
+                yield ReplayPackets.BoardSessionControlC2S.setFollow(pos, nextFollow);
+            }
+            case "closeup" -> ReplayPackets.BoardSessionControlC2S.setKillCloseup(pos,
+                    session == null ? flagArg : !session.killCloseupEnabled());
+            case "set_closeup" -> ReplayPackets.BoardSessionControlC2S.setKillCloseup(pos, flagArg);
+            case "roof" -> ReplayPackets.BoardSessionControlC2S.setRoofCutaway(pos,
+                    session == null ? flagArg : !session.roofCutaway());
+            case "set_roof" -> ReplayPackets.BoardSessionControlC2S.setRoofCutaway(pos, flagArg);
+            case "end" -> ReplayPackets.BoardSessionControlC2S.endToIdle(pos);
+            default -> null;
+        };
+        if (packet == null) return false;
+        ClientPlayNetworking.send(packet);
+        return true;
+    }
+
+    private static float nextSpeed(float current) {
+        float[] speeds = ReplayBoardSessionState.ALLOWED_SPEEDS;
+        for (int i = 0; i < speeds.length; i++) {
+            if (Math.abs(current - speeds[i]) < 0.05f) {
+                return speeds[(i + 1) % speeds.length];
+            }
+        }
+        return ReplayBoardSessionState.DEFAULT_SPEED;
+    }
+
+    private static @Nullable UUID nextFollowTarget(BlockPos pos, @Nullable ReplayBoardSessionState session, int delta) {
+        if (session == null) return null;
+        ClientReplayBoard.View view = resolveBoardView(pos, session.roundId());
+        LastMatchReplay replay = view == null ? null : view.replay();
+        if (replay == null || replay.participants().isEmpty()) return null;
+        var list = replay.participants();
+        UUID current = session.followPlayerUuid();
+        if (current == null) {
+            return delta >= 0 ? list.getFirst().id() : list.getLast().id();
+        }
+        int idx = -1;
+        for (int i = 0; i < list.size(); i++) {
+            if (current.equals(list.get(i).id())) { idx = i; break; }
+        }
+        if (idx < 0) return list.getFirst().id();
+        int next = idx + delta;
+        if (next < 0 || next >= list.size()) return null; // wrap back to Global
+        return list.get(next).id();
     }
 
     private static void stopVoiceRequests(Round round) {
         round.voiceUnavailable = true;
         round.voiceBuffer = null;
         round.voiceHave = null;
+        round.voiceReceivedParts = 0;
+        round.voiceTotalParts = 0;
     }
 
     private static boolean send(Request request, long now) {
@@ -421,15 +642,36 @@ public final class ReplayHistoryClient {
     }
 
     public static void share(UUID id, BlockPos board) {
-        if (!supported()) return;
+        shareSession(id, board, 0.0, ReplayBoardSessionState.DEFAULT_SPEED, false, null, false, true);
+    }
+
+    /**
+     * Seamless Session Handoff: casts the current backpack preview state (timestamp, speed, pause,
+     * follow-player perspective, kill close-up flag, and roof cutaway flag) onto a nearby lobby table.
+     */
+    public static void shareSession(UUID id, BlockPos board, double currentTick, float speed, boolean paused,
+                                    @Nullable UUID followPlayerUuid, boolean killCloseupEnabled, boolean roofCutaway) {
+        if (!supported() || id == null || board == null) return;
         sharing = id;
         shareResult = READY; // waiting
         shareDeadline = System.nanoTime() + 4_000_000_000L;
-        ClientPlayNetworking.send(Request.share(id, board));
+        if (ClientPlayNetworking.canSend(ReplayPackets.ShareSessionC2S.TYPE)) {
+            ClientPlayNetworking.send(new ReplayPackets.ShareSessionC2S(
+                    board,
+                    id,
+                    Math.max(0.0, currentTick),
+                    ReplayBoardSessionState.sanitizeSpeed(speed),
+                    paused,
+                    followPlayerUuid,
+                    killCloseupEnabled,
+                    roofCutaway));
+        } else {
+            ClientPlayNetworking.send(Request.share(id, board));
+        }
     }
 
     public static int shareStatus(UUID id) {
-        if (!id.equals(sharing)) return -1;
+        if (id == null || !id.equals(sharing)) return -1;
         if (shareResult == READY && System.nanoTime() - shareDeadline >= 0) return ERROR;
         return shareResult;
     }

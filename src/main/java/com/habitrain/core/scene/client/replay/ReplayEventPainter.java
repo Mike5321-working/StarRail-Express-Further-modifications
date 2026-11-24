@@ -3,11 +3,15 @@ package com.habitrain.core.scene.client.replay;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
+import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
 import net.minecraft.client.renderer.LightTexture;
+import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemDisplayContext;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
@@ -18,13 +22,22 @@ import static com.habitrain.core.api.match.replay.LastMatchReplay.*;
 /**
  * Spatial event nodes: kill pulses with floating 3D weapons and slash lines, ballistic beams with
  * muzzle stars and impact sparks, explosion / poison / shield / door / skill halos, plus the
- * briefing bar shown while a highlight is in slow motion. In the review and honors acts every node
- * is shown as a quiet static marker for an overview of the whole match.
+ * anti-occlusion side-wing holographic kill feed positioned strictly above the diorama's dynamic
+ * roof envelope. In the review act every node is shown as a quiet static marker for an overview.
  */
 final class ReplayEventPainter {
+    private static final int MAX_FEED = 5;
+    private static final double FEED_DURATION_SEC = 4.6;
+    private static final double FEED_IN_SEC = 0.28;
+    private static final double FEED_OUT_START_SEC = 3.95;
+
     private ReplayEventPainter() {}
 
     static void paint(ReplayFrame f, ReplayBoardSite s, Matrix4f d) {
+        paint(f, s, d, f.model == null ? 1.0 : f.model.rate);
+    }
+
+    static void paint(ReplayFrame f, ReplayBoardSite s, Matrix4f d, double playbackRate) {
         ReplayBoardModel model = f.model;
         ReplayStagePlan.Stage stage = f.stage;
         if (model == null || stage == null || f.frame == null || stage.actors() <= 0.01) return;
@@ -32,19 +45,42 @@ final class ReplayEventPainter {
         double a = s.fade() * stage.actors();
         boolean play = f.frame.phase() == ReplayTimeline.Phase.PLAY;
         double emphasis = f.frame.slowMotion() ? 1.6 : 1.0;
+        double effectiveRate = Math.max(0.5, playbackRate);
         float elemScale = s.scale() * (float) f.focus.zoom();
         VertexConsumer glow = f.glow();
         for (ReplayBoardModel.EventMark e : model.events) {
             double age = t - e.node.tick();
             if (age < 0) continue;
-            double window = window(e.node.kind(), model.rate);
+            double window = window(e.node.kind(), effectiveRate);
             if (play && age <= window) {
                 // Exported videos render dedicated video-clock 3D effects in ReplayVideoFx;
                 // skipping board live effects here avoids double beams/rings and giant frozen weapons.
                 if (!f.video) live(f, s, d, glow, e, age, window, a, emphasis, elemScale);
             } else if (stage.history() > 0.01 || age > window) {
-                marker(f, d, glow, e, a * (play ? 0.35 : stage.history()), elemScale);
+                double alpha = a * (play ? 0.35 : stage.history());
+                marker(f, d, glow, e, alpha, elemScale);
+                if (e.node.kind() == Kind.KILL && alpha > 0.5 && !f.video) markerWeapon(f, d, e, alpha, elemScale);
             }
+        }
+    }
+
+    static void paintSettledReview(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayBoardHistoryCache history) {
+        var model = f.model;
+        var scope = f.activeMapScope();
+        double alpha = s.fade();
+        float elemScale = s.scale() * (float) f.focus.zoom();
+        int slot = model.actors.length;
+        for (var run : history.markers()) {
+            if (!history.emit(scope, slot)) {
+                history.record(scope, slot, glow -> {
+                    for (int i = run.from(); i < run.to(); i++) {
+                        var event = model.events[i];
+                        if (event.node.tick() <= f.replayTick) marker(f, d, glow, event, alpha, elemScale);
+                    }
+                });
+            }
+            if (run.weapon() >= 0) markerWeapon(f, d, model.events[run.weapon()], alpha, elemScale);
+            slot++;
         }
     }
 
@@ -192,7 +228,6 @@ final class ReplayEventPainter {
                 ReplayDraw.ring(glow, d, x, y, z, overview ? 0.082f : 0.05f, overview ? 0.014f : 0.008f, 18,
                         ReplayPalette.alpha(ReplayPalette.RUBY, (overview ? 0.78 : 0.5) * a),
                         ReplayPalette.alpha(ReplayPalette.RUBY, 0.1 * a));
-                if (a > 0.5 && !f.video) weapon(f, d, e, x, y + 0.14f, z, 0.08f, a * 0.8, elemScale);
             }
             case GUNSHOT -> ReplayDraw.segment(glow, d, e.fx, e.fy, e.fz, e.tx, e.ty, e.tz, 0.006f * elemScale,
                     ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.35 * a), ReplayPalette.alpha(e.has(HIT) ? ReplayPalette.RUBY : ReplayPalette.LAMP, 0.35 * a));
@@ -237,6 +272,10 @@ final class ReplayEventPainter {
     }
 
     /** Floating, slowly spinning 3D weapon model above a kill / detonation. */
+    private static void markerWeapon(ReplayFrame f, Matrix4f d, ReplayBoardModel.EventMark e, double alpha, float elemScale) {
+        weapon(f, d, e, e.tx, e.ty + 0.008f + 0.14f, e.tz, 0.08f, alpha * 0.8, elemScale);
+    }
+
     private static void weapon(ReplayFrame f, Matrix4f d, ReplayBoardModel.EventMark e, float x, float y, float z,
                                float size, double a, float elemScale) {
         if (a <= 0.1) return;
@@ -257,46 +296,257 @@ final class ReplayEventPainter {
         return actor == null ? ReplayPalette.BRASS_LIGHT : actor.color;
     }
 
-    // ------------------------------------------------------------------ briefing bar
+    // ------------------------------------------------------------------ anti-occlusion side-wing kill feed
 
     static void briefing(ReplayFrame f, ReplayBoardSite s) {
+        killFeed(f, s, Double.NEGATIVE_INFINITY, f.model == null ? 1.0 : f.model.rate, 1.0);
+    }
+
+    /**
+     * Star-Night Express holographic side-wing kill &amp; action feed matching {@link ReplayVideoOverlay}.
+     *
+     * <p>Positions the stack dynamically above the true highest diorama geometry
+     * ({@code effectiveTop = MAP_BASE + max(mapH, meshCeiling * scale) * currentZoom + clearance})
+     * and offset onto the viewer's right flank so single-story trains, multi-story stations, and
+     * 2.4x close-up zooms never intersect or occlude the feed cards.</p>
+     */
+    static void killFeed(ReplayFrame f, ReplayBoardSite s, double meshReplayCeiling,
+                         double playbackSpeed, double currentZoom) {
         ReplayBoardModel model = f.model;
-        if (model == null || f.frame == null || f.frame.phase() != ReplayTimeline.Phase.PLAY) return;
+        ReplayStagePlan.Stage stage = f.stage;
+        if (model == null || stage == null || f.frame == null || stage.actors() <= 0.05) return;
         double t = f.replayTick;
-        double hold = ReplayStagePlan.effectWindow(2.2, model.rate);
-        LastMatchReplay.Node focus = null;
-        for (LastMatchReplay.Node node : model.replay.events()) {
-            if (node.tick() > t) break;
-            if (node.highlight() && t - node.tick() <= hold) focus = node;
+        double speed = Math.max(0.5, playbackSpeed);
+        double windowTicks = FEED_DURATION_SEC * 20.0 * speed;
+
+        var feed = model.feedEvents;
+        int lo = 0, hi = feed.size();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (feed.get(mid).node.tick() <= t) lo = mid + 1;
+            else hi = mid;
         }
-        if (focus == null) return;
-        double k = (t - focus.tick()) / hold;
-        double a = s.fade() * Math.min(1, Math.min(k * 8, (1 - k) * 5));
-        if (a <= 0.02) return;
-        Component line = switch (focus.kind()) {
-            case KILL -> focus.actor() == null
-                    ? ReplayBoardTexts.tr("brief.death", ReplayBoardTexts.name(model.participantData(focus.target())), ReplayBoardTexts.weapon(focus))
-                    : ReplayBoardTexts.tr("brief.kill", ReplayBoardTexts.name(model.participantData(focus.actor())),
-                    ReplayBoardTexts.weapon(focus), ReplayBoardTexts.name(model.participantData(focus.target())));
-            case GUNSHOT -> ReplayBoardTexts.tr("brief.shot", ReplayBoardTexts.name(model.participantData(focus.actor())),
-                    ReplayBoardTexts.weapon(focus), ReplayBoardTexts.name(model.participantData(focus.target())));
-            default -> ReplayBoardTexts.tr("brief.explosion", ReplayBoardTexts.name(model.participantData(focus.actor())));
-        };
-        float y = ReplayBoardSite.MAP_BASE + Math.max(0.35f, model.mapH + 0.22f);
-        Vector3f anchor = s.board().transformPosition(0, y, 0, new Vector3f());
+        int end = lo;
+        int from = end;
+        while (from > 0 && end - from < MAX_FEED && t - feed.get(from - 1).node.tick() <= windowTicks) from--;
+        int count = end - from;
+        if (count == 0) return;
         float worldScale = s.scale();
-        Matrix4f m = new Matrix4f().translate(anchor).rotate(f.rotation).scale(worldScale);
-        float w = Math.min(s.hw() * 2 - 0.2f, Minecraft.getInstance().font.width(line) * 0.0062f + 0.36f);
-        float h = 0.13f;
-        VertexConsumer fill = f.fill();
-        ReplayDraw.rectXY(fill, m, -w / 2, -h / 2, w / 2, h / 2, 0, ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.88 * a),
-                ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.88 * a));
+        float cardW = Math.min(2.10f, Math.max(1.38f, s.hw() * 0.56f));
+        float cardH = 0.215f;
+        float rowStep = 0.248f;
+        float stackHeight = (count - 1) * rowStep + cardH;
+
+        float clearance = ReplayStagePlan.DEFAULT_FEED_CLEARANCE + 0.06f * (float) Math.max(1.0, currentZoom);
+        float effectiveTop = ReplayStagePlan.effectiveFeedTop(
+                ReplayBoardSite.MAP_BASE, model.mapH, meshReplayCeiling, model.scale, currentZoom, clearance);
+        // Compensate for camera pitch tilt so the lowest card edge stays strictly above effectiveTop.
+        float pitchSafeLift = stackHeight * 0.5f * Math.abs(f.look.y) + 0.04f;
+        float bottomCardCenterY = effectiveTop + cardH * 0.5f + pitchSafeLift;
+
+        // Place onto the viewer's right flank of the tray (matches top-right feed in exported videos).
+        Vector3f horizRight = new Vector3f(f.right.x, 0f, f.right.z);
+        if (horizRight.lengthSquared() < 1e-5f) horizRight.set(1f, 0f, 0f);
+        else horizRight.normalize();
+        Vector3f horizTowardViewer = new Vector3f(-f.look.x, 0f, -f.look.z);
+        if (horizTowardViewer.lengthSquared() < 1e-5f) horizTowardViewer.set(0f, 0f, 1f);
+        else horizTowardViewer.normalize();
+
+        float flankOffset = Math.max(0.55f, s.hw() * 0.62f - cardW * 0.25f) * worldScale;
+        float viewerPull = Math.min(0.45f, s.hd() * 0.16f) * worldScale;
+        Vector3f baseAnchor = s.board().transformPosition(0f, bottomCardCenterY, 0f, new Vector3f());
+        baseAnchor.add(horizRight.x * flankOffset + horizTowardViewer.x * viewerPull,
+                0f,
+                horizRight.z * flankOffset + horizTowardViewer.z * viewerPull);
+
+        VertexConsumer panel = f.buffers.getBuffer(ReplayDraw.PANEL);
         VertexConsumer glow = f.glow();
-        int brass = ReplayPalette.alpha(ReplayPalette.BRASS, 0.9 * a);
-        ReplayDraw.segment(glow, m, -w / 2, h / 2, 0.002f, w / 2, h / 2, 0.002f, 0.007f * worldScale, brass, brass);
-        ReplayDraw.segment(glow, m, -w / 2, -h / 2, 0.002f, w / 2, -h / 2, 0.002f, 0.007f * worldScale, brass, brass);
-        int ruby = ReplayPalette.alpha(ReplayPalette.RUBY, 0.95 * a);
-        ReplayDraw.rectXY(fill, m, -w / 2, -h / 2, -w / 2 + 0.03f, h / 2, 0.001f, ruby, ruby);
-        f.text(m, line, 0.015f, 0, 0.004f, 0.0062f, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a), 0, true, w - 0.12f);
+        Font font = f.mc.font;
+
+        // Render oldest at bottom (index 0 above effectiveTop) and newest on top.
+        for (int idx = 0; idx < count; idx++) {
+            ReplayBoardModel.EventMark mark = feed.get(from + idx);
+            double ageSec = (t - mark.node.tick()) / (20.0 * speed);
+            double in = ReplayStagePlan.easeOutCubic(ageSec / FEED_IN_SEC);
+            double out = 1.0 - ReplayStagePlan.smoothstep(FEED_OUT_START_SEC, FEED_DURATION_SEC, ageSec);
+            double a = in * out * s.fade() * stage.actors();
+            if (a <= 0.02) continue;
+
+            float localY = idx * rowStep;
+            float slideX = (float) ((1.0 - in) * 0.42);
+            Matrix4f m = new Matrix4f()
+                    .translate(baseAnchor.x, baseAnchor.y + localY * worldScale, baseAnchor.z)
+                    .rotate(f.rotation)
+                    .scale(worldScale)
+                    .translate(slideX, 0f, 0f);
+
+            drawFeedCard(f, panel, glow, font, m, mark, cardW, cardH, worldScale, a);
+        }
+    }
+
+    static boolean isFeedEvent(LastMatchReplay.Node node) {
+        return switch (node.kind()) {
+            case KILL, BOMB_DETONATE, GRENADE_EXPLOSION, PLAYER_REVIVAL, BOMB_DEFUSE, SHIELD_BROKEN -> true;
+            case GUNSHOT -> (node.flags() & LastMatchReplay.BACKFIRE) != 0;
+            default -> false;
+        };
+    }
+
+    private static void drawFeedCard(ReplayFrame f, VertexConsumer panel, VertexConsumer glow, Font font,
+                                     Matrix4f m, ReplayBoardModel.EventMark mark,
+                                     float cardW, float cardH, float worldScale, double a) {
+        LastMatchReplay.Node node = mark.node;
+        ReplayBoardModel model = f.model;
+        ReplayBoardModel.Actor killer = model.participant(node.actor());
+        ReplayBoardModel.Actor victim = model.participant(node.target());
+
+        float hw = cardW * 0.5f;
+        float hh = cardH * 0.5f;
+        float skew = 0.042f;
+        int accent = feedAccentColor(node, killer, victim);
+
+        // Slanted Star-Night Express Art Deco plate (matches ReplayVideoOverlay.feed slab)
+        int leftCol = ReplayPalette.alpha(ReplayPalette.NIGHT_1, 0.78 * a);
+        int rightCol = ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.94 * a);
+        ReplayDraw.quad(panel, m,
+                -hw, -hh, 0f,
+                hw, -hh, 0f,
+                hw + skew, hh, 0f,
+                -hw + skew, hh, 0f,
+                leftCol, rightCol, rightCol, leftCol);
+
+        // Faction / event glowing right side light strip
+        float barW = 0.030f;
+        int barCol = ReplayPalette.alpha(accent, 0.96 * a);
+        ReplayDraw.quad(glow, m,
+                hw - barW, -hh, 0.002f,
+                hw, -hh, 0.002f,
+                hw + skew, hh, 0.002f,
+                hw - barW + skew, hh, 0.002f,
+                barCol, barCol, barCol, barCol);
+
+        // Subtle brass top & bottom Art Deco hairlines
+        int brassHi = ReplayPalette.alpha(ReplayPalette.BRASS, 0.78 * a);
+        int brassLo = ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.30 * a);
+        ReplayDraw.segment(glow, m, -hw + skew, hh, 0.002f, hw + skew, hh, 0.002f, 0.0045f * worldScale, brassLo, brassHi);
+        ReplayDraw.segment(glow, m, -hw, -hh, 0.002f, hw, -hh, 0.002f, 0.0035f * worldScale, brassLo, brassLo);
+
+        float textScale = 0.0056f;
+        float leftPad = -hw + 0.06f;
+        float rightLimit = hw - barW - 0.04f;
+
+        if (node.kind() == Kind.KILL) {
+            float faceSize = cardH * 0.68f;
+            float cursorX = leftPad;
+            // Killer avatar + role-colored name
+            if (killer != null) {
+                drawFeedAvatar(f, m, killer.p.id(), cursorX + faceSize * 0.5f, 0f, 0.004f, faceSize, 0xFFFFFFFF, a);
+                cursorX += faceSize + 0.04f;
+                int kColor = ReplayPalette.alpha(ReplayPalette.lerp(killer.color, 0xFFFFFFFF, 0.20), a);
+                float killerMaxW = (rightLimit - cursorX) * 0.36f;
+                f.text(m, killer.name, cursorX, 0f, 0.005f, textScale, kColor, -1, true, killerMaxW);
+                cursorX += Math.min(killerMaxW, font.width(killer.name) * textScale) + 0.045f;
+            } else {
+                Component env = ReplayBoardTexts.tr("environment");
+                float envMaxW = (rightLimit - cursorX) * 0.28f;
+                f.text(m, env, cursorX, 0f, 0.005f, textScale, ReplayPalette.alpha(ReplayPalette.TEXT_MUTED, a), -1, true, envMaxW);
+                cursorX += Math.min(envMaxW, font.width(env) * textScale) + 0.045f;
+            }
+
+            // Weapon icon medallion in center
+            float wx = cursorX + 0.075f;
+            int discCol = ReplayPalette.alpha(accent, 0.24 * a);
+            int discEdge = ReplayPalette.alpha(accent, 0.0);
+            ReplayDraw.quad(glow, m, wx - 0.068f, -0.068f, 0.002f, wx + 0.068f, -0.068f, 0.002f,
+                    wx + 0.068f, 0.068f, 0.002f, wx - 0.068f, 0.068f, 0.002f, discEdge, discCol, discEdge, discCol);
+            var weaponStack = mark.item();
+            Matrix4f itemM = new Matrix4f(m).translate(wx, 0f, 0.008f).scale(0.135f);
+            f.model(itemM, pose -> Minecraft.getInstance().getItemRenderer().renderStatic(
+                    weaponStack, ItemDisplayContext.GUI, LightTexture.FULL_BRIGHT,
+                    OverlayTexture.NO_OVERLAY, pose, f.modelBuffers(), f.level, 0));
+            cursorX = wx + 0.095f;
+
+            // Victim red-X + strikethrough name on the right
+            Component victimName = ReplayBoardTexts.name(victim == null ? null : victim.p);
+            float xMarkR = 0.032f;
+            float xMarkCx = cursorX + xMarkR;
+            int rubyCol = ReplayPalette.alpha(ReplayPalette.RUBY, 0.95 * a);
+            ReplayDraw.segment(glow, m, xMarkCx - xMarkR, -xMarkR, 0.005f, xMarkCx + xMarkR, xMarkR, 0.005f, 0.0055f * worldScale, rubyCol, rubyCol);
+            ReplayDraw.segment(glow, m, xMarkCx - xMarkR, xMarkR, 0.005f, xMarkCx + xMarkR, -xMarkR, 0.005f, 0.0055f * worldScale, rubyCol, rubyCol);
+            float vTextX = xMarkCx + xMarkR + 0.035f;
+            float vAvail = Math.max(0.15f, rightLimit - vTextX);
+            float vRawW = font.width(victimName) * textScale;
+            float vDrawnW = Math.min(vAvail, vRawW);
+            f.text(m, victimName, vTextX, 0f, 0.005f, textScale, ReplayPalette.alpha(ReplayPalette.TEXT, 0.92 * a), -1, true, vAvail);
+            // Ruby strikethrough bar across victim name (matches ReplayVideoOverlay.card)
+            ReplayDraw.segment(glow, m, vTextX, 0.002f, 0.006f, vTextX + vDrawnW, 0.002f, 0.006f,
+                    0.0045f * worldScale, rubyCol, rubyCol);
+        } else {
+            ReplayBoardModel.Actor subject = node.kind() == Kind.SHIELD_BROKEN && victim != null ? victim
+                    : killer != null ? killer : victim;
+            float faceSize = cardH * 0.66f;
+            float cursorX = leftPad;
+            if (subject != null) {
+                drawFeedAvatar(f, m, subject.p.id(), cursorX + faceSize * 0.5f, 0f, 0.004f, faceSize, 0xFFFFFFFF, a);
+                cursorX += faceSize + 0.045f;
+            }
+            Component summary = switch (node.kind()) {
+                case BOMB_DETONATE, GRENADE_EXPLOSION -> ReplayBoardTexts.tr("brief.explosion",
+                        ReplayBoardTexts.name(subject == null ? null : subject.p));
+                case GUNSHOT -> ReplayBoardTexts.tr("brief.shot",
+                        ReplayBoardTexts.name(killer == null ? null : killer.p),
+                        ReplayBoardTexts.weapon(node),
+                        ReplayBoardTexts.name(victim == null ? null : victim.p));
+                case PLAYER_REVIVAL -> Component.translatable("habitrain_core.replay_video.card.revived",
+                        ReplayBoardTexts.name(subject == null ? null : subject.p));
+                case BOMB_DEFUSE -> Component.translatable("habitrain_core.replay_video.card.defused",
+                        ReplayBoardTexts.name(subject == null ? null : subject.p));
+                case SHIELD_BROKEN -> Component.translatable("habitrain_core.replay_video.card.shield",
+                        ReplayBoardTexts.name(subject == null ? null : subject.p));
+                default -> ReplayBoardTexts.name(subject == null ? null : subject.p);
+            };
+            f.text(m, summary, cursorX, 0f, 0.005f, textScale,
+                    ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a), -1, true, Math.max(0.2f, rightLimit - cursorX));
+        }
+    }
+
+    private static int feedAccentColor(LastMatchReplay.Node node,
+                                       @Nullable ReplayBoardModel.Actor killer,
+                                       @Nullable ReplayBoardModel.Actor victim) {
+        return switch (node.kind()) {
+            case KILL -> killer != null ? killer.factionColor() : ReplayPalette.RUBY;
+            case BOMB_DETONATE, GRENADE_EXPLOSION -> ReplayPalette.EXPLOSION;
+            case PLAYER_REVIVAL -> ReplayPalette.BRASS_LIGHT;
+            case BOMB_DEFUSE, SHIELD_BROKEN -> ReplayPalette.SHIELD;
+            case GUNSHOT -> ReplayPalette.LAMP;
+            default -> victim != null ? victim.factionColor() : ReplayPalette.BRASS;
+        };
+    }
+
+    /** Crisp 2D player face (base + hat layer) on a world-space panel. */
+    static void drawFeedAvatar(ReplayFrame f, Matrix4f panelMatrix, java.util.UUID playerId,
+                               float cx, float cy, float z, float size, int tint, double alpha) {
+        if (alpha <= 0.02) return;
+        ResourceLocation skin = ReplayHeadSkins.texture(playerId);
+        int color = ReplayPalette.alpha(tint, alpha);
+        float half = size * 0.5f;
+        Matrix4f m = new Matrix4f(panelMatrix).translate(cx, cy, z);
+        f.model(m, stack -> {
+            VertexConsumer vc = f.modelBuffers().getBuffer(RenderType.entityTranslucent(skin));
+            PoseStack.Pose pose = stack.last();
+            int light = LightTexture.FULL_BRIGHT;
+            // Base face UV: 8..16 / 64
+            emitFaceQuad(vc, pose, half, 0f, 8f / 64f, 8f / 64f, 16f / 64f, 16f / 64f, color, light);
+            // Hat overlay UV: 40..48 / 64, slightly proud in Z
+            emitFaceQuad(vc, pose, half * 1.07f, 0.0015f, 40f / 64f, 8f / 64f, 48f / 64f, 16f / 64f, color, light);
+        });
+    }
+
+    private static void emitFaceQuad(VertexConsumer vc, PoseStack.Pose pose, float h, float z,
+                                     float u0, float v0, float u1, float v1, int color, int light) {
+        vc.addVertex(pose, -h, h, z).setColor(color).setUv(u0, v0).setOverlay(OverlayTexture.NO_OVERLAY).setLight(light).setNormal(pose, 0, 0, 1);
+        vc.addVertex(pose, h, h, z).setColor(color).setUv(u1, v0).setOverlay(OverlayTexture.NO_OVERLAY).setLight(light).setNormal(pose, 0, 0, 1);
+        vc.addVertex(pose, h, -h, z).setColor(color).setUv(u1, v1).setOverlay(OverlayTexture.NO_OVERLAY).setLight(light).setNormal(pose, 0, 0, 1);
+        vc.addVertex(pose, -h, -h, z).setColor(color).setUv(u0, v1).setOverlay(OverlayTexture.NO_OVERLAY).setLight(light).setNormal(pose, 0, 0, 1);
     }
 }

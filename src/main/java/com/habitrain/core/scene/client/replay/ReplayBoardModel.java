@@ -46,8 +46,13 @@ final class ReplayBoardModel {
     final Actor[] actors;
     final List<Drone> drones;
     final List<LastMatchReplay.Span> sortedSpans;
+    private final List<LastMatchReplay.Span> blackouts = new ArrayList<>();
+    private final Map<UUID, List<LastMatchReplay.Span>> psychoSpans = new HashMap<>();
+    private final Map<UUID, List<Integer>> revivals = new HashMap<>();
     final Map<UUID, Actor> byId = new HashMap<>();
     final EventMark[] events;
+    final List<EventMark> feedEvents;
+    private List<ReplaySkillEffectRegistry.SkillSignal> dioramaSkills, worldSkills;
     final double rate, comet;
     final Component title, subtitle, modeLabel;
     final int winColor;
@@ -97,13 +102,27 @@ final class ReplayBoardModel {
         maxSurvival = survival;
         drones = replay.drones().stream().map(d -> new Drone(new ReplayTrackSampler(d.track()), byId.get(d.owner()))).toList();
         sortedSpans = replay.spans().stream().sorted(Comparator.comparingInt(LastMatchReplay.Span::startTick)).toList();
+        for (var span : sortedSpans) {
+            if (span.kind() == LastMatchReplay.SpanKind.BLACKOUT) blackouts.add(span);
+            else if (span.kind() == LastMatchReplay.SpanKind.PSYCHO && span.actor() != null) {
+                psychoSpans.computeIfAbsent(span.actor(), ignored -> new ArrayList<>()).add(span);
+            }
+        }
 
         List<EventMark> marks = new ArrayList<>();
         for (LastMatchReplay.Node node : replay.events()) {
             if (node.from() == null && node.to() == null) continue;
             marks.add(new EventMark(node, this, tmp));
+            if (node.kind() == LastMatchReplay.Kind.PLAYER_REVIVAL) {
+                if (node.actor() != null) revivals.computeIfAbsent(node.actor(), ignored -> new ArrayList<>()).add(node.tick());
+                if (node.target() != null && !node.target().equals(node.actor())) {
+                    revivals.computeIfAbsent(node.target(), ignored -> new ArrayList<>()).add(node.tick());
+                }
+            }
         }
         events = marks.toArray(EventMark[]::new);
+        feedEvents = marks.stream().filter(mark -> ReplayEventPainter.isFeedEvent(mark.node))
+                .sorted(Comparator.comparingInt(mark -> mark.node.tick())).toList();
 
         title = ReplayBoardTexts.winTitle(replay);
         subtitle = ReplayBoardTexts.winSubtitle(replay);
@@ -147,20 +166,36 @@ final class ReplayBoardModel {
     }
 
     boolean blackoutAt(double tick) {
-        for (LastMatchReplay.Span span : sortedSpans) {
+        return spanActive(blackouts, tick);
+    }
+
+    boolean psychoAt(UUID actor, double tick) {
+        return spanActive(psychoSpans.getOrDefault(actor, List.of()), tick);
+    }
+
+    private static boolean spanActive(List<LastMatchReplay.Span> spans, double tick) {
+        for (LastMatchReplay.Span span : spans) {
             if (span.startTick() > tick) break;
-            if (span.kind() == LastMatchReplay.SpanKind.BLACKOUT && tick < span.endTick()) return true;
+            if (tick < span.endTick()) return true;
         }
         return false;
     }
 
-    boolean psychoAt(UUID actor, double tick) {
-        for (LastMatchReplay.Span span : sortedSpans) {
-            if (span.startTick() > tick) break;
-            if (span.kind() == LastMatchReplay.SpanKind.PSYCHO && actor.equals(span.actor())
-                    && tick < span.endTick()) return true;
+    /** Returns true when an actual {@code PLAYER_REVIVAL} event was recorded for {@code actorId} near {@code tick}. */
+    boolean hasRevivalNear(@Nullable UUID actorId, double tick) {
+        for (int revivalTick : revivals.getOrDefault(actorId, List.of())) {
+            if (Math.abs(revivalTick - tick) <= 45.0) return true;
         }
         return false;
+    }
+
+    List<ReplaySkillEffectRegistry.SkillSignal> skillSignals(boolean diorama) {
+        if (diorama) {
+            if (dioramaSkills == null) dioramaSkills = ReplaySkillEffectRegistry.buildSignals(this, true);
+            return dioramaSkills;
+        }
+        if (worldSkills == null) worldSkills = ReplaySkillEffectRegistry.buildSignals(this, false);
+        return worldSkills;
     }
 
     record Drone(ReplayTrackSampler track, @Nullable Actor owner) {}
@@ -170,6 +205,7 @@ final class ReplayBoardModel {
         final LastMatchReplay.Participant p;
         final ReplayTrackSampler track;
         final float[] xs, ys, zs;
+        final int[] trailEnds;
         final int color;
         final boolean mvp;
         final Component name, role;
@@ -182,10 +218,21 @@ final class ReplayBoardModel {
             this.xs = xs;
             this.ys = ys;
             this.zs = zs;
+            trailEnds = new int[track.size()];
+            for (int i = trailEnds.length - 1; i >= 0; i--) {
+                trailEnds[i] = track.connects(i + 1) ? trailEnds[i + 1] : i;
+            }
             this.color = color;
             this.mvp = mvp;
             this.name = ReplayBoardTexts.name(p);
             this.role = ReplayBoardTexts.role(p.endRole());
+        }
+
+        int nextTrailPoint(int current, int recent, int stride) {
+            int next = current + 1;
+            if (stride <= 1 || next >= recent || next > trailEnds[current]) return next;
+            int nextOnStride = current + stride - current % stride;
+            return Math.min(recent, Math.min(nextOnStride, trailEnds[current]));
         }
 
         int factionColor() {

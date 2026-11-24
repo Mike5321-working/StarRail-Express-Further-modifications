@@ -18,6 +18,10 @@
         "ReplayC4CarrierMixin",
         "ReplayGrenadeImpactMixin",
         "ReplayFusedGrenadeMixin",
+        "ReplayServerSoundMixin",
+        "ReplayPlayerSoundMixin",
+        "ReplayDirectSoundPacketMixin",
+        "ReplaySmokeAreaMixin",
 
         "BoundItemDropMixin",
         "BoundItemContainerMixin",

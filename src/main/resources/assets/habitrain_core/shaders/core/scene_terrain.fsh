@@ -11,7 +11,7 @@ uniform vec4 SceneClip;
 // Source-local XZ limits of the fixed tray interior. Applies to opaque and translucent geometry.
 uniform vec4 SceneBounds;
 uniform int ReplayFanCount;
-// Columns hold (source-local x, foot y, z, rounded-apex radius), up to 128 avatars.
+// Columns hold (viewer-forward, foot y, viewer-sideways, radius), up to 128 avatars.
 uniform mat4 ReplayFanAnchors[32];
 uniform vec4 ReplayFanView;
 in vec3 scenePos;
@@ -20,17 +20,36 @@ in float vertexDistance;
 in vec4 vertexColor;
 in vec2 texCoord0;
 out vec4 fragColor;
-bool replayCut(vec3 cell) {
+float replayCoverage(vec3 cell, vec2 sampleXZ) {
+    float edge = ReplayFanView.w;
+    float distanceToCut = edge;
+    vec2 view = ReplayFanView.xy;
+    vec2 point = vec2(dot(sampleXZ, view), dot(sampleXZ, vec2(view.y, -view.x)));
     for (int i = 0; i < ReplayFanCount; ++i) {
         vec4 anchor = ReplayFanAnchors[i / 4][i % 4];
         if (cell.y <= anchor.y + 0.01) continue;
-        vec2 delta = cell.xz - anchor.xz;
-        if (dot(delta, delta) <= anchor.w * anchor.w) return true;
-        float forward = dot(delta, ReplayFanView.xy);
-        float sideways = abs(delta.x * ReplayFanView.y - delta.y * ReplayFanView.x);
-        if (forward >= 0.0 && sideways <= anchor.w + forward * ReplayFanView.z) return true;
+        vec2 delta = point - anchor.xz;
+        float distance;
+        if (delta.x >= 0.0) {
+            distance = abs(delta.y) - anchor.w - delta.x * ReplayFanView.z;
+        } else {
+            float reach = anchor.w + edge;
+            if (-delta.x >= reach || abs(delta.y) >= reach) continue;
+            distance = length(delta) - anchor.w;
+        }
+        if (distance <= -edge) return 0.0;
+        distanceToCut = min(distanceToCut, distance);
     }
-    return false;
+    return smoothstep(-edge, edge, distanceToCut);
+}
+// A fixed ordered threshold leaves the terrain in its existing depth-writing pass.
+float replayThreshold() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    int x = pixel.x & 3;
+    int y = pixel.y & 3;
+    int mixed = x ^ y;
+    int order = ((mixed & 1) << 3) | ((y & 1) << 2) | (mixed & 2) | ((y & 2) >> 1);
+    return (float(order) + 0.5) / 16.0;
 }
 void main() {
     if (scenePos.x < SceneBounds.x || scenePos.z < SceneBounds.y
@@ -40,7 +59,9 @@ void main() {
         // Classify the voxel just inside this face. Opposite faces of neighbouring blocks then
         // disagree at a cut boundary, exposing the retained solid face instead of a hollow shell.
         vec3 n = dot(sceneNormal, sceneNormal) > 0.00001 ? normalize(sceneNormal) : vec3(0.0, 1.0, 0.0);
-        if (replayCut(floor(scenePos - n * 0.002) + vec3(0.5))) discard;
+        vec3 cell = floor(scenePos - n * 0.002) + vec3(0.5);
+        float coverage = replayCoverage(cell, mix(scenePos.xz, cell.xz, 0.5));
+        if (coverage <= 0.0 || (coverage < 1.0 && coverage < replayThreshold())) discard;
     }
     vec4 color = texture(Sampler0, texCoord0) * vertexColor * ColorModulator;
     if (color.a < AlphaCutoff) discard;

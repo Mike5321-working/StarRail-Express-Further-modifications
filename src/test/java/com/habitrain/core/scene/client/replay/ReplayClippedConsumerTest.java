@@ -11,6 +11,28 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ReplayClippedConsumerTest {
+    @Test void passesInteriorCirclesDirectlyAndKeepsClippingAtTheRim() {
+        var output = new Collector();
+        var board = new Matrix4f().translation(3, 2, -6).rotateY(0.7f).scale(2);
+        try (var clip = new ReplayClippedConsumer(output, new Matrix4f(board).invert(), 1, 1)) {
+            assertSame(output, clip.horizontalArea(board, 0, 0, 0, 0.9f));
+            assertSame(clip, clip.horizontalArea(board, 0.5f, 0, 0, 0.7f));
+        }
+    }
+
+    @Test void reusesClippingBuffersAcrossIndependentDraws() {
+        var output = new Collector();
+        var clip = new ReplayClippedConsumer(output, new Matrix4f(), 1, 1);
+        try (clip) {
+            vertex(clip, -0.5f, 0, 0, 12);
+        }
+        try (clip) {
+            for (int i = 0; i < 4; i++) vertex(clip, 0.5f, 0, 0, 34);
+        }
+        assertEquals(4, output.vertices.size());
+        assertTrue(output.vertices.stream().allMatch(v -> v[0] == 0.5f && v[6] == 240));
+    }
+
     @Test void interleavedLayersAcquireTheirOutputOnlyWhenACompletePrimitiveIsFlushed() {
         var base = new Collector();
         var glint = new Collector();

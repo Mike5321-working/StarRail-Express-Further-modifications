@@ -277,7 +277,53 @@ public final class ReplayMusicPlan {
     /** Builds the score for {@code script}; {@code schedule} supplies voice and sound-effect cues for ducking. */
     public static Score compose(ReplayVideoScript script, @Nullable ReplaySoundCuePlan.Schedule schedule) {
         if (script == null || script.total() <= 0) return Score.EMPTY;
-        return new Composer(script, schedule).build();
+        return new Composer(ScriptSource.of(script), schedule, List.of()).build();
+    }
+
+    /** Builds a mode-aware procedural soundtrack for a {@link ReplayCinemaDirector.DirectedFilm}. */
+    public static Score compose(ReplayCinemaDirector.DirectedFilm film) {
+        if (film == null || film.total() <= 0) return Score.EMPTY;
+        return new Composer(ScriptSource.of(film), null, film.segments()).build();
+    }
+
+    private interface ScriptSource {
+        LastMatchReplay replay();
+        List<ReplayVideoScript.Beat> beats();
+        List<ReplayVideoScript.Feed> feeds();
+        int duration();
+        boolean hasMvpAct();
+        double actStart(ReplayVideoScript.Act act);
+        double actLength(ReplayVideoScript.Act act);
+        double total();
+        double replayTickAt(double time);
+
+        static ScriptSource of(ReplayVideoScript s) {
+            return new ScriptSource() {
+                @Override public LastMatchReplay replay() { return s.replay(); }
+                @Override public List<ReplayVideoScript.Beat> beats() { return s.beats(); }
+                @Override public List<ReplayVideoScript.Feed> feeds() { return s.feeds(); }
+                @Override public int duration() { return s.duration(); }
+                @Override public boolean hasMvpAct() { return s.hasMvpAct(); }
+                @Override public double actStart(ReplayVideoScript.Act act) { return s.actStart(act); }
+                @Override public double actLength(ReplayVideoScript.Act act) { return s.actLength(act); }
+                @Override public double total() { return s.total(); }
+                @Override public double replayTickAt(double time) { return s.sample(time).replayTick(); }
+            };
+        }
+
+        static ScriptSource of(ReplayCinemaDirector.DirectedFilm f) {
+            return new ScriptSource() {
+                @Override public LastMatchReplay replay() { return f.replay(); }
+                @Override public List<ReplayVideoScript.Beat> beats() { return f.beats(); }
+                @Override public List<ReplayVideoScript.Feed> feeds() { return f.feeds(); }
+                @Override public int duration() { return f.duration(); }
+                @Override public boolean hasMvpAct() { return f.hasMvpAct(); }
+                @Override public double actStart(ReplayVideoScript.Act act) { return f.actStart(act); }
+                @Override public double actLength(ReplayVideoScript.Act act) { return f.actLength(act); }
+                @Override public double total() { return f.total(); }
+                @Override public double replayTickAt(double time) { return f.sample(time).replayTick(); }
+            };
+        }
     }
 
     // ------------------------------------------------------------------ composer
@@ -308,9 +354,10 @@ public final class ReplayMusicPlan {
     }
 
     private static final class Composer {
-        private final ReplayVideoScript script;
+        private final ScriptSource script;
         private final LastMatchReplay replay;
         private final List<ReplayVideoScript.Beat> beats;
+        private final List<ReplayCinemaDirector.DirectedSegment> directedSegments;
         private final @Nullable ReplaySoundCuePlan.Schedule schedule;
         private final int transpose;
         private final int variant;
@@ -331,10 +378,12 @@ public final class ReplayMusicPlan {
         private final List<Segment> segments = new ArrayList<>();
         private final List<Anchor> anchors = new ArrayList<>();
 
-        Composer(ReplayVideoScript script, @Nullable ReplaySoundCuePlan.Schedule schedule) {
+        Composer(ScriptSource script, @Nullable ReplaySoundCuePlan.Schedule schedule,
+                 List<ReplayCinemaDirector.DirectedSegment> directedSegments) {
             this.script = script;
             this.replay = script.replay();
             this.beats = script.beats();
+            this.directedSegments = directedSegments;
             this.schedule = schedule;
             long seed = replay.roundId() == null ? 0 : replay.roundId().getMostSignificantBits() ^ replay.roundId().getLeastSignificantBits();
             seed ^= seed >>> 29;
@@ -396,6 +445,7 @@ public final class ReplayMusicPlan {
                 if (a.drop()) buildUp(a);
                 accent(a);
             }
+            tier5EncoreDrops();
             feedAccents();
             planDucks();
             notes.sort(Comparator.comparingDouble(Note::time).thenComparing(n -> n.voice().ordinal()));
@@ -408,12 +458,12 @@ public final class ReplayMusicPlan {
 
         private void planAnchors() {
             List<Anchor> raw = new ArrayList<>();
-            raw.add(new Anchor(actionStart, AnchorKind.ACTION, null));
+            if (script.actLength(ReplayVideoScript.Act.TITLE) > 0) raw.add(new Anchor(actionStart, AnchorKind.ACTION, null));
             for (ReplayVideoScript.Beat beat : beats) raw.add(new Anchor(beat.impact(), AnchorKind.IMPACT, beat));
-            raw.add(new Anchor(reviewStart, AnchorKind.REVIEW, null));
-            raw.add(new Anchor(victoryStart, AnchorKind.VICTORY, null));
-            if (script.hasMvpAct()) raw.add(new Anchor(mvpStart, AnchorKind.MVP, null));
-            raw.add(new Anchor(outroStart, AnchorKind.OUTRO, null));
+            if (script.actLength(ReplayVideoScript.Act.REVIEW) > 0) raw.add(new Anchor(reviewStart, AnchorKind.REVIEW, null));
+            if (script.actLength(ReplayVideoScript.Act.VICTORY) > 0) raw.add(new Anchor(victoryStart, AnchorKind.VICTORY, null));
+            if (script.hasMvpAct() && script.actLength(ReplayVideoScript.Act.MVP) > 0) raw.add(new Anchor(mvpStart, AnchorKind.MVP, null));
+            if (script.actLength(ReplayVideoScript.Act.OUTRO) > 0) raw.add(new Anchor(outroStart, AnchorKind.OUTRO, null));
             raw.sort(Comparator.comparingDouble(a -> a.time));
             for (Anchor a : raw) {
                 if (a.time <= 0 || a.time >= total) continue;
@@ -486,7 +536,7 @@ public final class ReplayMusicPlan {
         }
 
         private Mood actionMood(Anchor a, int index, Mood previous) {
-            double tick = a.beat != null ? a.beat.tick() : script.sample(a.time + EPS).replayTick();
+            double tick = a.beat != null ? a.beat.tick() : script.replayTickAt(a.time + EPS);
             int killsSoFar = countAtOrBefore(killTicks, tick);
             Mood mood;
             if (killsSoFar == 0) {
@@ -1038,6 +1088,25 @@ public final class ReplayMusicPlan {
                 }
             }
             hits.add(new Hit(t, kind));
+        }
+
+        /** Adds explosive orchestral drop & sub-bass pulse for Mode 4 Tier 5 Apotheosis segments. */
+        private void tier5EncoreDrops() {
+            for (var ds : directedSegments) {
+                if (ds.kind() == ReplayCinemaDirector.SegmentKind.TIER5_SUCTION_DOLLY) {
+                    // Deep pulsing sub-bass heartbeat under the 4-second pre-roll
+                    for (double t = ds.videoStart(); t < ds.videoEnd() - 0.2; t += 0.75) {
+                        notes.add(new Note(t, 0.35, Voice.HEART, 0, 0.65f, 0f));
+                    }
+                } else if (ds.kind() == ReplayCinemaDirector.SegmentKind.TIER5_ORBIT_ENCORE) {
+                    double drop = ds.videoStart();
+                    notes.add(new Note(drop, 0.55, Voice.KICK, 0, 1.0f, 0f));
+                    notes.add(new Note(drop, 2.2, Voice.SUB_BOOM, 0, 1.0f, 0f));
+                    notes.add(new Note(drop, 2.8, Voice.CRASH, 0, 0.95f, 0f));
+                    filter.add(new Ramp(Math.max(0, drop - 0.05), drop + 0.15, 1_200f, OPEN_FILTER));
+                    hits.add(new Hit(drop, "tier5_apotheosis_encore"));
+                }
+            }
         }
 
         /** Unfeatured kills, revivals and explosions get a small accent snapped to the nearest sixteenth. */

@@ -1,5 +1,6 @@
 package com.habitrain.core.scene.client.replay;
 
+import org.joml.FrustumIntersection;
 import org.joml.Matrix4f;
 
 import java.util.UUID;
@@ -11,6 +12,7 @@ final class ReplayActorSizing {
     private final float projectionScale;
     private final float displayScale;
     private final Matrix4f clip;
+    private final FrustumIntersection frustum;
     private final ToDoubleFunction<UUID> emphasis;
     private final boolean offscreen;
 
@@ -20,6 +22,7 @@ final class ReplayActorSizing {
         this.displayScale = displayScale;
         projectionScale = Math.abs(projection.m11()) * 0.5f * displayScale;
         clip = new Matrix4f(projection).mul(view).mul(diorama);
+        frustum = new FrustumIntersection(clip);
         this.emphasis = emphasis;
         this.offscreen = offscreen;
     }
@@ -41,4 +44,10 @@ final class ReplayActorSizing {
     }
 
     static float centerOffset(float size) { return size * 0.67f; }
+
+    boolean visible(float x, float y, float z, float size) {
+        // Allow room for held items, capes, death poses, revival effects and labels.
+        float margin = 0.5f + size * 3f;
+        return frustum.testAab(x - margin, y - margin, z - margin, x + margin, y + margin, z + margin);
+    }
 }

@@ -1,8 +1,10 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.scene.replay.ReplayCinemaDirector;
 import com.habitrain.core.scene.replay.ReplayMusicPlan;
 import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
+import com.habitrain.core.scene.replay.ReplayStreamingAudioMixer;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
@@ -21,6 +23,8 @@ import org.slf4j.LoggerFactory;
 import javax.sound.sampled.AudioFormat;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
@@ -87,6 +91,75 @@ final class ReplayVideoAudioRenderer {
             }
             return renderSchedule(schedule, keys -> decode(assets.getOrDefault(keys, List.of())), frames, score, level.gain);
         };
+    }
+
+    /**
+     * Prepares a streaming audio mix job for a {@link ReplayCinemaDirector.DirectedFilm}.
+     *
+     * <p>Resolves Minecraft {@code .ogg} resource handles on the client thread, then runs chunked 1-second
+     * streaming multi-track mixing (concurrent spatial voices + WSOLA pitch-preserving time-stretch +
+     * server-recorded game SFX + procedural dynamic music with Auto-Ducking) on a worker thread directly
+     * into a temporary {@code .pcm} file — never allocating a monolithic full-match {@code short[]}.</p>
+     */
+    static Supplier<Path> prepareStreaming(@Nullable Minecraft client,
+                                           Path tempDir,
+                                           ReplayCinemaDirector.DirectedFilm film,
+                                           @Nullable ReplayVoiceData voice,
+                                           int totalVideoFrames) {
+        var opts = film.options();
+        var level = opts.musicLevel();
+        var mixPlan = ReplayCinemaDirector.buildAudioMixPlan(
+                film, voice, totalVideoFrames, ReplayVideoExport.FPS,
+                file -> client != null && client.getResourceManager().getResource(file).isPresent());
+
+        // Pre-resolve Minecraft sound event resource handles on the calling (client) thread.
+        var assets = new HashMap<List<String>, List<SoundAsset>>();
+        var random = RandomSource.create(0x5245504C4159L);
+        if (client != null && mixPlan.sfxVolume() > 0.001f) {
+            for (var ev : mixPlan.sfxEvents()) {
+                List<String> keys = ev.keys();
+                if (keys.isEmpty() || assets.containsKey(keys)) continue;
+                assets.put(keys, resolveForStreaming(client, keys, random));
+            }
+        }
+
+        return () -> {
+            ReplayStreamingAudioMixer.MusicChunkMixer musicMixer = null;
+            if (level.enabled()) {
+                ReplayMusicPlan.Score score = ReplayMusicPlan.compose(film);
+                if (!score.notes().isEmpty()) {
+                    LOGGER.info("Replay streaming soundtrack ({}): {} notes, {} synced hits",
+                            film.mode().id, score.notes().size(), score.hits().size());
+                    var bus = new ReplayMusicSynth.Bus(score, level.gain,
+                            (int) Math.min(Integer.MAX_VALUE, mixPlan.totalStereoFrames()));
+                    musicMixer = (outL, outR, offset, count) -> bus.mix(outL, outR, (int) offset, count);
+                }
+            }
+            ReplayStreamingAudioMixer.SfxResolver resolver = keys -> {
+                DecodedSound decoded = decode(assets.getOrDefault(keys, List.of()));
+                if (decoded == null) return null;
+                return new ReplayStreamingAudioMixer.DecodedSfx(
+                        decoded.samples(), decoded.channels(), decoded.sampleRate(),
+                        decoded.soundVolume(), decoded.soundPitch());
+            };
+            try {
+                return ReplayStreamingAudioMixer.mixToTempPcmFile(tempDir, mixPlan, resolver, musicMixer);
+            } catch (IOException io) {
+                throw new UncheckedIOException(io);
+            }
+        };
+    }
+
+    private static List<SoundAsset> resolveForStreaming(Minecraft client, List<String> keys, RandomSource random) {
+        if (keys.size() == 1) {
+            ResourceLocation direct = ResourceLocation.tryParse(keys.getFirst());
+            if (direct != null && direct.getPath().endsWith(".ogg")) {
+                return client.getResourceManager().getResource(direct)
+                        .map(res -> List.of(new SoundAsset(direct, res, 1f, 1f)))
+                        .orElseGet(List::of);
+            }
+        }
+        return resolve(client, keys, random);
     }
 
     static short[] renderSchedule(ReplaySoundCuePlan.Schedule schedule, SoundResolver resolver, int totalVideoFrames) {

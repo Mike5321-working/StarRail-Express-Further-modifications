@@ -1,16 +1,21 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.scene.replay.ReplayCinemaDirector;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
 import com.habitrain.core.scene.replay.ReplayTrackSampler;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.UUID;
 
 import static com.habitrain.core.scene.client.replay.ReplayPalette.*;
 
@@ -23,16 +28,19 @@ import static com.habitrain.core.scene.client.replay.ReplayPalette.*;
  * frozen around it.</p>
  */
 final class ReplayVideoFx {
-    private final ReplayVideoScript script;
+    private final @Nullable ReplayVideoScript script;
+    private final @Nullable ReplayCinemaDirector.DirectedFilm film;
     private final ReplayBoardModel model;
     private final double[] eventTimes;
     private final float[] eventIntensity;
     private final boolean[] eventPrimary;
     private double time;
     private ReplayVideoScript.Sample sample;
+    private @Nullable ReplayCinemaDirector.CinemaSample cinemaSample;
 
     ReplayVideoFx(ReplayVideoScript script, ReplayBoardModel model) {
         this.script = script;
+        this.film = null;
         this.model = model;
         int n = model.events.length;
         eventTimes = new double[n];
@@ -49,6 +57,36 @@ final class ReplayVideoFx {
                 continue;
             }
             eventTimes[i] = script.eventTime(mark.node);
+            eventIntensity[i] = 1f;
+            eventPrimary[i] = true;
+            if (isBurstKind(mark.node.kind())) {
+                var position = mark.hasTo ? mark.node.to() : mark.node.from();
+                bursts.add(new Burst(i, eventTimes[i], mark.tx, mark.tz, position.blockY(), mark.node.kind()));
+            }
+        }
+        clusterBursts(bursts, eventIntensity, eventPrimary);
+    }
+
+    ReplayVideoFx(ReplayCinemaDirector.DirectedFilm film, ReplayBoardModel model) {
+        this.script = null;
+        this.film = film;
+        this.model = model;
+        int n = model.events.length;
+        eventTimes = new double[n];
+        eventIntensity = new float[n];
+        eventPrimary = new boolean[n];
+        int startTick = film.trimStartTick();
+        int endTick = film.trimEndTick();
+        List<Burst> bursts = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            var mark = model.events[i];
+            if (mark.node.tick() < startTick || mark.node.tick() > endTick) {
+                eventTimes[i] = Double.POSITIVE_INFINITY;
+                eventIntensity[i] = 0f;
+                eventPrimary[i] = false;
+                continue;
+            }
+            eventTimes[i] = film.eventTime(mark.node);
             eventIntensity[i] = 1f;
             eventPrimary[i] = true;
             if (isBurstKind(mark.node.kind())) {
@@ -102,20 +140,51 @@ final class ReplayVideoFx {
     void at(double time, ReplayVideoScript.Sample sample) {
         this.time = time;
         this.sample = sample;
+        this.cinemaSample = null;
+    }
+
+    void at(double time, ReplayCinemaDirector.CinemaSample cinemaSample) {
+        this.time = time;
+        this.cinemaSample = cinemaSample;
+        this.sample = cinemaSample.baseSample();
+    }
+
+    private int matchDurationTicks() {
+        return film != null ? film.duration() : (script != null ? script.duration() : model.replay.durationTicks());
     }
 
     // ------------------------------------------------------------------ outside the map scope
 
     void environment(ReplayFrame f, ReplayBoardSite s) {
+        // Apply Promo Tier-1 Glimmer 3D actor highlight/dimming BEFORE ReplayActorPainter runs.
+        if (cinemaSample != null && cinemaSample.segment() != null
+                && cinemaSample.segment().kind() == ReplayCinemaDirector.SegmentKind.TIER1_GLIMMER
+                && cinemaSample.activeHighlight() != null) {
+            var h = cinemaSample.activeHighlight();
+            Set<UUID> focal = new HashSet<>();
+            if (h.primaryActor() != null) focal.add(h.primaryActor());
+            if (h.secondaryActor() != null) focal.add(h.secondaryActor());
+            if (!focal.isEmpty()) {
+                double p = cinemaSample.segment().progressAt(time);
+                double env = ReplayStagePlan.smoothstep(0.0, 0.16, p) * (1.0 - ReplayStagePlan.smoothstep(0.82, 1.0, p));
+                float scale = (float) (1.0 + (cinemaSample.actorHighlightScale() - 1.0) * env);
+                float dim = (float) (1.0 - (1.0 - cinemaSample.backgroundDimAlpha()) * env);
+                f.highlight = ReplayFullPlayerRenderer.HighlightSpec.tier1(focal, scale, dim);
+            }
+        } else {
+            f.highlight = ReplayFullPlayerRenderer.HighlightSpec.NONE;
+        }
+        f.mvpSpotlightActor = (sample != null && sample.act() == ReplayVideoScript.Act.MVP && model.mvp != null)
+                ? model.mvp.p.id() : null;
         VertexConsumer glow = f.glow();
         Matrix4f b = s.board();
         float half = s.hw();
         float floor = ReplayBoardSite.TRAY_BOTTOM - 0.06f;
-        ReplayDraw.disc(glow, b, 0, floor, 0, half * 1.8f, 56, alpha(BRASS, 0.17), alpha(BRASS, 0));
+        ReplayDraw.disc(glow, b, 0, floor, 0, half * 1.8f, 56, alpha(BRASS_LIGHT, 0.17), alpha(BRASS_LIGHT, 0));
         ReplayDraw.ring(glow, b, 0, floor + 0.001f, 0, half * 1.32f + 0.06f * (float) Math.sin(time * 0.7), 0.035f, 72,
-                alpha(BRASS_LIGHT, 0.14), alpha(BRASS_LIGHT, 0));
-        ReplayDraw.ring(glow, b, 0, floor + 0.002f, 0, half * 1.62f, 0.012f, 72, alpha(PASSENGER, 0.08), alpha(PASSENGER, 0));
-        // Dust motes on slow orbits: depth cues in front of and behind the model.
+                alpha(BRASS_LIGHT, 0.18), alpha(BRASS_LIGHT, 0));
+        ReplayDraw.ring(glow, b, 0, floor + 0.002f, 0, half * 1.62f, 0.012f, 72, alpha(PASSENGER, 0.14), alpha(PASSENGER, 0));
+        // Dust motes on slow orbits: radial soft glow with near-lens fade so none turn into hard squares.
         for (int i = 0; i < 90; i++) {
             float a = (float) (rnd(i, 1) * Math.PI * 2 + time * 0.03 * (1 + i % 3) * (i % 2 == 0 ? 1 : -1));
             float r = half * (0.55f + 1.25f * rnd(i, 2));
@@ -123,8 +192,9 @@ final class ReplayVideoFx {
             Vector3f p = b.transformPosition((float) Math.cos(a) * r, y, (float) Math.sin(a) * r, new Vector3f());
             double twinkle = 0.55 + 0.45 * Math.sin(time * (1.1 + rnd(i, 4) * 2.3) + i * 1.7);
             int c = i % 5 == 0 ? PASSENGER : i % 3 == 0 ? BRASS_LIGHT : CHAMPAGNE;
-            float size = 0.01f + 0.022f * rnd(i, 5);
-            ReplayDraw.billboard(glow, p, f.right, f.up, size, size, alpha(c, (0.12 + 0.28 * rnd(i, 6)) * twinkle));
+            float size = (0.014f + 0.028f * rnd(i, 5));
+            ReplayDraw.softBillboard(glow, p, f.right, f.up, size, size,
+                    alpha(c, (0.14 + 0.28 * rnd(i, 6)) * twinkle), 0.85f, 2.0f);
         }
     }
 
@@ -321,33 +391,38 @@ final class ReplayVideoFx {
     private void kill(ReplayFrame f, Matrix4f d, VertexConsumer glow, VertexConsumer fill, ReplayBoardModel.EventMark e,
                       float x, float y, float z, double k, double fade, int seed, float intensity, boolean primary) {
         if (primary) flash(f, d, glow, x, y + 0.07f, z, k, 0.28, 0.24f, RUBY, intensity);
-        // Pillar of light.
-        float h = (float) ((primary ? 0.90 : 0.62) * ReplayStagePlan.easeOutCubic(k / 0.22));
-        float r = (float) (0.048 * (1 - ReplayStagePlan.easeOutCubic(k / 1.3)) + 0.007);
+        // Pillar of light (kept cleanly above the deck surface and slender so it never pierces thin carriage walls).
+        float baseY = y + 0.008f;
+        float h = (float) ((primary ? 0.85 : 0.58) * ReplayStagePlan.easeOutCubic(k / 0.22));
+        float r = (float) (0.032 * (1 - ReplayStagePlan.easeOutCubic(k / 1.3)) + 0.006);
         double pa = (1 - ReplayStagePlan.smoothstep(0.5, 1.8, k)) * intensity;
-        ReplayDraw.column(glow, d, x, y, z, h, r, alpha(RUBY, 0.62 * pa), alpha(RUBY, 0));
-        if (primary) ReplayDraw.column(glow, d, x, y, z, h * 0.78f, r * 0.34f, alpha(0xFFFFFFFF, 0.68 * pa), alpha(0xFFFFE0E0, 0));
-        // Shockwaves (only full stack on primary kill in a simultaneous cluster).
+        ReplayDraw.column(glow, d, x, baseY, z, h, r, alpha(RUBY, 0.58 * pa), alpha(RUBY, 0));
+        if (primary) ReplayDraw.column(glow, d, x, baseY, z, h * 0.78f, r * 0.34f, alpha(0xFFFFFFFF, 0.64 * pa), alpha(0xFFFFE0E0, 0));
+        // Shockwaves bounded to the train hull width so rings don't float outside onto the mahogany tray.
+        float maxRingRadius = Math.min(0.26f, Math.max(0.14f, model.mapD * 0.40f));
         int rings = primary ? 3 : 1;
         for (int i = 0; i < rings; i++) {
             double kk = (k - i * 0.09) / 0.7;
             if (kk <= 0 || kk >= 1) continue;
-            ReplayDraw.ring(glow, d, x, y + 0.002f * i, z, (float) (0.04 + 0.52 * ReplayStagePlan.easeOutCubic(kk)),
-                    (float) (0.022 * (1 - kk) + 0.005), 36,
-                    alpha(i == 0 && primary ? 0xFFFFFFFF : RUBY, (1 - kk) * 0.78 * intensity), alpha(RUBY, 0));
+            ReplayDraw.ring(glow, d, x, baseY + 0.002f * i, z,
+                    (float) (0.03 + (maxRingRadius - 0.03) * ReplayStagePlan.easeOutCubic(kk)),
+                    (float) (0.016 * (1 - kk) + 0.004), 32,
+                    alpha(i == 0 && primary ? 0xFFFFFFFF : RUBY, (1 - kk) * 0.74 * intensity), alpha(RUBY, 0));
         }
-        // Shards with gravity.
+        // Shards with gravity, clipped strictly above the deck floor so they never streak under the tray.
         if (k < 0.95) {
             int shards = primary ? 14 : 6;
             for (int i = 0; i < shards; i++) {
                 double ang = rnd(seed, i) * Math.PI * 2;
-                double speed = 0.35 + 0.45 * rnd(seed, i + 16), up = 0.45 + 0.6 * rnd(seed, i + 32);
+                double speed = 0.28 + 0.34 * rnd(seed, i + 16), up = 0.45 + 0.55 * rnd(seed, i + 32);
                 double t = k;
                 float px = x + (float) (Math.cos(ang) * speed * t), pz = z + (float) (Math.sin(ang) * speed * t);
-                float py = y + 0.06f + (float) (up * t - 1.7 * t * t);
+                float py = baseY + 0.05f + (float) (up * t - 1.7 * t * t);
+                if (py < baseY) continue;
                 float vx = (float) (Math.cos(ang) * speed), vz = (float) (Math.sin(ang) * speed), vy = (float) (up - 3.4 * t);
+                float tailY = Math.max(baseY, py - vy * 0.06f);
                 double a = (1 - k / 0.95) * intensity;
-                ReplayDraw.segment(glow, d, px - vx * 0.07f, py - vy * 0.07f, pz - vz * 0.07f, px, py, pz, 0.012f,
+                ReplayDraw.segment(glow, d, px - vx * 0.06f, tailY, pz - vz * 0.06f, px, py, pz, 0.011f,
                         alpha(RUBY, 0.2 * a), alpha(LAMP, a));
             }
         }
@@ -434,7 +509,7 @@ final class ReplayVideoFx {
         };
         if (sample.act() == ReplayVideoScript.Act.VICTORY) {
             for (var actor : model.winners) {
-                var pose = actor.track.sample(script.duration());
+                var pose = actor.track.sample(matchDurationTicks());
                 if (pose.state() != ReplayTrackSampler.State.ALIVE) continue;
                 float[] p = new float[3];
                 model.project(pose.x(), pose.y(), pose.z(), p);
@@ -443,35 +518,52 @@ final class ReplayVideoFx {
             }
         }
         if (weight <= 0.01 || model.mvp == null) return;
-        var pose = model.mvp.track.sample(script.duration());
+        var pose = model.mvp.track.sample(matchDurationTicks());
         if (!pose.visible()) return;
         float[] p = new float[3];
         model.project(pose.x(), pose.y(), pose.z(), p);
         float x = p[0], y = p[1] + 0.004f, z = p[2];
-        float top = 1.7f;
-        int segments = 18;
+        // Tall 2-stage volumetric spotlight beam whose upper alpha reaches 0 well outside the viewport (no hard cut box).
+        float mid = 1.15f, top = 4.2f;
+        int segments = 24;
+        int cTop = alpha(CHAMPAGNE, 0.0);
+        int cMid = alpha(CHAMPAGNE, 0.028 * weight);
+        int cBot = alpha(CHAMPAGNE, 0.085 * weight);
         for (int i = 0; i < segments; i++) {
             double a0 = Math.PI * 2 * i / segments, a1 = Math.PI * 2 * (i + 1) / segments;
             float c0 = (float) Math.cos(a0), s0 = (float) Math.sin(a0), c1 = (float) Math.cos(a1), s1 = (float) Math.sin(a1);
-            ReplayDraw.quad(glow, d, x + c0 * 0.035f, y + top, z + s0 * 0.035f, x + c1 * 0.035f, y + top, z + s1 * 0.035f,
-                    x + c1 * 0.24f, y, z + s1 * 0.24f, x + c0 * 0.24f, y, z + s0 * 0.24f,
-                    alpha(CHAMPAGNE, 0.02 * weight), alpha(CHAMPAGNE, 0.02 * weight), alpha(CHAMPAGNE, 0.11 * weight), alpha(CHAMPAGNE, 0.11 * weight));
+            ReplayDraw.quad(glow, d,
+                    x + c0 * 0.055f, y + top, z + s0 * 0.055f,
+                    x + c1 * 0.055f, y + top, z + s1 * 0.055f,
+                    x + c1 * 0.145f, y + mid, z + s1 * 0.145f,
+                    x + c0 * 0.145f, y + mid, z + s0 * 0.145f,
+                    cTop, cTop, cMid, cMid);
+            ReplayDraw.quad(glow, d,
+                    x + c0 * 0.145f, y + mid, z + s0 * 0.145f,
+                    x + c1 * 0.145f, y + mid, z + s1 * 0.145f,
+                    x + c1 * 0.185f, y, z + s1 * 0.185f,
+                    x + c0 * 0.185f, y, z + s0 * 0.185f,
+                    cMid, cMid, cBot, cBot);
         }
-        ReplayDraw.disc(glow, d, x, y, z, 0.26f, 32, alpha(BRASS_LIGHT, 0.45 * weight), alpha(BRASS_LIGHT, 0));
+        // Compact floor aura framing the MVP without slicing wide into adjacent carriage walls.
+        ReplayDraw.disc(glow, d, x, y, z, 0.17f, 32, alpha(BRASS_LIGHT, 0.36 * weight), alpha(BRASS_LIGHT, 0));
         float spin = (float) time;
-        for (int i = 0; i < 3; i++) arc(glow, d, x, y + 0.003f, z, 0.19f, i * 120 + spin * 40, i * 120 + 80 + spin * 40, 0.012f, alpha(BRASS_LIGHT, 0.85 * weight));
-        for (int i = 0; i < 4; i++) arc(glow, d, x, y + 0.004f, z, 0.23f, i * 90 - spin * 60, i * 90 + 40 - spin * 60, 0.007f, alpha(CHAMPAGNE, 0.6 * weight));
+        for (int i = 0; i < 3; i++) arc(glow, d, x, y + 0.003f, z, 0.125f, i * 120 + spin * 40, i * 120 + 80 + spin * 40, 0.009f, alpha(BRASS_LIGHT, 0.78 * weight));
+        for (int i = 0; i < 4; i++) arc(glow, d, x, y + 0.004f, z, 0.155f, i * 90 - spin * 60, i * 90 + 40 - spin * 60, 0.006f, alpha(CHAMPAGNE, 0.55 * weight));
         for (int i = 0; i < 10; i++) {
             double ang = time * 0.9 + i * Math.PI / 5;
-            float yy = y + 0.05f + 0.3f * (float) ((i * 0.37 + time * 0.12) % 1.0);
-            Vector3f s = d.transformPosition(x + (float) Math.cos(ang) * 0.15f, yy, z + (float) Math.sin(ang) * 0.15f, new Vector3f());
-            ReplayDraw.star(glow, s, f.right, f.up, 0.022f, 4, (float) ang, alpha(CHAMPAGNE, 0.9 * weight), alpha(BRASS, 0));
+            float yy = y + 0.05f + 0.32f * (float) ((i * 0.37 + time * 0.12) % 1.0);
+            Vector3f s = d.transformPosition(x + (float) Math.cos(ang) * 0.12f, yy, z + (float) Math.sin(ang) * 0.12f, new Vector3f());
+            ReplayDraw.star(glow, s, f.right, f.up, 0.019f, 4, (float) ang, alpha(CHAMPAGNE, 0.85 * weight), alpha(BRASS_LIGHT, 0));
         }
-        // A crown floats above the champion.
-        float bob = (float) Math.sin(time * 2.6) * 0.012f;
+        // Soft overhead halo glint complementing the vector emblem on the right card.
+        float bob = (float) Math.sin(time * 2.2) * 0.010f;
         float headSize = heads.size(model.mvp.p.id(), x, p[1], z);
-        Vector3f c = d.transformPosition(x, y + headSize * 2.6f + bob, z, new Vector3f());
-        crown(glow, f, c, 0.045f, alpha(BRASS_LIGHT, weight));
+        float haloY = y + headSize * 2.35f + bob;
+        ReplayDraw.ring(glow, d, x, haloY, z, headSize * 0.55f, 0.008f, 24,
+                alpha(CHAMPAGNE, 0.72 * weight), alpha(BRASS_LIGHT, 0.12 * weight));
+        Vector3f glint = d.transformPosition(x, haloY + 0.01f, z, new Vector3f());
+        soft(glow, f, glint, headSize * 0.62f, alpha(BRASS_LIGHT, 0.24 * weight));
     }
 
     // ------------------------------------------------------------------ primitives
@@ -557,19 +649,6 @@ final class ReplayVideoFx {
             if (prev != null) ReplayDraw.segment(glow, prev, p, width, color, color);
             prev = p;
         }
-    }
-
-    private static void crown(VertexConsumer glow, ReplayFrame f, Vector3f c, float w, int color) {
-        float h = w * 0.7f;
-        float[] xs = {-w, -w * 0.5f, 0, w * 0.5f, w};
-        float[] ys = {h, h * 0.35f, h * 1.2f, h * 0.35f, h};
-        Vector3f base0 = at(f, c, -w, 0), base1 = at(f, c, w, 0);
-        ReplayDraw.segment(glow, base0, base1, w * 0.18f, color, color);
-        ReplayDraw.segment(glow, base0, at(f, c, xs[0], ys[0]), w * 0.15f, color, color);
-        ReplayDraw.segment(glow, base1, at(f, c, xs[4], ys[4]), w * 0.15f, color, color);
-        for (int i = 0; i < 4; i++) ReplayDraw.segment(glow, at(f, c, xs[i], ys[i]), at(f, c, xs[i + 1], ys[i + 1]), w * 0.15f, color, color);
-        for (int i = 0; i < 5; i += 2) ReplayDraw.billboard(glow, at(f, c, xs[i], ys[i] + w * 0.12f), f.right, f.up, w * 0.13f, w * 0.13f,
-                fade(RUBY, ((color >>> 24) & 0xFF) / 255.0));
     }
 
     private static Vector3f at(ReplayFrame f, Vector3f c, float x, float y) {

@@ -9,7 +9,7 @@ import java.util.Comparator;
 import java.util.regex.Pattern;
 
 final class ReplayRoundCache {
-    static final long LIMIT = 64L << 20;
+    static final long LIMIT = 512L << 20;
     static final long AGE = Duration.ofDays(30).toMillis();
     private static final Pattern OWNED = Pattern.compile("[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\\.(?:voice|bin)");
     private static final Pattern PART = Pattern.compile("(?:replay|voice)-[0-9]+\\.part");

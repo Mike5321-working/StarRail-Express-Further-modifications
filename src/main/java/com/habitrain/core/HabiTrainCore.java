@@ -194,10 +194,17 @@ public class HabiTrainCore implements ModInitializer {
                                 com.habitrain.core.api.role.v2.action.RoleActionResult.OK, payload, true)));
         ((com.habitrain.core.role.action.RoleActionServiceImpl)
                 com.habitrain.core.api.role.v2.action.RoleActionApi.instance())
-                .setResultSender((player, id, sequence, ok, reason, payload) ->
-                        net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(player,
-                                new com.habitrain.core.network.RoleActionS2CPayload(id, sequence, ok, reason,
-                                        payload, false)));
+                .setResultSender((player, id, sequence, ok, reason, payload) -> {
+                    if (ok && player != null && id != null) {
+                        com.habitrain.core.game.sre.replay.MatchReplayRecorder.recordSkillEvent(
+                                player.serverLevel(), player, null, id.toString(), "",
+                                com.habitrain.core.api.match.replay.ReplaySkillEvent.CAT_ROLE_SKILL,
+                                player.position(), null, 40);
+                    }
+                    net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(player,
+                            new com.habitrain.core.network.RoleActionS2CPayload(id, sequence, ok, reason,
+                                    payload, false));
+                });
         // 角色动作握手门控（audit P1-4）：服务端权威决定该玩家能否执行角色动作；
         // 未完成 §14.2 握手（缺 provider / API 不兼容 / 定义 hash 不一致）一律拒绝。
         ((com.habitrain.core.role.action.RoleActionServiceImpl)

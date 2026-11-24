@@ -67,4 +67,19 @@ final class ReplayPalette {
         int b = (int) Math.min(255, (color & 0xFF) * brightness);
         return (color & 0xFF000000) | (r << 16) | (g << 8) | b;
     }
+
+    /**
+     * Lifts dark role colours toward white based on relative sRGB luminance so role labels remain
+     * clearly legible against dark night panels (outro passenger table, victory strip, world nameplates).
+     */
+    static int readableRoleColor(int color) {
+        int c = opaque(color, TEXT);
+        int r = (c >> 16) & 0xFF;
+        int g = (c >> 8) & 0xFF;
+        int b = c & 0xFF;
+        double lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+        if (lum >= 0.56) return lerp(c, 0xFFFFFFFF, 0.10);
+        double lift = Math.clamp((0.56 - lum) / Math.max(0.15, 1.0 - lum) * 0.90 + 0.22, 0.24, 0.76);
+        return lerp(c, 0xFFFFFFFF, lift);
+    }
 }

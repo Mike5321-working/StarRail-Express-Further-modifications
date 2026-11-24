@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -23,6 +24,26 @@ class ReplayVideoCameraTest {
         @Override public UUID mvpId() { return ReplayVideoScriptTest.A; }
         @Override public Vector3f winners() { return new Vector3f(1, 0.3f, 0); }
     };
+
+    @Test void firstPersonRetainsTerrainEvenWhenCutawayIsEnabledForOtherShots() {
+        var options = new ReplayPovSceneRenderer.RenderOptions(
+                true, true, false, true, true, true, true,
+                true, true, true, null, null, 1.0f, null, null, null);
+        assertFalse(options.roofCutawayFor(ReplayPovSceneRenderer.CameraMode.FIRST_PERSON));
+        assertTrue(options.roofCutawayFor(ReplayPovSceneRenderer.CameraMode.OVER_SHOULDER));
+        assertFalse(ReplayPovSceneRenderer.RenderOptions.DEFAULT.roofCutawayFor(
+                ReplayPovSceneRenderer.CameraMode.OVER_SHOULDER));
+    }
+
+    @Test void povNameplatesRevealOnlyTheAllowedRole() {
+        UUID revealed = UUID.randomUUID();
+        UUID unrevealed = UUID.randomUUID();
+        var options = new ReplayPovSceneRenderer.RenderOptions(
+                false, true, false, true, true, true, true,
+                true, true, true, null, null, 1.0f, null, null, Set.of(revealed));
+        assertTrue(options.showsRole(revealed));
+        assertFalse(options.showsRole(unrevealed));
+    }
 
     @Test void nearPlaneClearsTheMapAndShotsStayContinuousOutsideWipes() {
         var events = List.of(ReplayVideoScriptTest.node(900, LastMatchReplay.Kind.KILL, ReplayVideoScriptTest.A, ReplayVideoScriptTest.B),

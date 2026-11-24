@@ -54,6 +54,7 @@ public class NetworkReceiverRegistrar {
     }
 
     private void registerReceivers() {
+        com.habitrain.core.scene.client.replay.ReplayVisualClient.register();
         ClientPlayNetworking.registerGlobalReceiver(
                 com.habitrain.core.network.replay.ReplayBoardSettingsPackets.Result.TYPE, (payload, context) ->
                         executeIfConnected(context, () -> {
@@ -85,6 +86,9 @@ public class NetworkReceiverRegistrar {
                 com.habitrain.core.network.replay.ReplayPackets.VoiceExportAccessS2C.TYPE, (payload, context) ->
                         executeIfConnected(context, () ->
                                 com.habitrain.core.scene.client.replay.ReplayExportClient.acceptVoiceExportAccess(payload)));
+        ClientPlayNetworking.registerGlobalReceiver(com.habitrain.core.network.replay.ReplayPackets.ExportMatchS2C.TYPE,
+                (packet, context) -> executeIfConnected(context, () ->
+                        com.habitrain.core.scene.client.replay.ReplayExportClient.matchNotice(context.client(), packet)));
         // 1) 接收服务端任务配置同步
         ClientPlayNetworking.registerGlobalReceiver(TaskConfigPayload.TYPE, (payload, context) -> {
             executeIfConnected(context, () -> {

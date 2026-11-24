@@ -52,7 +52,11 @@ final class ReplayVideoCanvas {
         T_REVIVED("t_revived", 487, 175), T_DETONATION("t_detonation", 702, 175), T_DEFUSED("t_defused", 513, 175),
         T_BLACKOUT("t_blackout", 593, 175), T_PSYCHO("t_psycho", 460, 173), T_MVP("t_mvp", 281, 173), T_VICTORY("t_victory", 487, 174),
         T_OVERVIEW("t_overview", 969, 175), T_DEPARTURE("t_departure", 656, 175), T_FINAL_STATION("t_final_station", 824, 174),
-        T_SHIELD("t_shield", 864, 175);
+        T_SHIELD("t_shield", 864, 175),
+        SKILL_RUNE("skill_rune", 256, 256), SPLIT_BEAM("split_beam", 96, 720), SPLIT_MEDALLION("split_medallion", 192, 192),
+        T_APOTHEOSIS("t_apotheosis", 693, 175), T_DUAL_VISION("t_dual_vision", 700, 173),
+        T_SHADOW_SLASH("t_shadow_slash", 851, 174), T_GLIMMER("t_glimmer", 577, 175),
+        T_HIGHLIGHTS("t_highlights", 667, 174);
 
         final ResourceLocation id;
         final int w, h;
@@ -218,6 +222,65 @@ final class ReplayVideoCanvas {
         BufferUploader.drawWithShader(b.buildOrThrow());
     }
 
+    /**
+     * Composites a full-frame OpenGL framebuffer color texture (bottom-up V=1 at top, V=0 at bottom)
+     * across the canvas, optionally tinted/faded for cross-dissolves or star-trail afterimages.
+     */
+    void drawFramebuffer(int glTexId, int color, boolean additive) {
+        if (glTexId <= 0 || (color >>> 24) == 0) return;
+        prepareRawTexture(glTexId, additive);
+        BufferBuilder b = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX_COLOR);
+        b.addVertex(pose, 0, 0, 0).setUv(0f, 1f).setColor(color);
+        b.addVertex(pose, 0, height, 0).setUv(0f, 0f).setColor(color);
+        b.addVertex(pose, width, height, 0).setUv(1f, 0f).setColor(color);
+        b.addVertex(pose, width, 0, 0).setUv(1f, 1f).setColor(color);
+        BufferUploader.drawWithShader(b.buildOrThrow());
+        RenderSystem.defaultBlendFunc();
+    }
+
+    /**
+     * Composites the right side of a diagonal split-screen from an offscreen POV framebuffer texture
+     * bounded cleanly by the angled seam {@code (topSplitX, 0) -> (botSplitX, height)}.
+     *
+     * <p>Maps the full POV FBO cleanly across the right panel's horizontal span (centering the POV
+     * subject inside the right window with zero distortion or scissor stair-stepping).</p>
+     */
+    void drawDiagonalRightSplit(int glTexId, float topSplitX, float botSplitX, int color) {
+        if (glTexId <= 0 || (color >>> 24) == 0) return;
+        float tx = Math.clamp(topSplitX, 0f, width);
+        float bx = Math.clamp(botSplitX, 0f, width);
+        if (tx >= width - 0.5f && bx >= width - 0.5f) return;
+        float minEdge = Math.min(tx, bx);
+        // 1:1 square-pixel horizontal crop centered on the POV crosshair (u = 0.5) so the right panel
+        // never squishes horizontally and expands seamlessly to u in [0, 1] as the split slides open.
+        float uMin = 0.5f - 0.5f * (width - minEdge) / width;
+        float uTop = uMin + (tx - minEdge) / width;
+        float uBot = uMin + (bx - minEdge) / width;
+        float uRight = uMin + (width - minEdge) / width;
+        prepareRawTexture(glTexId, false);
+        BufferBuilder b = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX_COLOR);
+        b.addVertex(pose, tx, 0, 0).setUv(uTop, 1f).setColor(color);
+        b.addVertex(pose, bx, height, 0).setUv(uBot, 0f).setColor(color);
+        b.addVertex(pose, width, height, 0).setUv(uRight, 0f).setColor(color);
+        b.addVertex(pose, width, 0, 0).setUv(uRight, 1f).setColor(color);
+        BufferUploader.drawWithShader(b.buildOrThrow());
+        RenderSystem.defaultBlendFunc();
+    }
+
+    private void prepareRawTexture(int glTexId, boolean additive) {
+        RenderSystem.bindTexture(glTexId);
+        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
+        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
+        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, 0x812F);
+        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, 0x812F);
+        RenderSystem.disableDepthTest();
+        RenderSystem.enableBlend();
+        if (additive) RenderSystem.blendFunc(GlStateManager.SourceFactor.SRC_ALPHA, GlStateManager.DestFactor.ONE);
+        else RenderSystem.defaultBlendFunc();
+        RenderSystem.setShader(GameRenderer::getPositionTexColorShader);
+        RenderSystem.setShaderTexture(0, glTexId);
+    }
+
     private void vertex(BufferBuilder b, float cx, float cy, float x, float y, float c, float s, float u, float v, int color) {
         b.addVertex(pose, cx + x * c - y * s, cy + x * s + y * c, 0).setUv(u, v).setColor(color);
     }
@@ -225,7 +288,52 @@ final class ReplayVideoCanvas {
     // ------------------------------------------------------------------ text, faces and items
 
     static MutableComponent font(Component text, ResourceLocation font) {
-        return Component.empty().append(text).withStyle(style -> style.withFont(font));
+        if (text == null) return Component.empty();
+        String raw = text.getString();
+        if (raw.isEmpty()) return Component.empty();
+        if (isDisplayFontSafe(raw)) {
+            return Component.empty().append(text).withStyle(style -> style.withFont(font));
+        }
+        // Bundled display TTF faces (Oswald/Bebas) lack CJK/symbol glyphs and ModernUI does not fall
+        // back across custom font IDs; apply the display face only to pure ASCII/multiplier runs.
+        MutableComponent out = Component.empty();
+        text.visit((style, segment) -> {
+            if (segment == null || segment.isEmpty()) return java.util.Optional.empty();
+            int len = segment.length();
+            int i = 0;
+            while (i < len) {
+                boolean safe = isDisplayFontChar(segment.charAt(i));
+                int j = i + 1;
+                while (j < len && isDisplayFontChar(segment.charAt(j)) == safe) j++;
+                String part = segment.substring(i, j);
+                boolean useDisplay = safe && hasDisplayFontAnchor(part);
+                out.append(Component.literal(part).withStyle(useDisplay ? style.withFont(font) : style));
+                i = j;
+            }
+            return java.util.Optional.empty();
+        }, net.minecraft.network.chat.Style.EMPTY);
+        return out;
+    }
+
+    private static boolean isDisplayFontSafe(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (!isDisplayFontChar(s.charAt(i))) return false;
+        }
+        return true;
+    }
+
+    private static boolean isDisplayFontChar(char c) {
+        return (c >= 0x20 && c <= 0x7E) || c == '×';
+    }
+
+    private static boolean hasDisplayFontAnchor(String part) {
+        for (int i = 0; i < part.length(); i++) {
+            char c = part.charAt(i);
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '×') {
+                return true;
+            }
+        }
+        return false;
     }
 
     float width(Component text, float scale) { return mc.font.width(text) * scale; }

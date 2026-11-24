@@ -6,6 +6,7 @@ import org.joml.Vector3f;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Random;
 
 import static com.habitrain.core.api.match.replay.LastMatchReplay.*;
 import static org.junit.jupiter.api.Assertions.*;
@@ -118,6 +119,48 @@ class ReplayFanCutawayTest {
         assertEquals(MAX_PLAYERS, cut.count());
         assertEquals(32 * 16, cut.anchors().length);
         assertEquals(MAX_PLAYERS - 1, cut.anchors()[(MAX_PLAYERS - 1) * 4]);
+    }
+
+    @Test void fortyPlayerBatchesKeepFeatheredEdgesAndRejectDistantFans() {
+        var cut = new ReplayFanCutaway();
+        var random = new Random(40);
+        for (int i = 0; i < 40; i++) {
+            cut.add(pose(i * 5 + 0.5, (i % 4) * 3, 8 + random.nextInt(14)), BOUNDS, BOUNDS, 1.25);
+        }
+        int fullCheckCount = 0, selectedCheckCount = 0;
+        for (double angle : new double[]{0, 0.54, 1.58, 2.32, 3.14, 5.7}) {
+            cut.direction(Math.sin(angle), Math.cos(angle));
+            var full = cut.shaderFans();
+            for (int x = 0; x < 200; x += 16) {
+                var selected = cut.shaderFans(x, 4, x + 16, 9.5, 22);
+                fullCheckCount += full.count();
+                selectedCheckCount += selected.count();
+                for (int i = 0; i < 200; i++) {
+                    float px = x + random.nextFloat() * 16, py = random.nextFloat() * 9.5f;
+                    float pz = 4 + random.nextFloat() * 18;
+                    float sx = 0.5f * (px + (float) Math.floor(px) + 0.5f);
+                    float sz = 0.5f * (pz + (float) Math.floor(pz) + 0.5f);
+                    float cy = (float) Math.floor(py) + 0.5f;
+                    assertEquals(edgeDistance(full, sx, cy, sz), edgeDistance(selected, sx, cy, sz), 1e-6f);
+                }
+            }
+        }
+        assertTrue(selectedCheckCount < fullCheckCount * 0.6, "the long-map fixture should eliminate many fan checks");
+    }
+
+    private static float edgeDistance(ReplayFanCutaway.ShaderFans fans, float x, float cellY, float z) {
+        float forward = x * fans.directionX() + z * fans.directionZ();
+        float side = x * fans.directionZ() - z * fans.directionX();
+        float nearest = ReplayFanCutaway.EDGE_WIDTH;
+        var anchors = fans.anchors();
+        for (int i = 0; i < fans.count() * 4; i += 4) {
+            if (cellY <= anchors[i + 1] + 0.01f) continue;
+            float f = forward - anchors[i], s = side - anchors[i + 2], r = anchors[i + 3];
+            float distance = f >= 0 ? Math.abs(s) - r - f * ReplayFanCutaway.HALF_ANGLE_TANGENT
+                    : (float) Math.sqrt(f * f + s * s) - r;
+            nearest = Math.min(nearest, distance);
+        }
+        return Math.max(-ReplayFanCutaway.EDGE_WIDTH, nearest);
     }
 
     private static ReplayTrackSampler.Pose pose(double x, double y, double z) {

@@ -5,8 +5,15 @@ import com.habitrain.core.client.config.ClientVisualPreferences;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.client.ReplayHistoryClient;
+import com.habitrain.core.scene.replay.ReplayCinemaDirector;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions.ActorOverlayFilter;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions.ExportMode;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions.IdentityReveal;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions.PersonalPacing;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions.PersonalView;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions.PromoScope;
 import com.habitrain.core.scene.replay.ReplayMusicPlan;
-import com.habitrain.core.scene.replay.ReplayVideoScript;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.components.PlayerFaceRenderer;
@@ -14,7 +21,6 @@ import net.minecraft.client.gui.components.Tooltip;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.core.BlockPos;
-import net.minecraft.network.chat.CommonComponents;
 import net.minecraft.network.chat.Component;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.glfw.GLFW;
@@ -26,22 +32,21 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Supplier;
 
-/**
- * Detailed export page opened by the "Export Video" plaque above the replay table or from replay history:
- * match overview, perspective (global or single-player close-up), a collapsible video &amp; quality settings
- * page (quality/file-size tier, resolution, format, train-body view and soundtrack — folded by default so
- * the main page stays concise), the planned film length, live progress and the output folder.
- *
- * The client export task continues when this page closes.
- */
+/** Export settings opened from a replay table or replay history. */
 final class ReplayExportScreen extends Screen {
-    static final int PANEL_HEIGHT_MAIN = 232;
+    static final int PANEL_HEIGHT_MAIN = 206;
     static final int PANEL_HEIGHT_SETTINGS = 268;
+    static final int PANEL_HEIGHT_CUSTOMIZER = 312;
     static final int PANEL_HEIGHT_PICKER = 334;
-    static final int MAIN_PROGRESS_SECTION = 2;
-    static final int SETTINGS_SECTION_COUNT = 5;
+    static final int SETTINGS_SECTION_COUNT = 6;
     private static final int GAP = 4;
     private static final int PICKER_ROW_HEIGHT = 22;
+
+    private static final int SLIDER_NONE = 0;
+    private static final int SLIDER_VOICE = 1;
+    private static final int SLIDER_SFX = 2;
+    private static final int SLIDER_TRIM_START = 3;
+    private static final int SLIDER_TRIM_END = 4;
 
     private final ClientLevel level;
     private final BlockPos pos;
@@ -49,57 +54,122 @@ final class ReplayExportScreen extends Screen {
     private final UUID history;
     private ReplayExportResolution resolution;
     private boolean compress;
+    private boolean preferSimpleExport;
     private ReplayExportQuality quality;
     private ReplayMusicPlan.Level music;
+    private boolean preferredRoofCutaway;
     private @Nullable UUID focusPlayer;
+    private ReplayExportContentOptions contentOptions;
+
+    private final Button[] modeButtons = new Button[ExportMode.values().length];
     private final Button[] qualityButtons = new Button[ReplayExportQuality.values().length];
     private final Button[] resolutionButtons = new Button[ReplayExportResolution.values().length];
     private final Button[] musicButtons = new Button[ReplayMusicPlan.Level.values().length];
+    private final Button[] customizerTabButtons = new Button[3];
+    private final Button[] customizerMusicButtons = new Button[ReplayMusicPlan.Level.values().length];
+
     private final List<Button> mainWidgets = new ArrayList<>();
     private final List<Button> settingsWidgets = new ArrayList<>();
+    private final List<Button> customizerCommonWidgets = new ArrayList<>();
+    private final List<Button> customizerTab0Widgets = new ArrayList<>();
+    private final List<Button> customizerTab1Widgets = new ArrayList<>();
+    private final List<Button> customizerTab2Widgets = new ArrayList<>();
+
+    // Main widgets
+    private Button perspectiveGlobal, perspectivePlayer;
+    private Button subPrimaryButton;
+    private final Button[] pacingButtons = new Button[PersonalPacing.values().length];
+    private Button subSecondaryButton;
+    private Button customizerButton, videoSettingsButton, back, start, folderOrImport;
+
+    // Video & Quality settings widgets
     private Button mp4, avi, roofCut, roofFull, collapseSettingsButton;
-    private Button perspectiveGlobal, perspectivePrev, perspectivePlayer, perspectiveNext;
-    private Button videoSettingsButton, start, folderOrImport;
+    private Button nativeExport, simpleExport;
+
+    // Content Customizer widgets (Tab 0: Structure)
+    private Button optIntro, optOverview, optVictoryMvp, optOutro, optLetterbox, optWatermark, optKillSplit, optResetDefaults;
+    // Content Customizer widgets (Tab 1: HUD & Fog)
+    private Button optTimecode, optAliveMatrix, optKillFeed, optTimeline, optSkillToasts, optIdentity, optTrails, optNameplates;
+    // Content Customizer widgets (Tab 2: Audio & Trim)
+    private Button optAutoDucking, optTrimFull;
+    private Button collapseCustomizerButton;
+
     private int left, panelWidth;
     private int mainTop, mainPanelHeight;
     private int settingsTop, settingsPanelHeight;
+    private int customizerTop, customizerPanelHeight;
     private int pickerTop, pickerPanelHeight;
-    private ExportLayout mainLayout, settingsLayout;
+    private int mainModeY, mainPerspectiveY, mainSubY, mainDrawersY, mainProgressY;
+    private int playerButtonX, playerButtonWidth;
+    private ExportLayout settingsLayout;
+
+    // Slider geometry in Customizer Tab 2
+    private int sliderTrackX, sliderTrackW;
+    private int voiceSliderY, sfxSliderY, trimSliderY;
+    private int activeSlider = SLIDER_NONE;
+
     private ClientReplayBoard.View view;
     private ReplayVideoExport video;
     private boolean folderFailed;
     private boolean historyPinned;
     private @Nullable LastMatchReplay secondsFor;
-    private @Nullable UUID secondsFocus;
+    private @Nullable ReplayExportContentOptions secondsOptions;
     private double filmSeconds;
     private @Nullable LastMatchReplay participantsFor;
     private List<LastMatchReplay.Participant> participants = List.of();
     private boolean settingsOpen;
+    private boolean customizerOpen;
+    private int customizerTab;
     private boolean pickerOpen;
     private int pickerScroll;
+    private int pickerCursor;
 
     ReplayExportScreen(ClientLevel level, BlockPos pos) {
+        this(level, pos, null);
+    }
+
+    ReplayExportScreen(ClientLevel level, BlockPos pos, @Nullable UUID initialFocusPlayer) {
         super(tr("export.title"));
         this.level = level;
         this.parent = null;
         this.history = null;
         this.pos = pos.immutable();
-        this.resolution = ReplayExportResolution.fromId(ClientVisualPreferences.getReplayVideoResolution());
-        this.compress = ClientVisualPreferences.isReplayVideoCompress() || !this.resolution.aviSupported();
-        this.quality = ReplayExportQuality.fromId(ClientVisualPreferences.getReplayVideoQuality());
-        this.music = ReplayMusicPlan.Level.fromId(ClientVisualPreferences.getReplayVideoMusic());
+        initPrefs(initialFocusPlayer);
     }
 
-    ReplayExportScreen(Screen parent, java.util.UUID history) {
+    ReplayExportScreen(Screen parent, UUID history) {
+        this(parent, history, null);
+    }
+
+    ReplayExportScreen(Screen parent, UUID history, @Nullable UUID initialFocusPlayer) {
         super(tr("export.title"));
         this.level = null;
         this.pos = null;
         this.parent = parent;
         this.history = history;
+        initPrefs(initialFocusPlayer);
+    }
+
+    private void initPrefs(@Nullable UUID initialFocusPlayer) {
         this.resolution = ReplayExportResolution.fromId(ClientVisualPreferences.getReplayVideoResolution());
         this.compress = ClientVisualPreferences.isReplayVideoCompress() || !this.resolution.aviSupported();
         this.quality = ReplayExportQuality.fromId(ClientVisualPreferences.getReplayVideoQuality());
         this.music = ReplayMusicPlan.Level.fromId(ClientVisualPreferences.getReplayVideoMusic());
+        this.preferredRoofCutaway = !ReplayBoardLocalState.fullBody();
+        this.focusPlayer = initialFocusPlayer;
+        ExportMode initialMode = initialFocusPlayer != null ? ExportMode.PERSONAL : ExportMode.SHORT;
+        this.contentOptions = buildDefaultOptionsForMode(initialMode, initialFocusPlayer);
+    }
+
+    private ReplayExportContentOptions buildDefaultOptionsForMode(ExportMode mode, @Nullable UUID player) {
+        var base = ReplayExportContentOptions.defaultsFor(mode, player);
+        if (mode == ExportMode.SHORT) {
+            return base.toBuilder()
+                    .roofCutaway(this.preferredRoofCutaway)
+                    .musicLevel(this.music)
+                    .build();
+        }
+        return base;
     }
 
     @Override public void onClose() {
@@ -131,23 +201,56 @@ final class ReplayExportScreen extends Screen {
         return addRenderableWidget(widget);
     }
 
+    private <T extends Button> T addCustomizerCommon(T widget) {
+        customizerCommonWidgets.add(widget);
+        return addRenderableWidget(widget);
+    }
+
+    private <T extends Button> T addCustomizerTabWidget(int tab, T widget) {
+        switch (tab) {
+            case 0 -> customizerTab0Widgets.add(widget);
+            case 1 -> customizerTab1Widgets.add(widget);
+            default -> customizerTab2Widgets.add(widget);
+        }
+        return addRenderableWidget(widget);
+    }
+
     private int activeTop() {
-        return pickerOpen ? pickerTop : settingsOpen ? settingsTop : mainTop;
+        return pickerOpen ? pickerTop : customizerOpen ? customizerTop : settingsOpen ? settingsTop : mainTop;
     }
 
     private int activePanelHeight() {
-        return pickerOpen ? pickerPanelHeight : settingsOpen ? settingsPanelHeight : mainPanelHeight;
+        return pickerOpen ? pickerPanelHeight : customizerOpen ? customizerPanelHeight : settingsOpen ? settingsPanelHeight : mainPanelHeight;
     }
 
     private void setSettingsOpen(boolean open) {
         boolean next = open && !exporting();
-        if (settingsOpen == next && (!next || !pickerOpen)) {
+        if (settingsOpen == next && (!next || (!pickerOpen && !customizerOpen))) {
             syncWidgetsVisible();
             return;
         }
         settingsOpen = next;
         if (settingsOpen) {
             pickerOpen = false;
+            customizerOpen = false;
+            activeSlider = SLIDER_NONE;
+        }
+        setFocused(null);
+        syncWidgetsVisible();
+    }
+
+    private void setCustomizerOpen(boolean open) {
+        boolean next = open && !exporting();
+        if (customizerOpen == next && (!next || (!pickerOpen && !settingsOpen))) {
+            syncWidgetsVisible();
+            return;
+        }
+        customizerOpen = next;
+        if (customizerOpen) {
+            pickerOpen = false;
+            settingsOpen = false;
+        } else {
+            activeSlider = SLIDER_NONE;
         }
         setFocused(null);
         syncWidgetsVisible();
@@ -155,95 +258,172 @@ final class ReplayExportScreen extends Screen {
 
     private void setPickerOpen(boolean open) {
         boolean next = open && !participants.isEmpty() && !exporting();
-        if (pickerOpen == next && (!next || !settingsOpen)) {
+        if (pickerOpen == next && (!next || (!settingsOpen && !customizerOpen))) {
             syncWidgetsVisible();
             return;
         }
         pickerOpen = next;
         if (pickerOpen) {
             settingsOpen = false;
+            customizerOpen = false;
+            activeSlider = SLIDER_NONE;
             pickerScroll = 0;
+            movePickerCursor(Math.max(0, participantIndex(focusPlayer)));
         }
-        setFocused(null);
         syncWidgetsVisible();
+        setFocused(pickerOpen || exporting() ? null : perspectivePlayer);
     }
 
     private void syncWidgetsVisible() {
-        boolean showMain = !pickerOpen && !settingsOpen;
-        boolean showSettings = settingsOpen && !pickerOpen;
+        boolean showMain = !pickerOpen && !settingsOpen && !customizerOpen;
+        boolean showSettings = settingsOpen && !pickerOpen && !customizerOpen;
+        boolean showCustomizer = customizerOpen && !pickerOpen && !settingsOpen;
         for (Button widget : mainWidgets) {
             widget.visible = showMain;
+        }
+        if (showMain) {
+            ExportMode mode = shownOptions().mode();
+            boolean personal = mode == ExportMode.PERSONAL;
+            boolean autoEdit = mode == ExportMode.CINEMATIC_PROMO;
+            perspectiveGlobal.visible = !personal;
+            subPrimaryButton.visible = !autoEdit;
+            subSecondaryButton.visible = !personal && !autoEdit;
+            for (Button b : pacingButtons) b.visible = personal;
         }
         for (Button widget : settingsWidgets) {
             widget.visible = showSettings;
         }
+        for (Button widget : customizerCommonWidgets) {
+            widget.visible = showCustomizer;
+        }
+        for (Button widget : customizerTab0Widgets) {
+            widget.visible = showCustomizer && customizerTab == 0;
+        }
+        for (Button widget : customizerTab1Widgets) {
+            widget.visible = showCustomizer && customizerTab == 1;
+        }
+        for (Button widget : customizerTab2Widgets) {
+            widget.visible = showCustomizer && customizerTab == 2;
+        }
+    }
+
+    private void updateOptions(ReplayExportContentOptions updated) {
+        this.contentOptions = updated;
+        this.focusPlayer = updated.focusPlayer();
+        this.music = updated.musicLevel();
+        refresh();
+    }
+
+    private void selectMode(ExportMode mode) {
+        if (exporting()) return;
+        UUID subject = focusPlayer;
+        if (mode == ExportMode.PERSONAL && subject == null && !participants.isEmpty()) {
+            subject = participants.getFirst().id();
+        }
+        this.focusPlayer = subject;
+        this.contentOptions = buildDefaultOptionsForMode(mode, subject);
+        this.music = this.contentOptions.musicLevel();
+        refresh();
     }
 
     @Override protected void init() {
         mainWidgets.clear();
         settingsWidgets.clear();
+        customizerCommonWidgets.clear();
+        customizerTab0Widgets.clear();
+        customizerTab1Widgets.clear();
+        customizerTab2Widgets.clear();
         if (!historyPinned) {
             ReplayHistoryClient.pin(history);
             historyPinned = true;
         }
-        panelWidth = Math.min(348, width - 12);
+        panelWidth = Math.min(396, width - 12);
         left = (width - panelWidth) / 2;
 
         mainPanelHeight = Math.min(PANEL_HEIGHT_MAIN, height - 6);
         mainTop = (height - mainPanelHeight) / 2;
-        mainLayout = ExportLayout.forMain(mainPanelHeight);
 
         settingsPanelHeight = Math.min(PANEL_HEIGHT_SETTINGS, height - 6);
         settingsTop = (height - settingsPanelHeight) / 2;
         settingsLayout = ExportLayout.forSettings(settingsPanelHeight);
 
+        customizerPanelHeight = Math.min(PANEL_HEIGHT_CUSTOMIZER, height - 6);
+        customizerTop = (height - customizerPanelHeight) / 2;
+
         pickerPanelHeight = Math.min(PANEL_HEIGHT_PICKER, height - 6);
         pickerTop = (height - pickerPanelHeight) / 2;
+
+        MainLayout mainLayout = MainLayout.compute(mainPanelHeight);
+        int optH = mainLayout.optionHeight();
+        mainModeY = mainTop + mainLayout.modeY();
+        mainPerspectiveY = mainTop + mainLayout.perspectiveY();
+        mainSubY = mainTop + mainLayout.subY();
+        mainDrawersY = mainTop + mainLayout.drawersY();
+        mainProgressY = mainTop + mainLayout.progressY();
+        int mainButtonsY = mainTop + mainLayout.buttonsY();
 
         int inner = panelWidth - 24, x = left + 12;
         int half = (inner - GAP) / 2;
         int otherHalf = inner - half - GAP;
 
-        // ---- Main (collapsed) widgets: Perspective + Folded Video Settings Row + Bottom Actions ----
-        int mainOptH = mainLayout.optionHeight();
-        int globalW = Math.min(86, inner / 3);
-        int arrowW = 18;
-        int playerAreaX = x + globalW + GAP;
-        int playerAreaW = inner - globalW - GAP;
-        int playerMidW = Math.max(40, playerAreaW - (arrowW + GAP) * 2);
-        perspectiveGlobal = addMainWidget(new BrassButton(x, mainSectionY(0), globalW, mainOptH,
-                tr("export.perspective_global"), b -> {
-                    focusPlayer = null;
-                    setPickerOpen(false);
-                    refresh();
-                }));
-        perspectiveGlobal.setTooltip(Tooltip.create(tr("export.perspective_global_tip")));
-        perspectivePrev = addMainWidget(new BrassButton(playerAreaX, mainSectionY(0), arrowW, mainOptH,
-                Component.literal("‹"), b -> stepFocusPlayer(-1)));
-        perspectivePrev.setTooltip(Tooltip.create(tr("export.perspective_cycle_tip")));
-        perspectivePlayer = addMainWidget(new BrassButton(playerAreaX + arrowW + GAP, mainSectionY(0), playerMidW, mainOptH,
-                tr("export.perspective_pick"), b -> {
-                    if (!participants.isEmpty()) {
-                        setPickerOpen(!pickerOpen);
-                    }
-                }));
-        perspectivePlayer.setTooltip(Tooltip.create(tr("export.perspective_player_tip")));
-        perspectiveNext = addMainWidget(new BrassButton(playerAreaX + arrowW + GAP + playerMidW + GAP, mainSectionY(0),
-                Math.max(arrowW, x + inner - (playerAreaX + arrowW + GAP + playerMidW + GAP)), mainOptH,
-                Component.literal("›"), b -> stepFocusPlayer(1)));
-        perspectiveNext.setTooltip(Tooltip.create(tr("export.perspective_cycle_tip")));
+        ExportMode[] modes = ExportMode.values();
+        int modeW = (inner - GAP * (modes.length - 1)) / modes.length;
+        for (int i = 0; i < modes.length; i++) {
+            ExportMode mode = modes[i];
+            int bx = x + i * (modeW + GAP);
+            int bw = i == modes.length - 1 ? x + inner - bx : modeW;
+            modeButtons[i] = addMainWidget(new BrassButton(bx, mainModeY, bw, optH,
+                    tr("export.mode_" + mode.id), b -> selectMode(mode)));
+            modeButtons[i].setTooltip(Tooltip.create(tr("export.mode_" + mode.id + "_tip")));
+        }
 
-        videoSettingsButton = addMainWidget(new BrassButton(x, mainSectionY(1), inner, mainOptH,
-                Component.empty(), b -> {
-                    setSettingsOpen(true);
+        int globalW = inner / 3;
+        playerButtonX = x + globalW + GAP;
+        playerButtonWidth = inner - globalW - GAP;
+        perspectiveGlobal = addMainWidget(new BrassButton(x, mainPerspectiveY, globalW, optH,
+                tr("export.perspective_global"), b -> {
+                    setFocusPlayer(null);
                     refresh();
                 }));
+        perspectivePlayer = addMainWidget(new BrassButton(playerButtonX, mainPerspectiveY, playerButtonWidth, optH,
+                tr("export.perspective_pick"), b -> setPickerOpen(true)));
+        perspectivePlayer.setTooltip(Tooltip.create(tr("export.perspective_player_tip")));
+
+        int subPrimaryW = Math.min(138, inner * 40 / 100);
+        subPrimaryButton = addMainWidget(new BrassButton(x, mainSubY, subPrimaryW, optH, Component.empty(), b -> onSubPrimaryClick()));
+        int subRightX = x + subPrimaryW + GAP;
+        int subRightW = inner - subPrimaryW - GAP;
+        subSecondaryButton = addMainWidget(new BrassButton(subRightX, mainSubY, subRightW, optH, Component.empty(), b -> onSubSecondaryClick()));
+
+        PersonalPacing[] pacings = PersonalPacing.values();
+        int paceW = (subRightW - GAP * (pacings.length - 1)) / pacings.length;
+        for (int i = 0; i < pacings.length; i++) {
+            PersonalPacing pacing = pacings[i];
+            int bx = subRightX + i * (paceW + GAP);
+            int bw = i == pacings.length - 1 ? subRightX + subRightW - bx : paceW;
+            pacingButtons[i] = addMainWidget(new BrassButton(bx, mainSubY, bw, optH,
+                    tr("export.pacing_" + pacing.id), b -> updateOptions(
+                            contentOptions.toBuilder().personalPacing(pacing).build())));
+            if (pacing == PersonalPacing.HIGHLIGHTS_ONLY) {
+                pacingButtons[i].setTooltip(Tooltip.create(tr("export.pacing_highlights_tip")));
+            }
+        }
+
+        customizerButton = addMainWidget(new BrassButton(x, mainDrawersY, half, optH, tr("export.customizer_btn"), b -> {
+            setCustomizerOpen(true);
+            refresh();
+        }));
+        customizerButton.setTooltip(Tooltip.create(tr("export.customizer_btn_tip")));
+
+        videoSettingsButton = addMainWidget(new BrassButton(x + half + GAP, mainDrawersY, otherHalf, optH, tr("export.video_settings"), b -> {
+            setSettingsOpen(true);
+            refresh();
+        }));
         videoSettingsButton.setTooltip(Tooltip.create(tr("export.video_settings_tip")));
 
         int third = (inner - GAP * 2) / 3;
-        int mainButtonsY = mainTop + mainLayout.buttonsY();
-        start = addMainWidget(new BrassButton(x, mainButtonsY, third, 20, tr("export.start"), b -> toggleExport()));
-        folderOrImport = addMainWidget(new BrassButton(x + third + GAP, mainButtonsY, third, 20, tr("controls.folder"), b -> {
+        back = addMainWidget(new BrassButton(x, mainButtonsY, third, 20, tr("export.back"), b -> onClose()));
+        folderOrImport = addMainWidget(new BrassButton(x + third + GAP, mainButtonsY, third, 20, tr("export.open_folder"), b -> {
             if (needsFfmpegAction()) {
                 ReplayFfmpegManager.startManualImport(minecraft.gameDirectory.toPath());
             } else {
@@ -251,10 +431,120 @@ final class ReplayExportScreen extends Screen {
             }
             refresh();
         }));
-        addMainWidget(new BrassButton(x + (third + GAP) * 2, mainButtonsY, inner - (third + GAP) * 2, 20,
-                CommonComponents.GUI_DONE, b -> onClose()));
+        BrassButton startButton = addMainWidget(new BrassButton(x + (third + GAP) * 2, mainButtonsY,
+                inner - (third + GAP) * 2, 20, tr("export.start"), b -> toggleExport()));
+        startButton.primary = true;
+        start = startButton;
 
-        // ---- Folded Video & Quality Settings widgets ----
+        // ---- Folded Content Customizer Sub-View (3 Star-Night Tabs) ----
+        initCustomizerWidgets(x, inner, half, otherHalf);
+
+        // ---- Folded Video & Quality Settings Sub-View (5 sections, test-verified layout) ----
+        initSettingsWidgets(x, inner, half, otherHalf);
+
+        refresh();
+    }
+
+    private void initCustomizerWidgets(int x, int inner, int half, int otherHalf) {
+        int tabY = customizerTop + 26;
+        int tabH = 18;
+        int tabW = (inner - GAP * 2) / 3;
+        String[] tabKeys = {"export.customizer_tab_pack", "export.customizer_tab_hud", "export.customizer_tab_audio"};
+        for (int i = 0; i < 3; i++) {
+            int tabIdx = i;
+            int bx = x + i * (tabW + GAP);
+            int bw = i == 2 ? x + inner - bx : tabW;
+            customizerTabButtons[i] = addCustomizerCommon(new BrassButton(bx, tabY, bw, tabH, tr(tabKeys[i]), b -> {
+                customizerTab = tabIdx;
+                activeSlider = SLIDER_NONE;
+                syncWidgetsVisible();
+                refresh();
+            }));
+        }
+
+        int bodyTop = tabY + tabH + 10;
+        int closeBtnY = customizerTop + customizerPanelHeight - 26;
+        int bodyH = Math.max(120, closeBtnY - bodyTop - 6);
+        int rowStep = Math.min(28, bodyH / 5);
+        int btnH = Math.clamp(rowStep - 6, 16, 20);
+
+        // Tab 0: Structure & Cinema Packaging (6 toggles + Kill Split + Reset)
+        optIntro = addCustomizerTabWidget(0, new BrassButton(x, bodyTop, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().includeTitle(!contentOptions.includeTitle()).build())));
+        optOverview = addCustomizerTabWidget(0, new BrassButton(x + half + GAP, bodyTop, otherHalf, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().includeReview(!contentOptions.includeReview()).build())));
+        optVictoryMvp = addCustomizerTabWidget(0, new BrassButton(x, bodyTop + rowStep, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().includeVictoryMvp(!contentOptions.includeVictoryMvp()).build())));
+        optOutro = addCustomizerTabWidget(0, new BrassButton(x + half + GAP, bodyTop + rowStep, otherHalf, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().includeOutro(!contentOptions.includeOutro()).build())));
+        optLetterbox = addCustomizerTabWidget(0, new BrassButton(x, bodyTop + rowStep * 2, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().includeLetterboxDof(!contentOptions.includeLetterboxDof()).build())));
+        optWatermark = addCustomizerTabWidget(0, new BrassButton(x + half + GAP, bodyTop + rowStep * 2, otherHalf, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().includeWatermark(!contentOptions.includeWatermark()).build())));
+        optKillSplit = addCustomizerTabWidget(0, new BrassButton(x, bodyTop + rowStep * 3, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().splitScreenKillPov(!contentOptions.splitScreenKillPov()).build())));
+        optResetDefaults = addCustomizerTabWidget(0, new BrassButton(x + half + GAP, bodyTop + rowStep * 3, otherHalf, btnH,
+                tr("export.customizer_reset"), b -> {
+                    contentOptions = buildDefaultOptionsForMode(contentOptions.mode(), focusPlayer);
+                    music = contentOptions.musicLevel();
+                    refresh();
+                }));
+
+        // Tab 1: Tactical HUD & Anti-Spoiler Fog (8 controls)
+        optTimecode = addCustomizerTabWidget(1, new BrassButton(x, bodyTop, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().showTimecode(!contentOptions.showTimecode()).build())));
+        optAliveMatrix = addCustomizerTabWidget(1, new BrassButton(x + half + GAP, bodyTop, otherHalf, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().showAliveMatrix(!contentOptions.showAliveMatrix()).build())));
+        optKillFeed = addCustomizerTabWidget(1, new BrassButton(x, bodyTop + rowStep, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().showKillFeed(!contentOptions.showKillFeed()).build())));
+        optTimeline = addCustomizerTabWidget(1, new BrassButton(x + half + GAP, bodyTop + rowStep, otherHalf, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().showTimeline(!contentOptions.showTimeline()).build())));
+        optSkillToasts = addCustomizerTabWidget(1, new BrassButton(x, bodyTop + rowStep * 2, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().showSkillToasts(!contentOptions.showSkillToasts()).build())));
+        optIdentity = addCustomizerTabWidget(1, new BrassButton(x + half + GAP, bodyTop + rowStep * 2, otherHalf, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().identityReveal(nextIdentity(contentOptions.identityReveal())).build())));
+        optTrails = addCustomizerTabWidget(1, new BrassButton(x, bodyTop + rowStep * 3, half, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().trailFilter(nextFilter(contentOptions.trailFilter())).build())));
+        optNameplates = addCustomizerTabWidget(1, new BrassButton(x + half + GAP, bodyTop + rowStep * 3, otherHalf, btnH, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().nameplateFilter(nextFilter(contentOptions.nameplateFilter())).build())));
+
+        // Tab 2: Multi-Track Audio Sliders + Dynamic Music + Auto-Ducking + Dual-Handle Clip Trimmer
+        sliderTrackX = x + 4;
+        sliderTrackW = inner - 8;
+        voiceSliderY = bodyTop + 14;
+        sfxSliderY = voiceSliderY + 34;
+
+        int musicRowY = sfxSliderY + 26;
+        ReplayMusicPlan.Level[] levels = ReplayMusicPlan.Level.values();
+        int duckW = Math.min(118, inner * 36 / 100);
+        int musicSpanW = inner - duckW - GAP;
+        int mw = (musicSpanW - GAP * (levels.length - 1)) / levels.length;
+        for (int i = 0; i < levels.length; i++) {
+            ReplayMusicPlan.Level lvl = levels[i];
+            int bx = x + i * (mw + GAP);
+            int bw = i == levels.length - 1 ? x + musicSpanW - bx : mw;
+            customizerMusicButtons[i] = addCustomizerTabWidget(2, new BrassButton(bx, musicRowY, bw, 18,
+                    tr("export.music_" + lvl.id), b -> {
+                        music = lvl;
+                        ClientVisualPreferences.setReplayVideoMusic(lvl.id);
+                        updateOptions(contentOptions.toBuilder().musicLevel(lvl).build());
+                    }));
+        }
+        optAutoDucking = addCustomizerTabWidget(2, new BrassButton(x + musicSpanW + GAP, musicRowY, duckW, 18, Component.empty(),
+                b -> updateOptions(contentOptions.toBuilder().autoDucking(!contentOptions.autoDucking()).build())));
+
+        trimSliderY = Math.min(closeBtnY - 34, musicRowY + 42);
+        optTrimFull = addCustomizerTabWidget(2, new BrassButton(x + inner - 48, trimSliderY - 17, 48, 14,
+                tr("export.trim_full"), b -> updateOptions(contentOptions.toBuilder().trimRange(0, -1).build())));
+
+        collapseCustomizerButton = addCustomizerCommon(new BrassButton(x, closeBtnY, inner, 20,
+                tr("export.customizer_collapse"), b -> {
+                    setCustomizerOpen(false);
+                    refresh();
+                }));
+    }
+
+    private void initSettingsWidgets(int x, int inner, int half, int otherHalf) {
         int setOptH = settingsLayout.optionHeight();
         ReplayExportQuality[] qualities = ReplayExportQuality.values();
         int qualW = (inner - GAP * (qualities.length - 1)) / qualities.length;
@@ -301,13 +591,25 @@ final class ReplayExportScreen extends Screen {
         avi.setTooltip(Tooltip.create(tr("controls.compress_tooltip_off")));
 
         roofCut = addSettingsWidget(new BrassButton(x, settingsSectionY(3), half, setOptH, tr("export.roof_cut"), b -> {
-            if (ReplayBoardLocalState.fullBody()) ReplayBoardLocalState.toggleRoof();
-            refresh();
+            preferredRoofCutaway = true;
+            updateOptions(contentOptions.toBuilder().roofCutaway(true).build());
         }));
         roofFull = addSettingsWidget(new BrassButton(x + half + GAP, settingsSectionY(3), otherHalf, setOptH, tr("export.roof_full"), b -> {
-            if (!ReplayBoardLocalState.fullBody()) ReplayBoardLocalState.toggleRoof();
+            preferredRoofCutaway = false;
+            updateOptions(contentOptions.toBuilder().roofCutaway(false).build());
+        }));
+
+        nativeExport = addSettingsWidget(new BrassButton(x, settingsSectionY(5), half, setOptH, tr("export.backend_native"), b -> {
+            preferSimpleExport = false;
             refresh();
         }));
+        nativeExport.setTooltip(Tooltip.create(tr("export.backend_native_tip")));
+        simpleExport = addSettingsWidget(new BrassButton(x + half + GAP, settingsSectionY(5), otherHalf, setOptH,
+                tr("export.backend_simple"), b -> {
+                    preferSimpleExport = true;
+                    refresh();
+                }));
+        simpleExport.setTooltip(Tooltip.create(tr("export.backend_simple_tip")));
 
         ReplayMusicPlan.Level[] levels = ReplayMusicPlan.Level.values();
         int musicW = (inner - GAP * (levels.length - 1)) / levels.length;
@@ -319,7 +621,7 @@ final class ReplayExportScreen extends Screen {
                     tr("export.music_" + value.id), b -> {
                         music = value;
                         ClientVisualPreferences.setReplayVideoMusic(value.id);
-                        refresh();
+                        updateOptions(contentOptions.toBuilder().musicLevel(value).build());
                     }));
             musicButtons[i].setTooltip(Tooltip.create(tr(value.enabled() ? "export.music_tooltip" : "export.music_off_tooltip")));
         }
@@ -330,9 +632,49 @@ final class ReplayExportScreen extends Screen {
                     setSettingsOpen(false);
                     refresh();
                 }));
-
-        refresh();
     }
+
+    private void onSubPrimaryClick() {
+        if (exporting()) return;
+        switch (contentOptions.mode()) {
+            case SHORT -> updateOptions(contentOptions.toBuilder()
+                    .splitScreenKillPov(!contentOptions.splitScreenKillPov()).build());
+            case PERSONAL -> {
+                PersonalView next = contentOptions.personalView().toggle();
+                updateOptions(contentOptions.toBuilder().personalView(next).build());
+            }
+            case SANDBOX_FULL -> {
+                PersonalView next = contentOptions.personalView().toggle();
+                UUID subject = focusPlayer;
+                if (next == PersonalView.TRUE_POV && subject == null && !participants.isEmpty()) {
+                    subject = participants.getFirst().id();
+                }
+                updateOptions(contentOptions.toBuilder().personalView(next).focusPlayer(subject).build());
+            }
+            case CINEMATIC_PROMO -> {}
+        }
+    }
+
+    private void onSubSecondaryClick() {
+        if (exporting()) return;
+        switch (contentOptions.mode()) {
+            case SHORT -> updateOptions(contentOptions.toBuilder()
+                    .identityReveal(nextIdentity(contentOptions.identityReveal())).build());
+            case SANDBOX_FULL -> updateOptions(contentOptions.toBuilder()
+                    .showSkillToasts(!contentOptions.showSkillToasts()).build());
+            case PERSONAL, CINEMATIC_PROMO -> {}
+        }
+    }
+
+    private static IdentityReveal nextIdentity(IdentityReveal cur) {
+        return cur.next();
+    }
+
+    private static ActorOverlayFilter nextFilter(ActorOverlayFilter cur) {
+        return cur.next();
+    }
+
+    // ------------------------------------------------------------------ input handling
 
     @Override public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
         if (pickerOpen) {
@@ -340,20 +682,19 @@ final class ReplayExportScreen extends Screen {
                 setPickerOpen(false);
                 return true;
             }
-            if (keyCode == GLFW.GLFW_KEY_UP || keyCode == GLFW.GLFW_KEY_PAGE_UP) {
-                int step = keyCode == GLFW.GLFW_KEY_PAGE_UP
-                        ? Math.max(PICKER_ROW_HEIGHT, pickerListBottom() - pickerListTop() - PICKER_ROW_HEIGHT)
-                        : PICKER_ROW_HEIGHT;
-                pickerScroll = Math.clamp(pickerScroll - step, 0, maxPickerScroll());
-                return true;
+            int page = Math.max(1, (pickerListBottom() - pickerListTop()) / PICKER_ROW_HEIGHT - 1);
+            switch (keyCode) {
+                case GLFW.GLFW_KEY_UP -> movePickerCursor(pickerCursor - 1);
+                case GLFW.GLFW_KEY_DOWN -> movePickerCursor(pickerCursor + 1);
+                case GLFW.GLFW_KEY_PAGE_UP -> movePickerCursor(pickerCursor - page);
+                case GLFW.GLFW_KEY_PAGE_DOWN -> movePickerCursor(pickerCursor + page);
+                case GLFW.GLFW_KEY_ENTER, GLFW.GLFW_KEY_KP_ENTER, GLFW.GLFW_KEY_SPACE -> choosePlayer(pickerCursor);
+                default -> {}
             }
-            if (keyCode == GLFW.GLFW_KEY_DOWN || keyCode == GLFW.GLFW_KEY_PAGE_DOWN) {
-                int step = keyCode == GLFW.GLFW_KEY_PAGE_DOWN
-                        ? Math.max(PICKER_ROW_HEIGHT, pickerListBottom() - pickerListTop() - PICKER_ROW_HEIGHT)
-                        : PICKER_ROW_HEIGHT;
-                pickerScroll = Math.clamp(pickerScroll + step, 0, maxPickerScroll());
-                return true;
-            }
+            return true;
+        }
+        if (customizerOpen && keyCode == GLFW.GLFW_KEY_ESCAPE) {
+            setCustomizerOpen(false);
             return true;
         }
         if (settingsOpen && keyCode == GLFW.GLFW_KEY_ESCAPE) {
@@ -366,6 +707,28 @@ final class ReplayExportScreen extends Screen {
     @Override public boolean mouseClicked(double mouseX, double mouseY, int button) {
         if (pickerOpen) {
             return handlePickerClick(mouseX, mouseY, button);
+        }
+        if (customizerOpen) {
+            int closeX0 = customizerCloseX(), closeY0 = customizerCloseY();
+            if (button == 0 && mouseX >= closeX0 && mouseX < closeX0 + 18
+                    && mouseY >= closeY0 && mouseY < closeY0 + 16) {
+                setCustomizerOpen(false);
+                if (minecraft != null && collapseCustomizerButton != null) {
+                    collapseCustomizerButton.playDownSound(minecraft.getSoundManager());
+                }
+                return true;
+            }
+            if (mouseX < left || mouseX >= left + panelWidth
+                    || mouseY < customizerTop || mouseY >= customizerTop + customizerPanelHeight) {
+                setCustomizerOpen(false);
+                return true;
+            }
+            if (button == 0 && customizerTab == 2 && handleSliderClick(mouseX, mouseY)) {
+                return true;
+            }
+            boolean handled = super.mouseClicked(mouseX, mouseY, button);
+            if (!customizerOpen) setFocused(null);
+            return handled;
         }
         if (settingsOpen) {
             int closeX0 = settingsCloseX(), closeY0 = settingsCloseY();
@@ -383,9 +746,7 @@ final class ReplayExportScreen extends Screen {
                 return true;
             }
             boolean handled = super.mouseClicked(mouseX, mouseY, button);
-            if (!settingsOpen) {
-                setFocused(null);
-            }
+            if (!settingsOpen) setFocused(null);
             return handled;
         }
         if (button == 1 && perspectivePlayer != null && perspectivePlayer.active
@@ -402,12 +763,91 @@ final class ReplayExportScreen extends Screen {
             return true;
         }
         boolean handled = super.mouseClicked(mouseX, mouseY, button);
-        // ContainerEventHandler.mouseClicked focuses the clicked button after onPress(); clear it if
-        // the click opened a sub-view so no hidden widget keeps focus or queues a phantom tooltip.
-        if (pickerOpen || settingsOpen) {
+        if (pickerOpen || settingsOpen || customizerOpen) {
             setFocused(null);
         }
         return handled;
+    }
+
+    @Override public boolean mouseDragged(double mouseX, double mouseY, int button, double dragX, double dragY) {
+        if (customizerOpen && customizerTab == 2 && activeSlider != SLIDER_NONE && button == 0) {
+            applySliderDrag(mouseX);
+            return true;
+        }
+        return super.mouseDragged(mouseX, mouseY, button, dragX, dragY);
+    }
+
+    @Override public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (activeSlider != SLIDER_NONE) {
+            activeSlider = SLIDER_NONE;
+            refresh();
+            return true;
+        }
+        return super.mouseReleased(mouseX, mouseY, button);
+    }
+
+    private int matchDurationTicks() {
+        return view != null && view.replay() != null ? Math.max(1, view.replay().durationTicks()) : 1;
+    }
+
+    private boolean handleSliderClick(double mouseX, double mouseY) {
+        if (mouseX < sliderTrackX - 6 || mouseX > sliderTrackX + sliderTrackW + 6) return false;
+        if (Math.abs(mouseY - (voiceSliderY + 4)) <= 9) {
+            activeSlider = SLIDER_VOICE;
+            applySliderDrag(mouseX);
+            return true;
+        }
+        if (Math.abs(mouseY - (sfxSliderY + 4)) <= 9) {
+            activeSlider = SLIDER_SFX;
+            applySliderDrag(mouseX);
+            return true;
+        }
+        if (Math.abs(mouseY - (trimSliderY + 4)) <= 10) {
+            int dur = matchDurationTicks();
+            var trim = contentOptions.resolveTrimRange(dur);
+            double curStartR = trim.startTick() / (double) dur;
+            double curEndR = trim.endTick() / (double) dur;
+            double ratio = Math.clamp((mouseX - sliderTrackX) / (double) Math.max(1, sliderTrackW), 0.0, 1.0);
+            double dStart = Math.abs(ratio - curStartR);
+            double dEnd = Math.abs(ratio - curEndR);
+            activeSlider = dStart <= dEnd ? SLIDER_TRIM_START : SLIDER_TRIM_END;
+            applySliderDrag(mouseX);
+            return true;
+        }
+        return false;
+    }
+
+    private void applySliderDrag(double mouseX) {
+        double ratio = Math.clamp((mouseX - sliderTrackX) / (double) Math.max(1, sliderTrackW), 0.0, 1.0);
+        switch (activeSlider) {
+            case SLIDER_VOICE -> {
+                float vol = Math.round(ratio * 40.0) * 0.05f; // 5% steps in [0.0, 2.0]
+                contentOptions = contentOptions.toBuilder().voiceVolume(vol).build();
+            }
+            case SLIDER_SFX -> {
+                float vol = Math.round(ratio * 40.0) * 0.05f;
+                contentOptions = contentOptions.toBuilder().sfxVolume(vol).build();
+            }
+            case SLIDER_TRIM_START -> {
+                int dur = matchDurationTicks();
+                var trim = contentOptions.resolveTrimRange(dur);
+                int minGap = Math.max(20, dur / 50);
+                int endTick = trim.endTick();
+                int startTick = Math.clamp((int) Math.round(ratio * dur), 0, Math.max(0, endTick - minGap));
+                int storedEnd = endTick >= dur ? -1 : endTick;
+                contentOptions = contentOptions.toBuilder().trimRange(startTick, storedEnd).build();
+            }
+            case SLIDER_TRIM_END -> {
+                int dur = matchDurationTicks();
+                var trim = contentOptions.resolveTrimRange(dur);
+                int minGap = Math.max(20, dur / 50);
+                int startTick = trim.startTick();
+                int endTick = Math.clamp((int) Math.round(ratio * dur), Math.min(dur, startTick + minGap), dur);
+                int storedEnd = endTick >= dur ? -1 : endTick;
+                contentOptions = contentOptions.toBuilder().trimRange(startTick, storedEnd).build();
+            }
+            default -> {}
+        }
     }
 
     @Override public boolean mouseScrolled(double mouseX, double mouseY, double horizontal, double vertical) {
@@ -418,29 +858,32 @@ final class ReplayExportScreen extends Screen {
             }
             return true;
         }
-        if (!settingsOpen && !exporting() && !participants.isEmpty() && vertical != 0 && isOverPerspectiveRow(mouseX, mouseY)) {
+        if (perspectivePlayer != null && perspectivePlayer.active && vertical != 0
+                && perspectivePlayer.isMouseOver(mouseX, mouseY)) {
             stepFocusPlayer(vertical > 0 ? -1 : 1);
             return true;
         }
         return super.mouseScrolled(mouseX, mouseY, horizontal, vertical);
     }
 
-    private boolean isOverPerspectiveRow(double mouseX, double mouseY) {
-        return (perspectivePlayer != null && perspectivePlayer.isMouseOver(mouseX, mouseY))
-                || (perspectivePrev != null && perspectivePrev.isMouseOver(mouseX, mouseY))
-                || (perspectiveNext != null && perspectiveNext.isMouseOver(mouseX, mouseY));
-    }
-
     private void stepFocusPlayer(int delta) {
         if (exporting() || participants.isEmpty()) return;
         int current = participantIndex(focusPlayer);
-        if (current < 0) {
-            focusPlayer = delta >= 0 ? participants.getFirst().id() : participants.getLast().id();
-        } else {
-            int next = Math.floorMod(current + delta, participants.size());
-            focusPlayer = participants.get(next).id();
-        }
+        int next = current < 0 ? (delta >= 0 ? 0 : participants.size() - 1)
+                : Math.floorMod(current + delta, participants.size());
+        setFocusPlayer(participants.get(next).id());
         refresh();
+    }
+
+    private void setFocusPlayer(@Nullable UUID player) {
+        focusPlayer = player;
+        var builder = contentOptions.toBuilder().focusPlayer(player);
+        if (contentOptions.mode() == ExportMode.CINEMATIC_PROMO) {
+            builder.promoScope(player == null ? PromoScope.GLOBAL_ENSEMBLE : PromoScope.PERSONAL_MVP);
+        } else if (contentOptions.mode() == ExportMode.SANDBOX_FULL && player == null) {
+            builder.personalView(PersonalView.SANDBOX_FOLLOW);
+        }
+        contentOptions = builder.build();
     }
 
     private int participantIndex(@Nullable UUID id) {
@@ -456,7 +899,9 @@ final class ReplayExportScreen extends Screen {
         participantsFor = replay;
         if (replay == null || replay.participants().isEmpty()) {
             participants = List.of();
-            if (!exporting()) focusPlayer = null;
+            if (!exporting()) {
+                setFocusPlayer(null);
+            }
             setPickerOpen(false);
             return;
         }
@@ -470,6 +915,12 @@ final class ReplayExportScreen extends Screen {
         participants = List.copyOf(sorted);
         if (focusPlayer != null && participantIndex(focusPlayer) < 0 && !exporting()) {
             focusPlayer = null;
+        }
+        if (contentOptions.mode() == ExportMode.PERSONAL && focusPlayer == null && !exporting()) {
+            focusPlayer = participants.getFirst().id();
+        }
+        if (!exporting()) {
+            setFocusPlayer(focusPlayer);
         }
     }
 
@@ -496,12 +947,16 @@ final class ReplayExportScreen extends Screen {
             folderFailed = false;
             setPickerOpen(false);
             setSettingsOpen(false);
+            setCustomizerOpen(false);
             var id = history;
             var board = pos;
             Supplier<ClientReplayBoard.View> source = id == null
                     ? () -> ClientReplayBoard.viewAt(board) : () -> ReplayHistoryClient.watch(id);
-            ReplayExportClient.start(source.get(), ReplayBoardLocalState.fullBody(), resolution, compress,
-                    quality, music, focusPlayer, source);
+            ReplayExportContentOptions launchOpts = contentOptions.toBuilder()
+                    .focusPlayer(focusPlayer)
+                    .musicLevel(music)
+                    .build();
+            ReplayExportClient.start(source.get(), launchOpts, resolution, compress, quality, source, preferSimpleExport);
         }
         refresh();
     }
@@ -520,12 +975,15 @@ final class ReplayExportScreen extends Screen {
                 || !level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK)) return false;
         double reach = level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker
                 ? marker.settings().interactReach() : 8;
-        // A little slack: the player can drift while the page is open.
         double limit = reach + 6;
         return minecraft.player.distanceToSqr(pos.getX() + .5, pos.getY() + .5, pos.getZ() + .5) <= limit * limit;
     }
 
     private boolean exporting() { return video != null && video.running(); }
+
+    private ReplayExportContentOptions shownOptions() {
+        return exporting() ? video.options : contentOptions;
+    }
 
     private void refresh() {
         view = history == null ? ClientReplayBoard.viewAt(pos) : ReplayHistoryClient.watch(history);
@@ -535,18 +993,107 @@ final class ReplayExportScreen extends Screen {
         if (exporting) {
             setPickerOpen(false);
             setSettingsOpen(false);
+            setCustomizerOpen(false);
         } else if (participants.isEmpty()) {
             setPickerOpen(false);
-        } else {
-            syncWidgetsVisible();
         }
+        syncWidgetsVisible();
+
+        ReplayExportContentOptions shownOpts = shownOptions();
         ReplayExportResolution shownRes = exporting ? video.resolution : resolution;
         boolean shownCompress = exporting ? video.compress : compress;
         ReplayExportQuality shownQuality = exporting ? video.quality : quality;
-        ReplayMusicPlan.Level shownMusic = exporting ? video.music : music;
-        UUID shownFocus = exporting ? video.focusPlayer : focusPlayer;
-        boolean full = ReplayBoardLocalState.fullBody();
+        ReplayMusicPlan.Level shownMusic = shownOpts.musicLevel();
+        UUID shownFocus = shownOpts.focusPlayer();
+        boolean full = !shownOpts.roofCutaway();
 
+        // Mode tabs
+        ExportMode[] modes = ExportMode.values();
+        for (int i = 0; i < modes.length; i++) {
+            modeButtons[i].active = !exporting;
+            ((BrassButton) modeButtons[i]).selected = modes[i] == shownOpts.mode();
+        }
+
+        // Sub-controls row
+        subPrimaryButton.active = !exporting;
+        subSecondaryButton.active = !exporting;
+        ((BrassButton) subPrimaryButton).selected = false;
+        ((BrassButton) subSecondaryButton).selected = false;
+        switch (shownOpts.mode()) {
+            case SHORT -> {
+                boolean split = shownOpts.splitScreenKillPov();
+                subPrimaryButton.setMessage(toggleLabel("export.opt_kill_split", split));
+                ((BrassButton) subPrimaryButton).selected = split;
+                subSecondaryButton.setMessage(tr("export.opt_identity", tr("export.identity_" + shownOpts.identityReveal().id)));
+            }
+            case PERSONAL -> {
+                boolean pov = shownOpts.personalView() == PersonalView.TRUE_POV;
+                subPrimaryButton.setMessage(tr(pov ? "export.personal_view_pov" : "export.personal_view_sandbox"));
+                ((BrassButton) subPrimaryButton).selected = pov;
+                PersonalPacing[] pacings = PersonalPacing.values();
+                for (int i = 0; i < pacings.length; i++) {
+                    pacingButtons[i].active = !exporting;
+                    ((BrassButton) pacingButtons[i]).selected = pacings[i] == shownOpts.personalPacing();
+                }
+            }
+            case SANDBOX_FULL -> {
+                boolean pov = shownOpts.personalView() == PersonalView.TRUE_POV;
+                subPrimaryButton.setMessage(tr(pov ? "export.personal_view_pov"
+                        : shownFocus != null ? "export.personal_view_sandbox" : "export.sandbox_view_diorama"));
+                ((BrassButton) subPrimaryButton).selected = pov;
+                boolean toasts = shownOpts.showSkillToasts();
+                subSecondaryButton.setMessage(toggleLabel("export.opt_skill_toasts", toasts));
+                ((BrassButton) subSecondaryButton).selected = toasts;
+            }
+            case CINEMATIC_PROMO -> {}
+        }
+
+        int settingsY = shownOpts.mode() == ExportMode.CINEMATIC_PROMO
+                ? (mainSubY + mainDrawersY) / 2 : mainDrawersY;
+        customizerButton.active = !exporting;
+        customizerButton.setY(settingsY);
+        videoSettingsButton.active = !exporting;
+        videoSettingsButton.setY(settingsY);
+
+        // Customizer sub-view states
+        for (int i = 0; i < 3; i++) {
+            customizerTabButtons[i].active = !exporting;
+            ((BrassButton) customizerTabButtons[i]).selected = customizerTab == i;
+        }
+        refreshToggle(optIntro, "export.opt_intro", shownOpts.includeTitle(), exporting);
+        refreshToggle(optOverview, "export.opt_overview", shownOpts.includeReview(), exporting);
+        refreshToggle(optVictoryMvp, "export.opt_victory_mvp", shownOpts.includeVictoryMvp(), exporting);
+        refreshToggle(optOutro, "export.opt_outro", shownOpts.includeOutro(), exporting);
+        refreshToggle(optLetterbox, "export.opt_letterbox_dof", shownOpts.includeLetterboxDof(), exporting);
+        refreshToggle(optWatermark, "export.opt_watermark", shownOpts.includeWatermark(), exporting);
+        refreshToggle(optKillSplit, "export.opt_kill_split", shownOpts.splitScreenKillPov(), exporting);
+        optResetDefaults.active = !exporting;
+
+        refreshToggle(optTimecode, "export.opt_timecode", shownOpts.showTimecode(), exporting);
+        refreshToggle(optAliveMatrix, "export.opt_alive_matrix", shownOpts.showAliveMatrix(), exporting);
+        refreshToggle(optKillFeed, "export.opt_kill_feed", shownOpts.showKillFeed(), exporting);
+        refreshToggle(optTimeline, "export.opt_timeline", shownOpts.showTimeline(), exporting);
+        refreshToggle(optSkillToasts, "export.opt_skill_toasts", shownOpts.showSkillToasts(), exporting);
+        optIdentity.active = !exporting;
+        optIdentity.setMessage(tr("export.opt_identity", tr("export.identity_" + shownOpts.identityReveal().id)));
+        ((BrassButton) optIdentity).selected = shownOpts.identityReveal() != IdentityReveal.HIDDEN;
+        optTrails.active = !exporting;
+        optTrails.setMessage(tr("export.opt_trails", tr("export.filter_" + shownOpts.trailFilter().id)));
+        ((BrassButton) optTrails).selected = shownOpts.trailFilter() != ActorOverlayFilter.NONE;
+        optNameplates.active = !exporting;
+        optNameplates.setMessage(tr("export.opt_nameplates", tr("export.filter_" + shownOpts.nameplateFilter().id)));
+        ((BrassButton) optNameplates).selected = shownOpts.nameplateFilter() != ActorOverlayFilter.NONE;
+
+        ReplayMusicPlan.Level[] levels = ReplayMusicPlan.Level.values();
+        for (int i = 0; i < levels.length; i++) {
+            customizerMusicButtons[i].active = !exporting;
+            ((BrassButton) customizerMusicButtons[i]).selected = levels[i] == shownMusic;
+        }
+        refreshToggle(optAutoDucking, "export.audio_ducking", shownOpts.autoDucking(), exporting);
+        int dur = view != null && view.replay() != null ? view.replay().durationTicks() : 0;
+        optTrimFull.active = !exporting && dur > 0 && shownOpts.resolveTrimRange(dur).isTrimmed(dur);
+
+        // Video & Quality settings buttons
         ReplayExportQuality[] qualities = ReplayExportQuality.values();
         for (int i = 0; i < qualities.length; i++) {
             ReplayExportQuality candidate = qualities[i];
@@ -555,7 +1102,6 @@ final class ReplayExportScreen extends Screen {
             qualityButtons[i].setTooltip(Tooltip.create(shownCompress
                     ? candidate.tooltip() : tr("export.quality_avi_disabled")));
         }
-
         ReplayExportResolution[] all = ReplayExportResolution.values();
         for (int i = 0; i < all.length; i++) {
             resolutionButtons[i].active = !exporting;
@@ -568,41 +1114,39 @@ final class ReplayExportScreen extends Screen {
         avi.setTooltip(Tooltip.create(resolution.aviSupported()
                 ? tr("controls.compress_tooltip_off") : tr("export.avi_2160")));
         roofCut.active = roofFull.active = !exporting;
+        boolean canUseNative = ReplayExportBackend.supportsNative(shownOpts);
+        nativeExport.active = simpleExport.active = canUseNative && !exporting;
+        var backend = exporting ? video.backend : ReplayExportBackend.select(shownOpts, preferSimpleExport);
+        ((BrassButton) nativeExport).selected = canUseNative && backend == ReplayExportBackend.NATIVE;
+        ((BrassButton) simpleExport).selected = canUseNative && backend == ReplayExportBackend.SIMPLE;
         ((BrassButton) roofCut).selected = !full;
         ((BrassButton) roofFull).selected = full;
-        ReplayMusicPlan.Level[] levels = ReplayMusicPlan.Level.values();
         for (int i = 0; i < levels.length; i++) {
             musicButtons[i].active = !exporting;
             ((BrassButton) musicButtons[i]).selected = levels[i] == shownMusic;
         }
 
-        Component roofLabel = tr(full ? "export.roof_full" : "export.roof_cut");
-        Component musicLabel = tr("export.music_" + shownMusic.id);
-        videoSettingsButton.active = !exporting;
-        videoSettingsButton.setMessage(shownCompress
-                ? tr("export.video_settings_summary_mp4", shownRes.label(), shownQuality.label(), roofLabel, musicLabel)
-                : tr("export.video_settings_summary_avi", shownRes.label(), roofLabel, musicLabel));
-
+        // Perspective row
         boolean hasPlayers = !participants.isEmpty();
         int focusedIdx = participantIndex(shownFocus);
-        perspectiveGlobal.active = !exporting;
+        boolean personal = shownOpts.mode() == ExportMode.PERSONAL;
+        perspectiveGlobal.active = !exporting && !personal;
         ((BrassButton) perspectiveGlobal).selected = focusedIdx < 0;
-        perspectivePrev.active = !exporting && hasPlayers;
-        perspectiveNext.active = !exporting && hasPlayers;
         perspectivePlayer.active = !exporting && hasPlayers;
         ((BrassButton) perspectivePlayer).selected = focusedIdx >= 0;
-        ((BrassButton) perspectivePlayer).focusTint = focusedIdx >= 0;
+        perspectivePlayer.setX(personal ? left + 12 : playerButtonX);
+        perspectivePlayer.setWidth(personal ? panelWidth - 24 : playerButtonWidth);
         if (focusedIdx >= 0) {
-            var p = participants.get(focusedIdx);
-            perspectivePlayer.setMessage(tr("export.perspective_selected",
-                    ReplayBoardTexts.name(p), focusedIdx + 1, participants.size()));
+            perspectivePlayer.setMessage(ReplayBoardTexts.name(participants.get(focusedIdx)));
         } else {
             perspectivePlayer.setMessage(tr(hasPlayers ? "export.perspective_pick" : "export.perspective_none"));
         }
 
+        // Start / Cancel & Folder / FFmpeg buttons
         boolean needFfmpeg = needsFfmpegAction();
         boolean installing = ReplayFfmpegManager.isInstalling();
         boolean importing = ReplayFfmpegManager.isImporting();
+        back.setTooltip(exporting ? Tooltip.create(tr("export.continue_in_background")) : null);
         if (exporting) {
             start.setMessage(tr("controls.cancel"));
             ((BrassButton) start).accent = true;
@@ -624,24 +1168,34 @@ final class ReplayExportScreen extends Screen {
             folderOrImport.active = !installing && !importing;
             folderOrImport.setTooltip(Tooltip.create(tr("export.ffmpeg_import_tip")));
         } else {
-            folderOrImport.setMessage(tr("controls.folder"));
+            folderOrImport.setMessage(tr("export.open_folder"));
             folderOrImport.active = true;
             folderOrImport.setTooltip(null);
         }
+    }
+
+    private void refreshToggle(Button button, String key, boolean on, boolean exporting) {
+        button.active = !exporting;
+        button.setMessage(toggleLabel(key, on));
+        ((BrassButton) button).selected = on;
+    }
+
+    private static Component toggleLabel(String key, boolean on) {
+        return Component.literal(on ? "✓ " : "✕ ").append(tr(key));
     }
 
     // ------------------------------------------------------------------ text
 
     private double filmSeconds() {
         LastMatchReplay replay = view == null ? null : view.replay();
-        UUID shownFocus = exporting() ? video.focusPlayer : focusPlayer;
-        if (replay != secondsFor || !Objects.equals(shownFocus, secondsFocus)) {
+        ReplayExportContentOptions shownOpts = shownOptions();
+        if (activeSlider == SLIDER_NONE && (replay != secondsFor || !Objects.equals(shownOpts, secondsOptions))) {
             secondsFor = replay;
-            secondsFocus = shownFocus;
+            secondsOptions = shownOpts;
             filmSeconds = 0;
             if (replay != null) {
                 try {
-                    filmSeconds = new ReplayVideoScript(replay, shownFocus).total();
+                    filmSeconds = ReplayCinemaDirector.direct(replay, view.voice(), shownOpts).total();
                 } catch (RuntimeException ignored) {
                     filmSeconds = 0;
                 }
@@ -653,20 +1207,8 @@ final class ReplayExportScreen extends Screen {
     private Component matchStatus() {
         if (view == null || !view.hasRound()) return tr("controls.no_round");
         if (view.replay() == null) return tr("controls.loading_round");
-        return tr("controls.round", view.replay().mapName());
-    }
-
-    private Component statsLine() {
-        var replay = view == null ? null : view.replay();
-        if (replay == null) return Component.empty();
-        return tr("export.stats", ReplayBoardTexts.clock(replay.durationTicks()), replay.participants().size(),
-                replay.killCount());
-    }
-
-    private Component resultLine() {
-        var replay = view == null ? null : view.replay();
-        if (replay == null) return Component.empty();
-        return tr("export.result", ReplayBoardTexts.winTitle(replay));
+        var replay = view.replay();
+        return tr("export.match", replay.mapName(), ReplayBoardTexts.clock(replay.durationTicks()));
     }
 
     private Component settingsSubtitle() {
@@ -688,15 +1230,15 @@ final class ReplayExportScreen extends Screen {
                 return tr("controls.map_unavailable");
             }
             double seconds = filmSeconds();
-            return seconds > 0 ? tr("export.detail", resolution.dimensions(), Math.round(seconds))
-                    : tr("export.detail_short", resolution.dimensions());
+            Component format = tr(compress ? "export.format_mp4" : "export.format_avi");
+            return seconds > 0 ? tr("export.detail", format, resolution.dimensions(), Math.round(seconds))
+                    : tr("export.detail_short", format, resolution.dimensions());
         }
         return video.status();
     }
 
     // ------------------------------------------------------------------ rendering
 
-    /** The page plate is drawn here so the widgets (drawn by {@code super.render}) end up on top of it. */
     @Override public void renderBackground(GuiGraphics g, int mouseX, int mouseY, float delta) {
         int top = activeTop();
         int panelHeight = activePanelHeight();
@@ -704,7 +1246,9 @@ final class ReplayExportScreen extends Screen {
         g.fillGradient(left, top, left + panelWidth, top + panelHeight, 0xF2111A33, 0xF204060D);
         g.renderOutline(left, top, panelWidth, panelHeight, ReplayPalette.BRASS);
         g.renderOutline(left + 3, top + 3, panelWidth - 6, panelHeight - 6, 0x998A6A35);
-        if (pickerOpen) {
+        if (pickerOpen) return;
+        if (customizerOpen) {
+            renderCustomizerBackground(g);
             return;
         }
         if (settingsOpen) {
@@ -712,28 +1256,27 @@ final class ReplayExportScreen extends Screen {
             return;
         }
 
+        caption(g, tr("export.mode_section"), mainModeY - 10);
+        caption(g, tr("export.perspective"), mainPerspectiveY - 10);
+    }
+
+    private void renderCustomizerBackground(GuiGraphics g) {
+        String header = font.plainSubstrByWidth(
+                tr("export.customizer_title").getString(), Math.max(40, panelWidth - 64));
         int cx = left + panelWidth / 2;
-        int titleW = font.width(title);
-        int ruleY = top + 14;
-        int lx0 = left + 14, lx1 = cx - titleW / 2 - 14, rx0 = cx + titleW / 2 + 14, rx1 = left + panelWidth - 14;
-        g.fill(lx0, ruleY, Math.max(lx0, lx1), ruleY + 1, ReplayPalette.BRASS_DIM);
-        g.fill(Math.min(rx0, rx1), ruleY, rx1, ruleY + 1, ReplayPalette.BRASS_DIM);
-        diamond(g, lx1 + 5, ruleY, ReplayPalette.BRASS_LIGHT);
-        diamond(g, rx0 - 5, ruleY, ReplayPalette.BRASS_LIGHT);
-
-        // Overview card.
-        int cardTop = top + 38, cardBottom = Math.min(top + 74, mainSectionY(0) - 14);
-        if (cardBottom > cardTop) g.fill(left + 12, cardTop, left + panelWidth - 12, cardBottom, 0x99070B18);
-        if (cardBottom > cardTop) g.renderOutline(left + 12, cardTop, panelWidth - 24, cardBottom - cardTop, 0x668A6A35);
-
-        // Collapsed main page section captions.
-        caption(g, tr("export.perspective"), mainSectionY(0) - 10);
-        caption(g, tr("export.video_settings"), mainSectionY(1) - 10);
-
-        // Progress bar track.
-        int barY = mainSectionY(MAIN_PROGRESS_SECTION) - 5, barX = left + 12, barW = panelWidth - 24;
-        g.fill(barX, barY, barX + barW, barY + 7, 0xFF1A2236);
-        g.renderOutline(barX - 1, barY - 1, barW + 2, 9, 0x808A6A35);
+        int titleW = font.width(header);
+        int ruleY = customizerTop + 14;
+        int closeX0 = customizerCloseX();
+        int lx0 = left + 14, lx1 = cx - titleW / 2 - 14;
+        int rx0 = cx + titleW / 2 + 14, rx1 = closeX0 - 8;
+        if (lx1 > lx0 + 4) {
+            g.fill(lx0, ruleY, lx1, ruleY + 1, ReplayPalette.BRASS_DIM);
+            diamond(g, lx1 + 5, ruleY, ReplayPalette.BRASS_LIGHT);
+        }
+        if (rx1 > rx0 + 4) {
+            g.fill(rx0, ruleY, rx1, ruleY + 1, ReplayPalette.BRASS_DIM);
+            diamond(g, rx0 - 5, ruleY, ReplayPalette.BRASS_LIGHT);
+        }
     }
 
     private void renderSettingsBackground(GuiGraphics g) {
@@ -759,10 +1302,7 @@ final class ReplayExportScreen extends Screen {
         caption(g, tr("export.format"), settingsSectionY(2) - 10);
         caption(g, tr("export.roof"), settingsSectionY(3) - 10);
         caption(g, tr("export.music"), settingsSectionY(4) - 10);
-    }
-
-    private int mainSectionY(int index) {
-        return mainTop + mainLayout.sectionY(index);
+        caption(g, tr("export.backend"), settingsSectionY(5) - 10);
     }
 
     private int settingsSectionY(int index) {
@@ -771,18 +1311,30 @@ final class ReplayExportScreen extends Screen {
 
     private int settingsCloseX() { return left + panelWidth - 26; }
     private int settingsCloseY() { return settingsTop + 7; }
+    private int customizerCloseX() { return left + panelWidth - 26; }
+    private int customizerCloseY() { return customizerTop + 7; }
+
+    /**
+     * Adaptive vertical layout for the main export view. Guarantees zero overlap at tight GUI scales
+     * (e.g. 1280x720 at guiScale=4 -> panelHeight=174) and avoids excessive empty vertical gaps at
+     * standard scales (e.g. panelHeight=234) by allocating card height and row gaps proportionally.
+     */
+    record MainLayout(int modeY, int perspectiveY, int subY, int drawersY,
+                      int progressY, int buttonsY, int optionHeight) {
+        static MainLayout compute(int panelHeight) {
+            int optH = panelHeight < 183 ? 14 : panelHeight < 198 ? 16 : 18;
+            int buttonsY = panelHeight - 25;
+            int progressY = buttonsY - 22;
+            int modeY = 42;
+            int perspectiveY = modeY + optH + 13;
+            int subY = perspectiveY + optH + 4;
+            int drawersY = progressY - optH - 7;
+            return new MainLayout(modeY, perspectiveY, subY, drawersY, progressY, buttonsY, optH);
+        }
+    }
 
     record ExportLayout(int firstY, int spacing, int optionHeight, int buttonsY) {
-        /** Collapsed main view: 2 option sections (Perspective, Video Settings) + progress bar + bottom buttons. */
-        static ExportLayout forMain(int panelHeight) {
-            int buttonsY = panelHeight - (panelHeight < 190 ? 26 : panelHeight < 220 ? 28 : 30);
-            int progressY = buttonsY - 21;
-            int firstY = Math.clamp(panelHeight - 138, 40, 88);
-            int spacing = Math.min(36, (progressY - firstY) / MAIN_PROGRESS_SECTION);
-            return new ExportLayout(firstY, spacing, Math.clamp(spacing - 12, 8, 20), buttonsY);
-        }
-
-        /** Expanded video &amp; quality settings view: 5 option sections + bottom collapse button. */
+        /** Expanded video &amp; quality settings view. */
         static ExportLayout forSettings(int panelHeight) {
             int buttonsY = panelHeight - (panelHeight < 210 ? 24 : 28);
             int firstY = Math.clamp(panelHeight - 216, 36, 48);
@@ -810,41 +1362,97 @@ final class ReplayExportScreen extends Screen {
             renderPicker(graphics, mouseX, mouseY);
             return;
         }
+        if (customizerOpen) {
+            renderCustomizerForeground(graphics, mouseX, mouseY);
+            return;
+        }
         if (settingsOpen) {
             renderSettingsForeground(graphics, mouseX, mouseY);
             return;
         }
 
         int top = mainTop;
-        int panelHeight = mainPanelHeight;
         int cx = width / 2;
         int textW = panelWidth - 24;
         graphics.drawCenteredString(font, title, cx, top + 10, ReplayPalette.BRASS_LIGHT);
-        if (mainLayout.firstY() >= 46) {
-            graphics.drawCenteredString(font, font.plainSubstrByWidth(matchStatus().getString(), textW), cx, top + 24, ReplayPalette.TEXT);
-        }
-        if (mainSectionY(0) >= top + 72) {
-            graphics.drawString(font, font.plainSubstrByWidth(statsLine().getString(), textW - 8), left + 18, top + 43, ReplayPalette.TEXT, false);
-        }
-        if (mainSectionY(0) >= top + 82) {
-            graphics.drawString(font, font.plainSubstrByWidth(resultLine().getString(), textW - 8), left + 18, top + 58,
-                    view != null && view.replay() != null ? ReplayBoardTexts.winColor(view.replay()) : ReplayPalette.TEXT_MUTED, false);
-        }
+        graphics.drawCenteredString(font, font.plainSubstrByWidth(matchStatus().getString(), textW), cx, top + 22, ReplayPalette.TEXT);
 
-        int barX = left + 12, barW = panelWidth - 24, barY = mainSectionY(MAIN_PROGRESS_SECTION) - 5;
-        if (video != null) {
-            graphics.fill(barX, barY, barX + (int) (barW * video.displayProgress()), barY + 7, 0xFF52C5B9);
-        } else if (needsFfmpegAction() && ReplayFfmpegManager.isInstalling()) {
-            graphics.fill(barX, barY, barX + (int) (barW * ReplayFfmpegManager.progress()), barY + 7, ReplayPalette.BRASS_LIGHT);
+        boolean exporting = exporting();
+        boolean installing = needsFfmpegAction() && ReplayFfmpegManager.isInstalling();
+        if (exporting || installing) {
+            int x = left + 12, y = mainProgressY;
+            double progress = exporting ? video.displayProgress() : ReplayFfmpegManager.progress();
+            graphics.fill(x, y, x + textW, y + 6, 0xFF1A2236);
+            graphics.fill(x, y, x + (int) (textW * progress), y + 6,
+                    exporting ? 0xFF52C5B9 : ReplayPalette.BRASS_LIGHT);
         }
-        graphics.drawCenteredString(font, font.plainSubstrByWidth(exportStatus().getString(), textW), cx, barY + 12, 0xFFC5D3E2);
-        Component note = exporting() ? tr("export.continue_in_background")
-                : needsFfmpegAction() ? tr(resolution.aviSupported() ? "export.ffmpeg_fallback_hint" : "export.ffmpeg_bin_hint")
-                : resolution.highLoad() ? tr("export.warn_high") : null;
-        if (note != null && barY + 24 < top + panelHeight - 40) {
-            graphics.drawCenteredString(font, font.plainSubstrByWidth(note.getString(), textW), cx, barY + 24,
-                    exporting() ? ReplayPalette.TEXT_FAINT : ReplayPalette.LAMP);
+        var statusLines = font.split(exportStatus(), textW);
+        int maxLines = exporting || installing ? 1 : 2;
+        int statusY = mainProgressY + (maxLines == 1 ? 9 : statusLines.size() > 1 ? 2 : 5);
+        for (int i = 0; i < Math.min(maxLines, statusLines.size()); i++) {
+            graphics.drawCenteredString(font, statusLines.get(i), cx, statusY + i * 9, 0xFFC5D3E2);
         }
+    }
+
+    private void renderCustomizerForeground(GuiGraphics g, int mouseX, int mouseY) {
+        String header = font.plainSubstrByWidth(
+                tr("export.customizer_title").getString(), Math.max(40, panelWidth - 64));
+        int cx = left + panelWidth / 2;
+        g.drawCenteredString(font, header, cx, customizerTop + 10, ReplayPalette.BRASS_LIGHT);
+
+        int closeX0 = customizerCloseX(), closeY0 = customizerCloseY();
+        boolean closeHover = mouseX >= closeX0 && mouseX < closeX0 + 18 && mouseY >= closeY0 && mouseY < closeY0 + 16;
+        g.fill(closeX0, closeY0, closeX0 + 18, closeY0 + 16, closeHover ? 0xFF4E1E24 : 0xFF18233F);
+        g.renderOutline(closeX0, closeY0, 18, 16, closeHover ? ReplayPalette.RUBY : ReplayPalette.BRASS_DIM);
+        g.drawCenteredString(font, "×", closeX0 + 9, closeY0 + 4, closeHover ? 0xFFFFFFFF : ReplayPalette.TEXT);
+
+        if (customizerTab == 2) {
+            renderAudioAndTrimSliders(g);
+        }
+    }
+
+    private void renderAudioAndTrimSliders(GuiGraphics g) {
+        int voicePct = Math.round(contentOptions.voiceVolume() * 100f);
+        g.drawString(font, tr("export.audio_voice", voicePct), sliderTrackX, voiceSliderY - 12, ReplayPalette.TEXT, false);
+        drawSingleSlider(g, sliderTrackX, voiceSliderY, sliderTrackW, contentOptions.voiceVolume() / 2.0,
+                activeSlider == SLIDER_VOICE, 0xFF52C5B9);
+
+        int sfxPct = Math.round(contentOptions.sfxVolume() * 100f);
+        g.drawString(font, tr("export.audio_sfx", sfxPct), sliderTrackX, sfxSliderY - 12, ReplayPalette.TEXT, false);
+        drawSingleSlider(g, sliderTrackX, sfxSliderY, sliderTrackW, contentOptions.sfxVolume() / 2.0,
+                activeSlider == SLIDER_SFX, ReplayPalette.BRASS_LIGHT);
+
+        g.drawString(font, tr("export.audio_music"), sliderTrackX, sfxSliderY + 15, ReplayPalette.TEXT_MUTED, false);
+
+        int durationTicks = matchDurationTicks();
+        var trim = contentOptions.resolveTrimRange(durationTicks);
+        g.drawString(font, tr("export.trim_range", ReplayBoardTexts.clock(trim.startTick()), ReplayBoardTexts.clock(trim.endTick())),
+                sliderTrackX, trimSliderY - 14, ReplayPalette.CHAMPAGNE, false);
+        drawDualRangeSlider(g, sliderTrackX, trimSliderY, sliderTrackW,
+                trim.startTick() / (double) durationTicks, trim.endTick() / (double) durationTicks,
+                activeSlider == SLIDER_TRIM_START, activeSlider == SLIDER_TRIM_END);
+    }
+
+    private static void drawSingleSlider(GuiGraphics g, int x, int y, int w, double ratio, boolean dragging, int fillColor) {
+        double r = Math.clamp(ratio, 0.0, 1.0);
+        int thumbX = x + (int) Math.round(r * w);
+        g.fill(x, y + 2, x + w, y + 6, 0xFF1A2236);
+        g.renderOutline(x - 1, y + 1, w + 2, 6, 0x808A6A35);
+        g.fill(x, y + 2, thumbX, y + 6, fillColor);
+        // 100% midpoint tick
+        g.fill(x + w / 2, y, x + w / 2 + 1, y + 8, 0x88E5CA8A);
+        diamond(g, thumbX, y + 4, dragging ? 0xFFFFFFFF : ReplayPalette.CHAMPAGNE);
+    }
+
+    private static void drawDualRangeSlider(GuiGraphics g, int x, int y, int w, double startR, double endR,
+                                            boolean dragStart, boolean dragEnd) {
+        int x0 = x + (int) Math.round(Math.clamp(startR, 0.0, 1.0) * w);
+        int x1 = x + (int) Math.round(Math.clamp(endR, 0.0, 1.0) * w);
+        g.fill(x, y + 2, x + w, y + 6, 0xFF141B2E);
+        g.renderOutline(x - 1, y + 1, w + 2, 6, 0x808A6A35);
+        g.fill(x0, y + 2, Math.max(x0 + 2, x1), y + 6, ReplayPalette.BRASS);
+        diamond(g, x0, y + 4, dragStart ? 0xFFFFFFFF : ReplayPalette.BRASS_LIGHT);
+        diamond(g, x1, y + 4, dragEnd ? 0xFFFFFFFF : ReplayPalette.BRASS_LIGHT);
     }
 
     private void renderSettingsForeground(GuiGraphics g, int mouseX, int mouseY) {
@@ -880,13 +1488,30 @@ final class ReplayExportScreen extends Screen {
     private int pickerListLeft() { return left + 12; }
     private int pickerListRight() { return left + panelWidth - 16; }
     private int pickerListTop() { return pickerTop + 30; }
-    private int pickerListBottom() { return Math.max(pickerListTop() + 1, pickerTop + pickerPanelHeight - 12); }
-    private int pickerTotalRows() { return 1 + participants.size(); }
-
+    private int pickerListBottom() {
+        int rawHeight = Math.max(PICKER_ROW_HEIGHT, (pickerTop + pickerPanelHeight - 12) - pickerListTop());
+        int fullRows = Math.max(1, rawHeight / PICKER_ROW_HEIGHT);
+        return pickerListTop() + fullRows * PICKER_ROW_HEIGHT;
+    }
     private int maxPickerScroll() {
-        int contentHeight = pickerTotalRows() * PICKER_ROW_HEIGHT;
+        int contentHeight = participants.size() * PICKER_ROW_HEIGHT;
         int viewHeight = Math.max(1, pickerListBottom() - pickerListTop());
         return Math.max(0, contentHeight - viewHeight);
+    }
+
+    private void movePickerCursor(int index) {
+        pickerCursor = Math.clamp(index, 0, Math.max(0, participants.size() - 1));
+        int rowTop = pickerCursor * PICKER_ROW_HEIGHT;
+        int viewHeight = pickerListBottom() - pickerListTop();
+        pickerScroll = Math.clamp(pickerScroll, Math.max(0, rowTop + PICKER_ROW_HEIGHT - viewHeight), rowTop);
+    }
+
+    private void choosePlayer(int index) {
+        if (index < 0 || index >= participants.size()) return;
+        setFocusPlayer(participants.get(index).id());
+        setPickerOpen(false);
+        if (minecraft != null) perspectivePlayer.playDownSound(minecraft.getSoundManager());
+        refresh();
     }
 
     private boolean handlePickerClick(double mouseX, double mouseY, int button) {
@@ -898,7 +1523,6 @@ final class ReplayExportScreen extends Screen {
             setPickerOpen(false);
             return true;
         }
-        // Close [x] button in top-right of the picker header.
         int closeX0 = pickerCloseX(), closeY0 = pickerCloseY();
         if (mouseX >= closeX0 && mouseX < closeX0 + 18 && mouseY >= closeY0 && mouseY < closeY0 + 16) {
             setPickerOpen(false);
@@ -909,13 +1533,7 @@ final class ReplayExportScreen extends Screen {
         int listTop = pickerListTop(), listBottom = pickerListBottom();
         if (mouseX >= listLeft && mouseX < listRight && mouseY >= listTop && mouseY < listBottom) {
             int row = (int) ((mouseY - listTop + pickerScroll) / PICKER_ROW_HEIGHT);
-            if (row >= 0 && row < pickerTotalRows()) {
-                focusPlayer = row == 0 ? null : participants.get(row - 1).id();
-                setPickerOpen(false);
-                if (minecraft != null && perspectivePlayer != null) perspectivePlayer.playDownSound(minecraft.getSoundManager());
-                refresh();
-                return true;
-            }
+            choosePlayer(row);
         }
         return true;
     }
@@ -951,20 +1569,20 @@ final class ReplayExportScreen extends Screen {
         g.fill(listLeft, listTop, listRight, listBottom, 0xFF070C1A);
         g.flush();
         g.enableScissor(listLeft, listTop, listRight, listBottom);
-        int totalRows = pickerTotalRows();
-        // Pass 1: row backgrounds and accent bars (committed before immediate head blits & text).
+        int totalRows = participants.size();
         for (int i = 0; i < totalRows; i++) {
             int rowTop = listTop + i * PICKER_ROW_HEIGHT - pickerScroll;
             int rowBottom = rowTop + PICKER_ROW_HEIGHT;
             if (rowBottom <= listTop || rowTop >= listBottom) continue;
             boolean hovered = mouseX >= listLeft && mouseX < listRight && mouseY >= Math.max(listTop, rowTop)
                     && mouseY < Math.min(listBottom, rowBottom);
-            boolean selected = i == 0 ? focusPlayer == null : participants.get(i - 1).id().equals(focusPlayer);
+            var participant = participants.get(i);
+            boolean selected = participant.id().equals(focusPlayer);
             int bgTop, bgBot, accent;
             if (selected) {
-                bgTop = i == 0 ? 0xFF3A2D14 : 0xFF4A2029;
-                bgBot = i == 0 ? 0xFF21190B : 0xFF2A1118;
-                accent = i == 0 ? ReplayPalette.BRASS_LIGHT : ReplayPalette.FOCUS_TRAIL;
+                bgTop = 0xFF3A2D14;
+                bgBot = 0xFF21190B;
+                accent = ReplayPalette.BRASS_LIGHT;
             } else if (hovered) {
                 bgTop = 0xFF233256;
                 bgBot = 0xFF151F3B;
@@ -977,50 +1595,41 @@ final class ReplayExportScreen extends Screen {
             g.fillGradient(listLeft + 1, rowTop + 1, listRight - 1, rowBottom - 1, bgTop, bgBot);
             if (accent != 0) {
                 g.fill(listLeft + 1, rowTop + 1, listLeft + 4, rowBottom - 1, accent);
-            } else if (i > 0) {
-                int roleColor = ReplayPalette.opaque(participants.get(i - 1).endColor(), ReplayPalette.PASSENGER);
+            } else {
+                int roleColor = ReplayPalette.opaque(participant.endColor(), ReplayPalette.PASSENGER);
                 g.fill(listLeft + 1, rowTop + 3, listLeft + 3, rowBottom - 3, roleColor);
+            }
+            if (i == pickerCursor) {
+                g.renderOutline(listLeft + 1, rowTop + 1, listRight - listLeft - 2, PICKER_ROW_HEIGHT - 2,
+                        ReplayPalette.TEXT_MUTED);
             }
         }
         g.flush();
-        // Pass 2: player faces and row text on top of the flushed backgrounds.
         for (int i = 0; i < totalRows; i++) {
             int rowTop = listTop + i * PICKER_ROW_HEIGHT - pickerScroll;
             int rowBottom = rowTop + PICKER_ROW_HEIGHT;
             if (rowBottom <= listTop || rowTop >= listBottom) continue;
-            boolean selected = i == 0 ? focusPlayer == null : participants.get(i - 1).id().equals(focusPlayer);
-            if (i == 0) {
-                Component globalLabel = tr("export.perspective_global");
-                g.drawString(font, globalLabel, listLeft + 10, rowTop + 7,
-                        selected ? ReplayPalette.CHAMPAGNE : ReplayPalette.TEXT, false);
-                int descX = listLeft + 10 + font.width(globalLabel) + 10;
-                int descAvail = listRight - descX - 6;
-                if (descAvail > 16) {
-                    g.drawString(font, font.plainSubstrByWidth(tr("export.perspective_global_desc").getString(), descAvail),
-                            descX, rowTop + 7, ReplayPalette.TEXT_MUTED, false);
-                }
-            } else {
-                LastMatchReplay.Participant p = participants.get(i - 1);
-                int roleColor = ReplayPalette.opaque(p.endColor(), ReplayPalette.PASSENGER);
-                PlayerFaceRenderer.draw(g, ReplayHeadSkins.texture(p.id()), listLeft + 8, rowTop + 4, 14);
-                Component kills = p.kills() > 0 ? tr("export.perspective_kills", p.kills()) : Component.empty();
-                int killsW = kills.getString().isEmpty() ? 0 : font.width(kills) + 8;
-                int nameX = listLeft + 26;
-                int avail = Math.max(40, listRight - nameX - killsW - 8);
-                String nameStr = ReplayBoardTexts.name(p).getString();
-                String roleStr = ReplayBoardTexts.role(p.endRole()).getString();
-                String clippedName = font.plainSubstrByWidth(nameStr, Math.max(24, avail * 58 / 100));
-                int nameW = font.width(clippedName);
-                g.drawString(font, clippedName,
-                        nameX, rowTop + 7, selected ? ReplayPalette.FOCUS_TRAIL_HEAD : ReplayPalette.TEXT, false);
-                int roleX = nameX + nameW + 6;
-                int roleAvail = listRight - killsW - roleX - 6;
-                if (roleAvail > 16) {
-                    g.drawString(font, font.plainSubstrByWidth(roleStr, roleAvail), roleX, rowTop + 7, roleColor, false);
-                }
-                if (killsW > 0) {
-                    g.drawString(font, kills, listRight - killsW, rowTop + 7, ReplayPalette.RUBY, false);
-                }
+            LastMatchReplay.Participant p = participants.get(i);
+            boolean selected = p.id().equals(focusPlayer);
+            int roleColor = ReplayPalette.opaque(p.endColor(), ReplayPalette.PASSENGER);
+            PlayerFaceRenderer.draw(g, ReplayHeadSkins.texture(p.id()), listLeft + 8, rowTop + 4, 14);
+            Component kills = p.kills() > 0 ? tr("export.perspective_kills", p.kills()) : Component.empty();
+            int killsW = kills.getString().isEmpty() ? 0 : font.width(kills) + 8;
+            int nameX = listLeft + 26;
+            int avail = Math.max(40, listRight - nameX - killsW - 8);
+            String nameStr = ReplayBoardTexts.name(p).getString();
+            String roleStr = ReplayBoardTexts.role(p.endRole()).getString();
+            String clippedName = font.plainSubstrByWidth(nameStr, Math.max(24, avail * 58 / 100));
+            int nameW = font.width(clippedName);
+            g.drawString(font, clippedName,
+                    nameX, rowTop + 7, selected ? ReplayPalette.CHAMPAGNE : ReplayPalette.TEXT, false);
+            int roleX = nameX + nameW + 6;
+            int roleAvail = listRight - killsW - roleX - 6;
+            if (roleAvail > 16) {
+                g.drawString(font, font.plainSubstrByWidth(roleStr, roleAvail), roleX, rowTop + 7, roleColor, false);
+            }
+            if (killsW > 0) {
+                g.drawString(font, kills, listRight - killsW, rowTop + 7, ReplayPalette.RUBY, false);
             }
         }
         g.flush();
@@ -1043,7 +1652,7 @@ final class ReplayExportScreen extends Screen {
     private static final class BrassButton extends Button {
         boolean selected;
         boolean accent;
-        boolean focusTint;
+        boolean primary;
 
         BrassButton(int x, int y, int w, int h, Component message, OnPress onPress) {
             super(x, y, w, h, message, onPress, DEFAULT_NARRATION);
@@ -1057,10 +1666,9 @@ final class ReplayExportScreen extends Screen {
                 top = 0xFF0E1426; bottom = 0xFF080C18; border = 0xFF3B3322; text = ReplayPalette.TEXT_FAINT;
             } else if (accent) {
                 top = hover ? 0xFF6A2A30 : 0xFF4E1E24; bottom = 0xFF2A1015; border = ReplayPalette.RUBY; text = 0xFFFFE0E0;
-            } else if (selected && focusTint) {
-                top = hover ? 0xFF5D2632 : 0xFF4B1E28; bottom = 0xFF271016;
-                border = active ? ReplayPalette.FOCUS_TRAIL : ReplayPalette.BRASS_DIM;
-                text = active ? ReplayPalette.FOCUS_TRAIL_HEAD : ReplayPalette.BRASS;
+            } else if (primary) {
+                top = hover ? 0xFF27565B : 0xFF1D4147; bottom = 0xFF12282E;
+                border = hover ? 0xFF91D6D0 : 0xFF61A39F; text = 0xFFF0FAF8;
             } else if (selected) {
                 top = hover ? 0xFF4A3A1A : 0xFF3A2D14; bottom = 0xFF1E170A;
                 border = active ? ReplayPalette.BRASS_LIGHT : ReplayPalette.BRASS_DIM;
@@ -1071,9 +1679,16 @@ final class ReplayExportScreen extends Screen {
                 top = 0xFF18233F; bottom = 0xFF0C1326; border = ReplayPalette.BRASS_DIM; text = ReplayPalette.TEXT;
             }
             g.fillGradient(x0, y0, x1, y1, top, bottom);
-            g.renderOutline(x0, y0, getWidth(), getHeight(), border);
+            g.renderOutline(x0, y0, getWidth(), getHeight(), isFocused() && active ? 0xFFE3E9EF : border);
+            if (selected) {
+                g.fill(x0 + 1, y1 - 2, x1 - 1, y1 - 1, border);
+            }
             var font = net.minecraft.client.Minecraft.getInstance().font;
-            String label = font.plainSubstrByWidth(getMessage().getString(), getWidth() - 6);
+            String label = getMessage().getString();
+            int available = getWidth() - 6;
+            if (font.width(label) > available) {
+                label = font.plainSubstrByWidth(label, Math.max(0, available - font.width("…"))) + "…";
+            }
             g.drawCenteredString(font, label, x0 + getWidth() / 2, y0 + (getHeight() - 8) / 2, text);
         }
     }

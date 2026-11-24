@@ -68,12 +68,16 @@ public final class ReplayFocusPlan {
     }
 
     private final List<Cue> cues;
+    private final List<LinearCue> linearCues;
     private final double actionLength;
+
+    private record LinearCue(int matchTick, int priority, Pose target, LastMatchReplay.Node event) {}
 
     public ReplayFocusPlan(LastMatchReplay replay, ReplayTimeline timeline) {
         actionLength = timeline.cycleTicks() - ReplayTimeline.INTRO - ReplayTimeline.REVIEW - ReplayTimeline.HONORS;
         ReplayProjection.Layout layout = ReplayProjection.layout(replay);
         List<Cue> built = new ArrayList<>();
+        List<LinearCue> linearBuilt = new ArrayList<>();
         if (layout != null) {
             List<LastMatchReplay.Node> sorted = replay.events().stream()
                     .filter(e -> priority(e) > 0 && (e.from() != null || e.to() != null))
@@ -83,15 +87,97 @@ public final class ReplayFocusPlan {
                 double at = timeline.actionTickAt(event.tick());
                 Cue previous = built.isEmpty() ? null : built.getLast();
                 int priority = priority(event);
+                Pose targetPose = target(layout, event, priority);
+                if (priority >= 3) {
+                    LinearCue prevLin = linearBuilt.isEmpty() ? null : linearBuilt.getLast();
+                    if (prevLin == null || event.tick() - prevLin.matchTick >= 8
+                            || priority > prevLin.priority) {
+                        if (prevLin != null && event.tick() - prevLin.matchTick < 8 && priority > prevLin.priority) {
+                            linearBuilt.set(linearBuilt.size() - 1, new LinearCue(event.tick(), priority, targetPose, event));
+                        } else {
+                            linearBuilt.add(new LinearCue(event.tick(), priority, targetPose, event));
+                        }
+                    }
+                }
                 // Simultaneous events form one shot. Incidental actions cannot steal a kill close-up.
                 if (previous != null && (at - previous.tick < ATTACK
                         || at - previous.tick < HOLD && priority < previous.priority)) continue;
                 Pose incoming = previous == null ? WIDE : previous.at(at);
-                built.add(new Cue(at, priority, incoming, target(layout, event, priority), event,
+                built.add(new Cue(at, priority, incoming, targetPose, event,
                         previous == null ? Highlight.NONE : previous.highlightAt(at)));
             }
         }
         cues = List.copyOf(built);
+        linearCues = List.copyOf(linearBuilt);
+    }
+
+    /**
+     * Evaluates optional kill/highlight close-ups on the linear match-tick clock.
+     *
+     * <p>When {@code killCloseupEnabled} is {@code false} (the default for the interactive replay table),
+     * this always returns {@link #UNFOCUSED} so the diorama never jerks or obstructs spectators.</p>
+     */
+    public Sample sampleLinear(double matchTick, double playbackSpeed, boolean killCloseupEnabled) {
+        if (!killCloseupEnabled || linearCues.isEmpty() || !Double.isFinite(matchTick)) return UNFOCUSED;
+        double speed = Math.clamp(Double.isFinite(playbackSpeed) ? playbackSpeed : 1.0, 0.5, 4.0);
+        double attack = ATTACK * speed;
+        double hold = HOLD * speed;
+        double release = RELEASE * speed;
+        double length = hold + release;
+        LinearCue selected = null;
+        for (LinearCue cue : linearCues) {
+            if (cue.matchTick > matchTick) break;
+            selected = cue;
+        }
+        if (selected == null) return UNFOCUSED;
+        double age = matchTick - selected.matchTick;
+        if (age < 0 || age >= length) return UNFOCUSED;
+        Pose pose;
+        double weight;
+        if (age < attack) {
+            double u = age / attack;
+            pose = mix(WIDE, selected.target, impact(u), ReplayStagePlan.easeOutCubic(u));
+            weight = ReplayStagePlan.smoothstep(0, attack, age);
+        } else if (age <= hold) {
+            pose = selected.target;
+            weight = 1.0;
+        } else {
+            double out = ReplayStagePlan.easeInOutQuart((age - hold) / release);
+            pose = mix(selected.target, WIDE, out, out);
+            weight = 1.0 - out;
+        }
+        return new Sample(pose, Highlight.NONE, new Highlight(selected.event, weight));
+    }
+
+    /**
+     * Counter-rotation angle (degrees about +Y) that aligns a followed player's facing direction
+     * toward {@code -Z} (away from the table's front edge), producing a true over-the-shoulder view
+     * from the front of the replay table.
+     */
+    public static float followCounterYawDeg(float playerYawDeg, boolean mapRotated) {
+        return 180.0f + playerYawDeg - (mapRotated ? 90.0f : 0.0f);
+    }
+
+    /** Shortest signed angular delta in {@code (-180, 180]} degrees. */
+    public static float shortestAngleDeltaDeg(float fromDeg, float toDeg) {
+        float diff = (toDeg - fromDeg) % 360.0f;
+        if (diff > 180.0f) diff -= 360.0f;
+        if (diff <= -180.0f) diff += 360.0f;
+        return diff;
+    }
+
+    /**
+     * Builds the diorama transform anchored on a followed player, smoothly counter-rotated so their
+     * forward heading points along {@code -Z} into the tray.
+     */
+    public static Matrix4f applyFollowTransform(Matrix4f base, float playerX, float playerY, float playerZ,
+                                                float counterYawDeg, float zoom, float backShiftZ) {
+        float z = Math.max(1.0f, zoom);
+        return new Matrix4f(base)
+                .translate(0f, -playerY * (z - 1f), backShiftZ)
+                .rotateY((float) Math.toRadians(counterYawDeg))
+                .scale(z)
+                .translate(-playerX, 0f, -playerZ);
     }
 
     public Pose at(ReplayTimeline.Frame frame) {

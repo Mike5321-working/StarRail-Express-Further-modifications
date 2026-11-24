@@ -3,6 +3,8 @@ package com.habitrain.core.scene.client;
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.network.replay.ReplayArchivePackets;
+import com.habitrain.core.network.replay.ReplayPackets;
+import com.habitrain.core.scene.server.SceneBandwidthGovernor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.*;
@@ -81,5 +83,30 @@ class ReplayHistoryRecoveryTest {
         assertTrue(data.failed());
         data.step(5_000_000_000L, ignored -> true);
         assertFalse(data.failed());
+    }
+
+    @Test void fortyViewerQueueCanCrossRetryDeadlineWithoutDiscardingMapFragments() {
+        var bandwidth = new SceneBandwidthGovernor(() -> 0L, 4L * 1024 * 1024);
+        long lastReady = 0;
+        for (int i = 0; i < 40; i++) {
+            lastReady = bandwidth.reserve(new UUID(0L, i), ReplayPackets.MAX_SUMMARY, 512L * 1024);
+        }
+        assertTrue(lastReady > 8_000_000_000L);
+
+        var manifest = new ReplayMapManifest("test", "test:level", new SceneBounds(0, 0, 0, 16, 16, 16),
+                "0".repeat(64), List.of(new ReplayMapManifest.Entry(new ReplayMapManifest.Section(0, 0, 0), 1)));
+        var data = new ClientReplayBoard.MapData(manifest);
+        data.diskLoading = false;
+        data.step(0, requested -> true);
+        int fragmentSize = ReplayPackets.FRAGMENT_BYTES;
+        data.accept(new ReplayPackets.ReplaySectionPatchS2C(UUID.randomUUID(), 0, 0,
+                fragmentSize + 1, new byte[fragmentSize]));
+        Object partial = data.partial.get(0);
+        assertNotNull(partial);
+        data.step(data.retryAt, requested -> {
+            assertEquals(BitSet.valueOf(new long[]{1L}), requested);
+            return true;
+        });
+        assertSame(partial, data.partial.get(0));
     }
 }

@@ -1,6 +1,7 @@
 package com.habitrain.core.game.sre.mixin;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplaySkillEvent;
 import com.habitrain.core.game.sre.replay.MatchReplayRecorder;
 import com.llamalad7.mixinextras.injector.wrapoperation.Operation;
 import com.llamalad7.mixinextras.injector.wrapoperation.WrapOperation;
@@ -19,8 +20,12 @@ abstract class ReplayRoleSkillMixin {
             var player = context.player();
             var level = player.serverLevel();
             var target = context.target() == null ? null : level.getPlayerByUUID(context.target());
+            String skillId = context.skillId().toString();
             MatchReplayRecorder.spatial(level, LastMatchReplay.Kind.SKILL_RELEASE, player.getUUID(), context.target(),
-                    player.position(), target == null ? null : target.position(), context.skillId().toString(), LastMatchReplay.SUCCESS);
+                    player.position(), target == null ? null : target.position(), skillId, LastMatchReplay.SUCCESS);
+            MatchReplayRecorder.recordSkillEvent(level, player, context.target(), skillId,
+                    "", ReplaySkillEvent.CAT_ROLE_SKILL, player.position(),
+                    target == null ? null : target.position(), 40);
         }
         return used;
     }

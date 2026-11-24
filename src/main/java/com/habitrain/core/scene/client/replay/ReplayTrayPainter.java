@@ -52,13 +52,16 @@ final class ReplayTrayPainter {
     // ------------------------------------------------------------------ tray (textured, opaque)
 
     static void tray(ReplayFrame f, ReplayBoardSite s) {
+        tray(f.tray(), s.board(), s.hw(), s.hd(), s.detail(), s.light());
+    }
+
+    static void tray(VertexConsumer vc, Matrix4f board, float hw, float hd, boolean detail, int light) {
         ensureSprites();
-        VertexConsumer vc = f.tray();
         PoseStack stack = new PoseStack();
-        stack.mulPose(s.board());
+        stack.mulPose(board);
         PoseStack.Pose pose = stack.last();
-        float hw = s.hw(), hd = s.hd(), ft = FRAME;
-        int l = s.light();
+        float ft = FRAME;
+        int l = light;
         // floor
         box(vc, pose, -hw + ft * 0.5f, TRAY_BOTTOM + 0.03f, -hd + ft * 0.5f, hw - ft * 0.5f, BASE_TOP, hd - ft * 0.5f,
                 mahogany, herringbone, l, 0.5f);
@@ -89,7 +92,7 @@ final class ReplayTrayPainter {
                         brass, brass, l, 0.25f);
             }
         }
-        if (s.detail()) {
+        if (detail) {
             // rivets along the frame
             float ry = FRAME_TOP + 0.016f;
             for (float x = -hw + 0.45f; x < hw - 0.3f; x += 0.42f) {
@@ -111,7 +114,7 @@ final class ReplayTrayPainter {
             box(vc, pose, -hw + 0.12f, TRAY_BOTTOM - 0.03f, z - 0.022f, hw - 0.12f, TRAY_BOTTOM, z + 0.022f,
                     brass, brass, l, 0.5f);
         }
-        plaqueBody(s, vc);
+        plaqueBody(vc, board, hw, hd, light);
     }
 
     private static void rivet(VertexConsumer vc, PoseStack.Pose pose, float x, float y, float z, int light) {
@@ -148,8 +151,12 @@ final class ReplayTrayPainter {
     }
 
     static Matrix4f plaqueMatrix(ReplayBoardSite s, int side) {
-        float pScale = plaqueScale((side & 1) == 0 ? s.hw() : s.hd());
-        return plaqueFrameMatrix(s.board(), s.hw(), s.hd(), side).scale(pScale);
+        return plaqueMatrix(s.board(), s.hw(), s.hd(), side);
+    }
+
+    private static Matrix4f plaqueMatrix(Matrix4f board, float hw, float hd, int side) {
+        float pScale = plaqueScale((side & 1) == 0 ? hw : hd);
+        return plaqueFrameMatrix(board, hw, hd, side).scale(pScale);
     }
 
     /** The camera is at the origin of the render pass. Only draw the readable side of the plaque. */
@@ -157,19 +164,19 @@ final class ReplayTrayPainter {
         return m.m20() * m.m30() + m.m21() * m.m31() + m.m22() * m.m32() < 0f;
     }
 
-    private static void plaqueBody(ReplayBoardSite s, VertexConsumer vc) {
+    private static void plaqueBody(VertexConsumer vc, Matrix4f board, float hw, float hd, int light) {
         float pw = BASE_PLAQUE_W, ph = PLAQUE_H;
         for (int side = 0; side < 4; side++) {
             PoseStack stack = new PoseStack();
-            stack.mulPose(plaqueMatrix(s, side));
+            stack.mulPose(plaqueMatrix(board, hw, hd, side));
             PoseStack.Pose pose = stack.last();
             box(vc, pose, -pw / 2 - 0.035f, -ph / 2 - 0.035f, -0.045f, pw / 2 + 0.035f, ph / 2 + 0.035f, -0.02f,
-                    ebonyWall, ebony, s.light(), 0.5f);
-            box(vc, pose, -pw / 2, -ph / 2, -0.02f, pw / 2, ph / 2, 0f, brass, brass, s.light(), 0.5f);
+                    ebonyWall, ebony, light, 0.5f);
+            box(vc, pose, -pw / 2, -ph / 2, -0.02f, pw / 2, ph / 2, 0f, brass, brass, light, 0.5f);
             // fan ornaments at both ends
             for (int endSide = -1; endSide <= 1; endSide += 2) {
                 float x = endSide * (pw / 2 + 0.06f);
-                box(vc, pose, x - 0.05f, -0.06f, -0.04f, x + 0.05f, 0.06f, -0.005f, corner, corner, s.light(), 0.25f);
+                box(vc, pose, x - 0.05f, -0.06f, -0.04f, x + 0.05f, 0.06f, -0.005f, corner, corner, light, 0.25f);
             }
         }
     }
@@ -177,6 +184,7 @@ final class ReplayTrayPainter {
     private static final int MAX_CLOCK_CHARS = 16;
 
     static void plaque(ReplayFrame f, ReplayBoardSite s) {
+        if (!f.video && ReplayBoardButtons.hasActiveDeck(s.pos())) return;
         float pw = BASE_PLAQUE_W, ph = PLAQUE_H;
         VertexConsumer fill = f.fill();
         float left = -pw / 2 + 0.07f, rightEdge = pw / 2 - 0.07f, z = 0.006f;
@@ -394,12 +402,19 @@ final class ReplayTrayPainter {
                     ReplayPalette.alpha(ReplayPalette.BRASS, 0.55 * a * (1 - stage.scan() * 0.5)));
         }
         if (stage.reviewWave() >= 0) {
-            float x = -w + (float) (2 * w * stage.reviewWave());
-            int core = ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, 0.5 * a), clear = ReplayPalette.alpha(ReplayPalette.BRASS, 0);
-            ReplayDraw.quad(glow, d, x, 0, -dd, x, 0, dd, x, h * 1.2f, dd, x, h * 1.2f, -dd, core, core, clear, clear);
-            int trail = ReplayPalette.alpha(ReplayPalette.BRASS, 0.22 * a);
-            ReplayDraw.quad(glow, d, x - 0.35f, 0.006f, -dd, x, 0.006f, -dd, x, 0.006f, dd, x - 0.35f, 0.006f, dd,
-                    clear, trail, trail, clear);
+            double wave = stage.reviewWave();
+            double env = Math.sin(Mth.clamp(wave, 0.0, 1.0) * Math.PI);
+            if (env > 0.02) {
+                float x = -w + (float) (2 * w * wave);
+                float bandZ = Math.min(dd, model.mapD * 0.5f + 0.02f);
+                int core = ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, 0.28 * a * env);
+                int trail = ReplayPalette.alpha(ReplayPalette.BRASS, 0.16 * a * env);
+                int clear = ReplayPalette.alpha(ReplayPalette.BRASS, 0);
+                // Low deck-hugging golden sweep (avoid tall vertical walls that read as diagonal trapezoid beams).
+                ReplayDraw.segment(glow, d, x, 0.012f, -bandZ, x, 0.012f, bandZ, 0.018f * elemScale, core, core);
+                ReplayDraw.quad(glow, d, x - 0.30f, 0.008f, -bandZ, x, 0.008f, -bandZ, x, 0.008f, bandZ, x - 0.30f, 0.008f, bandZ,
+                        clear, trail, trail, clear);
+            }
         }
         if (f.blackout) {
             double pulse = 0.55 + 0.45 * Math.sin(f.anim * 5.2);

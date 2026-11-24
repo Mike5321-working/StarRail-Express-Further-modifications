@@ -33,12 +33,13 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
     private final Thread logDrainThread;
     private final ByteArrayOutputStream logBuffer = new ByteArrayOutputStream(1024);
     private final @Nullable Path tempAudioPcm;
+    private final boolean deleteAudioOnClose;
     private final int expectedBytes;
     private boolean finished;
     private boolean closed;
 
     ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps) throws IOException {
-        this(ffmpegExecutable, path, width, height, fps, null, ReplayExportQuality.DEFAULT);
+        this(ffmpegExecutable, path, width, height, fps, (short[]) null, ReplayExportQuality.DEFAULT);
     }
 
     ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
@@ -48,6 +49,14 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
 
     ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
                     @Nullable short[] soundtrackStereo48k, ReplayExportQuality quality) throws IOException {
+        this(ffmpegExecutable, path, width, height, fps,
+                writeTempPcmIfPresent(path, soundtrackStereo48k), quality, true);
+    }
+
+    /** Streaming constructor accepting a pre-mixed 48 kHz s16le stereo PCM file on disk (zero giant heap array). */
+    ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
+                    @Nullable Path preMixedAudioPcmFile, ReplayExportQuality quality,
+                    boolean deleteAudioOnClose) throws IOException {
         Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable");
         Objects.requireNonNull(path, "path");
         ReplayExportQuality effectiveQuality = quality == null ? ReplayExportQuality.DEFAULT : quality;
@@ -62,17 +71,16 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         Path parent = path.toAbsolutePath().normalize().getParent();
         if (parent != null) Files.createDirectories(parent);
 
-        Path audioTemp = null;
+        Path audioTemp = preMixedAudioPcmFile != null && Files.exists(preMixedAudioPcmFile)
+                && Files.size(preMixedAudioPcmFile) >= AUDIO_CHANNELS * 2L ? preMixedAudioPcmFile : null;
         Process started = null;
         try {
-            if (soundtrackStereo48k != null && soundtrackStereo48k.length >= AUDIO_CHANNELS) {
-                audioTemp = writeTempPcm(parent != null ? parent : Path.of("."), soundtrackStereo48k);
-            }
             List<String> cmd = buildCommand(ffmpegExecutable, path, width, height, fps, audioTemp, effectiveQuality);
             started = new ProcessBuilder(cmd)
                     .redirectErrorStream(true)
                     .start();
-            this.tempAudioPcm = audioTemp;
+            this.tempAudioPcm = preMixedAudioPcmFile;
+            this.deleteAudioOnClose = deleteAudioOnClose;
             this.process = started;
             this.videoOut = new BufferedOutputStream(started.getOutputStream(), 256 * 1024);
             this.logDrainThread = Thread.ofPlatform().daemon().name("habitrain-ffmpeg-log").start(this::drainOutput);
@@ -80,9 +88,16 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
             if (started != null) {
                 started.destroyForcibly();
             }
-            deleteQuietly(audioTemp);
+            if (deleteAudioOnClose) deleteQuietly(preMixedAudioPcmFile);
             throw failure;
         }
+    }
+
+    private static @Nullable Path writeTempPcmIfPresent(Path outputPath, @Nullable short[] soundtrackStereo48k) throws IOException {
+        if (soundtrackStereo48k == null || soundtrackStereo48k.length < AUDIO_CHANNELS) return null;
+        Path parent = outputPath.toAbsolutePath().normalize().getParent();
+        if (parent != null) Files.createDirectories(parent);
+        return writeTempPcm(parent != null ? parent : Path.of("."), soundtrackStereo48k);
     }
 
     static List<String> buildCommand(Path ffmpegExecutable, Path outputPath, int width, int height, int fps,
@@ -284,7 +299,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
                 Thread.currentThread().interrupt();
             }
         } finally {
-            deleteQuietly(tempAudioPcm);
+            if (deleteAudioOnClose) deleteQuietly(tempAudioPcm);
         }
     }
 

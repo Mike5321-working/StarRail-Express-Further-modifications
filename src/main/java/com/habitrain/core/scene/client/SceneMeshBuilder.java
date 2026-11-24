@@ -258,9 +258,10 @@ public final class SceneMeshBuilder {
                     Minecraft.getInstance().getModelManager().getAtlas(net.minecraft.world.inventory.InventoryMenu.BLOCK_ATLAS));
             this.meshQuotaMiB = ClientVisualPreferences.getMeshCacheQuotaMiB();
             this.maxVertices = vertexBudgetForMiB(meshQuotaMiB);
-            this.batchPlan = SceneMeshBatchPolicy.plan(asset.sections.size(),
-                    com.habitrain.core.client.config.ClientVisualPreferences.getMeshBatchMinSections(),
-                    asset.sourceBounds);
+            int batchThreshold = ClientVisualPreferences.getMeshBatchMinSections();
+            this.batchPlan = retainHiddenFaces
+                    ? SceneMeshBatchPolicy.replayPlan(asset.sections.size(), batchThreshold, asset.sourceBounds)
+                    : SceneMeshBatchPolicy.plan(asset.sections.size(), batchThreshold, asset.sourceBounds);
             if (asset.blockPayloads != null) {
                 for (SceneBlockPayloadEntry entry : asset.blockPayloads) {
                     payloadMap.put(new BlockPos(entry.localX(), entry.localY(), entry.localZ()), entry);
@@ -704,12 +705,14 @@ public final class SceneMeshBuilder {
                         // 5. 原版静态模型快速路径，同时也是 Sodium/Indium 增强模型的
                         //    兼容回退。让活动渲染器创建自己的上下文，避免手工 getQuads
                         //    丢掉 Wathe 等模型的面、材质层和嵌套模型。
-                        BufferBuilder builder = builderFor(resolveLayer(state));
+                        SceneMeshSet.Layer blockLayer = resolveLayer(state);
+                        boolean keepHidden = retainHiddenFaces && blockLayer != SceneMeshSet.Layer.TRANSLUCENT;
+                        BufferBuilder builder = builderFor(blockLayer);
                         long verticesBeforeModel = vertexCount;
                         poses.pushPose();
                         poses.translate(localX, localY, localZ);
                         dispatcher.renderBatched(state, localPos, blockView, poses,
-                                budgeted(builder), !(retainHiddenFaces && state.canOcclude()), random);
+                                budgeted(builder), !keepHidden, random);
                         poses.popPose();
                         long modelVertexCount = vertexCount - verticesBeforeModel;
 
@@ -759,13 +762,14 @@ public final class SceneMeshBuilder {
             List<String> materialFailures = new java.util.ArrayList<>();
             long seed = state.getSeed(localPos);
             try {
+                boolean keepHiddenFabric = retainHiddenFaces && resolveLayer(state) != SceneMeshSet.Layer.TRANSLUCENT;
                 SceneFabricModelCollector.CollectionResult collection = SceneFabricModelCollector.collect(
                         model,
                         blockView,
                         state,
                         localPos,
                         () -> RandomSource.create(seed),
-                        face -> !(retainHiddenFaces && state.canOcclude()) && !Block.shouldRenderFace(
+                        face -> !keepHiddenFabric && !Block.shouldRenderFace(
                                 state, blockView, localPos, face, localPos.relative(face)),
                         quad -> emitFabricQuad(quad, state, localPos, verticesByMaterial, materialFailures)
                 );
@@ -1088,6 +1092,7 @@ public final class SceneMeshBuilder {
                                 : upload.layer() == SceneMeshSet.Layer.TRANSLUCENT;
                         boolean batched = batchPlan.isBatched() && !translucent;
                         try (data) {
+                            int stride = data.drawState().format().getVertexSize();
                             SceneTransparencySort sort = null;
                             if (translucent && upload.byteBuilder() != null) {
                                 float sortX = asset.sourceBounds != null ? asset.sourceBounds.sizeX() * 0.5f : 0.0f;
@@ -1099,12 +1104,10 @@ public final class SceneMeshBuilder {
                             if (batched || retainHiddenFaces) {
                                 var bounds = batched ? batchBounds.computeIfAbsent(upload.batch(), ignored -> new SceneVertexBounds())
                                         : replayUnbatchedBounds;
-                                bounds.include(data.vertexBuffer(), data.drawState().vertexCount(),
-                                        DefaultVertexFormat.BLOCK.getVertexSize());
+                                bounds.include(data.vertexBuffer(), data.drawState().vertexCount(), stride);
                                 if (retainHiddenFaces) uploadTarget.includeReplayCeiling(bounds.maxY());
                             }
-                            long bytes = (long) data.drawState().vertexCount()
-                                    * DefaultVertexFormat.BLOCK.getVertexSize();
+                            long bytes = (long) data.drawState().vertexCount() * stride;
                             if (sort != null) bytes += sort.indexBytes();
                             else if (data.indexBuffer() != null) bytes += data.indexBuffer().remaining();
                             storeUpload(upload, uploadBuffer(data), bytes, sort);

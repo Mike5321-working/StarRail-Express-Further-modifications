@@ -1,14 +1,35 @@
 package com.habitrain.core.scene.client.replay;
 
+import com.habitrain.core.api.match.replay.ReplayBlockDelta;
 import com.habitrain.core.api.scene.asset.SceneAssetCodec;
+import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.scene.client.SceneBuildScheduler;
 import com.habitrain.core.scene.client.SceneMeshBuilder;
 import com.habitrain.core.scene.client.SceneMeshSet;
+import com.habitrain.core.scene.replay.ReplayFanCutaway;
+import com.mojang.blaze3d.vertex.PoseStack;
+import io.wifi.starrailexpress.content.block.DoorPartBlock;
+import io.wifi.starrailexpress.content.block_entity.DoorBlockEntity;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.LightTexture;
+import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.block.BlockRenderDispatcher;
+import net.minecraft.client.renderer.texture.OverlayTexture;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
 import org.jetbrains.annotations.Nullable;
+import org.joml.Matrix4f;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
@@ -32,6 +53,7 @@ final class ReplayDioramaMesh {
     }
 
     private static final java.util.LinkedHashMap<String, Slot> slots = new java.util.LinkedHashMap<>(8, .75f, true);
+    private static final java.util.LinkedHashMap<String, DynamicWorld> dynamicCache = new java.util.LinkedHashMap<>(8, .75f, true);
     private static Slot selected;
     private ReplayDioramaMesh() {}
 
@@ -44,6 +66,37 @@ final class ReplayDioramaMesh {
     static void retry(String fingerprint) {
         Slot slot = slots.get(fingerprint);
         if (slot != null) slot.failedKey = null;
+    }
+
+    /**
+     * Prepares (and caches) a {@link DynamicWorld} combining an immutable static base asset (with
+     * dynamic coordinates masked out so surrounding faces stay closed via {@code retainHiddenFaces})
+     * and an O(log N) tick-indexed dynamic block state overlay for seek-safe door/wall replay.
+     */
+    static @Nullable DynamicWorld prepareDynamic(@Nullable SceneAssetCodec.AssetData baseAsset,
+                                                 @Nullable SceneBounds origin,
+                                                 @Nullable List<ReplayBlockDelta> deltas) {
+        if (baseAsset == null || baseAsset.sections.isEmpty()) return null;
+        if (deltas == null || deltas.isEmpty() || origin == null || origin.isEmpty()) {
+            return DynamicWorld.staticOnly(baseAsset);
+        }
+        String cacheKey = baseAsset.fingerprint + "#" + baseAsset.sections.size() + "#" + deltaSignature(deltas);
+        DynamicWorld cached = dynamicCache.get(cacheKey);
+        if (cached != null) return cached;
+        DynamicWorld created = DynamicWorld.create(baseAsset, origin, deltas, cacheKey);
+        dynamicCache.put(cacheKey, created);
+        while (dynamicCache.size() > 6) dynamicCache.pollFirstEntry();
+        return created;
+    }
+
+    private static int deltaSignature(List<ReplayBlockDelta> deltas) {
+        int h = deltas.size() * 31;
+        if (!deltas.isEmpty()) {
+            h = h * 31 + deltas.getFirst().hashCode();
+            h = h * 31 + deltas.getLast().hashCode();
+            h = h * 31 + deltas.get(deltas.size() / 2).hashCode();
+        }
+        return h;
     }
 
     static void update(@Nullable SceneAssetCodec.AssetData asset, int present, int total) {
@@ -78,7 +131,269 @@ final class ReplayDioramaMesh {
     static void reset() {
         slots.values().forEach(Slot::reset);
         slots.clear();
+        dynamicCache.clear();
+        ReplayPovTerrain.reset();
+        ReplayFirstPersonHands.reset();
         selected = null;
+    }
+
+    /** One resolved dynamic block at a given {@code matchTick}. */
+    record ResolvedBlock(int localX, int localY, int localZ, String stateString, byte reasonFlags) {}
+
+    /**
+     * Seek-safe dynamic block overlay derived from an immutable base {@link SceneAssetCodec.AssetData}
+     * and time-ordered {@link ReplayBlockDelta} events.
+     *
+     * <p>Dynamic coordinates are stripped once from the static base mesh (which preserves adjacent
+     * solid faces via {@code retainHiddenFaces = true}), while the few affected doors/walls are
+     * resolved in O(log N) for any {@code matchTick} (forward or backward seek) and rendered cleanly
+     * in the exact same local source coordinate frame.</p>
+     */
+    static final class DynamicWorld {
+        private final SceneAssetCodec.AssetData staticAsset;
+        private final List<ReplayBlockDelta> sortedDeltas;
+        private final int offsetX, offsetY, offsetZ;
+        private final Map<Long, BlockHistory> histories;
+        private final Map<String, BlockState> parsedCache = new HashMap<>();
+        private final Map<Long, DoorBlockEntity> replayDoors = new HashMap<>();
+        private int cachedRevision = -1;
+        private Map<Long, ResolvedBlock> cachedStates = Map.of();
+
+        private record BlockChange(int tick, ResolvedBlock state) {}
+
+        private record BlockHistory(ResolvedBlock initial, List<BlockChange> changes) {
+            ResolvedBlock at(double tick) {
+                int lo = 0, hi = changes.size();
+                while (lo < hi) {
+                    int mid = (lo + hi) >>> 1;
+                    if (changes.get(mid).tick() <= tick) lo = mid + 1;
+                    else hi = mid;
+                }
+                return lo == 0 ? initial : changes.get(lo - 1).state();
+            }
+        }
+
+        private DynamicWorld(SceneAssetCodec.AssetData staticAsset, List<ReplayBlockDelta> sortedDeltas,
+                             int offsetX, int offsetY, int offsetZ, Map<Long, BlockHistory> histories) {
+            this.staticAsset = staticAsset;
+            this.sortedDeltas = sortedDeltas;
+            this.offsetX = offsetX;
+            this.offsetY = offsetY;
+            this.offsetZ = offsetZ;
+            this.histories = histories;
+        }
+
+        static DynamicWorld staticOnly(SceneAssetCodec.AssetData base) {
+            return new DynamicWorld(base, List.of(), 0, 0, 0, Map.of());
+        }
+
+        static DynamicWorld create(SceneAssetCodec.AssetData base, SceneBounds origin,
+                                   List<ReplayBlockDelta> deltas, String fingerprint) {
+            SceneBounds src = base.sourceBounds;
+            int offX = origin.minX() - src.minX();
+            int offY = origin.minY() - src.minY();
+            int offZ = origin.minZ() - src.minZ();
+
+            List<ReplayBlockDelta> ordered = new ArrayList<>(deltas.size());
+            boolean sorted = true;
+            int prevTick = -1;
+            Map<Long, int[]> uniquePositions = new LinkedHashMap<>();
+            for (ReplayBlockDelta d : deltas) {
+                int lx = offX + d.x();
+                int ly = offY + d.y();
+                int lz = offZ + d.z();
+                if (lx < 0 || ly < 0 || lz < 0 || lx >= src.sizeX() || ly >= src.sizeY() || lz >= src.sizeZ()) {
+                    continue;
+                }
+                if (d.tick() < prevTick) sorted = false;
+                prevTick = d.tick();
+                ordered.add(d);
+                uniquePositions.putIfAbsent(d.posKey(), new int[]{lx, ly, lz});
+            }
+            if (ordered.isEmpty()) return staticOnly(base);
+            if (!sorted) ordered.sort(Comparator.comparingInt(ReplayBlockDelta::tick));
+
+            // Group dynamic cells by section so untouched sections are shared by reference
+            Map<Long, List<long[]>> bySection = new HashMap<>();
+            for (var entry : uniquePositions.entrySet()) {
+                int[] loc = entry.getValue();
+                int wx = src.minX() + loc[0];
+                int wy = src.minY() + loc[1];
+                int wz = src.minZ() + loc[2];
+                int relX = Math.floorDiv(wx, 16) - src.minSectionX();
+                int relY = Math.floorDiv(wy, 16) - src.minSectionY();
+                int relZ = Math.floorDiv(wz, 16) - src.minSectionZ();
+                int cellIdx = ((wy & 15) << 8) | ((wz & 15) << 4) | (wx & 15);
+                long secKey = packSection(relX, relY, relZ);
+                bySection.computeIfAbsent(secKey, k -> new ArrayList<>())
+                        .add(new long[]{entry.getKey(), cellIdx, loc[0], loc[1], loc[2]});
+            }
+
+            Map<Long, ResolvedBlock> initials = new LinkedHashMap<>(uniquePositions.size());
+            List<SceneAssetCodec.SectionData> patchedSections = new ArrayList<>(base.sections.size());
+            for (SceneAssetCodec.SectionData sec : base.sections) {
+                long secKey = packSection(sec.relX, sec.relY, sec.relZ);
+                List<long[]> touches = bySection.get(secKey);
+                if (touches == null) {
+                    patchedSections.add(sec);
+                    continue;
+                }
+                short[] cloned = sec.blockIndices.clone();
+                for (long[] t : touches) {
+                    long posKey = t[0];
+                    int cellIdx = (int) t[1];
+                    int lx = (int) t[2], ly = (int) t[3], lz = (int) t[4];
+                    int pIdx = cellIdx >= 0 && cellIdx < cloned.length ? (cloned[cellIdx] & 0xFFFF) : 0;
+                    String stateStr = pIdx > 0 && pIdx < sec.palette.size()
+                            ? sec.palette.get(pIdx) : SceneAssetCodec.AIR_BLOCK_ID;
+                    initials.put(posKey, new ResolvedBlock(lx, ly, lz, stateStr, ReplayBlockDelta.REASON_OTHER));
+                    if (cellIdx >= 0 && cellIdx < cloned.length) {
+                        cloned[cellIdx] = 0; // Mask out so base mesh leaves adjacent faces closed
+                    }
+                }
+                patchedSections.add(new SceneAssetCodec.SectionData(
+                        sec.relX, sec.relY, sec.relZ, sec.palette, cloned, sec.skyLight, sec.blockLight));
+            }
+            // Any dynamic block in a previously-air section starts as air
+            for (var entry : uniquePositions.entrySet()) {
+                initials.putIfAbsent(entry.getKey(),
+                        new ResolvedBlock(entry.getValue()[0], entry.getValue()[1], entry.getValue()[2],
+                                SceneAssetCodec.AIR_BLOCK_ID, ReplayBlockDelta.REASON_OTHER));
+            }
+
+            SceneAssetCodec.AssetData stripped = new SceneAssetCodec.AssetData(
+                    base.formatVersion, base.dataVersion, base.dimensionId,
+                    base.sourceBounds, base.haloBounds, fingerprint, patchedSections, base.blockPayloads);
+            Map<Long, List<BlockChange>> changes = new HashMap<>(initials.size());
+            for (ReplayBlockDelta delta : ordered) {
+                var state = new ResolvedBlock(offX + delta.x(), offY + delta.y(), offZ + delta.z(),
+                        delta.blockState(), delta.reasonFlags());
+                changes.computeIfAbsent(delta.posKey(), key -> new ArrayList<>())
+                        .add(new BlockChange(delta.tick(), state));
+            }
+            Map<Long, BlockHistory> histories = new LinkedHashMap<>(initials.size());
+            for (var entry : initials.entrySet()) {
+                histories.put(entry.getKey(), new BlockHistory(entry.getValue(), changes.get(entry.getKey())));
+            }
+            return new DynamicWorld(stripped, List.copyOf(ordered), offX, offY, offZ, histories);
+        }
+
+        /** Static base asset with dynamic coordinates masked out (pass into {@link ReplayDioramaMesh#update}). */
+        SceneAssetCodec.AssetData staticAsset() { return staticAsset; }
+
+        boolean hasDynamics() { return !sortedDeltas.isEmpty(); }
+
+        boolean manages(int localX, int localY, int localZ) {
+            long key = packSection(localX - offsetX, localY - offsetY, localZ - offsetZ);
+            return histories.containsKey(key);
+        }
+
+        /** Count of deltas with {@code tick <= matchTick}, computed in O(log N). */
+        int revisionAt(double matchTick) {
+            int lo = 0, hi = sortedDeltas.size();
+            while (lo < hi) {
+                int mid = (lo + hi) >>> 1;
+                if (sortedDeltas.get(mid).tick() <= matchTick) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo;
+        }
+
+        /**
+         * Returns the exact state of every dynamic block at {@code matchTick}.
+         * Works identically for forward playback and arbitrary backward/forward Seek.
+         */
+        Map<Long, ResolvedBlock> resolveAt(double matchTick) {
+            if (sortedDeltas.isEmpty()) return Map.of();
+            int rev = revisionAt(matchTick);
+            if (rev == cachedRevision) return cachedStates;
+            Map<Long, ResolvedBlock> map = LinkedHashMap.newLinkedHashMap(histories.size());
+            for (var entry : histories.entrySet()) {
+                map.put(entry.getKey(), entry.getValue().at(matchTick));
+            }
+            cachedRevision = rev;
+            cachedStates = Collections.unmodifiableMap(map);
+            return cachedStates;
+        }
+
+        /**
+         * Renders all active non-air dynamic blocks (doors, windows, breakable walls) at {@code matchTick}
+         * in the exact same local source coordinate frame as the static {@link SceneMeshSet}.
+         */
+        void render(Minecraft mc, Matrix4f modelToCamera, MultiBufferSource buffers,
+                    double matchTick, int roofCutLayer, @Nullable ReplayFanCutaway fanCutaway, int packedLight) {
+            render(mc, modelToCamera, buffers, matchTick, roofCutLayer, fanCutaway, packedLight, null);
+        }
+
+        void render(Minecraft mc, Matrix4f modelToCamera, MultiBufferSource buffers, double matchTick,
+                    int roofCutLayer, @Nullable ReplayFanCutaway fanCutaway, int packedLight,
+                    @Nullable ReplayPovTerrain terrain) {
+            if (sortedDeltas.isEmpty() || mc == null) return;
+            Map<Long, ResolvedBlock> active = resolveAt(matchTick);
+            if (active.isEmpty()) return;
+            BlockRenderDispatcher dispatcher = mc.getBlockRenderer();
+            int fallbackLight = packedLight == 0 ? LightTexture.FULL_BRIGHT : packedLight;
+            PoseStack stack = new PoseStack();
+            for (var entry : active.entrySet()) {
+                ResolvedBlock rb = entry.getValue();
+                if (roofCutLayer > 0 && rb.localY() >= roofCutLayer) continue;
+                if (fanCutaway != null && fanCutaway.removes(rb.localX() + 0.5, rb.localY() + 0.5, rb.localZ() + 0.5)) {
+                    continue;
+                }
+                BlockState state = parsedCache.computeIfAbsent(rb.stateString(), SceneMeshBuilder::parseBlockState);
+                if (state == null || state.isAir() || state.getBlock() == Blocks.AIR) continue;
+                stack.pushPose();
+                stack.mulPose(modelToCamera);
+                stack.translate(rb.localX(), rb.localY(), rb.localZ());
+                int light = fallbackLight;
+                if (terrain != null) {
+                    var bounds = staticAsset.sourceBounds;
+                    var position = new BlockPos(bounds.minX() + rb.localX(), bounds.minY() + rb.localY(), bounds.minZ() + rb.localZ());
+                    light = terrain.lightAt(position.getX(), position.getY(), position.getZ(), fallbackLight);
+                    if (state.getBlock() instanceof DoorPartBlock doorBlock) {
+                        DoorBlockEntity door = replayDoors.get(entry.getKey());
+                        if (door == null || door.getBlockState() != state) {
+                            door = doorBlock.newBlockEntity(position, state) instanceof DoorBlockEntity blockEntity ? blockEntity : null;
+                            if (door != null) replayDoors.put(entry.getKey(), door);
+                        }
+                        if (door != null && ReplayPovTerrain.renderDoor(mc, door, stack, buffers,
+                                terrain.doorLight(position, fallbackLight))) {
+                            stack.popPose();
+                            continue;
+                        }
+                    }
+                }
+                // SRE SmallDoorBlock/DoorPartBlock uses a single static blockstate variant (BER animated in live world);
+                // rotate the leaf open by 90 degrees around its hinge edge when OPEN=true so open doors are visually unmistakable.
+                if (isSreOpenDoor(state)) {
+                    applyOpenDoorSwing(stack, state);
+                }
+                dispatcher.renderSingleBlock(state, stack, buffers, light, OverlayTexture.NO_OVERLAY);
+                stack.popPose();
+            }
+        }
+
+        private static boolean isSreOpenDoor(BlockState state) {
+            if (!state.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.OPEN)) return false;
+            if (!state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.OPEN)) return false;
+            return state.getBlock() instanceof io.wifi.starrailexpress.content.block.DoorPartBlock;
+        }
+
+        private static void applyOpenDoorSwing(PoseStack stack, BlockState state) {
+            net.minecraft.core.Direction facing = state.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING)
+                    ? state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING)
+                    : net.minecraft.core.Direction.NORTH;
+            // Pivot around the clockwise hinge edge of the door block and swing 88 degrees open
+            float hx = 0.5f + facing.getClockWise().getStepX() * 0.44f;
+            float hz = 0.5f + facing.getClockWise().getStepZ() * 0.44f;
+            stack.translate(hx, 0f, hz);
+            stack.mulPose(com.mojang.math.Axis.YP.rotationDegrees(88f));
+            stack.translate(-hx, 0f, -hz);
+        }
+
+        private static long packSection(int rx, int ry, int rz) {
+            return (((long) rx & 0x1FFFFFL) << 42) | (((long) rz & 0x1FFFFFL) << 21) | ((long) ry & 0x1FFFFFL);
+        }
     }
 
     static final class Slot {

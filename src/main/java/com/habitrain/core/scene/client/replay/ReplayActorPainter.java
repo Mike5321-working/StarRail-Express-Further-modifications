@@ -15,8 +15,10 @@ import org.joml.Matrix4f;
 import org.joml.Vector3f;
 
 /**
- * Participants on the diorama: two-layer 3D skin heads, faction / state rings, comet trails over a
- * faint full-history thread, and death / revival / disguise / psycho / sleep states.
+ * Participants on the diorama: complete two-layer 3D humanoid skin characters (head/body/arms/legs,
+ * capes, walk/sprint/sneak/crawl/sleep/hurt/aim/swing animations, 3D held items, disguise swaps
+ * with god-view violet phantom echoes), faction / state rings, Promo Tier-1 spotlight/dimming
+ * emphasis, and comet trails over a faint full-history thread.
  */
 final class ReplayActorPainter {
     private ReplayActorPainter() {}
@@ -28,32 +30,59 @@ final class ReplayActorPainter {
     private static int[] haloColors = new int[512];
 
     static void paint(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayActorSizing heads) {
+        paint(f, s, d, heads, null);
+    }
+
+    static void paint(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayActorSizing heads,
+                      @org.jetbrains.annotations.Nullable ReplayBoardHistoryCache history) {
         ReplayBoardModel model = f.model;
         ReplayStagePlan.Stage stage = f.stage;
         if (model == null || stage == null || stage.actors() <= 0.01) return;
         double t = f.replayTick;
-        double alpha = stage.actors() * s.fade();
+        double baseAlpha = stage.actors() * s.fade();
         boolean review = f.frame != null && (f.frame.phase() == ReplayTimeline.Phase.REVIEW || f.frame.phase() == ReplayTimeline.Phase.HONORS);
         float elemScale = s.scale() * (float) f.focus.zoom();
         VertexConsumer glow = f.glow();
-        float[] tmp = new float[3];
+        var scope = history == null ? null : f.activeMapScope();
         Vector3f trailPoint = new Vector3f();
         boolean singleFocus = f.focusPlayer != null;
+        ReplayFullPlayerRenderer.HighlightSpec highlight = f.highlight != null
+                ? f.highlight : ReplayFullPlayerRenderer.HighlightSpec.NONE;
+
         for (ReplayBoardModel.Actor actor : model.actors) {
-            ReplayTrackSampler.Pose pose = f.pose(actor);
-            if (pose.visible()) model.project(pose.x(), pose.y(), pose.z(), tmp);
             boolean focusedTrail = singleFocus && f.focusPlayer.equals(actor.p.id());
+            boolean mvpMode = f.mvpSpotlightActor != null;
+            boolean isMvp = mvpMode && f.mvpSpotlightActor.equals(actor.p.id());
+            if (mvpMode && !isMvp) continue; // Keep the MVP showcase stage focused solely on the champion without overlapping corpses.
+            ReplayTrackSampler.Pose pose = f.pose(actor);
+            var position = pose.visible() ? f.project(actor, heads) : null;
+            float actorDim = highlight.brightnessFor(actor.p.id());
+            double alpha = baseAlpha * actorDim;
+
             if (!singleFocus || focusedTrail) {
-                trails(f, d, actor, t, alpha, stage.history(), review, elemScale, pose, tmp, trailPoint, s.detail(), focusedTrail);
+                double trailAlpha = mvpMode ? (isMvp ? alpha * 0.22 : alpha * 0.05) : alpha;
+                if (trailAlpha > 0.015) {
+                    var live = pose.state() == ReplayTrackSampler.State.ALIVE ? position : null;
+                    if (history == null) {
+                        trails(f, glow, d, actor, t, trailAlpha, stage.history(), review, elemScale,
+                                live, trailPoint, s.detail(), focusedTrail);
+                    } else if (!history.emit(scope, actor.index)) {
+                        history.record(scope, actor.index, target -> trails(f, target, d, actor, t, trailAlpha,
+                                stage.history(), review, elemScale, live, trailPoint, s.detail(), false));
+                    }
+                }
             }
-            if (!pose.visible()) continue;
-            float size = heads.size(actor.p.id(), tmp[0], tmp[1], tmp[2]);
-            if (size <= 0) continue;
-            float x = tmp[0], y = tmp[1] + 0.006f, z = tmp[2];
+            if (position == null || position.size() <= 0) continue;
+            float size = position.size() * highlight.scaleFor(actor.p.id());
+            float x = position.x(), y = position.y() + 0.006f, z = position.z();
+            if (!heads.visible(x, y, z, size)) continue;
+            ReplayHeadSkins.rememberName(actor.p.id(), actor.p.name());
             boolean alive = pose.state() == ReplayTrackSampler.State.ALIVE;
             int ringColor = alive ? actor.color : ReplayPalette.GHOST;
             double ringA = alive ? 0.85 : 0.35;
             if (review && actor.p.winner()) ringColor = ReplayPalette.BRASS_LIGHT;
+            if (actorDim < 0.99f) ringColor = ReplayPalette.scale(ringColor, actorDim);
+
             ReplayDraw.ring(glow, d, x, y, z, size * 0.58f, size * 0.12f, 20, ReplayPalette.alpha(ringColor, ringA * alpha),
                     ReplayPalette.alpha(ringColor, ringA * 0.25 * alpha));
             if (focusedTrail) {
@@ -61,62 +90,89 @@ final class ReplayActorPainter {
                         ReplayPalette.alpha(ReplayPalette.FOCUS_TRAIL, 0.9 * alpha),
                         ReplayPalette.alpha(ReplayPalette.FOCUS_TRAIL_GLOW, 0.25 * alpha));
             }
+            if (highlight.isFocused(actor.p.id()) && highlight.spotlightRing()) {
+                ReplayFullPlayerRenderer.emitSpotlightAura(glow, d, x, y, z, size * 0.96f, size * 2.4f,
+                        actor.factionColor(), f.anim, baseAlpha);
+            }
             ReplayDraw.disc(glow, d, x, y - 0.001f, z, size * 0.5f, 16, ReplayPalette.alpha(ringColor, 0.18 * alpha),
                     ReplayPalette.alpha(ringColor, 0));
-            if (alive) aliveActor(f, s, d, actor, pose, x, y, z, alpha, elemScale, size);
-            else deadActor(f, s, d, actor, pose, x, y, z, alpha, elemScale, size);
+            if (alive) aliveActor(f, s, d, actor, pose, x, y, z, alpha, actorDim, elemScale, size);
+            else deadActor(f, s, d, actor, pose, x, y, z, alpha, actorDim, elemScale, size);
         }
     }
 
     private static void aliveActor(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayBoardModel.Actor actor,
-                                   ReplayTrackSampler.Pose pose, float x, float y, float z, double alpha, float elemScale, float size) {
+                                   ReplayTrackSampler.Pose pose, float x, float y, float z,
+                                   double alpha, float brightness, float elemScale, float size) {
         ReplayBoardModel model = f.model;
         VertexConsumer glow = f.glow();
-        double moving = Math.min(1, pose.speed() / 0.12);
-        float bob = (float) (Math.abs(Math.sin(f.anim * 9.0 + actor.index * 1.7)) * size * 0.15 * moving);
-        float hy = y + ReplayActorSizing.centerOffset(size) + bob;
-        float yaw = (model.rotated ? 90f : 0f) - pose.yaw();
-        double revive = pose.revived() ? ReplayStagePlan.pulse(f.replayTick - pose.stateSince(),
-                ReplayStagePlan.effectWindow(1.0, model.rate)) : 0;
-        float lift = (float) (revive * size * 0.67);
-        int tint = 0xFFFFFFFF;
-        hy += lift;
-        head(f, d, actor, x, hy, z, yaw, size, tint, alpha);
+        double revive = (pose.revived() && model.hasRevivalNear(actor.p.id(), pose.stateSince()))
+                ? ReplayStagePlan.pulse(f.replayTick - pose.stateSince(), ReplayStagePlan.effectWindow(1.0, model.rate))
+                : 0;
+        float lift = (float) (revive * size * 0.55);
+        int tint = ReplayPalette.alpha(ReplayPalette.scale(0xFFFFFFFF, brightness), alpha);
+        float yawOffset = model.rotated ? 90f : 0f;
+
+        if (f.fullBodyCharacters) {
+            ReplayFullPlayerRenderer.PoseSpec spec = ReplayFullPlayerRenderer.poseFrom(model, actor, pose, f.replayTick);
+            float charScale = size * 0.92f;
+            Matrix4f m = new Matrix4f(d).translate(x, y + lift, z);
+            f.model(m, stack -> ReplayFullPlayerRenderer.renderCharacter(
+                    stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
+                    tint, LightTexture.FULL_BRIGHT, 1.18f, true));
+        } else {
+            double moving = Math.min(1, pose.speed() / 0.12);
+            float bob = (float) (Math.abs(Math.sin(f.anim * 9.0 + actor.index * 1.7)) * size * 0.15 * moving);
+            float hy = y + ReplayActorSizing.centerOffset(size) + bob + lift;
+            float yaw = yawOffset - pose.yaw();
+            head(f, d, actor, x, hy, z, yaw, size, tint, alpha);
+        }
+
+        float topY = y + lift + (f.fullBodyCharacters ? size * 1.95f : ReplayActorSizing.centerOffset(size) + size * 0.9f);
         if (revive > 0) {
             ReplayDraw.column(glow, d, x, y, z, 0.45f, 0.06f, ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.7 * revive * alpha),
                     ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0));
             ReplayDraw.ring(glow, d, x, y + 0.002f, z, (float) (0.08 + (1 - revive) * 0.18), 0.02f, 24,
                     ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, revive * alpha), ReplayPalette.alpha(ReplayPalette.BRASS, 0));
         }
-        if (pose.has(LastMatchReplay.DISGUISED)) {
-            float wob = (float) Math.sin(f.anim * 3 + actor.index) * size * 0.1f;
-            head(f, d, actor, x + size * 0.375f + wob, hy + size * 0.21f, z - size * 0.25f, yaw + 12,
-                    size * 1.05f, 0xFFB46CFF, alpha * 0.38);
+        boolean disguised = pose.has(LastMatchReplay.DISGUISED) || pose.hasStatus(LastMatchReplay.STATUS_DISGUISED);
+        if (disguised) {
             ReplayDraw.ring(glow, d, x, y + 0.003f, z, size * 0.79f, size * 0.083f, 20, ReplayPalette.alpha(ReplayPalette.DISGUISE, 0.7 * alpha),
                     ReplayPalette.alpha(ReplayPalette.DISGUISE, 0.1 * alpha));
-            Vector3f badge = d.transformPosition(x + size * 0.6f, hy + size * 0.75f, z, new Vector3f());
+            Vector3f badge = d.transformPosition(x + size * 0.55f, topY - size * 0.12f, z, new Vector3f());
             ReplayDraw.billboard(glow, badge, f.right, f.up, size * 0.17f * elemScale, size * 0.17f * elemScale,
                     ReplayPalette.alpha(ReplayPalette.DISGUISE, 0.9 * alpha));
         }
-        boolean psycho = pose.has(LastMatchReplay.PSYCHO) || model.psychoAt(actor.p.id(), f.replayTick);
+        if (pose.hasStatus(LastMatchReplay.STATUS_SHIELDED)) {
+            ReplayDraw.ring(glow, d, x, y + size * 0.85f, z, size * 0.62f, size * 0.07f, 20,
+                    ReplayPalette.alpha(ReplayPalette.SHIELD, 0.72 * alpha), ReplayPalette.alpha(ReplayPalette.SHIELD, 0.1 * alpha));
+        }
+        if (pose.hasStatus(LastMatchReplay.STATUS_MUTED)) {
+            ReplayDraw.ring(glow, d, x, y + size * 1.35f, z, size * 0.50f, size * 0.06f, 18,
+                    ReplayPalette.alpha(0xFF8B5CF6, 0.78 * alpha), ReplayPalette.alpha(0xFF8B5CF6, 0.08 * alpha));
+        }
+        boolean psycho = pose.has(LastMatchReplay.PSYCHO) || pose.hasStatus(LastMatchReplay.STATUS_PSYCHO)
+                || model.psychoAt(actor.p.id(), f.replayTick);
         if (psycho) {
-            Vector3f c = d.transformPosition(x, hy, z, new Vector3f());
+            float midY = y + size * 0.95f;
+            Vector3f c = d.transformPosition(x, midY, z, new Vector3f());
             for (int i = 0; i < 6; i++) {
                 double ph = f.anim * 6 + i * 1.3 + actor.index;
                 float ox = (float) Math.cos(i * 1.05 + f.anim) * size * 0.55f;
                 float oz = (float) Math.sin(i * 1.05 + f.anim) * size * 0.55f;
-                float h = (float) (0.42 + 0.33 * Math.abs(Math.sin(ph))) * size;
-                Vector3f p = d.transformPosition(x + ox, hy - size * 0.3f + h * 0.5f, z + oz, new Vector3f());
-                ReplayDraw.billboard(glow, p, f.right, f.up, size * 0.15f * elemScale, h * elemScale,
-                        ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.45 * alpha));
+                float h = (float) (0.48 + 0.36 * Math.abs(Math.sin(ph))) * size;
+                Vector3f p = d.transformPosition(x + ox, y + h * 0.5f, z + oz, new Vector3f());
+                ReplayDraw.softBillboard(glow, p, f.right, f.up, size * 0.20f * elemScale, h * 1.1f * elemScale,
+                        ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.48 * alpha), 0.35f, 0.9f);
             }
-            ReplayDraw.billboard(glow, c, f.right, f.up, size * 0.95f * elemScale, size * 0.95f * elemScale, ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.18 * alpha));
+            ReplayDraw.softBillboard(glow, c, f.right, f.up, size * 1.05f * elemScale, size * 1.05f * elemScale,
+                    ReplayPalette.alpha(ReplayPalette.PSYCHO, 0.22 * alpha), 0.45f, 1.1f);
         }
         if (s.detail() && !f.video) {
-            Vector3f top = d.transformPosition(x, hy + size * 0.9f, z, new Vector3f());
+            Vector3f top = d.transformPosition(x, topY, z, new Vector3f());
             float dist = top.length();
             float distScale = Math.max(1f, s.scale());
-            if (pose.has(LastMatchReplay.ASLEEP)) {
+            if (pose.has(LastMatchReplay.ASLEEP) || pose.hasStatus(LastMatchReplay.STATUS_ASLEEP)) {
                 f.billboardText(new Vector3f(top).add(0, 0.03f * elemScale, 0), Component.literal("z Z"), 0.0035f * elemScale,
                         ReplayPalette.alpha(ReplayPalette.PASSENGER, alpha));
             } else if (dist < 6.5f * distScale && f.stage.history() < 0.5) {
@@ -127,48 +183,71 @@ final class ReplayActorPainter {
     }
 
     private static void deadActor(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayBoardModel.Actor actor,
-                                  ReplayTrackSampler.Pose pose, float x, float y, float z, double alpha, float elemScale, float size) {
+                                  ReplayTrackSampler.Pose pose, float x, float y, float z,
+                                  double alpha, float brightness, float elemScale, float size) {
         ReplayBoardModel model = f.model;
         double window = ReplayStagePlan.effectWindow(0.9, model.rate);
         double age = f.replayTick - pose.stateSince();
-        float yaw = (model.rotated ? 90f : 0f) - pose.yaw();
+        float yawOffset = model.rotated ? 90f : 0f;
+        float yaw = yawOffset - pose.yaw();
         VertexConsumer glow = f.glow();
         if (age >= 0 && age < window) {
             double k = ReplayStagePlan.easeOutCubic(age / window);
-            float drop = (float) (k * size * 0.58);
-            float fallen = (float) (size * (1 - 0.35 * k));
-            float center = y + ReplayActorSizing.centerOffset(size) - drop;
-            head(f, d, actor, x, center, z, yaw + (float) (k * 70), fallen, 0xFFFF8080, alpha * (1 - 0.6 * k));
-            Vector3f c = d.transformPosition(x, center, z, new Vector3f());
+            if (f.fullBodyCharacters) {
+                ReplayFullPlayerRenderer.PoseSpec spec = ReplayFullPlayerRenderer.poseFrom(model, actor, pose, f.replayTick);
+                float charScale = size * 0.72f;
+                int tint = ReplayPalette.alpha(ReplayPalette.lerp(0xFFFFFFFF, 0xFFFF7070, 1.0 - k * 0.5), alpha * (1.0 - 0.35 * k));
+                Matrix4f m = new Matrix4f(d).translate(x, y, z);
+                f.model(m, stack -> ReplayFullPlayerRenderer.renderCharacter(
+                        stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
+                        tint, LightTexture.FULL_BRIGHT, 1.10f, true));
+            } else {
+                float drop = (float) (k * size * 0.58);
+                float fallen = (float) (size * (1 - 0.35 * k));
+                float center = y + ReplayActorSizing.centerOffset(size) - drop;
+                head(f, d, actor, x, center, z, yaw + (float) (k * 70), fallen, 0xFFFF8080, alpha * (1 - 0.6 * k));
+            }
+            Vector3f c = d.transformPosition(x, y + size * 0.5f, z, new Vector3f());
             if (s.detail()) {
                 ReplayDraw.star(glow, c, f.right, f.up, (float) (0.42 + k) * size * elemScale, 8, (float) (k * 2),
                         ReplayPalette.alpha(ReplayPalette.RUBY, (1 - k) * alpha), ReplayPalette.alpha(ReplayPalette.RUBY, 0));
             }
             return;
         }
-        // tombstone
-        VertexConsumer fill = f.fill();
-        int stone = ReplayPalette.alpha(0xFF6E7380, 0.85 * alpha), stoneTop = ReplayPalette.alpha(0xFF9AA0AE, 0.85 * alpha);
-        Matrix4f tm = new Matrix4f(d).translate(x, y, z).rotateY((float) Math.toRadians(yaw));
-        float w = size * 0.23f, h = size * 0.5f, t = size * 0.1f;
-        ReplayDraw.rectXY(fill, tm, -w, 0, w, h, t, stoneTop, stone);
-        ReplayDraw.rectXY(fill, tm, -w, 0, w, h, -t, stoneTop, stone);
-        ReplayDraw.quad(fill, tm, -w, h, -t, w, h, -t, w, h, t, -w, h, t, stoneTop, stoneTop, stoneTop, stoneTop);
-        ReplayDraw.quad(fill, tm, -w, 0, -t, -w, 0, t, -w, h, t, -w, h, -t, stone, stone, stoneTop, stoneTop);
-        ReplayDraw.quad(fill, tm, w, 0, -t, w, 0, t, w, h, t, w, h, -t, stone, stone, stoneTop, stoneTop);
-        int cross = ReplayPalette.alpha(ReplayPalette.GHOST, 0.75 * alpha);
-        ReplayDraw.rectXY(fill, tm, -w * 0.14f, h * 0.35f, w * 0.14f, h * 0.85f, t + 0.001f, cross, cross);
-        ReplayDraw.rectXY(fill, tm, -w * 0.5f, h * 0.62f, w * 0.5f, h * 0.7f, t + 0.001f, cross, cross);
-        // translucent ghost
+        // Fallen full-body silhouette on ground + subtle Art Deco ghost indicator
+        if (f.fullBodyCharacters) {
+            ReplayFullPlayerRenderer.PoseSpec spec = ReplayFullPlayerRenderer.poseFrom(model, actor, pose, f.replayTick);
+            float charScale = size * 0.68f;
+            int corpseTint = ReplayPalette.alpha(ReplayPalette.scale(0xFFD6DCE8, brightness), 0.78 * alpha);
+            Matrix4f m = new Matrix4f(d).translate(x, y, z);
+            f.model(m, stack -> ReplayFullPlayerRenderer.renderCharacter(
+                    stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
+                    corpseTint, LightTexture.FULL_BRIGHT, 1.06f, true));
+        } else {
+            // Legacy tombstone fallback
+            VertexConsumer fill = f.fill();
+            int stone = ReplayPalette.alpha(0xFF6E7380, 0.85 * alpha), stoneTop = ReplayPalette.alpha(0xFF9AA0AE, 0.85 * alpha);
+            Matrix4f tm = new Matrix4f(d).translate(x, y, z).rotateY((float) Math.toRadians(yaw));
+            float w = size * 0.23f, h = size * 0.5f, t = size * 0.1f;
+            ReplayDraw.rectXY(fill, tm, -w, 0, w, h, t, stoneTop, stone);
+            ReplayDraw.rectXY(fill, tm, -w, 0, w, h, -t, stoneTop, stone);
+            ReplayDraw.quad(fill, tm, -w, h, -t, w, h, -t, w, h, t, -w, h, t, stoneTop, stoneTop, stoneTop, stoneTop);
+            ReplayDraw.quad(fill, tm, -w, 0, -t, -w, 0, t, -w, h, t, -w, h, -t, stone, stone, stoneTop, stoneTop);
+            ReplayDraw.quad(fill, tm, w, 0, -t, w, 0, t, w, h, t, w, h, -t, stone, stone, stoneTop, stoneTop);
+            int cross = ReplayPalette.alpha(ReplayPalette.GHOST, 0.75 * alpha);
+            ReplayDraw.rectXY(fill, tm, -w * 0.14f, h * 0.35f, w * 0.14f, h * 0.85f, t + 0.001f, cross, cross);
+            ReplayDraw.rectXY(fill, tm, -w * 0.5f, h * 0.62f, w * 0.5f, h * 0.7f, t + 0.001f, cross, cross);
+        }
+        // Translucent hovering ghost head above fallen player
         float floatY = (float) (1.15 + Math.sin(f.anim * 1.6 + actor.index) * 0.1) * size;
-        head(f, d, actor, x, y + floatY, z, yaw, size * 0.8f, 0xFFB9C3D9, alpha * 0.32);
+        head(f, d, actor, x, y + floatY, z, yaw, size * 0.68f, 0xFFB9C3D9, alpha * 0.28);
     }
 
-    /** Two-layer skin head (8x8x8 + 1.125x hat) centred at a diorama-frame point. */
+    /** Two-layer skin head (8x8x8 + 1.125x hat) centred at a diorama-frame point (also used by Honors podium). */
     static void head(ReplayFrame f, Matrix4f frame, ReplayBoardModel.Actor actor, float x, float y, float z, float yawDeg,
                      float size, int tint, double alpha) {
         if (alpha <= 0.02) return;
-        ResourceLocation skin = ReplayHeadSkins.texture(actor.p.id());
+        ResourceLocation skin = ReplayHeadSkins.skin(actor.p.id(), actor.p.name()).texture();
         Matrix4f m = new Matrix4f(frame).translate(x, y, z).rotateY((float) Math.toRadians(yawDeg)).scale(size);
         int color = ReplayPalette.alpha(tint, alpha);
         f.model(m, stack -> drawHead(f, stack, skin, color));
@@ -210,20 +289,20 @@ final class ReplayActorPainter {
 
     // ------------------------------------------------------------------ trails
 
-    private static void trails(ReplayFrame f, Matrix4f d, ReplayBoardModel.Actor actor, double t, double alpha,
-                               double history, boolean review, float elemScale, ReplayTrackSampler.Pose live,
-                               float[] livePosition, Vector3f tmp, boolean detail, boolean focused) {
+    private static void trails(ReplayFrame f, VertexConsumer glow, Matrix4f d, ReplayBoardModel.Actor actor, double t, double alpha,
+                               double history, boolean review, float elemScale,
+                               @org.jetbrains.annotations.Nullable ReplayFrame.ActorProjection livePosition,
+                               Vector3f tmp, boolean detail, boolean focused) {
         ReplayTrackSampler track = actor.track;
         int last = track.indexAt(t);
         if (last < 0) return;
         ReplayBoardModel model = f.model;
-        VertexConsumer glow = f.glow();
         VertexConsumer fill = focused ? f.fill() : null;
         double cometStart = t - model.comet;
         boolean videoReview = f.video && f.frame != null && f.frame.phase() == ReplayTimeline.Phase.REVIEW;
         double baseA = alpha * (videoReview ? 0.22 + 0.58 * history : (0.13 + 0.32 * history) * (review ? 1.2 : 1));
-        int base = actor.color;
-        boolean appendLive = live.state() == ReplayTrackSampler.State.ALIVE;
+        int base = ReplayPalette.scale(actor.color, 0.85);
+        int tip = ReplayPalette.lerp(actor.color, 0xFFFFFFFF, 0.35);
         int recent = Math.max(0, track.indexAt(cometStart));
         int first = detail || focused ? 0 : recent;
         int stride = f.video ? 1 : Math.max(1, (recent + 95) / 96);
@@ -231,13 +310,12 @@ final class ReplayActorPainter {
         float yLift = focused ? 0.014f : 0.012f;
         int n = 0;
         int cap = widths.length - 1;
-        for (int i = first; i <= last; i++) {
+        for (int i = first; i <= last; i = actor.nextTrailPoint(i, recent, stride)) {
             boolean startsSegment = i == first || !track.connects(i);
             if (startsSegment) {
                 if (n >= 2) emitTrail(fill, glow, n, focused);
                 n = 0;
             }
-            if (!startsSegment && i < recent && i % stride != 0 && track.connects(i + 1)) continue;
             if (n >= cap) {
                 emitTrail(fill, glow, n, focused);
                 int o = (n - 1) * 3;
@@ -252,27 +330,27 @@ final class ReplayActorPainter {
             if (focused) {
                 putFocused(n++, tmp, track.tick(i), cometStart, t, alpha, videoReview, trailScale);
             } else {
-                put(n++, tmp, track.tick(i), cometStart, t, baseA, base, alpha, trailScale);
+                put(n++, tmp, track.tick(i), cometStart, t, baseA, base, tip, alpha, trailScale);
             }
         }
-        if (appendLive && n >= 1) {
-            d.transformPosition(livePosition[0], livePosition[1] + yLift, livePosition[2], tmp);
+        if (livePosition != null && n >= 1) {
+            d.transformPosition(livePosition.x(), livePosition.y() + yLift, livePosition.z(), tmp);
             if (focused) {
                 putFocused(n++, tmp, t, cometStart, t, alpha, videoReview, trailScale);
             } else {
-                put(n++, tmp, t, cometStart, t, baseA, base, alpha, trailScale);
+                put(n++, tmp, t, cometStart, t, baseA, base, tip, alpha, trailScale);
             }
         }
         if (n >= 2) emitTrail(fill, glow, n, focused);
     }
 
-    private static void put(int index, Vector3f p, double tick, double cometStart, double t, double baseA, int color,
+    private static void put(int index, Vector3f p, double tick, double cometStart, double t, double baseA, int base, int tip,
                             double alpha, float elemScale) {
         int o = index * 3;
         points[o] = p.x; points[o + 1] = p.y; points[o + 2] = p.z;
         double comet = tick >= cometStart ? (tick - cometStart) / Math.max(1, t - cometStart) : 0;
         double a = baseA + comet * comet * 0.85 * alpha;
-        int c = ReplayPalette.lerp(ReplayPalette.scale(color, 0.85), ReplayPalette.lerp(color, 0xFFFFFFFF, 0.35), comet);
+        int c = comet == 0 ? base : ReplayPalette.lerp(base, tip, comet);
         colors[index] = ReplayPalette.alpha(c, a);
         widths[index] = (float) (0.010 + 0.022 * comet) * elemScale;
     }

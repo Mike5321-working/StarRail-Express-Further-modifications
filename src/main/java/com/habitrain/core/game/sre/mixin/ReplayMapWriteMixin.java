@@ -17,4 +17,15 @@ abstract class ReplayMapWriteMixin {
         LevelChunk chunk = (LevelChunk) (Object) this;
         if (chunk.getLevel() instanceof ServerLevel level) MatchReplayRecorder.beforeBlockWrite(level, chunk, pos);
     }
+
+    @Inject(method = "setBlockState", at = @At("RETURN"))
+    private void habitrain$captureDynamicBlockDelta(BlockPos pos, BlockState state, boolean moving, CallbackInfoReturnable<BlockState> cir) {
+        BlockState previous = cir.getReturnValue();
+        if (previous != null && !previous.equals(state)) {
+            LevelChunk chunk = (LevelChunk) (Object) this;
+            if (chunk.getLevel() instanceof ServerLevel level) {
+                MatchReplayRecorder.afterBlockWrite(level, pos, previous, state);
+            }
+        }
+    }
 }

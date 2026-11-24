@@ -82,14 +82,14 @@ public final class SceneShaders {
         @Override public void close() { bounds = previous; }
     }
 
-    private static ReplayFanCutaway fans;
+    private static ReplayFanCutaway.ShaderFans fans;
 
     /** Scoped to one board: its display transform determines the viewer-facing fan direction. */
-    public static FanScope fans(ReplayFanCutaway next) { return new FanScope(next); }
+    public static FanScope fans(ReplayFanCutaway.ShaderFans next) { return new FanScope(next); }
 
     public static final class FanScope implements AutoCloseable {
-        private final ReplayFanCutaway previous = fans;
-        private FanScope(ReplayFanCutaway next) { fans = next; }
+        private final ReplayFanCutaway.ShaderFans previous = fans;
+        private FanScope(ReplayFanCutaway.ShaderFans next) { fans = next; }
         @Override public void close() { fans = previous; }
     }
 
@@ -106,7 +106,7 @@ public final class SceneShaders {
         if (fanCount > 0) {
             terrain.safeGetUniform("ReplayFanAnchors").set(fans.anchors());
             terrain.safeGetUniform("ReplayFanView").set(fans.directionX(), fans.directionZ(),
-                    ReplayFanCutaway.HALF_ANGLE_TANGENT, 0f);
+                    ReplayFanCutaway.HALF_ANGLE_TANGENT, ReplayFanCutaway.EDGE_WIDTH);
         }
         terrain.safeGetUniform("SceneLightFloor").set(LightTexture.block(minimumLight) << 4,
                 LightTexture.sky(minimumLight) << 4);

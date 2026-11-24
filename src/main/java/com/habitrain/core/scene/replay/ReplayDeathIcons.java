@@ -29,25 +29,29 @@ public final class ReplayDeathIcons {
         String ns = colon >= 0 ? id.substring(0, colon) : "";
         String path = colon >= 0 ? id.substring(colon + 1) : id;
         if (path.contains("backfire") || path.contains("mistake")) return Icon.BACKFIRE;
-        if (path.contains("throwing_knife") || path.contains("throwing_axe")) return Icon.THROWING_KNIFE;
+        if (path.contains("throwing_knife") || path.contains("throwing_axe") || path.contains("flying_axe")) return Icon.THROWING_KNIFE;
         if (path.contains("shuriken")) return Icon.SHURIKEN;
-        if (path.contains("knife") || path.contains("stab") || path.contains("execution")) return Icon.KNIFE;
+        if (path.contains("knife") || path.contains("stab") || path.contains("execution") || path.contains("blade")) return Icon.KNIFE;
         if (path.contains("derringer")) return Icon.DERRINGER;
-        if (path.contains("sniper")) return Icon.SNIPER;
-        if (path.contains("shotgun")) return Icon.SHOTGUN;
-        if (path.contains("revolver") || path.contains("gun") || path.endsWith("_shot") || path.startsWith("shot")) return Icon.REVOLVER;
-        if (path.contains("grenade")) return Icon.GRENADE;
+        if (path.contains("sniper") || path.contains("awm") || path.contains("m24") || path.contains("barrett")) return Icon.SNIPER;
+        if (path.contains("shotgun") || path.contains("spas") || path.contains("m870") || path.contains("db_")) return Icon.SHOTGUN;
+        if (ns.equals("tacz") || path.contains("revolver") || path.contains("gun") || path.contains("rifle")
+                || path.contains("pistol") || path.contains("smg") || path.contains("bullet")
+                || path.endsWith("_shot") || path.startsWith("shot")) return Icon.REVOLVER;
+        if (path.contains("grenade") || path.contains("molotov") || path.contains("incendiary")
+                || path.contains("flash") || path.contains("slime")) return Icon.GRENADE;
         if (path.contains("bomb") || path.contains("explo") || path.contains("c4") || path.contains("creeper")
-                || path.contains("detonat")) return Icon.EXPLOSION;
-        if (path.contains("poison") || path.contains("toxic") || path.contains("gas")) return Icon.POISON;
-        if (path.contains("bat") || path.contains("nunchuck") || path.contains("axe") || path.contains("crush")) return Icon.BAT;
-        if (path.contains("arrow") || path.contains("trident")) return Icon.ARROW;
+                || path.contains("detonat") || path.contains("mine")) return Icon.EXPLOSION;
+        if (path.contains("poison") || path.contains("toxic") || path.contains("gas") || path.contains("chlorine")) return Icon.POISON;
+        if (path.contains("bat") || path.contains("nunchuck") || path.contains("axe") || path.contains("crush")
+                || path.contains("crowbar")) return Icon.BAT;
+        if (path.contains("arrow") || path.contains("trident") || path.contains("bolt")) return Icon.ARROW;
         if (path.contains("fell") || path.contains("fall")) return Icon.FALL;
         if (ns.equals("habitrain_core") || path.contains("sin_") || path.contains("wrath") || path.contains("lust")
                 || path.contains("envy") || path.contains("greed") || path.contains("pride") || path.contains("sloth")
                 || path.contains("gluttony")) return Icon.SIN;
         if (path.contains("voodoo") || path.contains("curse") || path.contains("heart_attack") || path.contains("god")
-                || path.contains("magic") || path.contains("usurp")) return Icon.MAGIC;
+                || path.contains("magic") || path.contains("usurp") || path.contains("ritual")) return Icon.MAGIC;
         return Icon.SKULL;
     }
 
@@ -66,7 +70,7 @@ public final class ReplayDeathIcons {
             case POISON -> List.of("starrailexpress:poison_vial", "noellesroles:toilet_poison", "minecraft:potion");
             case ARROW -> List.of("minecraft:arrow");
             case SHURIKEN -> List.of("noellesroles:ninja_shuriken", "minecraft:nether_star");
-            case FALL -> List.of("minecraft:feather");
+            case FALL -> List.of("minecraft:minecart", "minecraft:iron_boots");
             case SIN -> List.of("minecraft:wither_rose");
             case BACKFIRE -> List.of("starrailexpress:revolver", "minecraft:flint_and_steel");
             case MAGIC -> List.of("minecraft:amethyst_shard");

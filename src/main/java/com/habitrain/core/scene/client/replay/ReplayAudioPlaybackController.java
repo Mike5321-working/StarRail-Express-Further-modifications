@@ -1,10 +1,13 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
-import com.habitrain.core.api.match.replay.ReplayTimeline;
+import com.habitrain.core.api.match.replay.ReplayGameSoundData;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
+import com.habitrain.core.scene.replay.ReplayTrackSampler;
+import com.habitrain.core.scene.replay.ReplayVoiceAudibilityResolver;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
+import com.habitrain.core.scene.replay.ReplayWsolaTimeStretch;
 import net.fabricmc.fabric.api.client.sound.v1.FabricSoundInstance;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.resources.sounds.AbstractTickableSoundInstance;
@@ -32,251 +35,500 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Plays synchronized weapon/item game sounds and server-recorded proximity voice clips during live
- * 3D {@code SettlementSummaryBoard} playback and {@link ReplayHistoryScreen} linear previewing.
+ * Multi-speaker concurrent spatial audio &amp; game-sound playback pool for both live 3D
+ * {@code SettlementSummaryBoard} linear sessions and {@link ReplayHistoryScreen} previews.
+ *
+ * <p>Replaces the legacy single-{@code activeVoice} slot that truncated overlapping speakers:
+ * up to {@link #MAX_CONCURRENT_VOICES} simultaneous utterances play concurrently through OpenAL,
+ * filtered via {@link ReplayVoiceAudibilityResolver} when following a player and pitch-preserved
+ * via {@link ReplayWsolaTimeStretch} at {@code 0.5x / 2x / 4x} playback speeds.</p>
  */
 public final class ReplayAudioPlaybackController {
     static final float REPLAY_GAIN = 0.60f;
+    static final int MAX_CONCURRENT_VOICES = 12;
+    private static final int MAX_PLAYING_EFFECTS = 24;
     private static final ResourceLocation BOARD_VOICE_ID = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_voice");
     private static final ResourceLocation REPLAY_EFFECT_ID = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_effect");
-    private static final int MAX_PLAYING_EFFECTS = 16;
     private static final double TICKS_PER_SECOND = 20.0;
+    private static final double MS_PER_TICK = 50.0;
     private static final int VOICE_RATE = ReplayVoiceData.VOICECHAT_SAMPLE_RATE;
 
-    private static final Map<BlockPos, BoardState> BOARDS = new HashMap<>();
-    private static @Nullable HistoryState history;
+    private static final Map<BlockPos, PlaybackPool> BOARDS = new HashMap<>();
+    private static @Nullable PlaybackPool history;
 
     private ReplayAudioPlaybackController() {}
 
-    private static final class BoardState {
-        UUID roundId;
+    private record ActiveVoice(Object key, @Nullable UUID speakerId, float gain, boolean isSelf,
+                               VoiceClipSoundInstance instance) {}
+
+    private static final class PlaybackPool {
+        @Nullable UUID roundId;
+        @Nullable LastMatchReplay replay;
         ReplayVoiceData voice = ReplayVoiceData.EMPTY;
-        ReplaySoundCuePlan.Schedule schedule = ReplaySoundCuePlan.Schedule.EMPTY;
-        double prevActionTick = -1.0;
-        int nextSoundIdx;
-        int nextVoiceIdx;
+        @Nullable ReplayVoiceAudibilityResolver.Context audibility;
+        ReplaySoundCuePlan.Schedule legacySchedule = ReplaySoundCuePlan.Schedule.EMPTY;
+        double prevMatchTick = -1.0;
+        float prevSpeed = 1.0f;
+        @Nullable UUID prevFollow;
+        int nextLegacySoundIdx;
+        int nextLegacyVoiceIdx;
         final ArrayDeque<ReplayEffectSound> effects = new ArrayDeque<>();
-        @Nullable VoiceClipSoundInstance activeVoice;
+        final List<ActiveVoice> activeVoices = new ArrayList<>();
+        final Map<ReplayVoiceData.VoiceUtterance, Long> startedUtterances = new IdentityHashMap<>();
+
+        void ensureLoaded(Minecraft mc, LastMatchReplay nextReplay, ReplayVoiceData nextVoice) {
+            boolean newRound = !nextReplay.roundId().equals(roundId) || replay != nextReplay;
+            boolean newVoice = voice != nextVoice;
+            if (!newRound && !newVoice) return;
+            if (newRound) {
+                stopAll(mc);
+                roundId = nextReplay.roundId();
+                replay = nextReplay;
+                prevMatchTick = -1.0;
+            }
+            voice = nextVoice;
+            audibility = ReplayVoiceAudibilityResolver.Context.of(nextReplay, nextVoice);
+            if (nextReplay.gameSounds().isEmpty() || !nextVoice.hasMultitrack()) {
+                legacySchedule = ReplaySoundCuePlan.forLinearReplay(nextReplay, nextVoice,
+                        file -> mc.getResourceManager().getResource(file).isPresent());
+            } else {
+                legacySchedule = ReplaySoundCuePlan.Schedule.EMPTY;
+            }
+            if (prevMatchTick >= 0) {
+                nextLegacySoundIdx = firstSoundAfter(legacySchedule.sounds(), prevMatchTick);
+                nextLegacyVoiceIdx = firstVoiceAtOrAfter(legacySchedule.voices(), prevMatchTick);
+            } else {
+                nextLegacySoundIdx = 0;
+                nextLegacyVoiceIdx = 0;
+            }
+        }
+
+        void pruneFinished(Minecraft mc) {
+            SoundManager manager = mc.getSoundManager();
+            Iterator<ActiveVoice> it = activeVoices.iterator();
+            while (it.hasNext()) {
+                ActiveVoice v = it.next();
+                if (v.instance().isStopped() || !manager.isActive(v.instance())) {
+                    it.remove();
+                }
+            }
+            effects.removeIf(e -> !manager.isActive(e));
+        }
+
+        void stopAll(@Nullable Minecraft mc) {
+            for (ActiveVoice v : activeVoices) {
+                v.instance().stopClip();
+                if (mc != null && mc.getSoundManager() != null) {
+                    mc.getSoundManager().stop(v.instance());
+                }
+            }
+            activeVoices.clear();
+            startedUtterances.clear();
+            stopEffects(mc, effects);
+        }
+
+        boolean isPlayingKey(Object key) {
+            for (ActiveVoice v : activeVoices) {
+                if (v.key() == key) return true;
+            }
+            return false;
+        }
     }
 
-    private static final class HistoryState {
-        UUID roundId;
-        ReplayVoiceData voice = ReplayVoiceData.EMPTY;
-        ReplaySoundCuePlan.Schedule schedule = ReplaySoundCuePlan.Schedule.EMPTY;
-        double prevCursor = -1.0;
-        int nextSoundIdx;
-        int nextVoiceIdx;
-        final ArrayDeque<ReplayEffectSound> effects = new ArrayDeque<>();
-        @Nullable VoiceClipSoundInstance activeVoice;
-    }
+    // ------------------------------------------------------------------ 3D Replay Table entry points
 
+    /** Legacy compatibility entrypoint (delegates to linear session playback at 1.0x global view). */
     static void updateBoard(Minecraft mc, BlockPos pos, Vec3 cam, ReplayBoardSite site,
                             ReplayBoardModel model, ClientReplayBoard.View view,
                             boolean active, double elapsedTicks) {
+        if (model == null) return;
+        double matchTick = model.timeline != null ? model.timeline.atElapsed(elapsedTicks).replayTick() : elapsedTicks;
+        updateBoardSession(mc, pos, cam, site, model, view, active, matchTick, 1.0f, null);
+    }
+
+    /**
+     * Drives synchronized multi-track spatial voices and server-recorded game sounds for one active
+     * 3D replay table session at linear {@code matchTick} and {@code speed} ({@code 0.5x/1x/2x/4x}).
+     *
+     * <p>When {@code followPlayerUuid != null}, audio is automatically filtered through
+     * {@link ReplayVoiceAudibilityResolver} to the followed player's own voice + audible peers +
+     * audible game sounds in their hearing radius.</p>
+     */
+    static void updateBoardSession(Minecraft mc, BlockPos pos, Vec3 cam, ReplayBoardSite site,
+                                   ReplayBoardModel model, ClientReplayBoard.View view,
+                                   boolean playing, double matchTick, float speed,
+                                   @Nullable UUID followPlayerUuid) {
         if (mc == null || mc.getSoundManager() == null || model == null || view == null) return;
-        double actionLength = model.timeline.cycleTicks() - ReplayTimeline.INTRO - ReplayTimeline.HONORS - ReplayTimeline.REVIEW;
-        double actionTick = elapsedTicks - ReplayTimeline.INTRO;
-        if (!active || actionLength <= 0 || actionTick < 0 || actionTick >= actionLength + ReplayTimeline.REVIEW) {
-            BoardState existing = BOARDS.get(pos);
+        int duration = Math.max(0, model.replay.durationTicks());
+        if (!playing || matchTick < 0 || matchTick >= duration + 20.0) {
+            PlaybackPool existing = BOARDS.get(pos);
             if (existing != null) {
-                stopActiveVoice(mc, existing.activeVoice);
-                stopEffects(mc, existing.effects);
-                existing.activeVoice = null;
-                existing.prevActionTick = -1.0;
-                existing.nextSoundIdx = 0;
-                existing.nextVoiceIdx = 0;
+                existing.stopAll(mc);
+                existing.prevMatchTick = -1.0;
             }
             return;
         }
-
-        BoardState state = BOARDS.computeIfAbsent(pos.immutable(), k -> new BoardState());
+        PlaybackPool pool = BOARDS.computeIfAbsent(pos.immutable(), k -> new PlaybackPool());
         ReplayVoiceData currentVoice = view.voice() == null ? ReplayVoiceData.EMPTY : view.voice();
-        boolean newRound = !model.replay.roundId().equals(state.roundId);
-        if (newRound || state.voice != currentVoice) {
-            state.roundId = model.replay.roundId();
-            state.voice = currentVoice;
-            state.schedule = ReplaySoundCuePlan.forBoard(model.replay, model.timeline, currentVoice,
-                    file -> mc.getResourceManager().getResource(file).isPresent());
-            if (newRound) {
-                stopActiveVoice(mc, state.activeVoice);
-                stopEffects(mc, state.effects);
-                state.activeVoice = null;
-                state.prevActionTick = -1.0;
-                state.nextSoundIdx = 0;
-                state.nextVoiceIdx = 0;
-            } else if (state.prevActionTick >= 0) {
-                state.nextSoundIdx = firstSoundAfter(state.schedule.sounds(), state.prevActionTick);
-                state.nextVoiceIdx = firstVoiceAtOrAfter(state.schedule.voices(), state.prevActionTick);
-            }
-        }
-
-        if (state.prevActionTick < 0 || actionTick < state.prevActionTick - 2.0
-                || actionTick - state.prevActionTick > 15.0) {
-            stopActiveVoice(mc, state.activeVoice);
-            stopEffects(mc, state.effects);
-            state.activeVoice = null;
-            state.nextSoundIdx = firstSoundAfter(state.schedule.sounds(), actionTick - 0.5);
-            state.nextVoiceIdx = firstVoiceAtOrAfter(state.schedule.voices(), actionTick);
-            state.prevActionTick = actionTick;
-            return;
-        }
-
         float fade = Math.clamp(site.fade(), 0f, 1f);
-        List<ReplaySoundCuePlan.SoundCue> sounds = state.schedule.sounds();
-        while (state.nextSoundIdx < sounds.size()) {
-            ReplaySoundCuePlan.SoundCue cue = sounds.get(state.nextSoundIdx);
-            if (cue.time() > actionTick) break;
-            if (cue.time() >= state.prevActionTick - 1.0 && fade > 0.02f) {
-                Vec3 emitter = boardEventWorldPos(cam, site, model, cue.eventIndex());
-                Vec3 clamped = clampAudibleDistance(cam, emitter, 12.0);
-                playEffect(mc, state.effects, cue, Math.min(1.25f, cue.volume() * fade), clamped, false);
-            }
-            state.nextSoundIdx++;
-        }
-
-        List<ReplaySoundCuePlan.VoiceCue> voices = state.schedule.voices();
-        while (state.nextVoiceIdx < voices.size()) {
-            ReplaySoundCuePlan.VoiceCue voiceCue = voices.get(state.nextVoiceIdx);
-            if (voiceCue.startTime() > actionTick) break;
-            if (actionTick < voiceCue.endTime() - 1.0 && fade > 0.02f) {
-                double skipSeconds = (actionTick - voiceCue.sampleStartTime(TICKS_PER_SECOND)) / TICKS_PER_SECOND;
-                double maxDuration = (voiceCue.endTime() - actionTick) / TICKS_PER_SECOND;
-                byte[] pcm = buildPcm48kSlice(voiceCue.clip(), skipSeconds, maxDuration);
-                if (pcm.length > 0) {
-                    stopActiveVoice(mc, state.activeVoice);
-                    Vec3 emitter = boardEventWorldPos(cam, site, model, voiceCue.clip().eventIndex());
-                    Vec3 clamped = clampAudibleDistance(cam, emitter, 12.0);
-                    VoiceClipSoundInstance instance = new VoiceClipSoundInstance(
-                            pcm, fade, clamped.x, clamped.y, clamped.z, false);
-                    state.activeVoice = instance;
-                    mc.getSoundManager().play(instance);
-                }
-            }
-            state.nextVoiceIdx++;
-        }
-
-        state.prevActionTick = actionTick;
+        stepPool(mc, pool, model.replay, currentVoice, matchTick, speed, followPlayerUuid, fade, false, cam, site, model);
     }
 
     static void endBoardFrame(Minecraft mc, Set<BlockPos> activeBoards) {
         if (BOARDS.isEmpty()) return;
-        Iterator<Map.Entry<BlockPos, BoardState>> it = BOARDS.entrySet().iterator();
+        Iterator<Map.Entry<BlockPos, PlaybackPool>> it = BOARDS.entrySet().iterator();
         while (it.hasNext()) {
-            Map.Entry<BlockPos, BoardState> entry = it.next();
+            Map.Entry<BlockPos, PlaybackPool> entry = it.next();
             if (!activeBoards.contains(entry.getKey())) {
-                if (mc != null) stopActiveVoice(mc, entry.getValue().activeVoice);
-                stopEffects(mc, entry.getValue().effects);
+                entry.getValue().stopAll(mc);
                 it.remove();
             }
         }
     }
 
+    // ------------------------------------------------------------------ History Screen entry points
+
+    /** Legacy 1.0x global history audio entrypoint (kept for binary/source compatibility). */
     static void updateHistory(Minecraft mc, @Nullable UUID roundId, @Nullable LastMatchReplay replay,
                               @Nullable ReplayVoiceData voice, boolean playing, double cursorTicks) {
+        updateHistory(mc, roundId, replay, voice, playing, cursorTicks, 1.0f, null);
+    }
+
+    /** Full linear history audio entrypoint supporting speed ({@code 0.5x..4x}) and followed-player audibility filter. */
+    static void updateHistory(Minecraft mc, @Nullable UUID roundId, @Nullable LastMatchReplay replay,
+                              @Nullable ReplayVoiceData voice, boolean playing, double cursorTicks,
+                              float speed, @Nullable UUID followPlayerUuid) {
         if (mc == null || mc.getSoundManager() == null) return;
         if (!playing || roundId == null || replay == null) {
             if (history != null) {
-                stopActiveVoice(mc, history.activeVoice);
-                stopEffects(mc, history.effects);
-                history.activeVoice = null;
-                history.prevCursor = playing ? cursorTicks : -1.0;
+                history.stopAll(mc);
+                history.prevMatchTick = -1.0;
             }
             return;
         }
-        ReplayVoiceData currentVoice = voice == null ? ReplayVoiceData.EMPTY : voice;
         if (history == null || !roundId.equals(history.roundId)) {
             stopHistory(mc);
-            history = new HistoryState();
-            history.roundId = roundId;
-            history.voice = currentVoice;
-            history.schedule = ReplaySoundCuePlan.forLinearReplay(replay, currentVoice,
-                    file -> mc.getResourceManager().getResource(file).isPresent());
-            history.prevCursor = Math.max(0.0, cursorTicks - 1.0);
-            history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 1.5);
-            history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), cursorTicks - 1.0);
+            history = new PlaybackPool();
         }
-        if (history.voice != currentVoice) {
-            history.voice = currentVoice;
-            history.schedule = ReplaySoundCuePlan.forLinearReplay(replay, currentVoice,
-                    file -> mc.getResourceManager().getResource(file).isPresent());
-            double anchor = history.prevCursor >= 0 ? history.prevCursor : cursorTicks;
-            history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), anchor);
-            history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), anchor);
-        }
-
-        if (history.prevCursor < 0 || cursorTicks < history.prevCursor - 1.5
-                || cursorTicks - history.prevCursor > 8.0) {
-            stopActiveVoice(mc, history.activeVoice);
-            stopEffects(mc, history.effects);
-            history.activeVoice = null;
-            history.prevCursor = cursorTicks;
-            history.nextSoundIdx = firstSoundAfter(history.schedule.sounds(), cursorTicks - 0.5);
-            history.nextVoiceIdx = firstVoiceAtOrAfter(history.schedule.voices(), cursorTicks);
-            return;
-        }
-
-        List<ReplaySoundCuePlan.SoundCue> sounds = history.schedule.sounds();
-        while (history.nextSoundIdx < sounds.size()) {
-            ReplaySoundCuePlan.SoundCue cue = sounds.get(history.nextSoundIdx);
-            if (cue.time() > cursorTicks) break;
-            if (cue.time() >= history.prevCursor - 0.5) {
-                playEffect(mc, history.effects, cue, Math.min(1.1f, cue.volume() * 0.9f), Vec3.ZERO, true);
-            }
-            history.nextSoundIdx++;
-        }
-
-        List<ReplaySoundCuePlan.VoiceCue> voices = history.schedule.voices();
-        while (history.nextVoiceIdx < voices.size()) {
-            ReplaySoundCuePlan.VoiceCue voiceCue = voices.get(history.nextVoiceIdx);
-            if (voiceCue.startTime() > cursorTicks) break;
-            if (cursorTicks < voiceCue.endTime() - 1.0) {
-                double skipSeconds = (cursorTicks - voiceCue.sampleStartTime(TICKS_PER_SECOND)) / TICKS_PER_SECOND;
-                double maxDuration = (voiceCue.endTime() - cursorTicks) / TICKS_PER_SECOND;
-                byte[] pcm = buildPcm48kSlice(voiceCue.clip(), skipSeconds, maxDuration);
-                if (pcm.length > 0) {
-                    stopActiveVoice(mc, history.activeVoice);
-                    VoiceClipSoundInstance instance = new VoiceClipSoundInstance(pcm, 0.95f, 0.0, 0.0, 0.0, true);
-                    history.activeVoice = instance;
-                    mc.getSoundManager().play(instance);
-                }
-            }
-            history.nextVoiceIdx++;
-        }
-
-        history.prevCursor = cursorTicks;
+        ReplayVoiceData currentVoice = voice == null ? ReplayVoiceData.EMPTY : voice;
+        stepPool(mc, history, replay, currentVoice, cursorTicks, speed, followPlayerUuid, 0.95f, true, Vec3.ZERO, null, null);
     }
 
     static void onHistoryScrub() {
         if (history != null) {
-            stopActiveVoice(Minecraft.getInstance(), history.activeVoice);
-            stopEffects(Minecraft.getInstance(), history.effects);
-            history.activeVoice = null;
-            history.prevCursor = -1.0;
+            history.stopAll(Minecraft.getInstance());
+            history.prevMatchTick = -1.0;
         }
     }
 
     static void stopHistory(Minecraft mc) {
         if (history != null) {
-            if (mc != null) stopActiveVoice(mc, history.activeVoice);
-            stopEffects(mc, history.effects);
+            history.stopAll(mc);
             history = null;
         }
     }
 
     public static void reset() {
         Minecraft mc = Minecraft.getInstance();
-        for (BoardState state : BOARDS.values()) {
-            if (mc != null) stopActiveVoice(mc, state.activeVoice);
-            stopEffects(mc, state.effects);
+        for (PlaybackPool pool : BOARDS.values()) {
+            pool.stopAll(mc);
         }
         BOARDS.clear();
         stopHistory(mc);
     }
 
     static boolean isBoardVoiceActive(Minecraft mc, BlockPos pos) {
-        BoardState state = BOARDS.get(pos);
-        return state != null && state.activeVoice != null && mc.getSoundManager().isActive(state.activeVoice);
+        PlaybackPool pool = BOARDS.get(pos);
+        if (pool == null || pool.activeVoices.isEmpty()) return false;
+        SoundManager mgr = mc.getSoundManager();
+        for (ActiveVoice v : pool.activeVoices) {
+            if (!v.instance().isStopped() && mgr.isActive(v.instance())) return true;
+        }
+        return false;
     }
+
+    static int activeVoiceCount(BlockPos pos) {
+        PlaybackPool pool = BOARDS.get(pos);
+        return pool == null ? 0 : pool.activeVoices.size();
+    }
+
+    // ------------------------------------------------------------------ core multi-track pool engine
+
+    private static void stepPool(Minecraft mc, PlaybackPool pool, LastMatchReplay replay,
+                                 ReplayVoiceData currentVoice, double matchTick, float rawSpeed,
+                                 @Nullable UUID followPlayerUuid, float masterFade, boolean headRelative,
+                                 Vec3 cam, @Nullable ReplayBoardSite site, @Nullable ReplayBoardModel model) {
+        pool.ensureLoaded(mc, replay, currentVoice);
+        pool.pruneFinished(mc);
+
+        float speed = Math.clamp(Float.isFinite(rawSpeed) && rawSpeed > 0f ? rawSpeed : 1.0f, 0.5f, 4.0f);
+        boolean speedChanged = Math.abs(speed - pool.prevSpeed) > 0.01f;
+        boolean followChanged = !Objects.equals(followPlayerUuid, pool.prevFollow);
+        double maxForwardJump = Math.max(12.0, 14.0 * speed);
+        boolean discontinuous = pool.prevMatchTick < 0
+                || matchTick < pool.prevMatchTick - 1.5
+                || matchTick - pool.prevMatchTick > maxForwardJump
+                || speedChanged
+                || followChanged;
+
+        if (discontinuous) {
+            pool.stopAll(mc);
+            pool.prevSpeed = speed;
+            pool.prevFollow = followPlayerUuid;
+            pool.nextLegacySoundIdx = firstSoundAfter(pool.legacySchedule.sounds(), matchTick - 0.5);
+            pool.nextLegacyVoiceIdx = firstVoiceAtOrAfter(pool.legacySchedule.voices(), matchTick);
+            pool.prevMatchTick = Math.max(0.0, matchTick - 0.5);
+            // Immediately trigger utterances already in progress at this seek position so scrubbing feels alive.
+            if (masterFade > 0.02f && currentVoice.hasMultitrack() && pool.audibility != null) {
+                long nowMs = Math.round(matchTick * MS_PER_TICK);
+                launchAudibleVoices(mc, pool, followPlayerUuid, nowMs, speed, masterFade, headRelative, cam, site, model, matchTick);
+            }
+            pool.prevMatchTick = matchTick;
+            return;
+        }
+
+        if (masterFade <= 0.02f) {
+            pool.prevMatchTick = matchTick;
+            return;
+        }
+
+        long prevMs = Math.round(pool.prevMatchTick * MS_PER_TICK);
+        long nowMs = Math.round(matchTick * MS_PER_TICK);
+
+        // 1. Server-recorded global game sounds (v2) OR fallback legacy event cues (v1 archives)
+        if (!replay.gameSounds().isEmpty() && pool.audibility != null) {
+            if (nowMs > prevMs) {
+                List<ReplayVoiceAudibilityResolver.AudibleSound> sounds =
+                        pool.audibility.resolveGameSoundsInWindow(followPlayerUuid, (int) (prevMs + 1), (int) nowMs);
+                for (ReplayVoiceAudibilityResolver.AudibleSound sound : sounds) {
+                    playRecordedGameSound(mc, pool, sound, masterFade, headRelative, followPlayerUuid != null, cam, site, model);
+                }
+            }
+        } else {
+            List<ReplaySoundCuePlan.SoundCue> legacySounds = pool.legacySchedule.sounds();
+            while (pool.nextLegacySoundIdx < legacySounds.size()) {
+                ReplaySoundCuePlan.SoundCue cue = legacySounds.get(pool.nextLegacySoundIdx);
+                if (cue.time() > matchTick) break;
+                if (cue.time() >= pool.prevMatchTick - 0.5) {
+                    Vec3 emitter = headRelative || site == null || model == null
+                            ? Vec3.ZERO : clampAudibleDistance(cam, boardEventWorldPos(cam, site, model, cue.eventIndex()), 14.0);
+                    playLegacyEffect(mc, pool.effects, cue, Math.min(1.25f, cue.volume() * masterFade), emitter, headRelative);
+                }
+                pool.nextLegacySoundIdx++;
+            }
+        }
+
+        // 2. Multi-speaker concurrent voice pool (HRVC v2) OR concurrent legacy v1 clips
+        if (currentVoice.hasMultitrack() && pool.audibility != null) {
+            if (nowMs >= prevMs) {
+                launchAudibleVoices(mc, pool, followPlayerUuid, nowMs, speed, masterFade, headRelative, cam, site, model, matchTick);
+            }
+        } else {
+            List<ReplaySoundCuePlan.VoiceCue> legacyVoices = pool.legacySchedule.voices();
+            while (pool.nextLegacyVoiceIdx < legacyVoices.size()) {
+                ReplaySoundCuePlan.VoiceCue voiceCue = legacyVoices.get(pool.nextLegacyVoiceIdx);
+                if (voiceCue.startTime() > matchTick) break;
+                if (matchTick < voiceCue.endTime() - 1.0 && !pool.isPlayingKey(voiceCue.clip())) {
+                    double skipSeconds = (matchTick - voiceCue.sampleStartTime(TICKS_PER_SECOND)) / TICKS_PER_SECOND;
+                    double maxDuration = (voiceCue.endTime() - matchTick) / TICKS_PER_SECOND;
+                    byte[] pcm = buildPcm48kSlice(voiceCue.clip(), skipSeconds, maxDuration, speed);
+                    if (pcm.length > 0) {
+                        Vec3 emitter = headRelative || site == null || model == null
+                                ? Vec3.ZERO : clampAudibleDistance(cam, boardEventWorldPos(cam, site, model, voiceCue.clip().eventIndex()), 14.0);
+                        enqueueVoice(mc, pool, voiceCue.clip(), null, masterFade, false, pcm, emitter, headRelative);
+                    }
+                }
+                pool.nextLegacyVoiceIdx++;
+            }
+        }
+
+        pool.prevMatchTick = matchTick;
+        pool.prevSpeed = speed;
+        pool.prevFollow = followPlayerUuid;
+    }
+
+    private static void launchAudibleVoices(Minecraft mc, PlaybackPool pool, @Nullable UUID listener, long nowMs,
+                                            float speed, float masterFade, boolean headRelative, Vec3 cam,
+                                            @Nullable ReplayBoardSite site, @Nullable ReplayBoardModel model, double matchTick) {
+        for (var audible : pool.audibility.resolveVoices(listener, nowMs)) {
+            if (pool.isPlayingKey(audible.utterance())) continue;
+            var slice = pool.audibility.playbackSlice(audible, listener, nowMs);
+            if (slice != null) {
+                launchMultitrackVoice(mc, pool, slice, nowMs, speed, masterFade, headRelative,
+                        listener != null, cam, site, model, matchTick);
+            }
+        }
+    }
+
+    private static void launchMultitrackVoice(Minecraft mc, PlaybackPool pool,
+                                              ReplayVoiceAudibilityResolver.VoiceSlice slice,
+                                              long nowMs, float speed, float masterFade,
+                                              boolean headRelative, boolean povFiltered,
+                                              Vec3 cam, @Nullable ReplayBoardSite site,
+                                              @Nullable ReplayBoardModel model, double matchTick) {
+        var av = slice.voice();
+        ReplayVoiceData.VoiceUtterance utterance = av.utterance();
+        if (Objects.equals(pool.startedUtterances.get(utterance), slice.startMs())) return;
+        double skipSec = Math.max(0.0, (nowMs - utterance.startMs()) / 1000.0);
+        double remainSec = (slice.endMs() - nowMs) / 1000.0;
+        if (remainSec < 0.08) return;
+
+        byte[] pcm = buildUtterancePcm48k(utterance, skipSec, remainSec, speed);
+        if (pcm.length == 0) return;
+
+        float effectiveGain = Math.clamp(av.gain() * masterFade, 0f, 1.35f);
+        if (effectiveGain < 0.02f) return;
+
+        boolean useRelative;
+        Vec3 emitter;
+        if (headRelative || povFiltered || site == null || model == null) {
+            // Stereo head-relative panning matching ReplayVoiceAudibilityResolver (self centered, peers panned L/R).
+            useRelative = true;
+            emitter = new Vec3(av.pan() * 2.2, 0.0, -1.0);
+        } else {
+            useRelative = false;
+            Vec3 speakerWorld = boardActorWorldPos(cam, site, model, utterance.speakerId(), matchTick);
+            emitter = clampAudibleDistance(cam, speakerWorld, 14.0);
+        }
+        pool.startedUtterances.put(utterance, slice.startMs());
+        enqueueVoice(mc, pool, utterance, utterance.speakerId(), effectiveGain, av.isSelf(), pcm, emitter, useRelative);
+    }
+
+    /**
+     * Pure voice-pool arbitration helper: returns {@code -2} when under capacity (accept without
+     * cutting any active speaker), {@code -1} when the incoming stream should be dropped, or a
+     * {@code >= 0} slot index to evict (preserving self-voice priority over peer streams).
+     */
+    static int selectVoiceEvictionIndex(float[] existingGains, boolean[] existingSelf,
+                                        float incomingGain, boolean incomingSelf, int capacity) {
+        int active = Math.min(existingGains.length, existingSelf.length);
+        if (active < capacity) return -2;
+        int peerVictimIdx = -1;
+        float lowestPeerGain = Float.MAX_VALUE;
+        int selfVictimIdx = -1;
+        float lowestSelfGain = Float.MAX_VALUE;
+        for (int i = 0; i < active; i++) {
+            if (existingSelf[i]) {
+                if (existingGains[i] < lowestSelfGain) {
+                    lowestSelfGain = existingGains[i];
+                    selfVictimIdx = i;
+                }
+            } else if (existingGains[i] < lowestPeerGain) {
+                lowestPeerGain = existingGains[i];
+                peerVictimIdx = i;
+            }
+        }
+        if (incomingSelf) {
+            return peerVictimIdx >= 0 ? peerVictimIdx : selfVictimIdx;
+        }
+        if (peerVictimIdx < 0 || incomingGain <= lowestPeerGain) return -1;
+        return peerVictimIdx;
+    }
+
+    private static void enqueueVoice(Minecraft mc, PlaybackPool pool, Object key, @Nullable UUID speakerId,
+                                     float gain, boolean isSelf, byte[] pcm, Vec3 pos, boolean relative) {
+        int size = pool.activeVoices.size();
+        if (size >= MAX_CONCURRENT_VOICES) {
+            float[] gains = new float[size];
+            boolean[] selfFlags = new boolean[size];
+            for (int i = 0; i < size; i++) {
+                ActiveVoice existing = pool.activeVoices.get(i);
+                gains[i] = existing.gain();
+                selfFlags[i] = existing.isSelf();
+            }
+            int victimIdx = selectVoiceEvictionIndex(gains, selfFlags, gain, isSelf, MAX_CONCURRENT_VOICES);
+            if (victimIdx < 0) return;
+            ActiveVoice evicted = pool.activeVoices.remove(victimIdx);
+            evicted.instance().stopClip();
+            mc.getSoundManager().stop(evicted.instance());
+        }
+        VoiceClipSoundInstance instance = new VoiceClipSoundInstance(pcm, gain, pos.x, pos.y, pos.z, relative);
+        pool.activeVoices.add(new ActiveVoice(key, speakerId, gain, isSelf, instance));
+        mc.getSoundManager().play(instance);
+    }
+
+    private static void playRecordedGameSound(Minecraft mc, PlaybackPool pool,
+                                              ReplayVoiceAudibilityResolver.AudibleSound sound,
+                                              float masterFade, boolean headRelative, boolean povFiltered,
+                                              Vec3 cam, @Nullable ReplayBoardSite site, @Nullable ReplayBoardModel model) {
+        ResourceLocation id = ResourceLocation.tryParse(sound.soundId());
+        if (id == null || mc.getSoundManager().getSoundEvent(id) == null) return;
+        float volume = Math.clamp(sound.gain() * masterFade, 0f, 1.35f);
+        if (volume < 0.02f) return;
+
+        boolean useRelative;
+        Vec3 emitter;
+        if (headRelative || povFiltered || site == null || model == null
+                || sound.cue().audibilityScope() == ReplayGameSoundData.AudibilityScope.GLOBAL) {
+            useRelative = true;
+            emitter = new Vec3(sound.pan() * 2.0, 0.0, -1.0);
+        } else {
+            useRelative = false;
+            Vec3 world = boardPointWorldPos(cam, site, model,
+                    sound.cue().blockX(), sound.cue().blockY(), sound.cue().blockZ());
+            emitter = clampAudibleDistance(cam, world, 14.0);
+        }
+
+        SoundManager manager = mc.getSoundManager();
+        if (pool.effects.size() >= MAX_PLAYING_EFFECTS) {
+            manager.stop(pool.effects.removeFirst());
+        }
+        ReplayEffectSound instance = new ReplayEffectSound(id, null, volume, sound.cue().pitch(), emitter, useRelative);
+        pool.effects.addLast(instance);
+        manager.play(instance);
+    }
+
+    // ------------------------------------------------------------------ PCM & WSOLA helpers
+
+    static byte[] buildPcm48kSlice(ReplayVoiceData.Clip clip, double skipSeconds, double maxDurationSeconds) {
+        return buildPcm48kSlice(clip, skipSeconds, maxDurationSeconds, 1.0);
+    }
+
+    static byte[] buildPcm48kSlice(ReplayVoiceData.Clip clip, double skipSeconds,
+                                    double maxDurationSeconds, double speed) {
+        return buildPcm48kFromSamples(clip.decode48k(), skipSeconds, maxDurationSeconds, speed);
+    }
+
+    static byte[] buildUtterancePcm48k(ReplayVoiceData.VoiceUtterance utterance, double skipSeconds,
+                                       double maxDurationSeconds, double speed) {
+        return buildPcm48kFromSamples(utterance.decode48k(), skipSeconds, maxDurationSeconds, speed);
+    }
+
+    private static byte[] buildPcm48kFromSamples(short[] samples, double skipSeconds,
+                                                 double maxDurationSeconds, double speed) {
+        if (samples.length == 0) return new byte[0];
+        int start = Math.clamp((int) Math.round(skipSeconds * VOICE_RATE), 0, samples.length);
+        int maxCount = Math.clamp((int) Math.round(maxDurationSeconds * VOICE_RATE), 0, samples.length - start);
+        if (maxCount < VOICE_RATE / 15) return new byte[0];
+
+        short[] processed;
+        if (Math.abs(speed - 1.0) > 0.02) {
+            processed = ReplayWsolaTimeStretch.stretchMonoRange(samples, start, maxCount, VOICE_RATE, speed);
+        } else {
+            processed = Arrays.copyOfRange(samples, start, start + maxCount);
+        }
+        if (processed.length < VOICE_RATE / 20) return new byte[0];
+
+        int count = processed.length;
+        int fadeIn = Math.min(VOICE_RATE / 30, count / 4);   // ~33 ms
+        int fadeOut = Math.min(VOICE_RATE / 16, count / 3);  // ~62 ms
+        byte[] bytes = new byte[count * 2];
+        for (int i = 0; i < count; i++) {
+            double env = 1.0;
+            if (i < fadeIn && fadeIn > 0) {
+                env = 0.5 * (1.0 - Math.cos(Math.PI * i / fadeIn));
+            } else if (i >= count - fadeOut && fadeOut > 0) {
+                int rem = count - 1 - i;
+                env = 0.5 * (1.0 - Math.cos(Math.PI * rem / fadeOut));
+            }
+            short v = (short) Math.clamp(Math.round(processed[i] * env), Short.MIN_VALUE, Short.MAX_VALUE);
+            bytes[i * 2] = (byte) (v & 0xFF);
+            bytes[i * 2 + 1] = (byte) ((v >>> 8) & 0xFF);
+        }
+        return bytes;
+    }
+
+    // ------------------------------------------------------------------ sound & spatial utilities
 
     static @Nullable ResourceLocation resolveSound(Minecraft mc, List<String> candidates) {
         SoundManager manager = mc.getSoundManager();
@@ -287,8 +539,8 @@ public final class ReplayAudioPlaybackController {
         return null;
     }
 
-    private static void playEffect(Minecraft mc, ArrayDeque<ReplayEffectSound> effects, ReplaySoundCuePlan.SoundCue cue,
-                                   float volume, Vec3 position, boolean relative) {
+    private static void playLegacyEffect(Minecraft mc, ArrayDeque<ReplayEffectSound> effects,
+                                         ReplaySoundCuePlan.SoundCue cue, float volume, Vec3 position, boolean relative) {
         ResourceLocation file = cue.recordedFile();
         ResourceLocation id = file == null ? resolveSound(mc, cue.candidates()) : REPLAY_EFFECT_ID;
         if (id == null || file != null && mc.getResourceManager().getResource(file).isEmpty()) return;
@@ -304,6 +556,61 @@ public final class ReplayAudioPlaybackController {
         if (mc != null && !effects.isEmpty()) effects.forEach(mc.getSoundManager()::stop);
         effects.clear();
     }
+
+    private static Vec3 boardActorWorldPos(Vec3 cam, ReplayBoardSite site, ReplayBoardModel model,
+                                           UUID speakerId, double matchTick) {
+        ReplayBoardModel.Actor actor = model.participant(speakerId);
+        if (actor != null) {
+            ReplayTrackSampler.Pose pose = actor.track.sample(matchTick);
+            if (pose.visible()) {
+                return boardPointWorldPos(cam, site, model, pose.x(), pose.y(), pose.z());
+            }
+        }
+        return new Vec3(site.pos().getX() + 0.5, site.pos().getY() + 1.35, site.pos().getZ() + 0.5);
+    }
+
+    private static Vec3 boardEventWorldPos(Vec3 cam, ReplayBoardSite site, ReplayBoardModel model, int eventIndex) {
+        if (eventIndex >= 0 && eventIndex < model.replay.events().size()) {
+            LastMatchReplay.Node ev = model.replay.events().get(eventIndex);
+            LastMatchReplay.Position pos = ev.to() != null ? ev.to() : ev.from();
+            if (pos != null) {
+                return boardPointWorldPos(cam, site, model, pos.blockX(), pos.blockY(), pos.blockZ());
+            }
+        }
+        return new Vec3(site.pos().getX() + 0.5, site.pos().getY() + 1.35, site.pos().getZ() + 0.5);
+    }
+
+    private static Vec3 boardPointWorldPos(Vec3 cam, ReplayBoardSite site, ReplayBoardModel model,
+                                           double bx, double by, double bz) {
+        float[] projected = new float[3];
+        model.project(bx, by, bz, projected);
+        Vector3f rel = site.board().transformPosition(
+                projected[0], ReplayBoardSite.MAP_BASE + projected[1], projected[2], new Vector3f());
+        return new Vec3(cam.x + rel.x, cam.y + rel.y, cam.z + rel.z);
+    }
+
+    private static Vec3 clampAudibleDistance(Vec3 cam, Vec3 emitter, double maxDist) {
+        Vec3 delta = emitter.subtract(cam);
+        double distSq = delta.lengthSqr();
+        if (distSq <= maxDist * maxDist || distSq < 1e-6) return emitter;
+        return cam.add(delta.scale(maxDist / Math.sqrt(distSq)));
+    }
+
+    private static int firstSoundAfter(List<ReplaySoundCuePlan.SoundCue> cues, double tick) {
+        for (int i = 0; i < cues.size(); i++) {
+            if (cues.get(i).time() >= tick) return i;
+        }
+        return cues.size();
+    }
+
+    private static int firstVoiceAtOrAfter(List<ReplaySoundCuePlan.VoiceCue> cues, double tick) {
+        for (int i = 0; i < cues.size(); i++) {
+            if (cues.get(i).endTime() > tick + 1.0) return i;
+        }
+        return cues.size();
+    }
+
+    // ------------------------------------------------------------------ OpenAL sound instances
 
     static final class ReplayEffectSound extends SimpleSoundInstance {
         private final @Nullable Sound recorded;
@@ -324,78 +631,9 @@ public final class ReplayAudioPlaybackController {
         }
     }
 
-    static byte[] buildPcm48kSlice(ReplayVoiceData.Clip clip, double skipSeconds, double maxDurationSeconds) {
-        short[] samples = clip.decode48k();
-        if (samples.length == 0) return new byte[0];
-        int start = Math.clamp((int) Math.round(skipSeconds * VOICE_RATE), 0, samples.length);
-        int maxCount = Math.clamp((int) Math.round(maxDurationSeconds * VOICE_RATE), 0, samples.length - start);
-        if (maxCount < VOICE_RATE / 10) return new byte[0];
-
-        int fadeIn = Math.min(VOICE_RATE / 25, maxCount / 4);   // 40 ms
-        int fadeOut = Math.min(VOICE_RATE / 12, maxCount / 3);  // ~83 ms
-        byte[] bytes = new byte[maxCount * 2];
-        for (int i = 0; i < maxCount; i++) {
-            double env = 1.0;
-            if (i < fadeIn && fadeIn > 0) {
-                env = 0.5 * (1.0 - Math.cos(Math.PI * i / fadeIn));
-            } else if (i >= maxCount - fadeOut && fadeOut > 0) {
-                int rem = maxCount - 1 - i;
-                env = 0.5 * (1.0 - Math.cos(Math.PI * rem / fadeOut));
-            }
-            short v = (short) Math.clamp(Math.round(samples[start + i] * env), Short.MIN_VALUE, Short.MAX_VALUE);
-            bytes[i * 2] = (byte) (v & 0xFF);
-            bytes[i * 2 + 1] = (byte) ((v >>> 8) & 0xFF);
-        }
-        return bytes;
-    }
-
-    private static Vec3 boardEventWorldPos(Vec3 cam, ReplayBoardSite site, ReplayBoardModel model, int eventIndex) {
-        if (eventIndex >= 0 && eventIndex < model.replay.events().size()) {
-            LastMatchReplay.Node ev = model.replay.events().get(eventIndex);
-            LastMatchReplay.Position pos = ev.to() != null ? ev.to() : ev.from();
-            if (pos != null) {
-                float[] projected = new float[3];
-                model.project(pos.blockX(), pos.blockY(), pos.blockZ(), projected);
-                Vector3f rel = site.board().transformPosition(
-                        projected[0], ReplayBoardSite.MAP_BASE + projected[1], projected[2], new Vector3f());
-                return new Vec3(cam.x + rel.x, cam.y + rel.y, cam.z + rel.z);
-            }
-        }
-        return new Vec3(site.pos().getX() + 0.5, site.pos().getY() + 1.35, site.pos().getZ() + 0.5);
-    }
-
-    private static Vec3 clampAudibleDistance(Vec3 cam, Vec3 emitter, double maxDist) {
-        Vec3 delta = emitter.subtract(cam);
-        double distSq = delta.lengthSqr();
-        if (distSq <= maxDist * maxDist || distSq < 1e-6) return emitter;
-        return cam.add(delta.scale(maxDist / Math.sqrt(distSq)));
-    }
-
-    private static void stopActiveVoice(@Nullable Minecraft mc, @Nullable VoiceClipSoundInstance instance) {
-        if (instance == null) return;
-        instance.stopClip();
-        if (mc != null && mc.getSoundManager() != null) {
-            mc.getSoundManager().stop(instance);
-        }
-    }
-
-    private static int firstSoundAfter(List<ReplaySoundCuePlan.SoundCue> cues, double tick) {
-        for (int i = 0; i < cues.size(); i++) {
-            if (cues.get(i).time() >= tick) return i;
-        }
-        return cues.size();
-    }
-
-    private static int firstVoiceAtOrAfter(List<ReplaySoundCuePlan.VoiceCue> cues, double tick) {
-        for (int i = 0; i < cues.size(); i++) {
-            if (cues.get(i).endTime() > tick + 1.0) return i;
-        }
-        return cues.size();
-    }
-
     /**
      * Streaming 48 kHz mono 16-bit PCM {@link SoundInstance} backed by Fabric's {@link FabricSoundInstance}
-     * hook so server-recorded ADPCM clips play natively through OpenAL without writing temporary .ogg files.
+     * hook so server-recorded ADPCM clips &amp; WSOLA time-stretched voices play natively through OpenAL.
      */
     static final class VoiceClipSoundInstance extends AbstractTickableSoundInstance {
         private final byte[] pcmBytes;
@@ -414,7 +652,6 @@ public final class ReplayAudioPlaybackController {
             this.delay = 0;
             this.relative = relative;
             this.attenuation = relative ? Attenuation.NONE : Attenuation.LINEAR;
-            // Convert byte length (96,000 B/s) -> ticks plus generous OpenAL queue margin.
             this.maxTicks = (int) Math.ceil(pcmBytes.length / (VOICE_RATE * 2.0) * TICKS_PER_SECOND) + 30;
         }
 

@@ -19,9 +19,11 @@ public abstract class ReplayBoardButtonUseMixin {
 
     @Inject(method = "startUseItem", at = @At("HEAD"), cancellable = true)
     private void habitrain$replayBoardButtons(CallbackInfo ci) {
-        if (ReplayBoardButtons.handleUse((Minecraft) (Object) this)) {
-            // Holding the key must not re-trigger the plaque (or vanilla) every tick.
-            this.rightClickDelay = 6;
+        int delay = ReplayBoardButtons.handleUseWithDelay((Minecraft) (Object) this);
+        if (delay >= 0) {
+            // Holding right-click on the timeline rail scrubs smoothly (delay = 1);
+            // discrete deck/sculpture plaques debounce (delay = 6) and swallow held-item use.
+            this.rightClickDelay = delay;
             ci.cancel();
         }
     }

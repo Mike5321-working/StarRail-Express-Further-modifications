@@ -1,5 +1,8 @@
 package com.habitrain.core.scene.client.replay;
 
+import com.habitrain.core.scene.replay.ReplayExportContentOptions;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions.ExportMode;
+import org.joml.Matrix4f;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -8,11 +11,44 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class ReplayVideoExportOptionsTest {
+    @Test
+    void offscreenCameraUsesCapturedOptionsAndRecordedMotion() {
+        var camera = new ReplayNativeCamera(80, true, 0.5f);
+        assertEquals(80, camera.fov(false), 0.001);
+        assertEquals(86, camera.fov(true), 0.001);
+        var steadyCamera = new ReplayNativeCamera(96, false, 0);
+        assertEquals(96, steadyCamera.fov(true), 0.001);
+
+        var eyeView = new Matrix4f().rotateY(0.5f);
+        var original = new Matrix4f(eyeView);
+        var walking = camera.view(eyeView, 7.5, 0.18, true);
+        assertNotEquals(original, walking);
+        assertEquals(walking, camera.view(eyeView, 7.5, 0.18, true));
+        assertEquals(original, eyeView);
+        assertEquals(original, camera.view(eyeView, 7.5, 0.18, false));
+        assertEquals(original, camera.view(eyeView, 7.5, 0, true));
+        assertEquals(original, steadyCamera.view(eyeView, 7.5, 0.18, true));
+    }
+
+    @Test
+    void nativeBackendDefaultsToPersonalFirstPersonUnlessSimpleIsExplicit() {
+        var personal = ReplayExportContentOptions.defaultsFor(ExportMode.PERSONAL);
+        assertEquals(ReplayExportBackend.NATIVE, ReplayExportBackend.select(personal, false));
+        assertEquals(ReplayExportBackend.SIMPLE, ReplayExportBackend.select(personal, true));
+        assertEquals(ReplayExportBackend.SIMPLE, ReplayExportBackend.select(personal.toBuilder()
+                .personalView(ReplayExportContentOptions.PersonalView.SANDBOX_FOLLOW).build(), false));
+        for (var mode : ExportMode.values()) {
+            if (mode == personal.mode()) continue;
+            assertEquals(ReplayExportBackend.SIMPLE, ReplayExportBackend.select(
+                    ReplayExportContentOptions.defaultsFor(mode), false));
+        }
+    }
 
     @Test
     void resolutionPresetsAreEven16By9AndCycleCleanly() {
@@ -86,17 +122,7 @@ class ReplayVideoExportOptionsTest {
 
     @Test
     void exportOptionsAndStatusFitShortGuiHeights() {
-        for (int panelHeight : new int[]{174, 210, 232, 268, 298, 334}) {
-            var main = ReplayExportScreen.ExportLayout.forMain(panelHeight);
-            assertTrue(main.sectionY(0) + main.optionHeight() <= main.sectionY(1) - 10,
-                    "main section 0 overlaps section 1 at panelHeight " + panelHeight);
-            assertTrue(main.sectionY(1) + main.optionHeight() <= main.sectionY(ReplayExportScreen.MAIN_PROGRESS_SECTION) - 6,
-                    "main section 1 overlaps progress bar at panelHeight " + panelHeight);
-            assertTrue(main.sectionY(ReplayExportScreen.MAIN_PROGRESS_SECTION) + 7 + 9 <= main.buttonsY(),
-                    "progress status overlaps bottom buttons at panelHeight " + panelHeight);
-            assertTrue(main.buttonsY() + 20 <= panelHeight,
-                    "main bottom buttons overflow panelHeight " + panelHeight);
-
+        for (int panelHeight : new int[]{174, 180, 210, 232, 234, 245, 268, 286, 298, 334}) {
             var settings = ReplayExportScreen.ExportLayout.forSettings(panelHeight);
             for (int i = 0; i < ReplayExportScreen.SETTINGS_SECTION_COUNT - 1; i++) {
                 assertTrue(settings.sectionY(i) + settings.optionHeight() <= settings.sectionY(i + 1) - 10,
@@ -107,6 +133,22 @@ class ReplayVideoExportOptionsTest {
                     "last settings section overlaps collapse button at panelHeight " + panelHeight);
             assertTrue(settings.buttonsY() + 20 <= panelHeight,
                     "settings collapse button overflows panelHeight " + panelHeight);
+
+            int mainHeight = Math.min(panelHeight, ReplayExportScreen.PANEL_HEIGHT_MAIN);
+            var ml = ReplayExportScreen.MainLayout.compute(mainHeight);
+            assertTrue(ml.modeY() >= 42, "modeY collides with header at panelHeight " + panelHeight);
+            assertTrue(ml.modeY() + ml.optionHeight() + 10 <= ml.perspectiveY(),
+                    "mode row overlaps scope caption at panelHeight " + panelHeight);
+            assertTrue(ml.perspectiveY() + ml.optionHeight() + 3 <= ml.subY(),
+                    "perspective row overlaps sub row at panelHeight " + panelHeight);
+            assertTrue(ml.subY() + ml.optionHeight() + 3 <= ml.drawersY(),
+                    "sub row overlaps drawers row at panelHeight " + panelHeight);
+            assertTrue(ml.drawersY() + ml.optionHeight() + 4 <= ml.progressY(),
+                    "drawers row overlaps progress bar at panelHeight " + panelHeight);
+            assertTrue(ml.progressY() + 20 <= ml.buttonsY(),
+                    "status overlaps bottom buttons at panelHeight " + panelHeight);
+            assertTrue(ml.buttonsY() + 20 <= mainHeight,
+                    "bottom buttons overflow panelHeight " + panelHeight);
         }
     }
 

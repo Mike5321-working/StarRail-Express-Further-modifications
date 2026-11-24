@@ -124,6 +124,7 @@ public final class ReplaySoundCuePlan {
                                     Predicate<ResourceLocation> availableSound, boolean includeVictoryCue) {
         if (replay == null || script == null) return Schedule.EMPTY;
         List<LastMatchReplay.Node> events = replay.events();
+        Map<Integer, Integer> idMap = stableEventIndices(events);
         Map<LastMatchReplay.Node, Integer> indexMap = identityIndices(events);
         ReplayProjection.Layout layout = ReplayProjection.layout(replay);
 
@@ -151,13 +152,13 @@ public final class ReplaySoundCuePlan {
 
         for (int b = 0; b < beats.size(); b++) {
             ReplayVideoScript.Beat beat = beats.get(b);
-            int primaryIdx = indexMap.getOrDefault(beat.node(), -1);
+            int primaryIdx = eventIndexOf(beat.node(), idMap, indexMap);
             if (primaryIdx >= 0) handledEvents.add(primaryIdx);
             float pan = panFor(layout, beat.node());
 
             LastMatchReplay.Node pairedShot = findPairedShotForKill(events, primaryIdx, beat.node());
             if (pairedShot != null) {
-                int shotIdx = indexMap.getOrDefault(pairedShot, -1);
+                int shotIdx = eventIndexOf(pairedShot, idMap, indexMap);
                 if (shotIdx >= 0) handledEvents.add(shotIdx);
             }
 
@@ -165,7 +166,7 @@ public final class ReplaySoundCuePlan {
                     actionStart,
                     soundEnd, soundEnd, 1f, pan);
 
-            ReplayVoiceData.Clip clip = findClipForBeat(primaryIdx, pairedShot == null ? -1 : indexMap.getOrDefault(pairedShot, -1), clipByEvent);
+            ReplayVoiceData.Clip clip = findClipForBeat(primaryIdx, pairedShot == null ? -1 : eventIndexOf(pairedShot, idMap, indexMap), clipByEvent);
             if (clip != null && clip.sampleCount() > 0) {
                 double nextBeatStart = (b + 1 < beats.size()) ? beats.get(b + 1).approach() - 0.15 : reviewStart;
                 double rawStart = beat.impact() + clip.offsetMs() / 1000.0;
@@ -453,6 +454,24 @@ public final class ReplaySoundCuePlan {
                 output.sort(byStart);
             }
         }
+    }
+
+    private static int eventIndexOf(LastMatchReplay.Node node, Map<Integer, Integer> idIndex,
+                                    Map<LastMatchReplay.Node, Integer> fallbackIdentity) {
+        if (node.eventId() >= 0) {
+            Integer byId = idIndex.get(node.eventId());
+            if (byId != null) return byId;
+        }
+        return fallbackIdentity.getOrDefault(node, -1);
+    }
+
+    private static Map<Integer, Integer> stableEventIndices(List<LastMatchReplay.Node> events) {
+        Map<Integer, Integer> map = new HashMap<>(events.size());
+        for (int i = 0; i < events.size(); i++) {
+            int id = events.get(i).eventId();
+            if (id >= 0) map.putIfAbsent(id, i);
+        }
+        return map;
     }
 
     private static Map<LastMatchReplay.Node, Integer> identityIndices(List<LastMatchReplay.Node> events) {

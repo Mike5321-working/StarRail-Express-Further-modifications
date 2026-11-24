@@ -131,6 +131,23 @@ final class ReplayBoardTexts {
         return ReplayStagePlan.clock(ticks);
     }
 
+    static Component facing(net.minecraft.core.Direction facing) {
+        if (facing == null) return tr("settings.facing_north");
+        return switch (facing) {
+            case EAST -> tr("settings.facing_east");
+            case SOUTH -> tr("settings.facing_south");
+            case WEST -> tr("settings.facing_west");
+            default -> tr("settings.facing_north");
+        };
+    }
+
+    static String speedLabel(float speed) {
+        if (Math.abs(speed - 0.5f) < 0.05f) return "0.5x";
+        if (Math.abs(speed - 2.0f) < 0.05f) return "2x";
+        if (Math.abs(speed - 4.0f) < 0.05f) return "4x";
+        return "1x";
+    }
+
     static Component killLine(String key, LastMatchReplay.Node node, ReplayBoardModel model) {
         MutableComponent killer = node.actor() == null ? tr("environment").copy()
                 : name(model.participantData(node.actor())).copy();

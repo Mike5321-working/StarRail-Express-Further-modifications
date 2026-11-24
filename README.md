@@ -98,8 +98,8 @@ star_rail_express-4.3.0-dev.jar
 
 在仓库根目录执行以下命令可校验成品：
 
-```powershell
-Get-FileHash .\libs\star_rail_express-4.3.0.jar -Algorithm SHA256
+```bash
+sha256sum ./libs/star_rail_express-4.3.0.jar
 ```
 
 </details>
@@ -125,6 +125,14 @@ Get-FileHash .\libs\star_rail_express-4.3.0.jar -Algorithm SHA256
 playerAnimator **2.0.4+1.21.1 已内嵌在 Core 中**。Simple Voice Chat 是固定 SRE 的必需依赖；Wathe、TACZ 内嵌的旧版 CCA / DataSync 不能单独满足 Core 的要求。
 
 **专用服部署限制**：固定 SRE 4.3.0 强制依赖 Mod Menu，而 Mod Menu 11.0.3 仅用于客户端。部署前请阅读[专用服限制与启动验收](docs/版本与安装依赖.md#专用服限制与启动验收)，确认可用的服务端方案。完整依赖与内嵌组件说明见[版本与安装依赖](docs/版本与安装依赖.md)。
+
+**回放语音**：管理员可回放原始录音，参赛者只收到本人发言与当时可听的片段。大厅观众仍可回看画面和游戏音效。早期归档的预混语音仅向管理员开放。语音由服务端按当前会话授权，旧客户端语音缓存不参与播放。单局语音上限为 64 MiB，达到上限时会提示录音不完整。客户端和服务端需一同更新才能传输较大的录音。
+
+**个人第一人称导出**：默认占用当前游戏窗口，用 Minecraft 的世界渲染器、当前资源包和已启用的 Iris 光影导出。不另起游戏进程。导出时角色和实时语音仍在服务器；如果新对局开始，窗口会提示，按 Esc 停止导出并回到当前对局。需要继续操作窗口时可改用「精简导出」，但画面不等价。
+
+服务端与参赛客户端都更新后，新录制的标准谋杀对局会另外保存场景变化和个人画面记录。赛后任何玩家都可以选择参赛者的视角；这不会开放原先无权收听的语音。录制包括场地昼夜和对局计时、方块更新及门动画、实体外观、手持物、视野和上游对局 HUD。遗体使用上游模型，记录出现、移动、隐藏、腐化和移除，不用死者的旁观镜头代替。只从结算归档按需加载共享场景和所选视角，不录制整个桌面或聊天窗口。
+
+旧录像不能补录缺失的效果。未提供客户端画面的时段使用服务器记录重建；上游 HUD 以外的第三方私有界面、未同步的特效、换过的皮肤或资源包不保证完全一致。为避免超长对局占满内存，每轨视觉数据上限为 16 MiB，单局合计 64 MiB；超出限额的录像会标记为不完整。
 
 ## 配置与常用命令
 
@@ -207,15 +215,9 @@ dependencies {
 
 准备 Java **21**，保留仓库 `libs/` 中的固定依赖，并在仓库根目录使用自带的 Gradle Wrapper。
 
-Windows / PowerShell：
+Linux Shell：
 
-```powershell
-.\gradlew.bat build --no-daemon
-```
-
-Linux / macOS：
-
-```sh
+```bash
 ./gradlew build --no-daemon
 ```
 
@@ -223,8 +225,8 @@ Linux / macOS：
 
 启动开发客户端：
 
-```powershell
-.\gradlew.bat runClient --no-daemon
+```bash
+./gradlew runClient --no-daemon
 ```
 
 开发运行使用 SRE `-dev.jar`。发布前应使用固定 SRE 成品与新构建的 Core，分别核对客户端和专用服的实际启动结果。

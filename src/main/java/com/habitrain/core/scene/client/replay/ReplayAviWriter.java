@@ -154,6 +154,18 @@ final class ReplayAviWriter implements ReplayVideoWriter {
     }
 
     @Override
+    public void addAudioBytes(byte[] pcm16LeStereo, int byteOffset, int byteLength) throws IOException {
+        if (!includeAudio || pcm16LeStereo == null || byteLength <= 0) return;
+        int aligned = byteLength & ~3;
+        if (aligned <= 0) return;
+        int offset = uint32(out.getFilePointer() - moviStart);
+        index.add(new Index("01wb", offset, aligned));
+        audioStereoFrames += aligned / AUDIO_BLOCK_ALIGN;
+        four("01wb"); le(aligned);
+        out.write(pcm16LeStereo, byteOffset, aligned);
+    }
+
+    @Override
     public void finish() throws IOException {
         finishList(moviSize);
         four("idx1"); le(index.size() * 16);

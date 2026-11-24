@@ -2,6 +2,9 @@ package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.GameModeIds;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.scene.replay.ReplayCinemaDirector;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions;
+import com.habitrain.core.scene.replay.ReplayHighlightScorer;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
 import com.habitrain.core.scene.replay.ReplayTrackSampler;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
@@ -20,6 +23,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 
 import static com.habitrain.core.scene.client.replay.ReplayPalette.*;
 import static com.habitrain.core.scene.client.replay.ReplayVideoCanvas.Tex;
@@ -35,14 +39,16 @@ import static com.habitrain.core.scene.client.replay.ReplayVideoCanvas.Tex;
  */
 final class ReplayVideoOverlay {
     private static final int MAX_FEED = 5;
-    private final ReplayVideoScript script;
+    private final @Nullable ReplayVideoScript script;
+    private final @Nullable ReplayCinemaDirector.DirectedFilm film;
+    private final ReplayExportContentOptions options;
     private final ReplayBoardModel model;
     private final boolean compress;
     private final ReplayExportQuality quality;
     private final Map<LastMatchReplay.Node, ReplayBoardModel.EventMark> marks = new IdentityHashMap<>();
     private final List<ReplayBoardModel.Actor> ranking;
     private final String date, trainNo;
-    private final int maxScore, maxKills, maxItems, maxSurvival;
+    private final int maxScore, maxKills, maxItems, maxSurvival, objectiveHighlights;
     private float w, h;
 
     ReplayVideoOverlay(ReplayVideoScript script, ReplayBoardModel model) {
@@ -54,7 +60,21 @@ final class ReplayVideoOverlay {
     }
 
     ReplayVideoOverlay(ReplayVideoScript script, ReplayBoardModel model, boolean compress, ReplayExportQuality quality) {
+        this(script, null, ReplayExportContentOptions.defaultsFor(ReplayExportContentOptions.ExportMode.SHORT, script.focusPlayer()),
+                model, compress, quality);
+    }
+
+    ReplayVideoOverlay(ReplayCinemaDirector.DirectedFilm film, ReplayBoardModel model, boolean compress, ReplayExportQuality quality) {
+        this(null, film, film.options(), model, compress, quality);
+    }
+
+    private ReplayVideoOverlay(@Nullable ReplayVideoScript script,
+                               @Nullable ReplayCinemaDirector.DirectedFilm film,
+                               ReplayExportContentOptions options,
+                               ReplayBoardModel model, boolean compress, ReplayExportQuality quality) {
         this.script = script;
+        this.film = film;
+        this.options = options == null ? ReplayExportContentOptions.defaultsFor(ReplayExportContentOptions.ExportMode.SHORT) : options;
         this.model = model;
         this.compress = compress;
         this.quality = quality == null ? ReplayExportQuality.DEFAULT : quality;
@@ -73,6 +93,21 @@ final class ReplayVideoOverlay {
             survival = Math.max(survival, a.p.survivalSeconds());
         }
         maxScore = score; maxKills = kills; maxItems = items; maxSurvival = survival;
+        // Objective mode-invariant highlight count computed from the match replay itself.
+        objectiveHighlights = new ReplayVideoScript(model.replay).beats().size();
+    }
+
+    private List<Beat> activeBeats() { return film != null ? film.beats() : script.beats(); }
+    private List<ReplayVideoScript.Feed> activeFeeds() { return film != null ? film.feeds() : script.feeds(); }
+    private List<ReplayVideoScript.SpanWindow> activeSpans() { return film != null ? film.spans() : script.spans(); }
+    private double totalSeconds() { return film != null ? film.total() : script.total(); }
+    private int matchDuration() { return film != null ? film.duration() : script.duration(); }
+    private int timelineEndTick() { return film != null ? film.trimEndTick() : script.actionEndTick(); }
+    private int timelineStartTick() { return film != null ? film.trimStartTick() : 0; }
+    private @Nullable UUID focusPlayer() { return film != null ? film.focusPlayer() : script.focusPlayer(); }
+    private double sampleWipe(double t) { return film != null ? film.sample(t).baseSample().wipe() : script.sample(t).wipe(); }
+    private boolean roleRevealed(UUID actorId, double matchTick) {
+        return film != null ? film.isRoleRevealedAt(actorId, matchTick) : options.isRoleRevealedAt(actorId, matchTick, 0);
     }
 
     private static Component tr(String key, Object... args) {
@@ -89,6 +124,11 @@ final class ReplayVideoOverlay {
     // =================================================================== background (behind the model)
 
     void background(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot) {
+        background(c, t, s, null, shot);
+    }
+
+    void background(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s,
+                    @Nullable ReplayCinemaDirector.CinemaSample cs, ReplayVideoCamera.Shot shot) {
         w = c.width; h = c.height;
         c.rect(0, 0, w, h, 0xFF04060F, 0xFF111936);
         float yaw = (float) Math.atan2(shot.look().x, shot.look().z);
@@ -123,7 +163,7 @@ final class ReplayVideoOverlay {
             Vector3f at = centre;
             double a = ReplayStagePlan.easeOutCubic(s.actTime() / 0.8);
             if (s.act() == Act.MVP && model.mvp != null) {
-                Vector3f m = actorPoint(model.mvp, script.duration());
+                Vector3f m = actorPoint(model.mvp, matchDuration());
                 if (m != null) {
                     Vector3f p = shot.toScreen(m, w, h);
                     if (p.z > 0) at = p;
@@ -141,23 +181,40 @@ final class ReplayVideoOverlay {
 
     void foreground(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, int frame,
                     ReplayActorSizing heads) {
+        foreground(c, t, s, null, shot, frame, heads);
+    }
+
+    void foreground(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s,
+                    @Nullable ReplayCinemaDirector.CinemaSample cs,
+                    ReplayVideoCamera.Shot shot, int frame, @Nullable ReplayActorSizing heads) {
         w = c.width; h = c.height;
         float yaw = (float) Math.atan2(shot.look().x, shot.look().z);
-        // Near bokeh moves opposite and faster than the stars: depth of field without blur.
-        for (int i = 0; i < 11; i++) {
-            float x = (float) frac(ReplayVideoFx.rnd(i, 31) + yaw / (Math.PI * 2) * 1.9 + t * 0.004 * (i % 2 == 0 ? 1 : -1)) * (w + 400) - 200;
-            float y = h * (0.1f + 0.85f * ReplayVideoFx.rnd(i, 32)) + (float) Math.sin(t * 0.3 + i) * 14;
-            float size = 70 + 170 * ReplayVideoFx.rnd(i, 33);
-            int col = i % 3 == 0 ? PASSENGER : BRASS_LIGHT;
-            c.sprite(Tex.BOKEH, x, y, size, size, (float) (i * 0.4), argb(col, 0.035 + 0.05 * ReplayVideoFx.rnd(i, 34)), true);
+        boolean dof = options.includeLetterboxDof();
+        if (dof) {
+            // Near bokeh moves opposite and faster than the stars: depth of field without blur.
+            for (int i = 0; i < 11; i++) {
+                float x = (float) frac(ReplayVideoFx.rnd(i, 31) + yaw / (Math.PI * 2) * 1.9 + t * 0.004 * (i % 2 == 0 ? 1 : -1)) * (w + 400) - 200;
+                float y = h * (0.1f + 0.85f * ReplayVideoFx.rnd(i, 32)) + (float) Math.sin(t * 0.3 + i) * 14;
+                float size = 70 + 170 * ReplayVideoFx.rnd(i, 33);
+                int col = i % 3 == 0 ? PASSENGER : BRASS_LIGHT;
+                c.sprite(Tex.BOKEH, x, y, size, size, (float) (i * 0.4), argb(col, 0.035 + 0.05 * ReplayVideoFx.rnd(i, 34)), true);
+            }
         }
         spans(c, t, s, shot, heads);
         // Grade: cool shadows at the top, warm lift at the bottom, then vignette and grain.
-        c.rect(0, 0, w, h * 0.45f, argb(0xFF030714, 0.35), argb(0xFF030714, 0));
-        c.rect(0, h * 0.6f, w, h, argb(LAMP, 0), argb(LAMP, 0.05));
-        c.sprite(Tex.VIGNETTE, w / 2, h / 2, w, h, 0, argb(0xFFFFFFFF, 0.82), false);
-        impacts(c, t, s, shot);
-        letterbox(c, t, s);
+        if (dof) {
+            c.rect(0, 0, w, h * 0.45f, argb(0xFF030714, 0.35), argb(0xFF030714, 0));
+            c.rect(0, h * 0.6f, w, h, argb(LAMP, 0), argb(LAMP, 0.05));
+            c.sprite(Tex.VIGNETTE, w / 2, h / 2, w, h, 0, argb(0xFFFFFFFF, 0.82), false);
+        }
+        // Diagonal 4-degree Star-Night Express brass split-screen divider & weapon medallion (Mode 1 & Mode 4 Tier 4).
+        if (cs != null && cs.splitScreen() && cs.splitLeftRatio() > 0.015 && cs.splitLeftRatio() < 0.985) {
+            splitBeamOverlay(c, t, cs);
+        }
+        impacts(c, t, s, cs, shot);
+        if (dof || (cs != null && cs.letterboxBoost() > 0.5)) {
+            letterbox(c, t, s, cs);
+        }
         if (compress) {
             if (quality.mp4GrainAlpha > 0) {
                 c.tile(Tex.GRAIN, 0, 0, w, h, 1.0f, 0.13f, 0.37f, argb(0xFFFFFFFF, quality.mp4GrainAlpha));
@@ -166,27 +223,125 @@ final class ReplayVideoOverlay {
             c.tile(Tex.GRAIN, 0, 0, w, h, 1.0f, ReplayVideoFx.rnd(frame, 1), ReplayVideoFx.rnd(frame, 2), argb(0xFFFFFFFF, 0.075));
         }
 
+        // Render skill toasts BEFORE action() highlight titles/cards so banners like FIRST BLOOD stay on top.
+        if (s.act() == Act.ACTION && options.showSkillToasts()) {
+            boolean splitActive = cs != null && cs.splitScreen() && cs.splitLeftRatio() > 0.015 && cs.splitLeftRatio() < 0.985;
+            boolean highlightActive = false;
+            for (Beat b : activeBeats()) {
+                double u = b.local(t);
+                if (u >= -0.05 && u <= 2.65) { highlightActive = true; break; }
+            }
+            double toastTick = cs != null && cs.splitScreen() ? cs.rightPovTick() : s.replayTick();
+            if (splitActive || highlightActive) {
+                float bottomBar = currentLetterboxHeight(t, s, cs);
+                float rightStart = splitActive ? Math.max(w * 0.54f, (float) (w * cs.splitLeftRatio()) + 34f) : w * 0.62f;
+                float safeBottom = h - Math.max(bottomBar + (splitActive ? 54f : 22f), 96f);
+                ReplaySkillFallbackHud.renderOnCanvas(c, model, toastTick,
+                        rightStart, 0f, Math.max(240f, w - rightStart - 10f), safeBottom,
+                        true, true, true, 2, 0.94f);
+            } else {
+                ReplaySkillFallbackHud.renderOnCanvas(c, model, toastTick, 0f, 0f, w, h, false, 1.0f);
+            }
+        }
         switch (s.act()) {
             case TITLE -> title(c, t, s);
-            case ACTION -> action(c, t, s, shot, heads);
+            case ACTION -> action(c, t, s, cs, shot, heads);
             case REVIEW -> review(c, s);
             case VICTORY -> victory(c, t, s);
             case MVP -> mvp(c, t, s, shot, heads);
             case OUTRO -> outro(c, t, s);
         }
-        if (s.act() == Act.ACTION || s.act() == Act.REVIEW) {
+        if (options.includeWatermark() && (s.act() == Act.ACTION || s.act() == Act.REVIEW)) {
             c.art(Tex.BRAND, w - 40 - Tex.BRAND.w * 0.16f, h - 48, 0.32f, 0, argb(0xFFFFFFFF, 0.6), false);
+        }
+        if (cs != null && cs.cutProgress() >= 0.0) {
+            segmentTransition(c, cs.activeCutStyle(), cs.cutProgress());
         }
         wipe(c, s);
         // Fade in from and out to black.
-        double black = Math.max(1 - t / 0.5, ReplayStagePlan.smoothstep(script.total() - 0.8, script.total() - 0.05, t));
+        double total = totalSeconds();
+        double black = Math.max(1 - t / 0.5, ReplayStagePlan.smoothstep(total - 0.8, total - 0.05, t));
         if (black > 0) c.rect(0, 0, w, h, argb(0xFF000000, black));
+    }
+
+    /** Computes the top and bottom X coordinates of the 4-degree tilted split-screen beam in design pixels. */
+    static float[] splitSeamX(double leftRatio, float width, float height) {
+        float midX = (float) (width * Math.clamp(leftRatio, 0.0, 1.0));
+        float dx = (float) (Math.tan(Math.toRadians(ReplayCinemaDirector.SPLIT_BEAM_TILT_DEGREES)) * height * 0.5);
+        return new float[]{midX + dx, midX - dx};
+    }
+
+    private void splitBeamOverlay(ReplayVideoCanvas c, double t, ReplayCinemaDirector.CinemaSample cs) {
+        float[] seam = splitSeamX(cs.splitLeftRatio(), w, h);
+        float topX = seam[0], botX = seam[1];
+        float midX = 0.5f * (topX + botX), midY = h * 0.5f;
+        float angleRad = (float) Math.atan2(botX - topX, h);
+        // Edge fade as beam slides out to 0% during Tier 4 POV full-screen expand
+        double edgeFade = ReplayStagePlan.smoothstep(0.015, 0.10, cs.splitLeftRatio());
+        // Star-Night Express brass split beam
+        c.sprite(Tex.SPLIT_BEAM, midX, midY, 84f, h * 1.08f, -angleRad, argb(0xFFFFFFFF, 0.96 * edgeFade), false);
+        // Octagonal Art Deco weapon emblem medallion at the center of the beam
+        double pulse = 1.0 + 0.03 * Math.sin(t * 7.0);
+        float medSize = (float) (112 * pulse);
+        c.sprite(Tex.GLOW, midX, midY, 180, 180, 0, argb(BRASS_LIGHT, 0.42 * edgeFade), true);
+        c.sprite(Tex.SPLIT_MEDALLION, midX, midY, medSize, medSize, 0, argb(0xFFFFFFFF, 0.98 * edgeFade), false);
+        var hBeat = cs.activeHighlight();
+        if (hBeat != null) {
+            var mark = marks.get(hBeat.primaryNode());
+            if (mark != null) c.item(mark.item(), midX, midY, 44);
+            else c.icon(ReplayVideoCanvas.CROSSHAIR, midX, midY, 38, argb(RUBY, edgeFade));
+        }
+        // Subtle right-panel POV badge docked at bottom-right above the letterbox/timeline so it never
+        // collides with centered FIRST BLOOD / MULTI KILL banners at top-center.
+        if (cs.povSubjectUuid() != null && edgeFade > 0.2) {
+            var actor = model.participant(cs.povSubjectUuid());
+            Component tag = actor != null
+                    ? Component.literal("POV · ").append(actor.name)
+                    : Component.literal("KILLER POV");
+            float bottomBar = currentLetterboxHeight(t, cs.baseSample(), cs);
+            float bw = Math.min(240f, c.width(tag, 1.55f) + 30f);
+            float bx = Math.max(botX + 26f, w - 28f - bw);
+            float by = h - Math.max(bottomBar + 24f, 88f);
+            c.slab(bx, by - 13, bx + bw, by + 13, 8, argb(NIGHT_1, 0.90 * edgeFade), argb(NIGHT_0, 0.94 * edgeFade));
+            c.rect(bx, by - 13, bx + 4, by + 13, argb(RUBY, edgeFade));
+            c.textFit(tag, bx + 14, by, 1.55f, bw - 22, argb(CHAMPAGNE, edgeFade), -1, true);
+        }
+    }
+
+    private void segmentTransition(ReplayVideoCanvas c, ReplayCinemaDirector.CutStyle style, double p) {
+        if (style == ReplayCinemaDirector.CutStyle.NONE) return;
+        double peak = Math.sin(Math.clamp(p, 0.0, 1.0) * Math.PI);
+        if (style == ReplayCinemaDirector.CutStyle.TICKET_FLIP) {
+            // Star-Night Express ticket-flip & brass light sweep between Personal Highlights clips
+            double e = ReplayStagePlan.easeInOutQuart(p);
+            float sweepX = (float) (-w * 0.35 + w * 1.7 * e);
+            c.rect(0, 0, w, h, argb(NIGHT_0, Math.min(1.0, peak * 1.12)));
+            c.slab(sweepX - 180, 0, sweepX + 180, h, -h * 0.25f, argb(NIGHT_2, 0.96 * peak), argb(NIGHT_0, 0.96 * peak));
+            c.slab(sweepX - 196, 0, sweepX - 180, h, -h * 0.25f, argb(BRASS_LIGHT, peak), argb(BRASS, peak));
+            c.slab(sweepX + 180, 0, sweepX + 194, h, -h * 0.25f, argb(BRASS, peak), argb(BRASS_LIGHT, peak));
+            c.sprite(Tex.STREAK, sweepX, h * 0.5f, 520, 140, (float) Math.toRadians(76), argb(BRASS_LIGHT, 0.75 * peak), true);
+            c.art(Tex.T_HIGHLIGHTS, w * 0.5f, h * 0.5f, (float) (0.38 + 0.08 * peak), 0, argb(0xFFFFFFFF, peak), false);
+        } else if (style == ReplayCinemaDirector.CutStyle.BRASS_SWEEP) {
+            // Full-frame opaque Star-Night brass curtain covering [0, w] completely at p = 0.5 when tickAt() switches.
+            double e = ReplayStagePlan.easeInOutQuart(p);
+            float skew = h * 0.30f;
+            float slabW = w * 1.45f;
+            float center = (float) (-slabW * 0.55 - skew + (w + slabW * 1.10 + skew * 2.0) * e);
+            float left = center - slabW * 0.5f;
+            float right = center + slabW * 0.5f;
+            c.slab(left - 24, 0, left, h, -skew, argb(BRASS_LIGHT, 1.0), argb(BRASS, 1.0));
+            c.slab(left, 0, right, h, -skew, argb(NIGHT_2, 1.0), argb(NIGHT_0, 1.0));
+            c.slab(right, 0, right + 18, h, -skew, argb(BRASS, 1.0), argb(BRASS_LIGHT, 1.0));
+            c.sprite(Tex.STREAK, center, h * 0.5f, 520, 110, (float) Math.toRadians(72), argb(CHAMPAGNE, 0.70 * peak), true);
+        } else if (style == ReplayCinemaDirector.CutStyle.CROSS_DISSOLVE) {
+            c.rect(0, 0, w, h, argb(NIGHT_0, Math.min(0.96, 0.96 * peak)));
+        }
     }
 
     /** Chromatic aberration strength for the encoder pass (0..1). */
     double aberration(double t) {
         double a = 0;
-        for (Beat b : script.beats()) {
+        for (Beat b : activeBeats()) {
             double u = b.local(t);
             if (u < 0 || u > 1) continue;
             double k = switch (b.type()) {
@@ -197,20 +352,31 @@ final class ReplayVideoOverlay {
             };
             a = Math.max(a, k * ReplayVideoScript.impulse(u, 6));
         }
-        for (var span : script.spans()) {
+        if (film != null) {
+            var cs = film.sample(t);
+            if (cs.segment() != null) {
+                var kind = cs.segment().kind();
+                if (kind == ReplayCinemaDirector.SegmentKind.TIER3_HERO_SIDE
+                        || kind == ReplayCinemaDirector.SegmentKind.TIER4_IMPACT_FREEZE
+                        || kind == ReplayCinemaDirector.SegmentKind.TIER5_APEX_FREEZE) {
+                    a = Math.max(a, 0.85 * ReplayVideoScript.impulse(t - cs.segment().videoStart(), 4.5));
+                }
+            }
+        }
+        for (var span : activeSpans()) {
             if (span.span().kind() == LastMatchReplay.SpanKind.BLACKOUT) {
                 double u = t - span.start();
                 if (u >= 0 && u < 0.6) a = Math.max(a, 0.7 * (1 - u / 0.6));
             }
         }
-        double wipe = script.sample(t).wipe();
+        double wipe = sampleWipe(t);
         if (wipe >= 0) a = Math.max(a, 0.5 * (1 - Math.abs(wipe - 0.5) * 2));
         return Math.min(1, a);
     }
 
-    private void spans(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, ReplayActorSizing heads) {
+    private void spans(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, @Nullable ReplayActorSizing heads) {
         if (s.act() != Act.ACTION) return;
-        for (var span : script.spans()) {
+        for (var span : activeSpans()) {
             double in = ReplayStagePlan.smoothstep(span.start(), span.start() + 0.25, t) * (1 - ReplayStagePlan.smoothstep(span.end(), span.end() + 0.4, t));
             if (in <= 0) continue;
             if (span.span().kind() == LastMatchReplay.SpanKind.BLACKOUT) {
@@ -222,7 +388,7 @@ final class ReplayVideoOverlay {
                 c.sprite(Tex.GLOW, 0, h / 2, h * 0.9f, h * 1.6f, 0, argb(PSYCHO, 0.16 * in * pulse), true);
                 c.sprite(Tex.GLOW, w, h / 2, h * 0.9f, h * 1.6f, 0, argb(PSYCHO, 0.16 * in * pulse), true);
                 ReplayBoardModel.Actor actor = model.participant(span.span().actor());
-                if (actor != null) {
+                if (actor != null && heads != null) {
                     Vector3f p = actorPoint(actor, s.replayTick());
                     if (p != null) {
                         Vector3f sp = shot.toScreen(p.add(0, headSize(heads, actor, p) * 1.6f, 0), w, h);
@@ -233,10 +399,11 @@ final class ReplayVideoOverlay {
         }
     }
 
-    private void impacts(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot) {
+    private void impacts(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s,
+                         @Nullable ReplayCinemaDirector.CinemaSample cs, ReplayVideoCamera.Shot shot) {
         double bestFlash = 0;
         int bestFlashColor = RUBY;
-        for (Beat b : script.beats()) {
+        for (Beat b : activeBeats()) {
             double u = b.local(t);
             if (u < 0 || u > 1.6) continue;
             int color = beatColor(b);
@@ -259,29 +426,76 @@ final class ReplayVideoOverlay {
                 c.sprite(Tex.SPEEDLINES, sp.x, sp.y, w * 1.7f, w * 1.7f, (float) (u * 0.4), argb(lc, lines), b.type() == BeatType.REVIVAL);
             }
         }
+        // Tier 5 Apotheosis Apex Freeze: radiant star-trail afterimages & colossal gilded stamp!
+        if (cs != null && cs.segment() != null && cs.segment().kind() == ReplayCinemaDirector.SegmentKind.TIER5_APEX_FREEZE) {
+            double p = cs.segment().progressAt(t);
+            double pulse = 1.0 - 0.25 * p;
+            c.sprite(Tex.RAYS, w * 0.5f, h * 0.5f, w * 1.35f, w * 1.35f, (float) (t * 0.6), argb(BRASS_LIGHT, 0.38 * pulse), true);
+            c.sprite(Tex.SPEEDLINES, w * 0.5f, h * 0.5f, w * 1.6f, w * 1.6f, (float) (p * 0.25), argb(CHAMPAGNE, 0.50 * pulse), true);
+            c.sprite(Tex.SKILL_RUNE, w * 0.5f, h * 0.5f, 440, 440, (float) (t * 0.8), argb(BRASS_LIGHT, 0.32 * pulse), true);
+            Tex stamp = switch (cs.stampKey()) {
+                case "MULTI_KILL" -> Tex.T_MULTI_KILL;
+                case "FINAL_BLOW" -> Tex.T_FINAL_BLOW;
+                case "MVP" -> Tex.T_MVP;
+                default -> Tex.T_APOTHEOSIS;
+            };
+            double slam = back(p / 0.35);
+            c.art(stamp, w * 0.5f, h * 0.30f, (float) (0.72 * (1.0 + 0.55 * (1.0 - slam))), (float) Math.toRadians(-2.5),
+                    argb(0xFFFFFFFF, Math.min(1.0, p / 0.08)), false);
+            c.art(Tex.T_APOTHEOSIS, w * 0.5f, h * 0.78f, 0.38f, 0, argb(BRASS_LIGHT, 0.88 * pulse), false);
+        }
         if (bestFlash > 0.01) {
             c.rect(0, 0, w, h, argb(bestFlashColor, bestFlash * 0.42));
             c.sprite(Tex.GLOW, w / 2, h / 2, w * 1.5f, h * 1.5f, 0, argb(0xFFFFFFFF, bestFlash * 0.30), true);
         }
     }
 
-    private void letterbox(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s) {
+    private float currentLetterboxHeight(double t, ReplayVideoScript.Sample s,
+                                         @Nullable ReplayCinemaDirector.CinemaSample cs) {
+        boolean dof = options.includeLetterboxDof();
+        if (!dof && (cs == null || cs.letterboxBoost() <= 0.5)) return 0f;
         double lb = switch (s.act()) {
             case VICTORY -> 0.9;
             case MVP -> 0.55;
             case TITLE -> 0.0;
             default -> 0;
         };
-        if (s.act() == Act.ACTION) for (Beat b : script.beats()) lb = Math.max(lb, ReplayVideoScript.influence(b, t, 0.6, 0.6));
+        if (s.act() == Act.ACTION) {
+            for (Beat b : activeBeats()) lb = Math.max(lb, ReplayVideoScript.influence(b, t, 0.6, 0.6));
+            if (cs != null && cs.letterboxBoost() > 0) {
+                lb = Math.max(lb, Math.min(1.0, cs.letterboxBoost()));
+            }
+        }
+        if (lb <= 0.01) return 0f;
+        boolean gildedDeep = cs != null && cs.letterboxBoost() > 1.05;
+        float ratio = gildedDeep ? 0.165f : (s.act() == Act.ACTION ? 0.148f : 0.095f);
+        return (float) (h * ratio * ReplayStagePlan.easeInOutQuart(lb));
+    }
+
+    private void letterbox(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s,
+                           @Nullable ReplayCinemaDirector.CinemaSample cs) {
+        double lb = switch (s.act()) {
+            case VICTORY -> 0.9;
+            case MVP -> 0.55;
+            case TITLE -> 0.0;
+            default -> 0;
+        };
+        if (s.act() == Act.ACTION) {
+            for (Beat b : activeBeats()) lb = Math.max(lb, ReplayVideoScript.influence(b, t, 0.6, 0.6));
+            if (cs != null && cs.letterboxBoost() > 0) {
+                lb = Math.max(lb, Math.min(1.0, cs.letterboxBoost()));
+            }
+        }
         if (lb <= 0.01) return;
-        // Pull ACTION letterbox slightly further inward so top/bottom HUD rows sit cleanly inside
-        // the black bars without the brass border slicing across them.
-        float ratio = s.act() == Act.ACTION ? 0.148f : 0.095f;
+        boolean gildedDeep = cs != null && cs.letterboxBoost() > 1.05;
+        float ratio = gildedDeep ? 0.165f : (s.act() == Act.ACTION ? 0.148f : 0.095f);
         float bar = (float) (h * ratio * ReplayStagePlan.easeInOutQuart(lb));
         c.rect(0, 0, w, bar, 0xFF000000);
         c.rect(0, h - bar, w, h, 0xFF000000);
-        c.rect(0, bar, w, bar + 2, argb(BRASS, 0.5 * lb), argb(BRASS, 0));
-        c.rect(0, h - bar - 2, w, h - bar, argb(BRASS, 0), argb(BRASS, 0.5 * lb));
+        int rimCol = gildedDeep ? BRASS_LIGHT : BRASS;
+        float rimH = gildedDeep ? 3.5f : 2.0f;
+        c.rect(0, bar, w, bar + rimH, argb(rimCol, (gildedDeep ? 0.92 : 0.5) * lb), argb(rimCol, 0));
+        c.rect(0, h - bar - rimH, w, h - bar, argb(rimCol, 0), argb(rimCol, (gildedDeep ? 0.92 : 0.5) * lb));
     }
 
     // =================================================================== act one: boarding ticket
@@ -345,40 +559,85 @@ final class ReplayVideoOverlay {
 
     // =================================================================== act two: the match
 
-    private void action(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, ReplayVideoCamera.Shot shot, ReplayActorSizing heads) {
+    private void action(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s,
+                        @Nullable ReplayCinemaDirector.CinemaSample cs,
+                        ReplayVideoCamera.Shot shot, @Nullable ReplayActorSizing heads) {
         double k = s.actTime();
         double hud = ReplayStagePlan.easeOutCubic((k - 0.2) / 0.5) * (1 - ReplayStagePlan.smoothstep(s.actLength() - 0.4, s.actLength(), k));
         double cinematic = 0;
-        for (Beat b : script.beats()) cinematic = Math.max(cinematic, ReplayVideoScript.influence(b, t, 0.6, 0.6));
+        for (Beat b : activeBeats()) cinematic = Math.max(cinematic, ReplayVideoScript.influence(b, t, 0.6, 0.6));
         double hudA = hud * (1 - 0.12 * cinematic);
-        hudClock(c, t, s, hudA, hud);
-        alive(c, s, hudA);
-        timeline(c, s, hudA);
-        feed(c, t, s, hud);
-        departure(c, k);
-        for (Beat b : script.beats()) {
+        if (options.showTimecode()) hudClock(c, t, s, cs, hudA, hud);
+        if (options.showAliveMatrix()) alive(c, s, hudA);
+        if (options.showTimeline()) timeline(c, s, hudA);
+        if (options.showKillFeed()) feed(c, t, s, hud);
+        if (options.includeTitle()) departure(c, k);
+        boolean isTier5Freeze = cs != null && cs.segment() != null
+                && cs.segment().kind() == ReplayCinemaDirector.SegmentKind.TIER5_APEX_FREEZE;
+        for (Beat b : activeBeats()) {
             double u = b.local(t);
             if (u < -0.05 || u > 3.2) continue;
-            callout(c, t, b, shot, u, heads);
-            badge(c, b, u);
-            card(c, b, u);
+            if (heads != null && (cs == null || cs.camera() == ReplayCinemaDirector.CameraDirective.DIORAMA_OVERVIEW
+                    || cs.camera() == ReplayCinemaDirector.CameraDirective.DIORAMA_CLOSEUP
+                    || cs.camera() == ReplayCinemaDirector.CameraDirective.DIORAMA_FOLLOW
+                    || cs.camera() == ReplayCinemaDirector.CameraDirective.SPLIT_DIORAMA_AND_POV)) {
+                float splitRightBound = (cs != null && cs.splitScreen() && cs.splitLeftRatio() < 0.985)
+                        ? (float) (w * cs.splitLeftRatio()) - 82f : w - 24f;
+                callout(c, t, b, shot, u, heads, splitRightBound);
+            }
+            if (!isTier5Freeze) badge(c, b, u);
+            card(c, b, u, s.replayTick());
+        }
+        // Tier 1 Glimmer subtle badge in top-right when active
+        if (cs != null && cs.segment() != null && cs.segment().kind() == ReplayCinemaDirector.SegmentKind.TIER1_GLIMMER
+                && cs.activeHighlight() != null) {
+            tier1GlimmerToast(c, cs, t);
         }
     }
 
-    private void hudClock(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, double a, double chipAlpha) {
+    private void tier1GlimmerToast(ReplayVideoCanvas c, ReplayCinemaDirector.CinemaSample cs, double t) {
+        var h = cs.activeHighlight();
+        double p = cs.segment().progressAt(t);
+        double a = ReplayStagePlan.smoothstep(0.0, 0.15, p) * (1.0 - ReplayStagePlan.smoothstep(0.82, 1.0, p));
+        if (a <= 0.02) return;
+        Component line = feedLine(h.primaryNode());
+        int col = feedColor(h.primaryNode());
+        float tw = Math.min(380, c.width(line, 1.65f)) + 74;
+        float x1 = w - 40, x0 = x1 - tw, y = 122;
+        c.slab(x0, y - 16, x1, y + 16, -8, argb(NIGHT_2, 0.90 * a), argb(NIGHT_0, 0.94 * a));
+        c.rect(x1 - 5, y - 16, x1, y + 16, argb(col, a));
+        c.diamond(x0 + 18, y, 6f, argb(BRASS_LIGHT, a));
+        c.textFit(line, x0 + 34, y, 1.65f, tw - 48, argb(CHAMPAGNE, a), -1, true);
+    }
+
+    private void hudClock(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s,
+                          @Nullable ReplayCinemaDirector.CinemaSample cs, double a, double chipAlpha) {
         if (a <= 0.01) return;
         float x = 44, y = 26;
         boolean blink = (t % 1.0) < 0.6;
-        c.disc(x + 6, y, 6, argb(RUBY, (blink ? 1 : 0.35) * a), argb(RUBY, (blink ? 0.6 : 0.2) * a), 16);
-        Component replayTag = ReplayVideoCanvas.font(Component.literal("REPLAY"), ReplayVideoCanvas.UI);
-        c.text(replayTag, x + 20, y, 2f, argb(CHAMPAGNE, 0.92 * a), -1, false);
-        var focusActor = model.participant(script.focusPlayer());
-        if (focusActor != null) {
-            float px = x + 32 + c.width(replayTag, 2f);
-            c.disc(px + 4, y, 4.5f, argb(FOCUS_TRAIL, 0.95 * a), argb(FOCUS_TRAIL_GLOW, 0.4 * a), 12);
-            c.textFit(tr("hud.pov", focusActor.name), px + 16, y, 1.8f, 340, argb(FOCUS_TRAIL_HEAD, 0.95 * a), -1, true);
+        String tagStr = cs != null && cs.instantReplay() ? "ENCORE" : "REPLAY";
+        Component replayTag = ReplayVideoCanvas.font(Component.literal(tagStr), ReplayVideoCanvas.UI);
+        float tagW = c.width(replayTag, 2f);
+        var focusActor = model.participant(focusPlayer());
+        Component povLabel = focusActor != null ? tr("hud.pov", focusActor.name) : null;
+        float pillRight = x + 20 + tagW + 14;
+        if (povLabel != null) {
+            pillRight = x + 32 + tagW + 16 + Math.min(340f, c.width(povLabel, 1.8f)) + 16;
         }
-        String clock = ReplayStagePlan.clock(s.replayTick());
+        // Subtle dark Art Deco backing strip so top-left REPLAY/POV status stays legible over bright carriages.
+        c.slab(x - 10, y - 13, pillRight, y + 13, 8, argb(NIGHT_0, 0.72 * a), argb(NIGHT_1, 0.56 * a));
+        c.disc(x + 6, y, 6, argb(RUBY, (blink ? 1 : 0.35) * a), argb(RUBY, (blink ? 0.6 : 0.2) * a), 16);
+        c.text(replayTag, x + 20, y, 2f, argb(CHAMPAGNE, 0.96 * a), -1, true);
+        if (focusActor != null && povLabel != null) {
+            float px = x + 32 + tagW;
+            c.disc(px + 4, y, 4.5f, argb(FOCUS_TRAIL, 0.95 * a), argb(FOCUS_TRAIL_GLOW, 0.4 * a), 12);
+            c.textFit(povLabel, px + 16, y, 1.8f, 340, argb(FOCUS_TRAIL_HEAD, 0.98 * a), -1, true);
+        }
+        boolean useRightPovTick = cs != null && cs.segment() != null
+                && (cs.segment().kind() == ReplayCinemaDirector.SegmentKind.TIER4_POV_EXPAND
+                || (cs.instantReplay() && cs.splitScreen() && cs.splitLeftRatio() < 0.5));
+        double clockTick = useRightPovTick ? cs.rightPovTick() : s.replayTick();
+        String clock = ReplayStagePlan.clock(clockTick);
         c.text(ReplayVideoCanvas.font(Component.literal(clock), ReplayVideoCanvas.BIG), x - 2, y + 40, 4.0f, argb(0xFFFFFFFF, a), -1, true);
         float cw = c.width(ReplayVideoCanvas.font(Component.literal(clock), ReplayVideoCanvas.BIG), 4.0f);
         Component chip;
@@ -419,7 +678,8 @@ final class ReplayVideoOverlay {
         for (int i = 0; i < shown; i++) {
             var actor = model.actors[i];
             float xx = px + i * 13, yy = y + 58;
-            int col = actor.factionColor();
+            // Anti-spoiler suspense fog: hide unrevealed faction colors behind neutral brass-slate until revealed!
+            int col = roleRevealed(actor.p.id(), s.replayTick()) ? actor.factionColor() : TEXT_MUTED;
             if (states[i]) c.rect(xx, yy, xx + 10, yy + 10, argb(col, a), argb(scale(col, 0.7), a));
             else {
                 c.rect(xx, yy, xx + 10, yy + 10, argb(0xFF2A2F3E, 0.8 * a));
@@ -432,24 +692,27 @@ final class ReplayVideoOverlay {
     private void timeline(ReplayVideoCanvas c, ReplayVideoScript.Sample s, double a) {
         if (a <= 0.01) return;
         float x0 = 230, x1 = w - 360, y = h - 46;
-        int duration = Math.max(1, script.actionEndTick());
+        int startT = timelineStartTick();
+        int endT = Math.max(startT + 1, timelineEndTick());
+        int span = endT - startT;
         c.rect(x0, y - 3, x1, y + 3, argb(0xFF070B18, 0.75 * a));
-        for (var span : script.spans()) {
-            if (span.span().kind() != LastMatchReplay.SpanKind.BLACKOUT) continue;
-            float sx = x0 + (x1 - x0) * span.span().startTick() / duration, ex = x0 + (x1 - x0) * Math.min(duration, span.span().endTick()) / duration;
+        for (var spanWin : activeSpans()) {
+            if (spanWin.span().kind() != LastMatchReplay.SpanKind.BLACKOUT) continue;
+            float sx = x0 + (x1 - x0) * (float) Math.clamp((spanWin.span().startTick() - startT) / (double) span, 0, 1);
+            float ex = x0 + (x1 - x0) * (float) Math.clamp((spanWin.span().endTick() - startT) / (double) span, 0, 1);
             c.rect(sx, y - 3, ex, y + 3, argb(0xFF4C6BB0, 0.6 * a));
         }
-        float px = x0 + (float) ((x1 - x0) * Math.clamp(s.replayTick() / duration, 0, 1));
+        float px = x0 + (float) ((x1 - x0) * Math.clamp((s.replayTick() - startT) / span, 0, 1));
         c.rectH(x0, y - 2, px, y + 2, argb(BRASS_DIM, a), argb(BRASS_LIGHT, a));
-        for (Beat b : script.beats()) {
-            float bx = x0 + (x1 - x0) * b.tick() / duration;
+        for (Beat b : activeBeats()) {
+            float bx = x0 + (x1 - x0) * (float) Math.clamp((b.tick() - startT) / (double) span, 0, 1);
             boolean past = b.tick() <= s.replayTick();
             c.diamond(bx, y, past ? 7 : 5, argb(beatColor(b), (past ? 1 : 0.55) * a));
         }
         c.sprite(Tex.GLOW, px, y, 46, 46, 0, argb(BRASS_LIGHT, 0.9 * a), true);
         c.disc(px, y, 5, argb(0xFFFFFFFF, a), argb(CHAMPAGNE, a), 16);
         c.textFit(Component.literal(model.replay.mapName()), x0 - 18, y, 1.6f, 170, argb(CHAMPAGNE, 0.9 * a), 1, true);
-        c.text(ReplayVideoCanvas.font(Component.literal(ReplayStagePlan.clock(duration)), ReplayVideoCanvas.UI), x1 + 18, y, 1.8f,
+        c.text(ReplayVideoCanvas.font(Component.literal(ReplayStagePlan.clock(endT)), ReplayVideoCanvas.UI), x1 + 18, y, 1.8f,
                 argb(TEXT_MUTED, a), -1, false);
     }
 
@@ -470,7 +733,7 @@ final class ReplayVideoOverlay {
     private void feed(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s, double hud) {
         if (hud <= 0.01) return;
         List<ReplayVideoScript.Feed> live = new ArrayList<>();
-        for (var f : script.feeds()) {
+        for (var f : activeFeeds()) {
             if (f.time() > t) break;
             if (t - f.time() < 3.2) live.add(f);
         }
@@ -515,10 +778,21 @@ final class ReplayVideoOverlay {
                     argb(0xFFFFFFFF, 0.55 * a * Math.sin(sweep * Math.PI)), true);
         }
         Component sub = badgeSubtitle(b);
-        if (sub != null) c.text(sub, w / 2, y + 62, 2f, argb(CHAMPAGNE, a * ReplayStagePlan.easeOutCubic((u - 0.2) / 0.3)), 0, true);
+        if (sub != null) {
+            double sa = a * ReplayStagePlan.easeOutCubic((u - 0.2) / 0.3);
+            if (sa > 0.01) {
+                float subY = y + 78;
+                float sw = Math.min(w * 0.65f, c.width(sub, 2f) + 46f);
+                c.slab(w / 2 - sw / 2, subY - 15, w / 2 + sw / 2, subY + 15, 10,
+                        argb(NIGHT_0, 0.88 * sa), argb(NIGHT_1, 0.88 * sa));
+                c.line(w / 2 - sw / 2 + 10, subY - 15, w / 2 + sw / 2 + 10, subY - 15, 1.5f,
+                        argb(BRASS_LIGHT, 0.65 * sa), argb(BRASS, 0.65 * sa));
+                c.text(sub, w / 2, subY, 2f, argb(CHAMPAGNE, sa), 0, true);
+            }
+        }
     }
 
-    private void card(ReplayVideoCanvas c, Beat b, double u) {
+    private void card(ReplayVideoCanvas c, Beat b, double u, double matchTick) {
         if (u < 0 || b.type() == BeatType.HIT) return;
         double in = back((u - 0.12) / 0.38), out = ReplayStagePlan.easeInOutQuart((u - 2.6) / 0.45);
         double a = Math.min(1, (u - 0.1) / 0.1) * (1 - out);
@@ -536,9 +810,10 @@ final class ReplayVideoOverlay {
             ReplayBoardModel.Actor killer = model.participant(node.actor()), victim = model.participant(node.target());
             float fx = x + 26;
             if (killer != null) {
+                boolean kr = roleRevealed(killer.p.id(), matchTick);
                 c.face(killer.p.id(), fx, cy - 22, 44, argb(0xFFFFFFFF, a));
-                c.textFit(killer.name, fx + 54, cy - 11, 2f, 145, argb(lerp(killer.color, 0xFFFFFFFF, 0.18), a), -1, true);
-                c.textFit(killer.role, fx + 54, cy + 14, 1.45f, 145, argb(subText, a), -1, true);
+                c.textFit(killer.name, fx + 54, cy - 11, 2f, 145, argb(kr ? readableRoleColor(killer.color) : TEXT, a), -1, true);
+                c.textFit(kr ? killer.role : Component.literal("???"), fx + 54, cy + 14, 1.45f, 145, argb(subText, a), -1, true);
             } else {
                 c.icon(ReplayVideoCanvas.SKULL, fx + 22, cy, 40, argb(subText, a));
                 c.textFit(ReplayBoardTexts.tr("environment"), fx + 54, cy, 2f, 145, argb(subText, a), -1, true);
@@ -551,14 +826,13 @@ final class ReplayVideoOverlay {
             else c.icon(ReplayVideoCanvas.CROSSHAIR, wx, wy, 34, argb(accent, a));
             c.textFit(ReplayBoardTexts.weapon(node), wx, cy + 28, 1.35f, 128, argb(CHAMPAGNE, 0.92 * a), 0, true);
             if (victim != null) {
+                boolean vr = roleRevealed(victim.p.id(), matchTick);
                 float vx = x + cw - 70;
                 c.face(victim.p.id(), vx, cy - 22, 44, argb(0xFFB06060, a));
                 c.line(vx + 4, cy - 18, vx + 40, cy + 18, 4, argb(RUBY, a), argb(RUBY, a));
                 c.line(vx + 40, cy - 18, vx + 4, cy + 18, 4, argb(RUBY, a), argb(RUBY, a));
-                c.textFit(victim.name, vx - 10, cy - 11, 2f, 125, argb(TEXT, a), 1, true);
-                float nw = Math.min(125, c.width(victim.name, 2f));
-                c.line(vx - 10 - nw, cy - 10, vx - 10, cy - 10, 2, argb(RUBY, 0.9 * a), argb(RUBY, 0.9 * a));
-                c.textFit(victim.role, vx - 10, cy + 14, 1.45f, 125, argb(lerp(victim.color, 0xFFFFFFFF, 0.22), a), 1, true);
+                c.textFit(victim.name, vx - 10, cy - 11, 2f, 125, argb(lerp(TEXT, TEXT_MUTED, 0.22), a), 1, true);
+                c.textFit(vr ? victim.role : Component.literal("???"), vx - 10, cy + 14, 1.45f, 125, argb(vr ? readableRoleColor(victim.color) : subText, a), 1, true);
             }
         } else {
             ReplayBoardModel.Actor subject = model.participant(b.type() == BeatType.SHIELD && node.target() != null ? node.target()
@@ -581,18 +855,23 @@ final class ReplayVideoOverlay {
                 default -> name;
             };
             c.textFit(line, fx + 56, cy - 10, 2f, cw - 150, argb(TEXT, a), -1, true);
-            if (subject != null) c.textFit(subject.role, fx + 56, cy + 16, 1.45f, cw - 150, argb(lerp(subject.color, 0xFFFFFFFF, 0.22), a), -1, true);
+            if (subject != null) {
+                boolean sr = roleRevealed(subject.p.id(), matchTick);
+                c.textFit(sr ? subject.role : Component.literal("???"), fx + 56, cy + 16, 1.45f, cw - 150,
+                        argb(sr ? readableRoleColor(subject.color) : subText, a), -1, true);
+            }
             c.sprite(Tex.GLOW, x + cw - 50, cy, 80, 80, 0, argb(accent, 0.5 * a), true);
             c.icon(icon, x + cw - 50, cy, 38, argb(accent, a));
         }
     }
 
-    private void callout(ReplayVideoCanvas c, double t, Beat b, ReplayVideoCamera.Shot shot, double u, ReplayActorSizing heads) {
+    private void callout(ReplayVideoCanvas c, double t, Beat b, ReplayVideoCamera.Shot shot, double u,
+                         ReplayActorSizing heads, float maxRightX) {
         if (u > 2.4) return;
         Vector3f p = subjectPoint(b);
         if (p == null) return;
         Vector3f sp = shot.toScreen(p.add(0, headSize(heads, subjectActor(b), p) * 0.9f, 0), w, h);
-        if (!onScreen(sp)) return;
+        if (!onScreen(sp) || sp.x > maxRightX + 20f) return;
         int color = beatColor(b);
         double a = (u < 0 ? 0.6 : 1) * (1 - ReplayStagePlan.smoothstep(1.9, 2.4, u));
         // Reticle brackets close in on the subject.
@@ -616,20 +895,29 @@ final class ReplayVideoOverlay {
             case SHIELD -> tr("callout.shield");
             case HIT -> tr("callout.hit", subject == null ? ReplayBoardTexts.tr("unknown_player") : subject.name);
         };
-        callout(c, sp.x, sp.y, label, color, a, u);
+        callout(c, sp.x, sp.y, label, color, a, u, maxRightX);
     }
 
-    /** Leader line from a 3D-anchored point to a label plate. */
     private void callout(ReplayVideoCanvas c, float x, float y, Component label, int color, double a, double age) {
+        callout(c, x, y, label, color, a, age, w - 24f);
+    }
+
+    /** Leader line from a 3D-anchored point to a label plate, constrained left of {@code maxRightX}. */
+    private void callout(ReplayVideoCanvas c, float x, float y, Component label, int color, double a, double age,
+                         float maxRightX) {
         double grow = ReplayStagePlan.easeOutCubic(age / 0.3);
-        boolean right = x < w * 0.62f;
+        float tw = c.width(label, 1.8f) + 24;
+        boolean right = x < Math.min(w * 0.62f, maxRightX - tw - 68f);
+        if (!right && x - 60f - tw < 24f) {
+            right = (x + 60f + tw) <= maxRightX;
+        }
         float dir = right ? 1 : -1;
-        float ex = x + dir * 60, ey = y - 60;
+        float ex = Math.clamp(x + dir * 60f, right ? 24f : 24f + tw, right ? Math.max(24f, maxRightX - tw) : maxRightX);
+        float ey = Math.max(150f, y - 60f);
         float jx = x + (ex - x) * (float) grow, jy = y + (ey - y) * (float) grow;
         c.disc(x, y, 5, argb(0xFFFFFFFF, a), argb(color, a), 12);
         c.line(x, y, jx, jy, 2.5f, argb(color, a), argb(color, a));
         if (grow < 0.95) return;
-        float tw = c.width(label, 1.8f) + 24;
         float lx0 = right ? ex : ex - tw, lx1 = right ? ex + tw : ex;
         double reveal = ReplayStagePlan.easeOutCubic((age - 0.25) / 0.25);
         float rx1 = right ? lx0 + (lx1 - lx0) * (float) reveal : lx1, rx0 = right ? lx0 : lx1 - (lx1 - lx0) * (float) reveal;
@@ -654,9 +942,10 @@ final class ReplayVideoOverlay {
                 ReplayStagePlan.clock(model.replay.durationTicks() * count),
                 String.valueOf((int) Math.round(kills * count)),
                 String.valueOf((int) Math.round(model.actors.length * count)),
-                String.valueOf((int) Math.round(script.beats().size() * count))};
+                String.valueOf((int) Math.round(objectiveHighlights * count))};
         int[] colors = {BRASS_LIGHT, RUBY, PASSENGER, LAMP};
-        float bw = 196, gap = 18, total = bw * 4 + gap * 3, x = (w - total) / 2 - 48, by = h - 144;
+        float bw = 184, gap = 14, total = bw * 4 + gap * 3, x = (w - total) / 2f;
+        float by = options.includeWatermark() ? h - 162 : h - 144;
         for (int i = 0; i < 4; i++) {
             double ia = back((k - 0.3 - i * 0.12) / 0.45);
             double ba = Math.min(1, Math.max(0, (k - 0.3 - i * 0.12) / 0.15)) * a;
@@ -679,18 +968,26 @@ final class ReplayVideoOverlay {
         int win = model.winColor;
         confetti(c, k, win, 1 - out);
         float y = h * 0.43f;
-        c.reveal(Tex.BRUSH, w / 2 - 560, y, 1120, 190, (float) ReplayStagePlan.easeOutCubic((k - 0.1) / 0.45), argb(scale(win, 0.38), 0.9 * a), false);
+        // Deep feathered night-blue backdrop band behind victory lettering so bright train roofs never wash out text.
+        double bandReveal = ReplayStagePlan.easeOutCubic((k - 0.08) / 0.40);
+        float bandHalfW = (float) (560.0 * bandReveal);
+        if (bandHalfW > 4f) {
+            c.rect(w / 2 - bandHalfW, y - 62, w / 2 + bandHalfW, y + 66, argb(NIGHT_0, 0.78 * a), argb(NIGHT_1, 0.82 * a));
+            c.rect(w / 2 - bandHalfW, y - 62, w / 2 + bandHalfW, y - 60, argb(BRASS_LIGHT, 0.65 * a));
+            c.rect(w / 2 - bandHalfW, y + 64, w / 2 + bandHalfW, y + 66, argb(win, 0.75 * a));
+        }
+        c.reveal(Tex.BRUSH, w / 2 - 560, y, 1120, 190, (float) ReplayStagePlan.easeOutCubic((k - 0.1) / 0.45), argb(scale(win, 0.34), 0.72 * a), false);
         c.reveal(Tex.BRUSH, w / 2 - 520, y + 6, 1040, 120, (float) ReplayStagePlan.easeOutCubic((k - 0.2) / 0.45), argb(win, 0.18 * a), true);
         double slam = back((k - 0.25) / 0.3);
         if (k > 0.25) c.art(Tex.T_VICTORY, w / 2, h * 0.22f, (float) (0.62 * (1 + 0.8 * (1 - slam))), (float) Math.toRadians(-2),
                 argb(0xFFFFFFFF, a * Math.min(1, (k - 0.25) / 0.08)), false);
         double ta = ReplayStagePlan.easeOutCubic((k - 0.45) / 0.4) * a;
-        c.textFit(model.title, w / 2, y - 8, 4f, w - 220, argb(lerp(win, 0xFFFFFFFF, 0.35), ta), 0, true);
+        c.textFit(model.title, w / 2, y - 10, 4f, w - 220, argb(lerp(readableRoleColor(win), 0xFFFFFFFF, 0.45), ta), 0, true);
         Component sub = Component.empty().append(model.subtitle);
         if (!model.modeLabel.getString().isBlank() && !model.modeLabel.getString().equals(model.subtitle.getString())) {
             sub = Component.empty().append(model.subtitle).append("  ·  ").append(model.modeLabel);
         }
-        c.textFit(sub, w / 2, y + 38, 2f, w - 300, argb(CHAMPAGNE, ta), 0, true);
+        c.textFit(sub, w / 2, y + 36, 2f, w - 300, argb(CHAMPAGNE, ta), 0, true);
         // Winners line up.
         List<ReplayBoardModel.Actor> winners = model.winners;
         if (winners.isEmpty()) {
@@ -712,7 +1009,7 @@ final class ReplayVideoOverlay {
             c.face(actor.p.id(), cx - size / 2, cy - size / 2, size, argb(0xFFFFFFFF, pa));
             if (actor == model.mvp) c.art(Tex.CROWN, cx, cy - size / 2 - 18, 0.24f, (float) Math.sin(t * 2.4) * 0.08f, argb(0xFFFFFFFF, pa), false);
             c.textFit(actor.name, cx, cy + size / 2 + 16, 1.6f, spacing - 10, argb(CHAMPAGNE, pa), 0, true);
-            c.textFit(actor.role, cx, cy + size / 2 + 34, 1.3f, spacing - 10, argb(actor.color, pa), 0, false);
+            c.textFit(actor.role, cx, cy + size / 2 + 34, 1.3f, spacing - 10, argb(readableRoleColor(actor.color), pa), 0, true);
         }
     }
 
@@ -744,8 +1041,10 @@ final class ReplayVideoOverlay {
         double k = s.actTime();
         double out = ReplayStagePlan.smoothstep(s.actLength() - 0.45, s.actLength(), k);
         double a = Math.min(1, k / 0.2) * (1 - out);
-        // Right-side cinematic scrim and Art Deco backdrop card so stats remain crisp over the 3D diorama.
-        c.rectH(w * 0.36f, 0, w, h, argb(NIGHT_0, 0), argb(NIGHT_0, 0.86 * a));
+        // Seamless full-width gradient scrim (0 -> w) so no hard vertical boundary appears behind the 3D MVP.
+        c.rectH(0, 0, w * 0.34f, h, argb(NIGHT_0, 0), argb(NIGHT_0, 0.12 * a));
+        c.rectH(w * 0.34f, 0, w * 0.54f, h, argb(NIGHT_0, 0.12 * a), argb(NIGHT_0, 0.62 * a));
+        c.rectH(w * 0.54f, 0, w, h, argb(NIGHT_0, 0.62 * a), argb(NIGHT_0, 0.88 * a));
         float cardX0 = w * 0.46f, cardX1 = w - 34, cardY0 = 96, cardY1 = h - 96;
         double panelOpen = ReplayStagePlan.easeOutCubic(k / 0.38);
         float panelLeft = cardX1 - (cardX1 - cardX0) * (float) panelOpen;
@@ -781,7 +1080,7 @@ final class ReplayVideoOverlay {
         double na = ReplayStagePlan.easeOutCubic((k - 0.6) / 0.4) * a;
         c.text(tr("mvp.subtitle"), tx, h * 0.34f, 1.6f, argb(BRASS_LIGHT, na), -1, true);
         c.textFit(mvp.name, tx, h * 0.40f, 3f, colRight - tx, argb(CHAMPAGNE, na), -1, true);
-        c.textFit(mvp.role, tx, h * 0.46f, 1.8f, colRight - tx, argb(lerp(mvp.color, 0xFFFFFFFF, 0.22), na), -1, true);
+        c.textFit(mvp.role, tx, h * 0.46f, 1.8f, colRight - tx, argb(readableRoleColor(mvp.color), na), -1, true);
         c.rect(tx, h * 0.495f, colRight, h * 0.495f + 1.5f, argb(BRASS_DIM, 0.75 * na));
         var p = mvp.p;
         String[] labels = {"mvp.score", "mvp.kills", "mvp.survival", "mvp.items"};
@@ -872,7 +1171,7 @@ final class ReplayVideoOverlay {
             if (ra <= 0.01) continue;
             float y = hy + 22 + rh * (slotIdx + 0.5f);
             float off = (float) ((1 - rowEnter) * 56) + pageSlideX;
-            boolean isFocus = script.focusPlayer() != null && script.focusPlayer().equals(actor.p.id());
+            boolean isFocus = focusPlayer() != null && focusPlayer().equals(actor.p.id());
             if (isFocus) {
                 c.rectH(x0 + 20 + off, y - rh / 2 + 2, x1 - 20, y + rh / 2 - 2, argb(FOCUS_TRAIL, 0.22 * ra), argb(FOCUS_TRAIL, 0.03 * ra));
                 c.rect(x0 + 20 + off, y - rh / 2 + 2, x0 + 24 + off, y + rh / 2 - 2, argb(FOCUS_TRAIL, ra));
@@ -886,7 +1185,7 @@ final class ReplayVideoOverlay {
             c.face(actor.p.id(), cols[1] + off, y - fs / 2, fs, argb(actor.p.winner() ? 0xFFFFFFFF : 0xFFAAAAAA, ra));
             c.textFit(actor.name, cols[1] + fs + 10 + off, y, 1.6f, cols[2] - cols[1] - fs - 24, argb(actor.p.winner() ? CHAMPAGNE : TEXT, ra), -1, true);
             if (actor == model.mvp) c.art(Tex.CROWN, cols[1] + fs / 2 + off, y - fs / 2 - 6, 0.12f, 0, argb(0xFFFFFFFF, ra), false);
-            c.textFit(actor.role, cols[2] + off, y, 1.4f, cols[3] - cols[2] - 40, argb(actor.color, ra), -1, false);
+            c.textFit(actor.role, cols[2] + off, y, 1.4f, cols[3] - cols[2] - 40, argb(readableRoleColor(actor.color), ra), -1, true);
             c.text(ReplayVideoCanvas.font(Component.literal(String.valueOf(actor.p.kills())), ReplayVideoCanvas.BIG), cols[3] + off, y, 2.4f, argb(RUBY, ra), 0, false);
             c.text(ReplayVideoCanvas.font(Component.literal(String.valueOf(actor.p.score())), ReplayVideoCanvas.BIG), cols[4] + off, y, 2.4f, argb(BRASS_LIGHT, ra), 0, false);
             c.text(ReplayVideoCanvas.font(Component.literal(ReplayStagePlan.clock(actor.p.survivalSeconds() * 20.0)), ReplayVideoCanvas.UI),

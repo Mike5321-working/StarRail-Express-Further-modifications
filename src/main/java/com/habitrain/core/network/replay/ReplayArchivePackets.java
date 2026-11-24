@@ -2,11 +2,11 @@ package com.habitrain.core.network.replay;
 
 import com.habitrain.core.HabiTrainCore;
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
-import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 
 import java.util.BitSet;
 import java.util.UUID;
@@ -63,11 +63,37 @@ public final class ReplayArchivePackets {
         @Override public Type<Reply> type() { return TYPE; }
     }
 
-    public record Settings(long used, long limit, String path, boolean editable, boolean ok) implements CustomPacketPayload {
+    public record Settings(long used, long limit, String path, boolean editable, boolean ok,
+                           int roundCount, int quarantinedCount, long quarantinedBytes) implements CustomPacketPayload {
         public static final Type<Settings> TYPE = new Type<>(HabiTrainCore.id("replay_archive_settings"));
         private static final StreamCodec<FriendlyByteBuf, Settings> CODEC = StreamCodec.ofMember(
-                (p, b) -> { b.writeLong(p.used); b.writeLong(p.limit); b.writeUtf(p.path, 4096); b.writeBoolean(p.editable); b.writeBoolean(p.ok); },
-                b -> new Settings(b.readLong(), b.readLong(), b.readUtf(4096), b.readBoolean(), b.readBoolean()));
+                (p, b) -> {
+                    b.writeLong(p.used);
+                    b.writeLong(p.limit);
+                    b.writeUtf(p.path, 4096);
+                    b.writeBoolean(p.editable);
+                    b.writeBoolean(p.ok);
+                    b.writeVarInt(p.roundCount);
+                    b.writeVarInt(p.quarantinedCount);
+                    b.writeLong(p.quarantinedBytes);
+                },
+                b -> {
+                    long used = b.readLong();
+                    long limit = b.readLong();
+                    String path = b.readUtf(4096);
+                    boolean editable = b.readBoolean();
+                    boolean ok = b.readBoolean();
+                    int rounds = b.isReadable() ? b.readVarInt() : 0;
+                    int qCount = b.isReadable() ? b.readVarInt() : 0;
+                    long qBytes = b.isReadable() ? b.readLong() : 0L;
+                    return new Settings(used, limit, path, editable, ok, rounds, qCount, qBytes);
+                });
+
+        /** Backward-compatible 5-arg constructor. */
+        public Settings(long used, long limit, String path, boolean editable, boolean ok) {
+            this(used, limit, path, editable, ok, 0, 0, 0L);
+        }
+
         @Override public Type<Settings> type() { return TYPE; }
     }
 

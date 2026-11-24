@@ -46,6 +46,11 @@ public final class SceneMeshBatchPolicy {
         return new Plan(1, 0, new int[]{0, 0});
     }
 
+    /** Replays retain interior faces and often zoom into one carriage of a long map. */
+    static Plan replayPlan(int sectionCount, int configuredThreshold, SceneBounds bounds) {
+        return plan(sectionCount, Math.min(configuredThreshold, 24), bounds);
+    }
+
     /**
      * 按 Section 数与包围盒决定分批。
      *

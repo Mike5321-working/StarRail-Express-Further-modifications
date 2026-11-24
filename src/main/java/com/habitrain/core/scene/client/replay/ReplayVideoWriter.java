@@ -8,6 +8,8 @@ interface ReplayVideoWriter extends AutoCloseable {
 
     default void addAudio(short[] interleavedStereo48k, int stereoFrameOffset, int stereoFrames) throws IOException {}
 
+    default void addAudioBytes(byte[] pcm16LeStereo, int byteOffset, int byteLength) throws IOException {}
+
     void finish() throws IOException;
 
     @Override

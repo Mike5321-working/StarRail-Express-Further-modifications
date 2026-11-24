@@ -134,7 +134,8 @@ public final class MvpScoreTracker {
             for (Map.Entry<UUID, MutableScore> entry : state.players.entrySet()) {
                 ServerPlayer player = server.getPlayerList().getPlayer(entry.getKey());
                 try {
-                    if (player == null || player.serverLevel() != level || !GameUtils.isPlayerAliveAndSurvival((Player)player)) continue;
+                    if (player == null || player.serverLevel() != level
+                            || (!GameUtils.isPlayerAliveAndSurvival((Player)player) && !(player.isCreative() && player.isAlive()))) continue;
                     ++entry.getValue().survivalTicks;
                 }
                 catch (Throwable throwable) {}

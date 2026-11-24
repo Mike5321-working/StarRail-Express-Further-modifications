@@ -6,12 +6,15 @@ import com.habitrain.core.game.sre.role.component.MimeKillerComponent;
 import com.habitrain.core.game.sre.role.drone.DroneOperatorService;
 import com.habitrain.core.game.sre.role.sins.component.SlothComponent;
 import com.habitrain.core.role.capability.ServerVoicePermissions;
+import com.habitrain.core.scene.replay.ReplayVoiceData;
 import de.maxhenkel.voicechat.api.Group;
 import de.maxhenkel.voicechat.api.VoicechatApi;
 import de.maxhenkel.voicechat.api.VoicechatConnection;
 import de.maxhenkel.voicechat.api.VoicechatPlugin;
 import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import de.maxhenkel.voicechat.api.events.EventRegistration;
+import de.maxhenkel.voicechat.api.events.JoinGroupEvent;
+import de.maxhenkel.voicechat.api.events.LeaveGroupEvent;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 import de.maxhenkel.voicechat.api.events.PlayerDisconnectedEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
@@ -27,8 +30,9 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Optional Simple Voice Chat plugin that captures proximity voice packets during active SRE
- * matches and forwards decoded 48 kHz mono PCM frames to {@link MatchVoiceRecorder}.
+ * Optional Simple Voice Chat plugin that captures full-match multi-track voice packets during active
+ * SRE matches (open proximity, whisper, radio, killer private channel, and voice groups) and forwards
+ * decoded 48 kHz mono PCM frames to {@link MatchVoiceRecorder}.
  *
  * <p>Loaded exclusively through the {@code voicechat} entrypoint so environments without Simple
  * Voice Chat never touch any {@code de.maxhenkel.voicechat.*} class.</p>
@@ -55,10 +59,12 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
         registration.registerEvent(VoicechatServerStartedEvent.class, this::onServerStarted);
         registration.registerEvent(VoicechatServerStoppedEvent.class, this::onServerStopped);
         registration.registerEvent(PlayerDisconnectedEvent.class, this::onDisconnect);
-        // Voicechat sorts larger priorities first.  Run after the upstream SRE plugins so their
-        // cancellation decisions are final before a packet can enter the replay recorder.
+        registration.registerEvent(JoinGroupEvent.class, this::onJoinGroup);
+        registration.registerEvent(LeaveGroupEvent.class, this::onLeaveGroup);
+        // Voicechat sorts larger priorities first. Run after the upstream SRE plugins so their
+        // cancellation decisions are final before a packet enters the replay recorder.
         registration.registerEvent(MicrophonePacketEvent.class, this::onMic, Integer.MIN_VALUE);
-        HabiTrainCore.LOGGER.info("[ReplayVoice] Simple Voice Chat replay recorder hook registered");
+        HabiTrainCore.LOGGER.info("[ReplayVoice] Simple Voice Chat HRVC v2 multi-track recorder hook registered");
     }
 
     public static @Nullable VoicechatServerApi serverApi() {
@@ -98,12 +104,19 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
         short[] pcm48k = decoder.decode(opusData);
         if (pcm48k == null || pcm48k.length == 0) return;
         float maxDist = maxDistOverride > 0 ? maxDistOverride : resolveMaxDistance(api, whispering);
-        MatchVoiceRecorder.recordPcm48kAtMs(roundId, speaker, matchMs, maxDist, pcm48k);
+        ReplayVoiceData.ChannelMode mode = whispering
+                ? ReplayVoiceData.ChannelMode.WHISPER : ReplayVoiceData.ChannelMode.NORMAL_OPEN;
+        MatchVoiceRecorder.recordPcm48kAtMs(roundId, speaker, matchMs, maxDist, mode, null, pcm48k);
     }
 
     private void onServerStarted(VoicechatServerStartedEvent event) {
         serverApi = event.getVoicechat();
         acceptingPackets = true;
+        if (serverApi != null) {
+            MatchVoiceRecorder.updateVoiceDistances(
+                    resolveMaxDistance(serverApi, false),
+                    resolveMaxDistance(serverApi, true));
+        }
     }
 
     private void onServerStopped(VoicechatServerStoppedEvent event) {
@@ -113,8 +126,30 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
     }
 
     private void onDisconnect(PlayerDisconnectedEvent event) {
-        DecoderState decoder = DECODERS.remove(event.getPlayerUuid());
+        UUID id = event.getPlayerUuid();
+        MatchVoiceRecorder.updateLiveGroup(id, null, false);
+        DecoderState decoder = DECODERS.remove(id);
         if (decoder != null) decoder.close();
+    }
+
+    private void onJoinGroup(JoinGroupEvent event) {
+        try {
+            VoicechatConnection conn = event.getConnection();
+            Group group = event.getGroup();
+            if (conn != null && conn.getPlayer() != null && group != null) {
+                MatchVoiceRecorder.updateLiveGroup(conn.getPlayer().getUuid(),
+                        group.getId(), group.getType() == Group.Type.OPEN);
+            }
+        } catch (RuntimeException ignored) {}
+    }
+
+    private void onLeaveGroup(LeaveGroupEvent event) {
+        try {
+            VoicechatConnection conn = event.getConnection();
+            if (conn != null && conn.getPlayer() != null) {
+                MatchVoiceRecorder.updateLiveGroup(conn.getPlayer().getUuid(), null, false);
+            }
+        } catch (RuntimeException ignored) {}
     }
 
     private void onMic(MicrophonePacketEvent event) {
@@ -139,19 +174,13 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
                 return;
             }
 
-            // Radio audio is deliberately routed by the upstream plugin as an additional private
-            // channel, so it is not represented by event cancellation.  A replay must only retain
-            // ordinary proximity speech.
-            if (permissions.isPrivateChannel(speaker)) return;
-
-            // Mirror Simple Voice Chat's Server.processMicPacket: closed/normal groups do not emit proximity voice.
             Group group = sender.getGroup();
-            if (group != null && group.getType() != Group.Type.OPEN) {
-                return;
+            if (group != null) {
+                MatchVoiceRecorder.updateLiveGroup(speaker, group.getId(), group.getType() == Group.Type.OPEN);
+            } else {
+                MatchVoiceRecorder.updateLiveGroup(speaker, null, false);
             }
 
-            // Another plugin may have cancelled the event after the initial checks when several
-            // voice plugins share the same packet dispatch.  Never decode a packet in that state.
             if (event.isCancelled()) return;
 
             MicrophonePacket packet = event.getPacket();
@@ -166,10 +195,35 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
             }
             short[] pcm48k = decoder.decode(opus);
             if (pcm48k == null || pcm48k.length == 0) return;
+
+            // Classify channel mode for HRVC v2 multi-track routing (offline ReplayVoiceAudibilityResolver
+            // enforces strict per-listener access control for RADIO, KILLER_PRIVATE, GROUP, and WHISPER).
+            MatchVoiceRecorder.ChannelHint hint = MatchVoiceRecorder.channelHint(speaker);
+            ReplayVoiceData.ChannelMode channelMode;
+            UUID effectiveGroupId = participant.group();
+            if (hint.radio()) {
+                channelMode = ReplayVoiceData.ChannelMode.RADIO;
+            } else if (hint.killerPrivate()) {
+                channelMode = ReplayVoiceData.ChannelMode.KILLER_PRIVATE;
+            } else if (permissions.isPrivateChannel(speaker)) {
+                channelMode = ReplayVoiceData.ChannelMode.RADIO;
+            } else if (group != null && group.getType() != Group.Type.OPEN) {
+                channelMode = ReplayVoiceData.ChannelMode.GROUP;
+                effectiveGroupId = group.getId();
+            } else if (packet.isWhispering()) {
+                channelMode = ReplayVoiceData.ChannelMode.WHISPER;
+                if (effectiveGroupId == null && group != null) effectiveGroupId = group.getId();
+            } else {
+                channelMode = ReplayVoiceData.ChannelMode.NORMAL_OPEN;
+                if (effectiveGroupId == null && group != null) effectiveGroupId = group.getId();
+            }
+
             float maxDist = resolveMaxDistance(api, packet.isWhispering());
-            MatchVoiceRecorder.recordPcm48k(round, speaker, maxDist, pcm48k);
+            MatchVoiceRecorder.updateVoiceDistances(
+                    resolveMaxDistance(api, false),
+                    resolveMaxDistance(api, true));
+            MatchVoiceRecorder.recordPcm48k(round, speaker, maxDist, channelMode, effectiveGroupId, pcm48k);
         } catch (RuntimeException failure) {
-            // Soft-fail: never break live voicechat transmission, but keep the failure observable.
             HabiTrainCore.LOGGER.debug("[ReplayVoice] microphone packet was not captured", failure);
         } catch (Error failure) {
             HabiTrainCore.LOGGER.error("[ReplayVoice] decoder failure while capturing microphone packet", failure);

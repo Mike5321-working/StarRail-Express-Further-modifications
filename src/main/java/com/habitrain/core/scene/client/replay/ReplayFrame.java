@@ -21,7 +21,7 @@ import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -74,7 +74,18 @@ final class ReplayFrame {
     final boolean loading;
     final int presentSections, totalSections;
     boolean meshFailed;
+    /** Optional Promo Tier-1 spotlight/dimming emphasis applied to 3D actors. */
+    ReplayFullPlayerRenderer.HighlightSpec highlight = ReplayFullPlayerRenderer.HighlightSpec.NONE;
+    /** Active MVP spotlight actor during the MVP honors act (dims non-MVP trails & crowd). */
+    @Nullable UUID mvpSpotlightActor;
+    /** Whether full 3D humanoid players are rendered (default true). */
+    boolean fullBodyCharacters = true;
+    /** Guards against double-painting entities/skills when both legacy & new renderers invoke painters. */
+    boolean entitiesPainted;
+    boolean skillsPainted;
     private ReplayTrackSampler.Pose[] poses;
+    private ActorProjection[] actorProjections;
+    private final float[] projectionScratch = new float[3];
     private final List<Runnable> models = new ArrayList<>();
     private final List<Runnable> texts = new ArrayList<>();
     private MapScope mapScope;
@@ -103,6 +114,41 @@ final class ReplayFrame {
                 boolean loading, int presentSections, int totalSections,
                 Vector3f right, Vector3f up, Vector3f look,
                 @Nullable ReplayStagePlan.Stage stageOverride, @Nullable UUID focusPlayer) {
+        this(mc, level, rotation, buffers, trayType, anim, ambient, model, frame, loading, presentSections, totalSections,
+                right, up, look, stageOverride != null,
+                stageOverride != null ? stageOverride : frame == null ? null : ReplayStagePlan.boardStage(frame),
+                stageOverride != null ? ReplayStagePlan.REPLAY : frame == null ? ReplayStagePlan.IDLE : ReplayStagePlan.boardHandoff(frame),
+                stageOverride != null || model == null ? ReplayFocusPlan.UNFOCUSED : model.focus.sample(frame),
+                stageOverride != null ? focusPlayer : null,
+                model != null && frame != null && frame.phase() == ReplayTimeline.Phase.PLAY && model.blackoutAt(frame.replayTick()));
+    }
+
+    /**
+     * Board linear-session factory: keeps {@code video = false} while letting the table session supply
+     * explicit linear stage, handoff, optional kill-closeup focus sample, follow player and blackout state.
+     */
+    static ReplayFrame forBoardSession(Minecraft mc, ClientLevel level, Quaternionf rotation,
+                                       MultiBufferSource.BufferSource buffers, RenderType trayType,
+                                       double anim, double ambient, @Nullable ReplayBoardModel model,
+                                       @Nullable ReplayTimeline.Frame frame, boolean loading,
+                                       int presentSections, int totalSections,
+                                       Vector3f right, Vector3f up, Vector3f look,
+                                       @Nullable ReplayStagePlan.Stage stage, ReplayStagePlan.Handoff handoff,
+                                       ReplayFocusPlan.Sample focusSample, @Nullable UUID focusPlayer,
+                                       boolean blackout) {
+        return new ReplayFrame(mc, level, rotation, buffers, trayType, anim, ambient, model, frame,
+                loading, presentSections, totalSections, right, up, look, false,
+                stage, handoff == null ? ReplayStagePlan.IDLE : handoff,
+                focusSample == null ? ReplayFocusPlan.UNFOCUSED : focusSample,
+                focusPlayer, blackout);
+    }
+
+    private ReplayFrame(Minecraft mc, ClientLevel level, Quaternionf rotation, MultiBufferSource.BufferSource buffers, RenderType trayType,
+                        double anim, double ambient, @Nullable ReplayBoardModel model, @Nullable ReplayTimeline.Frame frame,
+                        boolean loading, int presentSections, int totalSections,
+                        Vector3f right, Vector3f up, Vector3f look, boolean video,
+                        @Nullable ReplayStagePlan.Stage stage, ReplayStagePlan.Handoff handoff,
+                        ReplayFocusPlan.Sample focusSample, @Nullable UUID focusPlayer, boolean blackout) {
         this.mc = mc;
         this.level = level;
         this.rotation = rotation;
@@ -115,15 +161,15 @@ final class ReplayFrame {
         this.ambient = ambient;
         this.model = model;
         this.frame = frame;
-        this.stage = stageOverride != null ? stageOverride : frame == null ? null : ReplayStagePlan.boardStage(frame);
-        this.video = stageOverride != null;
-        this.focusPlayer = video ? focusPlayer : null;
-        this.handoff = video ? ReplayStagePlan.REPLAY : frame == null ? ReplayStagePlan.IDLE : ReplayStagePlan.boardHandoff(frame);
+        this.stage = stage;
+        this.video = video;
+        this.focusPlayer = focusPlayer;
+        this.handoff = handoff;
         this.replayTick = frame == null ? 0 : frame.replayTick();
-        this.focusSample = video || model == null ? ReplayFocusPlan.UNFOCUSED : model.focus.sample(frame);
+        this.focusSample = focusSample;
         this.focus = focusSample.pose();
         this.drawingBuffers = buffers;
-        this.blackout = model != null && frame != null && frame.phase() == ReplayTimeline.Phase.PLAY && model.blackoutAt(replayTick);
+        this.blackout = blackout;
         this.loading = loading;
         this.presentSections = presentSections;
         this.totalSections = totalSections;
@@ -141,8 +187,24 @@ final class ReplayFrame {
         return poses[actor.index] = actor.track.sample(replayTick);
     }
 
+    record ActorProjection(float x, float y, float z, float size) {}
+
+    ActorProjection project(ReplayBoardModel.Actor actor, ReplayActorSizing sizing) {
+        if (actorProjections == null) actorProjections = new ActorProjection[model.actors.length];
+        var cached = actorProjections[actor.index];
+        if (cached != null) return cached;
+        var pose = pose(actor);
+        model.project(pose.x(), pose.y(), pose.z(), projectionScratch);
+        float x = projectionScratch[0], y = projectionScratch[1], z = projectionScratch[2];
+        return actorProjections[actor.index] = new ActorProjection(x, y, z, sizing.size(actor.p.id(), x, y, z));
+    }
+
     /** Clip all map decorations; fixed tray UI and honors are collected outside this scope. */
     MapScope mapScope(ReplayBoardSite site) { return new MapScope(site); }
+
+    MapScope activeMapScope() {
+        return java.util.Objects.requireNonNull(mapScope);
+    }
 
     private record Viewport(Matrix4f inverseBoard, float hw, float hd) {
         ReplayClippedConsumer wrap(VertexConsumer source) {
@@ -151,16 +213,24 @@ final class ReplayFrame {
     }
 
     final class MapScope implements AutoCloseable {
-        final Viewport viewport;
         final ReplayClippedConsumer fill, glow;
+        final VertexConsumer glowBuffer;
+        final ViewportBuffers deferred;
+        private final Viewport viewport;
 
         private MapScope(ReplayBoardSite site) {
             if (mapScope != null) throw new IllegalStateException("Nested replay map scope");
             viewport = new Viewport(new Matrix4f(site.board()).invert(), site.hw() - ReplayBoardSite.FRAME - 0.04f,
                     site.hd() - ReplayBoardSite.FRAME - 0.04f);
             fill = viewport.wrap(buffers.getBuffer(ReplayDraw.FILL));
-            glow = viewport.wrap(buffers.getBuffer(ReplayDraw.GLOW));
+            glowBuffer = buffers.getBuffer(ReplayDraw.GLOW);
+            glow = viewport.wrap(glowBuffer);
+            deferred = new ViewportBuffers(viewport);
             mapScope = this;
+        }
+
+        ReplayClippedConsumer clipGlow(VertexConsumer target) {
+            return viewport.wrap(target);
         }
 
         @Override public void close() {
@@ -171,7 +241,8 @@ final class ReplayFrame {
 
     private final class ViewportBuffers implements MultiBufferSource, AutoCloseable {
         private final Viewport viewport;
-        private final Map<RenderType, ReplayClippedConsumer> layers = new LinkedHashMap<>();
+        private final Map<RenderType, ReplayClippedConsumer> layers = new HashMap<>();
+        private final List<ReplayClippedConsumer> usedLayers = new ArrayList<>();
         private ViewportBuffers(Viewport viewport) { this.viewport = viewport; }
         @Override public VertexConsumer getBuffer(RenderType type) {
             int primitiveSize = switch (type.mode()) {
@@ -181,22 +252,26 @@ final class ReplayFrame {
                 default -> 0;
             };
             if (primitiveSize == 0) return SKIP_LAYER;
-            return layers.computeIfAbsent(type, layer -> new ReplayClippedConsumer(() -> buffers.getBuffer(layer),
+            var clipped = layers.computeIfAbsent(type, layer -> new ReplayClippedConsumer(() -> buffers.getBuffer(layer),
                     viewport.inverseBoard(), viewport.hw(), viewport.hd(), primitiveSize));
+            if (!usedLayers.contains(clipped)) usedLayers.add(clipped);
+            return clipped;
         }
         @Override public void close() {
-            for (var layer : layers.values()) layer.close();
+            // Finish each draw in its original layer order before the next draw reuses the scratch buffers.
+            for (var layer : usedLayers) layer.close();
+            usedLayers.clear();
         }
     }
 
     /** Defers a model draw; the consumer receives a fresh pose stack positioned at {@code m}. */
     void model(Matrix4f m, Consumer<PoseStack> draw) {
         Matrix4f copy = new Matrix4f(m);
-        Viewport viewport = mapScope == null ? null : mapScope.viewport;
+        ViewportBuffers deferred = mapScope == null ? null : mapScope.deferred;
         models.add(() -> {
             PoseStack stack = new PoseStack();
             stack.mulPose(copy);
-            try (var clipped = viewport == null ? null : new ViewportBuffers(viewport)) {
+            try (var clipped = deferred) {
                 drawingBuffers = clipped == null ? buffers : clipped;
                 draw.accept(stack);
             } finally { drawingBuffers = buffers; }
@@ -211,7 +286,7 @@ final class ReplayFrame {
               boolean shadow, float maxWidth) {
         if (((color >>> 24) & 0xFF) < 8) return;
         Matrix4f copy = new Matrix4f(m);
-        Viewport viewport = mapScope == null ? null : mapScope.viewport;
+        ViewportBuffers deferred = mapScope == null ? null : mapScope.deferred;
         texts.add(() -> {
             Font font = mc.font;
             float width = font.width(text);
@@ -219,7 +294,7 @@ final class ReplayFrame {
             if (maxWidth > 0 && width * s > maxWidth) s = maxWidth / Math.max(1f, width);
             Matrix4f mm = new Matrix4f(copy).translate(x, y, z).scale(s, -s, s);
             float dx = align < 0 ? 0 : align == 0 ? -width / 2f : -width;
-            try (var clipped = viewport == null ? null : new ViewportBuffers(viewport)) {
+            try (var clipped = deferred) {
                 font.drawInBatch(text, dx, -font.lineHeight / 2f, color, shadow, mm, clipped == null ? buffers : clipped,
                         Font.DisplayMode.POLYGON_OFFSET, 0, LightTexture.FULL_BRIGHT);
             }

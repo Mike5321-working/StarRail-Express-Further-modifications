@@ -3,6 +3,7 @@ package com.habitrain.core.scene.client.replay;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.Direction;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
 
@@ -19,27 +20,26 @@ final class ReplayBoardLocalState {
             if (!(level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker)) return InteractionResult.PASS;
             Minecraft client = Minecraft.getInstance();
             if (player != client.player) return InteractionResult.PASS;
-            // Creative configuration works even while holding a block or tool.
+            // Creative Shift+Right-Click opens persistent placement & 4-way facing settings (works while holding any item).
             if (player.isCreative() && player.isShiftKeyDown()) {
                 if (!player.mayBuild() || !player.isAlive() || !player.canInteractWithBlock(pos, 1.0)) {
                     player.displayClientMessage(ReplayBoardTexts.tr("controls.build_required"), true);
                     return InteractionResult.CONSUME;
                 }
-                client.setScreen(new ReplayBoardSettingsScreen(level.dimension().location(), pos, marker.settings()));
+                Direction facing = level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK)
+                        ? level.getBlockState(pos).getValue(SettlementSummaryBoard.FACING) : Direction.NORTH;
+                client.setScreen(new ReplayBoardSettingsScreen(level.dimension().location(), pos, marker.settings(), facing));
                 return InteractionResult.CONSUME;
             }
-            if (!player.getMainHandItem().isEmpty()) return InteractionResult.PASS;
-            if (player.isShiftKeyDown()) {
-                toggleRoof();
-                player.displayClientMessage(ReplayBoardTexts.tr(fullBody ? "toggle.roof_full" : "toggle.roof_cut"), true);
-            } else {
-                client.setScreen(new ReplayBoardControlsScreen(client.level, pos));
-            }
+            // Right-clicking the replay table opens the secondary controls & roster panel even when holding
+            // a lobby item or train ticket; survival Shift+Right-Click no longer toggles roof implicitly.
+            client.setScreen(new ReplayBoardControlsScreen(client.level, pos));
             return InteractionResult.CONSUME;
         });
     }
 
     static boolean fullBody() { return fullBody; }
+    static void setFullBody(boolean value) { fullBody = value; }
     static void toggleRoof() { fullBody = !fullBody; }
     static void reset() { fullBody = false; }
 }

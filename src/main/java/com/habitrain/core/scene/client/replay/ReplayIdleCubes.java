@@ -49,8 +49,12 @@ final class ReplayIdleCubes {
      * beveled metallic/obsidian rim; inner 4x4 cells form the clear smoked-crystal window pane.
      */
     private static final float BEVEL_INNER = 0.80f;
+    private static final double MIDDLE_DETAIL_DISTANCE = 12.0;
+    private static final float[] MIDDLE_GRID_UV = {0f, (1f - BEVEL_INNER) * 0.5f, (1f + BEVEL_INNER) * 0.5f, 1f};
     private static final float[] GRID_STOPS = {-1.0f, -BEVEL_INNER, -0.40f, 0.0f, 0.40f, BEVEL_INNER, 1.0f};
     private static final int GRID_N = GRID_STOPS.length - 1; // 6x6 = 36 sub-quads per hero face
+    private static final float[] GRID_UV = new float[GRID_STOPS.length];
+    private static final double[][] GLASS_SHADE = new double[GRID_N][GRID_N];
 
     // Signature Star-Night Express triad: Burnished Gold + Astral Sapphire Cyan + Velvet Ruby-Rose
     private static final int GOLD_HALO = 0xFFE89E30;
@@ -72,6 +76,7 @@ final class ReplayIdleCubes {
     private static final float[] SQ_VERTS = new float[MAX_SUBQUADS * 12];
     private static final int[] SQ_COLORS = new int[MAX_SUBQUADS * 4];
     private static final long[] SORT_KEYS = new long[MAX_SUBQUADS];
+    private static final float[][] FACE_VERTS = new float[GRID_STOPS.length * GRID_STOPS.length][3];
     private static final float[] RIBBON_XYZ = new float[(RING_SEGMENTS + 1) * 3];
     private static final float[] RIBBON_W = new float[RING_SEGMENTS + 1];
     private static final int[] RIBBON_C = new int[RING_SEGMENTS + 1];
@@ -83,6 +88,15 @@ final class ReplayIdleCubes {
     static {
         for (int i = 0; i < HERO_CUBES; i++) HERO[i] = new CubePose();
         for (int i = 0; i < SAT_CUBES; i++) SATS[i] = new CubePose();
+        for (int i = 0; i < GRID_STOPS.length; i++) GRID_UV[i] = (GRID_STOPS[i] + 1f) * 0.5f;
+        for (int u = 1; u < GRID_N - 1; u++) {
+            for (int v = 1; v < GRID_N - 1; v++) {
+                float mu = 0.5f * (GRID_STOPS[u] + GRID_STOPS[u + 1]);
+                float mv = 0.5f * (GRID_STOPS[v] + GRID_STOPS[v + 1]);
+                float edge = Math.max(Math.abs(mu), Math.abs(mv)) / BEVEL_INNER;
+                GLASS_SHADE[u][v] = 0.78 + 0.34 * edge * edge;
+            }
+        }
     }
 
     static void paint(ReplayFrame f, ReplayBoardSite s) {
@@ -120,7 +134,8 @@ final class ReplayIdleCubes {
 
         // 3. Emit & depth-sort all beveled-frame and smoked-crystal sub-quads back-to-front into FILL,
         //    plus subtle specular reflections into GLOW
-        paintSortedSculptedFaces(fill, glow, masterAlpha, detail);
+        boolean middleDetail = detail && s.distance() >= MIDDLE_DETAIL_DISTANCE * Math.max(1f, s.scale());
+        paintSortedSculptedFaces(fill, glow, masterAlpha, detail, middleDetail);
 
         // 4. Crisp depth-cued glowing outer edges, inner window bevel trims & round vertex jewels
         for (int i = 0; i < HERO_CUBES; i++) {
@@ -333,9 +348,10 @@ final class ReplayIdleCubes {
     // ------------------------------------------------------------------ 3. depth-sorted sculpted beveled crystal faces
 
     private static void paintSortedSculptedFaces(VertexConsumer fill, VertexConsumer glow,
-                                                 double masterAlpha, boolean detail) {
+                                                 double masterAlpha, boolean detail, boolean middleDetail) {
         int quadCount = 0;
-        int steps = detail ? GRID_N : 1; // Far LOD: single quad per face
+        float[] grid = middleDetail ? MIDDLE_GRID_UV : GRID_UV;
+        int steps = detail ? grid.length - 1 : 1; // Far LOD: single quad per face
 
         for (int ci = 0; ci < HERO_CUBES; ci++) {
             CubePose cube = HERO[ci];
@@ -382,25 +398,26 @@ final class ReplayIdleCubes {
                     quadCount = pushSubQuad(quadCount, x00, y00, z00, x10, y10, z10, x11, y11, z11, x01, y01, z01, c, c, c, c);
                 } else {
                     int cFrame = ReplayPalette.alpha(frameCol, frameAlpha);
-                    for (int iu = 0; iu < GRID_N; iu++) {
-                        float u0 = (GRID_STOPS[iu] + 1f) * 0.5f, u1 = (GRID_STOPS[iu + 1] + 1f) * 0.5f;
-                        boolean rimU = (iu == 0 || iu == GRID_N - 1);
-                        for (int iv = 0; iv < GRID_N; iv++) {
-                            float v0 = (GRID_STOPS[iv] + 1f) * 0.5f, v1 = (GRID_STOPS[iv + 1] + 1f) * 0.5f;
-                            boolean isFrame = rimU || iv == 0 || iv == GRID_N - 1;
-                            int col;
-                            if (isFrame) {
-                                col = cFrame;
-                            } else {
-                                // Slight radial vignette from clear window center toward beveled rim
-                                float mu = 0.5f * (GRID_STOPS[iu] + GRID_STOPS[iu + 1]);
-                                float mv = 0.5f * (GRID_STOPS[iv] + GRID_STOPS[iv + 1]);
-                                float edgeProx = Math.max(Math.abs(mu), Math.abs(mv)) / BEVEL_INNER;
-                                col = ReplayPalette.alpha(glassCol, glassAlpha * (0.78 + 0.34 * edgeProx * edgeProx));
-                            }
-                            quadCount = pushBilinearPatch(quadCount,
-                                    x00, y00, z00, x10, y10, z10, x11, y11, z11, x01, y01, z01,
-                                    u0, v0, u1, v1, col);
+                    // Reuse the camera-space corners shared by neighboring sub-quads.
+                    int side = grid.length;
+                    for (int iu = 0; iu < side; iu++) {
+                        for (int iv = 0; iv < side; iv++) {
+                            float u = grid[iu], v = grid[iv];
+                            float[] vertex = FACE_VERTS[iu * side + iv];
+                            vertex[0] = bilerp(x00, x10, x11, x01, u, v);
+                            vertex[1] = bilerp(y00, y10, y11, y01, u, v);
+                            vertex[2] = bilerp(z00, z10, z11, z01, u, v);
+                        }
+                    }
+                    for (int iu = 0; iu < steps; iu++) {
+                        for (int iv = 0; iv < steps; iv++) {
+                            double glass = middleDetail ? (iu == 1 && iv == 1 ? 0.86 : 0.0) : GLASS_SHADE[iu][iv];
+                            int col = glass == 0 ? cFrame : ReplayPalette.alpha(glassCol, glassAlpha * glass);
+                            int corner = iu * side + iv;
+                            float[] a = FACE_VERTS[corner], b = FACE_VERTS[corner + side];
+                            float[] c = FACE_VERTS[corner + side + 1], d = FACE_VERTS[corner + 1];
+                            quadCount = pushSubQuad(quadCount, a[0], a[1], a[2], b[0], b[1], b[2],
+                                    c[0], c[1], c[2], d[0], d[1], d[2], col, col, col, col);
                         }
                     }
                 }
@@ -450,19 +467,6 @@ final class ReplayIdleCubes {
             fill.addVertex(SQ_VERTS[vo + 6], SQ_VERTS[vo + 7], SQ_VERTS[vo + 8]).setColor(SQ_COLORS[co + 2]);
             fill.addVertex(SQ_VERTS[vo + 9], SQ_VERTS[vo + 10], SQ_VERTS[vo + 11]).setColor(SQ_COLORS[co + 3]);
         }
-    }
-
-    private static int pushBilinearPatch(int idx,
-                                         float x00, float y00, float z00,
-                                         float x10, float y10, float z10,
-                                         float x11, float y11, float z11,
-                                         float x01, float y01, float z01,
-                                         float u0, float v0, float u1, float v1, int color) {
-        float ax = bilerp(x00, x10, x11, x01, u0, v0), ay = bilerp(y00, y10, y11, y01, u0, v0), az = bilerp(z00, z10, z11, z01, u0, v0);
-        float bx = bilerp(x00, x10, x11, x01, u1, v0), by = bilerp(y00, y10, y11, y01, u1, v0), bz = bilerp(z00, z10, z11, z01, u1, v0);
-        float cx = bilerp(x00, x10, x11, x01, u1, v1), cy = bilerp(y00, y10, y11, y01, u1, v1), cz = bilerp(z00, z10, z11, z01, u1, v1);
-        float dx = bilerp(x00, x10, x11, x01, u0, v1), dy = bilerp(y00, y10, y11, y01, u0, v1), dz = bilerp(z00, z10, z11, z01, u0, v1);
-        return pushSubQuad(idx, ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, color, color, color, color);
     }
 
     private static float bilerp(float p00, float p10, float p11, float p01, float u, float v) {

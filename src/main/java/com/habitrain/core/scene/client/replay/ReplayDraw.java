@@ -87,21 +87,31 @@ final class ReplayDraw {
     static void ring(VertexConsumer vc, Matrix4f m, float cx, float cy, float cz, float radius, float thickness,
                      int segments, int inner, int outer) {
         float r0 = Math.max(0, radius - thickness * 0.5f), r1 = radius + thickness * 0.5f;
+        if (vc instanceof ReplayClippedConsumer clipped) {
+            vc = clipped.horizontalArea(m, cx, cy, cz, Math.max(r0, Math.abs(r1)));
+        }
+        float c0 = Mth.cos(0), s0 = Mth.sin(0);
         for (int i = 0; i < segments; i++) {
-            float a0 = Mth.TWO_PI * i / segments, a1 = Mth.TWO_PI * (i + 1) / segments;
-            float c0 = Mth.cos(a0), s0 = Mth.sin(a0), c1 = Mth.cos(a1), s1 = Mth.sin(a1);
+            float a1 = Mth.TWO_PI * (i + 1) / segments;
+            float c1 = Mth.cos(a1), s1 = Mth.sin(a1);
             quad(vc, m, cx + c0 * r0, cy, cz + s0 * r0, cx + c0 * r1, cy, cz + s0 * r1,
                     cx + c1 * r1, cy, cz + s1 * r1, cx + c1 * r0, cy, cz + s1 * r0, inner, outer, outer, inner);
+            c0 = c1;
+            s0 = s1;
         }
     }
 
     /** Filled disc in the local XZ plane, bright centre fading out. */
     static void disc(VertexConsumer vc, Matrix4f m, float cx, float cy, float cz, float radius, int segments,
                      int center, int edge) {
+        if (vc instanceof ReplayClippedConsumer clipped) vc = clipped.horizontalArea(m, cx, cy, cz, radius);
+        float x0 = cx + Mth.cos(0) * radius, z0 = cz + Mth.sin(0) * radius;
         for (int i = 0; i < segments; i++) {
-            float a0 = Mth.TWO_PI * i / segments, a1 = Mth.TWO_PI * (i + 1) / segments;
-            quad(vc, m, cx, cy, cz, cx, cy, cz, cx + Mth.cos(a1) * radius, cy, cz + Mth.sin(a1) * radius,
-                    cx + Mth.cos(a0) * radius, cy, cz + Mth.sin(a0) * radius, center, center, edge, edge);
+            float a1 = Mth.TWO_PI * (i + 1) / segments;
+            float x1 = cx + Mth.cos(a1) * radius, z1 = cz + Mth.sin(a1) * radius;
+            quad(vc, m, cx, cy, cz, cx, cy, cz, x1, cy, z1, x0, cy, z0, center, center, edge, edge);
+            x0 = x1;
+            z0 = z1;
         }
     }
 
@@ -112,6 +122,146 @@ final class ReplayDraw {
                 bottom, bottom, top, top);
         quad(vc, m, cx, y0, cz - radius, cx, y0, cz + radius, cx, y0 + height, cz + radius, cx, y0 + height, cz - radius,
                 bottom, bottom, top, top);
+    }
+
+    /** Flat partial annulus arc in the local XZ plane (angles in radians). */
+    static void arcXZ(VertexConsumer vc, Matrix4f m, float cx, float cy, float cz, float radius, float thickness,
+                      float startRad, float endRad, int segments, int inner, int outer) {
+        if (segments <= 0 || Math.abs(endRad - startRad) < 1e-4f) return;
+        float r0 = Math.max(0, radius - thickness * 0.5f), r1 = radius + thickness * 0.5f;
+        for (int i = 0; i < segments; i++) {
+            float a0 = startRad + (endRad - startRad) * i / segments;
+            float a1 = startRad + (endRad - startRad) * (i + 1) / segments;
+            float c0 = Mth.cos(a0), s0 = Mth.sin(a0), c1 = Mth.cos(a1), s1 = Mth.sin(a1);
+            quad(vc, m, cx + c0 * r0, cy, cz + s0 * r0, cx + c0 * r1, cy, cz + s0 * r1,
+                    cx + c1 * r1, cy, cz + s1 * r1, cx + c1 * r0, cy, cz + s1 * r0, inner, outer, outer, inner);
+        }
+    }
+
+    /** Regular polygon outline in the local XZ plane. */
+    static void polygonXZ(VertexConsumer vc, Matrix4f m, float cx, float cy, float cz, float radius, int sides,
+                          float spinRad, float width, int color) {
+        if (sides < 3 || radius <= 1e-4f) return;
+        for (int i = 0; i < sides; i++) {
+            float a0 = spinRad + Mth.TWO_PI * i / sides;
+            float a1 = spinRad + Mth.TWO_PI * (i + 1) / sides;
+            segment(vc, m, cx + Mth.cos(a0) * radius, cy, cz + Mth.sin(a0) * radius,
+                    cx + Mth.cos(a1) * radius, cy, cz + Mth.sin(a1) * radius, width, color, color);
+        }
+    }
+
+    /** Star-Night Brass astrolabe rune: dual counter-rotating segmented rings + star ticks in XZ plane. */
+    static void astrolabeRune(VertexConsumer vc, Matrix4f m, float cx, float cy, float cz, float radius,
+                              float spinRad, float lineWidth, int primaryColor, int brassColor) {
+        // Outer dashed brass arcs (4 quadrants with Art Deco gaps)
+        for (int q = 0; q < 4; q++) {
+            float base = spinRad + q * Mth.HALF_PI;
+            arcXZ(vc, m, cx, cy, cz, radius, Math.max(lineWidth * 1.4f, radius * 0.06f),
+                    base + 0.14f, base + Mth.HALF_PI - 0.14f, 6, brassColor, ReplayPalette.fade(brassColor, 0.35));
+        }
+        // Inner counter-rotating hexagon in role primary color
+        polygonXZ(vc, m, cx, cy + 0.002f, cz, radius * 0.72f, 6, -spinRad * 1.35f, lineWidth, primaryColor);
+        // Cardinal diamond ticks
+        for (int i = 0; i < 8; i++) {
+            float a = spinRad * 0.7f + Mth.TWO_PI * i / 8f;
+            float rIn = radius * (i % 2 == 0 ? 0.78f : 0.86f);
+            float rOut = radius * (i % 2 == 0 ? 1.12f : 1.04f);
+            int c = i % 2 == 0 ? brassColor : primaryColor;
+            segment(vc, m, cx + Mth.cos(a) * rIn, cy + 0.003f, cz + Mth.sin(a) * rIn,
+                    cx + Mth.cos(a) * rOut, cy + 0.003f, cz + Mth.sin(a) * rOut, lineWidth * 0.85f, c, ReplayPalette.fade(c, 0.25));
+        }
+    }
+
+    /** Volumetric cone between apex and circular base (for spotlights, drone scan cones, warning beams). */
+    static void cone(VertexConsumer vc, Matrix4f m, float apexX, float apexY, float apexZ,
+                     float baseX, float baseY, float baseZ, float baseRadius, int segments,
+                     int apexColor, int baseColor) {
+        if (segments < 4 || baseRadius <= 1e-4f) return;
+        Vector3f axis = new Vector3f(baseX - apexX, baseY - apexY, baseZ - apexZ);
+        if (axis.lengthSquared() < 1e-7f) return;
+        axis.normalize();
+        Vector3f ref = Math.abs(axis.y) < 0.9f ? new Vector3f(0, 1, 0) : new Vector3f(1, 0, 0);
+        Vector3f u = new Vector3f(axis).cross(ref).normalize().mul(baseRadius);
+        Vector3f v = new Vector3f(axis).cross(u).normalize().mul(baseRadius);
+        for (int i = 0; i < segments; i++) {
+            float a0 = Mth.TWO_PI * i / segments;
+            float a1 = Mth.TWO_PI * (i + 1) / segments;
+            float c0 = Mth.cos(a0), s0 = Mth.sin(a0), c1 = Mth.cos(a1), s1 = Mth.sin(a1);
+            float bx0 = baseX + u.x * c0 + v.x * s0, by0 = baseY + u.y * c0 + v.y * s0, bz0 = baseZ + u.z * c0 + v.z * s0;
+            float bx1 = baseX + u.x * c1 + v.x * s1, by1 = baseY + u.y * c1 + v.y * s1, bz1 = baseZ + u.z * c1 + v.z * s1;
+            quad(vc, m, apexX, apexY, apexZ, apexX, apexY, apexZ, bx1, by1, bz1, bx0, by0, bz0,
+                    apexColor, apexColor, baseColor, baseColor);
+        }
+    }
+
+    /** Glowing parabolic energy arc from (x0,y0,z0) to (x1,y1,z1), clipped to {@code progress} in (0..1]. */
+    static void parabolicArc(VertexConsumer vc, Matrix4f m, float x0, float y0, float z0,
+                             float x1, float y1, float z1, float peakHeight, int steps, float width,
+                             int cStart, int cEnd, float progress) {
+        if (steps < 2 || progress <= 0.01f) return;
+        float clamped = Math.min(1f, progress);
+        Vector3f prev = m.transformPosition(x0, y0, z0, new Vector3f());
+        int prevColor = cStart;
+        for (int i = 1; i <= steps; i++) {
+            float u = (float) i / steps;
+            if (u > clamped + 1f / steps) break;
+            float t = Math.min(u, clamped);
+            float h = 4f * t * (1f - t) * peakHeight;
+            Vector3f next = m.transformPosition(
+                    x0 + (x1 - x0) * t,
+                    y0 + (y1 - y0) * t + h,
+                    z0 + (z1 - z0) * t,
+                    new Vector3f());
+            int nextColor = ReplayPalette.lerp(cStart, cEnd, t);
+            segment(vc, prev, next, width, prevColor, nextColor);
+            prev = next;
+            prevColor = nextColor;
+        }
+    }
+
+    /** Three orthogonal glowing rings forming a holographic sphere (drone pulse, flash sphere). */
+    static void sphereRings(VertexConsumer vc, Matrix4f m, float cx, float cy, float cz, float radius,
+                            float width, int segments, int color) {
+        if (radius <= 1e-4f || segments < 8) return;
+        for (int i = 0; i < segments; i++) {
+            float a0 = Mth.TWO_PI * i / segments, a1 = Mth.TWO_PI * (i + 1) / segments;
+            float c0 = Mth.cos(a0) * radius, s0 = Mth.sin(a0) * radius;
+            float c1 = Mth.cos(a1) * radius, s1 = Mth.sin(a1) * radius;
+            segment(vc, m, cx + c0, cy, cz + s0, cx + c1, cy, cz + s1, width, color, color);
+            segment(vc, m, cx + c0, cy + s0, cz, cx + c1, cy + s1, cz, width, color, color);
+            segment(vc, m, cx, cy + c0, cz + s0, cx, cy + c1, cz + s1, width, color, color);
+        }
+    }
+
+    /** Untextured flat-colored 3D axis-aligned box (useful for tiny props, traps, C4 bricks, chicks). */
+    static void solidBox(VertexConsumer vc, Matrix4f m, float x0, float y0, float z0,
+                         float x1, float y1, float z1, int color) {
+        int top = color;
+        int sideZ = ReplayPalette.scale(color, 0.85);
+        int sideX = ReplayPalette.scale(color, 0.72);
+        int bot = ReplayPalette.scale(color, 0.58);
+        quad(vc, m, x0, y1, z0, x1, y1, z0, x1, y1, z1, x0, y1, z1, top, top, top, top);
+        quad(vc, m, x0, y0, z1, x1, y0, z1, x1, y0, z0, x0, y0, z0, bot, bot, bot, bot);
+        quad(vc, m, x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1, sideZ, sideZ, sideZ, sideZ);
+        quad(vc, m, x1, y0, z0, x0, y0, z0, x0, y1, z0, x1, y1, z0, sideZ, sideZ, sideZ, sideZ);
+        quad(vc, m, x0, y0, z0, x0, y0, z1, x0, y1, z1, x0, y1, z0, sideX, sideX, sideX, sideX);
+        quad(vc, m, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, sideX, sideX, sideX, sideX);
+    }
+
+    /** 45°-chamfered Art Deco plate in the local XY plane. */
+    static void chamferRectXY(VertexConsumer vc, Matrix4f m, float x0, float y0, float x1, float y1, float z,
+                              float cut, int top, int bottom) {
+        float c = Math.max(0f, Math.min(cut, Math.min((x1 - x0) * 0.45f, (y1 - y0) * 0.45f)));
+        if (c <= 1e-4f) {
+            rectXY(vc, m, x0, y0, x1, y1, z, top, bottom);
+            return;
+        }
+        // Centre band
+        quad(vc, m, x0, y0 + c, z, x1, y0 + c, z, x1, y1 - c, z, x0, y1 - c, z, bottom, bottom, top, top);
+        // Bottom chamfer trapezoid
+        quad(vc, m, x0 + c, y0, z, x1 - c, y0, z, x1, y0 + c, z, x0, y0 + c, z, bottom, bottom, bottom, bottom);
+        // Top chamfer trapezoid
+        quad(vc, m, x0, y1 - c, z, x1, y1 - c, z, x1 - c, y1, z, x0 + c, y1, z, top, top, top, top);
     }
 
     // ------------------------------------------------------------------ camera-space strips
@@ -139,14 +289,23 @@ final class ReplayDraw {
             if (i > 0) {
                 int cPrev = colors[i - 1], cCur = colors[i];
                 if (((cPrev | cCur) >>> 24) != 0) {
-                    vc.addVertex(pax, pay, paz).setColor(cPrev);
-                    vc.addVertex(pbx, pby, pbz).setColor(cPrev);
-                    vc.addVertex(bx, by, bz).setColor(cCur);
-                    vc.addVertex(ax, ay, az).setColor(cCur);
+                    if (vc instanceof ReplayClippedConsumer clipped) {
+                        clipped.ribbonQuad(pax, pay, paz, pbx, pby, pbz, bx, by, bz, ax, ay, az, cPrev, cCur);
+                    } else {
+                        ribbonQuad(vc, pax, pay, paz, pbx, pby, pbz, bx, by, bz, ax, ay, az, cPrev, cCur);
+                    }
                 }
             }
             pax = ax; pay = ay; paz = az; pbx = bx; pby = by; pbz = bz;
         }
+    }
+
+    static void ribbonQuad(VertexConsumer vc, float ax, float ay, float az, float bx, float by, float bz,
+                           float cx, float cy, float cz, float dx, float dy, float dz, int startColor, int endColor) {
+        vc.addVertex(ax, ay, az).setColor(startColor);
+        vc.addVertex(bx, by, bz).setColor(startColor);
+        vc.addVertex(cx, cy, cz).setColor(endColor);
+        vc.addVertex(dx, dy, dz).setColor(endColor);
     }
 
     private static final float[] SEG = new float[6];
@@ -208,6 +367,40 @@ final class ReplayDraw {
         vc.addVertex(c.x + rx - ux, c.y + ry - uy, c.z + rz - uz).setColor(color);
         vc.addVertex(c.x + rx + ux, c.y + ry + uy, c.z + rz + uz).setColor(color);
         vc.addVertex(c.x - rx + ux, c.y - ry + uy, c.z - rz + uz).setColor(color);
+    }
+
+    /**
+     * Camera-facing radial soft circle (bright centre fading to transparent rim) with smooth
+     * near-camera distance culling/fade so particles crossing near the lens never turn into hard squares.
+     */
+    static void softBillboard(VertexConsumer vc, Vector3f c, Vector3f right, Vector3f up,
+                              float radiusX, float radiusY, int color, float nearCullDist, float nearFullDist) {
+        if ((color >>> 24) == 0 || radiusX <= 1e-5f || radiusY <= 1e-5f) return;
+        float dist = c.length();
+        if (dist <= nearCullDist) return;
+        int center = color;
+        if (dist < nearFullDist && nearFullDist > nearCullDist) {
+            double k = (dist - nearCullDist) / (nearFullDist - nearCullDist);
+            k = k * k * (3.0 - 2.0 * k);
+            center = ReplayPalette.fade(color, k);
+            if ((center >>> 24) == 0) return;
+        }
+        int edge = ReplayPalette.alpha(center, 0);
+        int segs = 12;
+        for (int i = 0; i < segs; i++) {
+            float a0 = Mth.TWO_PI * i / segs, a1 = Mth.TWO_PI * (i + 1) / segs;
+            float c0 = Mth.cos(a0), s0 = Mth.sin(a0), c1 = Mth.cos(a1), s1 = Mth.sin(a1);
+            float x0 = c.x + right.x * (c0 * radiusX) + up.x * (s0 * radiusY);
+            float y0 = c.y + right.y * (c0 * radiusX) + up.y * (s0 * radiusY);
+            float z0 = c.z + right.z * (c0 * radiusX) + up.z * (s0 * radiusY);
+            float x1 = c.x + right.x * (c1 * radiusX) + up.x * (s1 * radiusY);
+            float y1 = c.y + right.y * (c1 * radiusX) + up.y * (s1 * radiusY);
+            float z1 = c.z + right.z * (c1 * radiusX) + up.z * (s1 * radiusY);
+            vc.addVertex(c.x, c.y, c.z).setColor(center);
+            vc.addVertex(c.x, c.y, c.z).setColor(center);
+            vc.addVertex(x1, y1, z1).setColor(edge);
+            vc.addVertex(x0, y0, z0).setColor(edge);
+        }
     }
 
     // ------------------------------------------------------------------ textured cuboids (entity format)

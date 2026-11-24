@@ -648,10 +648,127 @@ def icon_atlas():
     save(out, "icons.png")
 
 
+def gen_skill_rune():
+    """256x256 centered concentric star-rail double ring (white RGB + alpha) for arbitrary role-color tinting."""
+    S = 256
+    K = 4
+    W = S * K
+    c = W / 2.0
+    m = Image.new("L", (W, W), 0)
+    d = ImageDraw.Draw(m)
+    outer_r = 118 * K
+    inner_r = 82 * K
+    # Outer ring and hairline inner companion
+    d.ellipse([c - outer_r, c - outer_r, c + outer_r, c + outer_r], outline=255, width=5 * K)
+    d.ellipse([c - (outer_r - 9 * K), c - (outer_r - 9 * K), c + (outer_r - 9 * K), c + (outer_r - 9 * K)],
+              outline=190, width=2 * K)
+    # Inner ring
+    d.ellipse([c - inner_r, c - inner_r, c + inner_r, c + inner_r], outline=235, width=4 * K)
+    # 24 Art Deco dial ticks between inner and outer rings
+    for i in range(24):
+        a = i * math.tau / 24.0
+        r0 = inner_r + 4 * K
+        r1 = outer_r - (12 * K if i % 3 == 0 else 20 * K)
+        w = 3 * K if i % 3 == 0 else int(1.6 * K)
+        d.line([c + math.cos(a) * r0, c + math.sin(a) * r0,
+                c + math.cos(a) * r1, c + math.sin(a) * r1], fill=240 if i % 3 == 0 else 155, width=w)
+    # 8-point star-rail octagram inscribed inside inner ring
+    for rot in (0.0, math.pi / 4.0):
+        sq = [(c + math.cos(rot + i * math.pi / 2.0) * inner_r,
+               c + math.sin(rot + i * math.pi / 2.0) * inner_r) for i in range(4)]
+        d.polygon(sq, outline=220, width=3 * K)
+    # 8 diamond nodes at compass points on outer ring
+    for i in range(8):
+        a = i * math.tau / 8.0
+        px = c + math.cos(a) * (outer_r - 4 * K)
+        py = c + math.sin(a) * (outer_r - 4 * K)
+        dr = 6 * K if i % 2 == 0 else 4 * K
+        d.polygon([(px, py - dr), (px + dr, py), (px, py + dr), (px - dr, py)], fill=255)
+    # Central 8-point compass star
+    star = []
+    for i in range(16):
+        a = -math.pi / 2 + i * math.pi / 8.0
+        rr = 32 * K if i % 2 == 0 else 11 * K
+        star.append((c + math.cos(a) * rr, c + math.sin(a) * rr))
+    d.polygon(star, fill=215)
+    core = m.resize((S, S), Image.LANCZOS)
+    glow = core.filter(ImageFilter.GaussianBlur(3.2)).point(lambda v: int(min(255, v * 0.72)))
+    combined = ImageChops.lighter(core, glow)
+    save(rgba_from_alpha(np.asarray(combined, np.float32) / 255.0, (255, 255, 255)), "skill_rune.png")
+
+
+def gen_split_beam():
+    """96x720 Star-Night Express gilded brass Art Deco split-screen divider beam."""
+    W, H = 96, 720
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    cx = W // 2
+    # Soft outer dark shadow & brass aura
+    aura = Image.new("L", (W, H), 0)
+    ad = ImageDraw.Draw(aura)
+    ad.rectangle([cx - 18, 0, cx + 18, H], fill=220)
+    aura = aura.filter(ImageFilter.GaussianBlur(10))
+    sh = Image.new("RGBA", (W, H), (4, 6, 13, 0))
+    sh.putalpha(aura.point(lambda v: int(v * 0.85)))
+    img = Image.alpha_composite(img, sh)
+
+    glow = Image.new("L", (W, H), 0)
+    ImageDraw.Draw(glow).rectangle([cx - 10, 0, cx + 10, H], fill=255)
+    glow = glow.filter(ImageFilter.GaussianBlur(7))
+    gl = Image.new("RGBA", (W, H), (244, 216, 148, 0))
+    gl.putalpha(glow.point(lambda v: int(v * 0.45)))
+    img = Image.alpha_composite(img, gl)
+
+    d = ImageDraw.Draw(img)
+    # Dark obsidian inlay core flanked by brushed brass rails
+    d.rectangle([cx - 10, 0, cx + 10, H], fill=NIGHT2 + (255,))
+    d.rectangle([cx - 12, 0, cx - 8, H], fill=BRASS + (255,))
+    d.rectangle([cx + 8, 0, cx + 12, H], fill=BRASS + (255,))
+    d.rectangle([cx - 11, 0, cx - 10, H], fill=BRASS_L + (255,))
+    d.rectangle([cx + 10, 0, cx + 11, H], fill=BRASS_L + (255,))
+    d.line([cx, 0, cx, H], fill=BRASS_D + (220,), width=2)
+    # Art Deco chevron accents & brass rivets along the beam
+    for y in range(28, H - 20, 44):
+        d.polygon([(cx, y - 6), (cx + 5, y), (cx, y + 6), (cx - 5, y)], fill=BRASS_L + (255,), outline=BRASS_D + (255,))
+        d.line([cx - 14, y - 16, cx - 10, y - 12], fill=BRASS_L + (220,), width=2)
+        d.line([cx + 14, y - 16, cx + 10, y - 12], fill=BRASS_L + (220,), width=2)
+    save(img, "split_beam.png")
+
+
+def gen_split_medallion():
+    """192x192 octagonal Art Deco brass weapon emblem medallion mounted on the split-screen beam."""
+    S = 192
+    K = 2
+    W = S * K
+    c = W / 2.0
+
+    def oct_pts(r):
+        return [(c + math.cos(math.pi / 8 + i * math.pi / 4) * r,
+                 c + math.sin(math.pi / 8 + i * math.pi / 4) * r) for i in range(8)]
+
+    glow = Image.new("L", (W, W), 0)
+    ImageDraw.Draw(glow).polygon(oct_pts(86 * K), fill=255)
+    glow = glow.filter(ImageFilter.GaussianBlur(14))
+    out = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    gl = Image.new("RGBA", (W, W), (244, 216, 148, 0))
+    gl.putalpha(glow.point(lambda v: int(v * 0.55)))
+    out = Image.alpha_composite(out, gl)
+
+    body = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+    d = ImageDraw.Draw(body)
+    d.polygon(oct_pts(80 * K), fill=NAVY + (248,), outline=BRASS_L + (255,), width=7 * K)
+    d.polygon(oct_pts(68 * K), fill=NIGHT2 + (240,), outline=BRASS + (230,), width=3 * K)
+    for px, py in oct_pts(80 * K):
+        r = 6 * K
+        d.polygon([(px, py - r), (px + r, py), (px, py + r), (px - r, py)], fill=CHAMP + (255,))
+    out = Image.alpha_composite(out, body).resize((S, S), Image.LANCZOS)
+    save(out, "split_medallion.png")
+
+
 def main():
     gen_glow(); gen_ring(); gen_bokeh(); gen_streak(); gen_rays(); gen_vignette(); gen_grain()
     gen_scanlines(); gen_speedlines(); gen_nebula()
     gen_brand(); gen_ticket(); gen_stamp(); gen_hex_frame(); gen_laurel(); gen_crown(); gen_brush(); icon_atlas()
+    gen_skill_rune(); gen_split_beam(); gen_split_medallion()
     titles = [
         ("FIRST BLOOD", "kill", "t_first_blood.png"), ("DOUBLE KILL", "kill", "t_double_kill.png"),
         ("TRIPLE KILL", "kill", "t_triple_kill.png"), ("MULTI KILL", "psycho", "t_multi_kill.png"),
@@ -662,6 +779,9 @@ def main():
         ("VICTORY", "gold", "t_victory.png"), ("MATCH OVERVIEW", "gold", "t_overview.png"),
         ("DEPARTURE", "gold", "t_departure.png"), ("FINAL STATION", "gold", "t_final_station.png"),
         ("SHIELD BROKEN", "cyan", "t_shield.png"),
+        ("APOTHEOSIS", "gold", "t_apotheosis.png"), ("DUAL VISION", "gold", "t_dual_vision.png"),
+        ("SHADOW SLASH", "kill", "t_shadow_slash.png"), ("KEY MOVE", "cyan", "t_glimmer.png"),
+        ("HIGHLIGHTS", "gold", "t_highlights.png"),
     ]
     for text, preset, name in titles:
         display_title(text, preset, name)

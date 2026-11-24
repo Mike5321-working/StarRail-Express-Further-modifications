@@ -1,14 +1,18 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.api.scene.asset.SceneAssetCodec;
 import com.habitrain.core.client.render.ClientRenderState;
+import com.habitrain.core.scene.replay.ReplayCinemaDirector;
+import com.habitrain.core.scene.replay.ReplayExportContentOptions;
 import com.habitrain.core.scene.replay.ReplayRoofCutaway;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.client.ReplayHistoryClient;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import com.habitrain.core.scene.client.SceneMeshSet;
 import com.habitrain.core.scene.replay.ReplayMusicPlan;
+import com.habitrain.core.scene.replay.ReplayStagePlan;
 import com.habitrain.core.scene.replay.ReplayTrackSampler;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
 import com.mojang.blaze3d.pipeline.TextureTarget;
@@ -30,31 +34,44 @@ import org.lwjgl.system.MemoryUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
- * Renders the directed replay film one frame per client frame: designed background, the 3D diorama through
- * the virtual camera with video effects, then the 2D motion graphics. Only pixel data crosses into the
- * encoder thread, which adds the impact lens effect and writes either H.264 MP4 (compressed) or Motion-JPEG AVI.
+ * Renders the directed replay film one frame per client frame across all 4 export modes:
+ * <ul>
+ *     <li>Mode 1 (Short): readable diorama + 4° brass split-screen killer POV on kills;</li>
+ *     <li>Mode 2 (Personal): True Player POV or Sandbox Follow at 1x/2x/4x (WSOLA) or Highlights Only;</li>
+ *     <li>Mode 3 (Sandbox Full-Fidelity): dynamic doors/blocks, full 3D players/entities and all-mod skills;</li>
+ *     <li>Mode 4 (Cinematic Promo &amp; MVP): &le;3x cruise + 5-tier rarity pyramid choreography.</li>
+ * </ul>
+ * Audio is streamed in 1-second chunks into a temporary PCM file so even a 20-minute match never allocates
+ * a monolithic heap soundtrack array.
  */
 final class ReplayVideoExport {
     private static final Logger LOGGER = LoggerFactory.getLogger(ReplayVideoExport.class);
     private static final SystemToast.SystemToastId OPEN_FOLDER_TOAST = new SystemToast.SystemToastId();
     static final int FPS = 30;
     private static final long PREPARE_LIMIT_NS = TimeUnit.MINUTES.toNanos(2);
+    private static final long SKIN_PREFETCH_WAIT_NS = TimeUnit.SECONDS.toNanos(3);
 
+    final ReplayExportContentOptions options;
     final ReplayExportResolution resolution;
     final boolean compress;
     final ReplayExportQuality quality;
@@ -64,11 +81,71 @@ final class ReplayVideoExport {
     private final boolean fullBody;
     private final UUID roundId;
     private final int frameBytes;
+    final ReplayExportBackend backend;
+    final ReplayVisualDownload visuals;
+    private @Nullable ReplayForegroundWorld foregroundWorld;
+    private boolean foregroundFrameReady;
+
+    private boolean nativeAction() {
+        if (backend != ReplayExportBackend.NATIVE || film == null || encoder == null || submitted >= encoder.frames) return false;
+        var sample = film.sample(submitted / (double) FPS);
+        return sample.baseSample().act() == ReplayVideoScript.Act.ACTION && sample.camera() == ReplayCinemaDirector.CameraDirective.POV_FIRST_PERSON;
+    }
+
+    void drawWindow(Minecraft client, java.util.function.Consumer<net.minecraft.client.DeltaTracker> drawWorld) {
+        foregroundFrameReady = false;
+        if (!nativeAction() || !running() || encoder.pool.isEmpty()) return;
+        try {
+            var shot = film.sample(submitted / (double) FPS);
+            UUID subject = shot.povSubjectUuid() == null ? film.focusPlayer() : shot.povSubjectUuid();
+            if (visuals.need(com.habitrain.core.network.replay.VisualTape.WORLD) || visuals.need(subject)) return;
+            if (foregroundWorld == null) foregroundWorld = new ReplayForegroundWorld(client, model, snapshot.asset(), visuals);
+            foregroundFrameReady = foregroundWorld.draw(client, subject, shot.replayTick(), drawWorld);
+            if (foregroundFrameReady) foregroundWorld.paintHud(client);
+        } catch (ReflectiveOperationException | IOException | RuntimeException failure) {
+            failed = true;
+            encoder.cancel();
+            releaseRenderResources();
+            LOGGER.warn("Could not render replay in game window", failure);
+        }
+    }
+
+    void preview(Minecraft client) {
+        if (!foregroundFrameReady && target != null && submitted > 0) blit(target, client.getMainRenderTarget());
+    }
+
+    private static void blit(com.mojang.blaze3d.pipeline.RenderTarget source, com.mojang.blaze3d.pipeline.RenderTarget destination) {
+        int previousRead = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+        int previousDraw = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+        boolean scissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
+        try {
+            if (scissor) GL11.glDisable(GL11.GL_SCISSOR_TEST);
+            GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, source.frameBufferId);
+            GlStateManager._glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, destination.frameBufferId);
+            double scale = Math.min((double)destination.viewWidth / source.viewWidth, (double)destination.viewHeight / source.viewHeight);
+            int width = (int)Math.round(source.viewWidth * scale), height = (int)Math.round(source.viewHeight * scale);
+            int left = (destination.viewWidth - width) / 2, bottom = (destination.viewHeight - height) / 2;
+            if (width != destination.viewWidth || height != destination.viewHeight) {
+                try (var stack = org.lwjgl.system.MemoryStack.stackPush()) {
+                    GL30.glClearBufferfv(GL11.GL_COLOR, 0, stack.floats(0f, 0f, 0f, 1f));
+                }
+            }
+            GL30.glBlitFramebuffer(0, 0, source.viewWidth, source.viewHeight, left, bottom, left + width, bottom + height,
+                    GL11.GL_COLOR_BUFFER_BIT, GL11.GL_LINEAR);
+        } finally {
+            GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, previousRead);
+            GlStateManager._glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, previousDraw);
+            if (scissor) GL11.glEnable(GL11.GL_SCISSOR_TEST);
+        }
+    }
     private ClientReplayBoard.View snapshot;
     private long meshDeadline;
+    private long skinWaitDeadline;
+    private @Nullable ReplayDioramaMesh.DynamicWorld dynamicWorld;
+    private @Nullable SceneAssetCodec.AssetData staticExportAsset;
     private @Nullable SceneAssetCodec.AssetData reviewAsset;
     private ReplayBoardModel model;
-    private ReplayVideoScript script;
+    private ReplayCinemaDirector.DirectedFilm film;
     private ReplayVideoFx fx;
     private ReplayVideoOverlay overlay;
     private Map<UUID, net.minecraft.resources.ResourceLocation> exportSkins = Map.of();
@@ -76,13 +153,15 @@ final class ReplayVideoExport {
     private ReplayVideoCamera.Stage cameraStage;
     private static final int PBO_COUNT = 2;
     private TextureTarget target;
+    private @Nullable TextureTarget povTarget;
     private ByteBuffer pixels;
     private int @Nullable [] pbos;
     private boolean pboUnavailable;
     private int pendingPbo = -1;
     private float pendingAberration;
     private Encoder encoder;
-    private java.util.concurrent.FutureTask<short[]> audioTask;
+    private java.util.concurrent.FutureTask<Path> audioTask;
+    private @Nullable Path stagedAudioPcm;
     private int submitted;
     private int captured;
     private final long voiceDeadline = System.nanoTime() + PREPARE_LIMIT_NS;
@@ -111,14 +190,36 @@ final class ReplayVideoExport {
     ReplayVideoExport(ClientReplayBoard.View snapshot, boolean fullBody, ReplayExportResolution resolution,
                       boolean compress, ReplayExportQuality quality, @Nullable Path ffmpegExecutable,
                       ReplayMusicPlan.Level music, @Nullable UUID focusPlayer) {
+        this(snapshot, ReplayExportContentOptions.defaultsFor(ReplayExportContentOptions.ExportMode.SHORT, focusPlayer)
+                        .toBuilder()
+                        .roofCutaway(!fullBody)
+                        .musicLevel(music == null ? ReplayMusicPlan.Level.OFF : music)
+                        .build(),
+                resolution, compress, quality, ffmpegExecutable);
+    }
+
+    ReplayVideoExport(ClientReplayBoard.View snapshot, ReplayExportContentOptions options,
+                      ReplayExportResolution resolution, boolean compress,
+                      ReplayExportQuality quality, @Nullable Path ffmpegExecutable) {
+        this(snapshot, options, resolution, compress, quality, ffmpegExecutable, ReplayExportBackend.SIMPLE);
+    }
+
+    ReplayVideoExport(ClientReplayBoard.View snapshot, ReplayExportContentOptions options,
+                      ReplayExportResolution resolution, boolean compress, ReplayExportQuality quality,
+                      @Nullable Path ffmpegExecutable, ReplayExportBackend backend) {
         this.snapshot = snapshot;
+        this.backend = backend;
         this.roundId = Objects.requireNonNull(snapshot.replay(), "replay").roundId();
-        this.fullBody = fullBody;
+        this.visuals = new ReplayVisualDownload(roundId);
+        this.options = options == null
+                ? ReplayExportContentOptions.defaultsFor(ReplayExportContentOptions.ExportMode.SHORT)
+                : options;
+        this.fullBody = !this.options.roofCutaway();
         this.resolution = Objects.requireNonNull(resolution, "resolution");
         this.compress = compress;
         this.quality = quality == null ? ReplayExportQuality.DEFAULT : quality;
-        this.music = music == null ? ReplayMusicPlan.Level.OFF : music;
-        this.focusPlayer = focusPlayer;
+        this.music = this.options.musicLevel();
+        this.focusPlayer = this.options.focusPlayer();
         this.ffmpegExecutable = compress ? Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable") : null;
         this.frameBytes = resolution.frameBytes();
         if (snapshot.asset() != null) ReplayDioramaMesh.retry(snapshot.asset().fingerprint);
@@ -152,7 +253,7 @@ final class ReplayVideoExport {
     boolean finalizing() { return encoder != null && captured >= encoder.frames && running(); }
     boolean encoderBusy() { return encoder != null && encoder.thread.isAlive(); }
     boolean running() { return !failed() && !cancelled && saved() == null; }
-    boolean failed() { return failed || encoder != null && encoder.failed; }
+    boolean failed() { return failed || (encoder != null && encoder.failed); }
     boolean cancelled() { return cancelled; }
     Path saved() { return encoder == null ? null : encoder.saved; }
     double displayProgress() {
@@ -162,13 +263,15 @@ final class ReplayVideoExport {
 
     Component status() {
         String key;
-        if (failed()) key = failureStatus == null ? "failed" : failureStatus;
+        if (failed()) key = failureStatus != null ? failureStatus
+                : backend == ReplayExportBackend.NATIVE ? "native_failed" : "failed";
         else if (cancelled()) key = "cancelled";
         else if (saved() != null) key = voiceUnavailable ? "saved_without_missing_voice" : voiceExportRestricted() ? "saved_no_player_voice" : "saved";
         else if (waitingForVoiceAccess()) key = "checking_voice_access";
         else if (waitingForVoice()) key = "waiting_for_voice";
         else if (preparing()) key = "preparing";
         else if (finalizing() && compress) key = "compressing";
+        else if (backend == ReplayExportBackend.NATIVE) key = "native_progress";
         else key = "progress";
         return ReplayBoardTexts.tr("controls." + key, (int) (displayProgress() * 100));
     }
@@ -194,27 +297,13 @@ final class ReplayVideoExport {
                 failureStatus = waitingForVoiceAccess() ? "voice_access_timeout" : "voice_download_timeout";
                 throw new IOException("Timed out waiting for replay voice");
             }
-            // The original map remains available when the table unloads or the next match replaces it.
-            // A world switch or resource reload can invalidate the GPU mesh, so rebuild it from that map.
-            var asset = view.asset();
-            if (asset == null) throw new IOException("Replay map asset unavailable");
-            if (reviewAsset != null && script.sample(submitted / (double) FPS).act() == ReplayVideoScript.Act.REVIEW) {
-                asset = reviewAsset;
+            var rawAsset = view.asset();
+            if (rawAsset == null) throw new IOException("Replay map asset unavailable");
+            SceneMeshSet mesh = null;
+            if (backend != ReplayExportBackend.NATIVE || (encoder != null && !nativeAction() && submitted < encoder.frames)) {
+                mesh = prepareMesh(view);
+                if (mesh == null) return;
             }
-            ReplayDioramaMesh.update(asset, view.presentSections(), view.totalSections());
-            if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(asset.fingerprint, view.totalSections()))) {
-                throw new IOException("Could not build the complete replay map");
-            }
-            var key = ReplayDioramaMesh.builtKey();
-            if (key == null || key.present() != view.totalSections() || !ReplayDioramaMesh.matches(asset)) {
-                long now = System.nanoTime();
-                if (meshDeadline == 0) meshDeadline = now + PREPARE_LIMIT_NS;
-                if (now - meshDeadline >= 0) throw new IOException("Timed out preparing the replay map");
-                return;
-            }
-            meshDeadline = 0;
-            SceneMeshSet mesh = ReplayDioramaMesh.current();
-            if (mesh == null) throw new IOException("Replay map mesh unavailable");
             if (encoder == null) {
                 int maxTex = RenderSystem.maxSupportedTextureSize();
                 if (resolution.width > maxTex || resolution.height > maxTex) {
@@ -224,38 +313,55 @@ final class ReplayVideoExport {
                 if (waitingForVoiceAccess() || waitingForVoice()) return;
                 if (audioTask == null) {
                     model = new ReplayBoardModel(view.replay(), view.timeline());
-                    if (!fullBody && model.roofCutLayer > 0) {
-                        var cut = ReplayRoofCutaway.apply(asset, model.roofCutLayer);
-                        if (cut != asset && !cut.sections.isEmpty()) {
+                    if (model.layout != null && backend != ReplayExportBackend.NATIVE) {
+                        dynamicWorld = ReplayDioramaMesh.prepareDynamic(
+                                rawAsset, model.layout.origin(), view.replay().blockDeltas());
+                    }
+                    staticExportAsset = (dynamicWorld != null && dynamicWorld.hasDynamics())
+                            ? dynamicWorld.staticAsset() : rawAsset;
+                    if (staticExportAsset != rawAsset) {
+                        ReplayDioramaMesh.retry(staticExportAsset.fingerprint);
+                    }
+                    if (backend != ReplayExportBackend.NATIVE && !fullBody && model.roofCutLayer > 0) {
+                        var cut = ReplayRoofCutaway.apply(staticExportAsset, model.roofCutLayer);
+                        if (cut != staticExportAsset && !cut.sections.isEmpty()) {
                             reviewAsset = cut;
                             ReplayDioramaMesh.retry(cut.fingerprint);
                         }
                     }
-                    for (var actor : model.actors) ReplayHeadSkins.texture(actor.p.id());
-                    script = new ReplayVideoScript(view.replay(), focusPlayer);
-                    fx = new ReplayVideoFx(script, model);
-                    overlay = new ReplayVideoOverlay(script, model, compress, quality);
+                    ReplayHeadSkins.prefetch(model);
+                    skinWaitDeadline = System.nanoTime() + SKIN_PREFETCH_WAIT_NS;
+                    ReplayVoiceData voice = voiceExportRestricted() ? ReplayVoiceData.EMPTY : view.voice();
+                    film = ReplayCinemaDirector.direct(view.replay(), voice, options);
+                    fx = new ReplayVideoFx(film, model);
+                    overlay = new ReplayVideoOverlay(film, model, compress, quality);
                     subjects = new ModelSubjects(model);
                     cameraStage = new ReplayVideoCamera.Stage(ReplayBoardRenderer.trayHalfSize(model), model.mapW, model.mapD, model.mapH,
-                            (float) Math.max(model.mapH, mesh.replayCeiling() * model.scale), ReplayActorSizing.baseSize(model.scale));
-                    ReplayVoiceData voice = voiceExportRestricted() ? ReplayVoiceData.EMPTY : view.voice();
-                    var audio = ReplayVideoAudioRenderer.prepare(client, view.replay(), script, voice, script.frames(FPS), music);
+                            mesh == null ? (float)model.mapH : (float) Math.max(model.mapH, mesh.replayCeiling() * model.scale),
+                            ReplayActorSizing.baseSize(model.scale));
+                    var audio = ReplayVideoAudioRenderer.prepareStreaming(client, directory(client), film, voice, film.frames(FPS));
                     audioTask = new java.util.concurrent.FutureTask<>(audio::get);
                     Thread.ofPlatform().daemon().name("habitrain-replay-audio-mix").start(audioTask);
                     return;
                 }
                 if (!audioTask.isDone()) return;
-                short[] soundtrack;
-                try { soundtrack = audioTask.get(); }
+                if (ReplayHeadSkins.hasPending(model) && System.nanoTime() - skinWaitDeadline < 0) return;
+                Path mixedPcm;
+                try { mixedPcm = audioTask.get(); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
                 catch (java.util.concurrent.ExecutionException failure) { throw new IOException("Could not prepare replay audio", failure.getCause()); }
                 audioTask = null;
+                stagedAudioPcm = mixedPcm;
                 exportSkins = ReplayHeadSkins.snapshot(model);
-                var focusData = model.participantData(script.focusPlayer());
+                var focusData = model.participantData(film.focusPlayer());
                 String focusSlug = focusData == null ? null : sanitizeFileSlug(focusData.name());
+                String modeSlug = sanitizeFileSlug(film.mode().id);
+                String combinedSlug = focusSlug == null ? modeSlug : (modeSlug == null ? focusSlug : modeSlug + "-" + focusSlug);
                 encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress, quality,
-                        ffmpegExecutable, script.frames(FPS), soundtrack, focusSlug);
+                        ffmpegExecutable, film.frames(FPS), mixedPcm, combinedSlug);
+                stagedAudioPcm = null; // Ownership transferred to Encoder
                 encoder.thread.start();
+                if (backend == ReplayExportBackend.NATIVE) return;
             }
 
             if (pendingPbo >= 0) {
@@ -279,6 +385,7 @@ final class ReplayVideoExport {
             }
 
             if (submitted < encoder.frames) {
+                if (nativeAction() && !foregroundFrameReady) return;
                 ensurePbos();
                 if (!pboUnavailable && pbos != null) {
                     int slot = submitted % PBO_COUNT;
@@ -309,6 +416,32 @@ final class ReplayVideoExport {
             releaseRenderResources();
             LOGGER.warn("Replay video export failed", failure);
         }
+    }
+
+    private @Nullable SceneMeshSet prepareMesh(ClientReplayBoard.View view) throws IOException {
+        var rawAsset = view.asset();
+        var activeAsset = staticExportAsset != null ? staticExportAsset : rawAsset;
+        if (reviewAsset != null && film != null
+                && film.sample(submitted / (double) FPS).baseSample().act() == ReplayVideoScript.Act.REVIEW) {
+            activeAsset = reviewAsset;
+        }
+        int expectedSections = activeAsset == rawAsset ? view.totalSections() : activeAsset.sections.size();
+        int presentSections = activeAsset == rawAsset ? view.presentSections() : expectedSections;
+        ReplayDioramaMesh.update(activeAsset, presentSections, expectedSections);
+        if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(activeAsset.fingerprint, expectedSections))) {
+            throw new IOException("Could not build the complete replay map");
+        }
+        var key = ReplayDioramaMesh.builtKey();
+        if (key == null || key.present() != expectedSections || !ReplayDioramaMesh.matches(activeAsset)) {
+            long now = System.nanoTime();
+            if (meshDeadline == 0) meshDeadline = now + PREPARE_LIMIT_NS;
+            if (now - meshDeadline >= 0) throw new IOException("Timed out preparing the replay map");
+            return null;
+        }
+        meshDeadline = 0;
+        var mesh = ReplayDioramaMesh.current();
+        if (mesh == null) throw new IOException("Replay map mesh unavailable");
+        return mesh;
     }
 
     private void ensurePbos() {
@@ -416,23 +549,44 @@ final class ReplayVideoExport {
     private float capture(Minecraft client, SceneMeshSet mesh, int index, @Nullable VideoFrame output, int pboId) throws IOException {
         int exportWidth = resolution.width;
         int exportHeight = resolution.height;
+        if (nativeAction()) {
+            int previousDraw = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+            int previousRead = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+            try {
+                if (target == null) target = new TextureTarget(exportWidth, exportHeight, false, Minecraft.ON_OSX);
+                blit(client.getMainRenderTarget(), target);
+                readPixels(pboId, output);
+            } finally {
+                GlStateManager._glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, previousDraw);
+                GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, previousRead);
+                RenderSystem.viewport(0, 0, client.getMainRenderTarget().viewWidth, client.getMainRenderTarget().viewHeight);
+            }
+            return 0f;
+        }
         double time = index / (double) FPS;
-        var sample = script.sample(time);
-        var stage = script.stage(sample);
-        var frame = script.frame(sample);
-        var shot = ReplayVideoCamera.at(script, subjects, cameraStage, time);
-        fx.at(time, sample);
+        var cs = film.sample(time);
+        var sample = cs.baseSample();
+        var stage = film.stage(sample);
+        var frame = film.frame(sample);
+        var shot = ReplayVideoCamera.at(film, subjects, cameraStage, time);
+        fx.at(time, cs);
         int draw = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
         int read = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
         int[] viewport = new int[4];
         GL11.glGetIntegerv(GL11.GL_VIEWPORT, viewport);
+        boolean scissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
+        int[] scissorBox = new int[4];
+        if (scissor) GL11.glGetIntegerv(GL11.GL_SCISSOR_BOX, scissorBox);
         float fogStart = RenderSystem.getShaderFogStart(), fogEnd = RenderSystem.getShaderFogEnd();
         int lightTexture = RenderSystem.getShaderTexture(2);
         var projection = RenderSystem.getProjectionMatrix();
         var sorting = RenderSystem.getVertexSorting();
         var modelView = RenderSystem.getModelViewStack().pushMatrix();
         try (var state = ClientRenderState.capture(); var skins = new ReplayHeadSkins.ExportScope(exportSkins)) {
-            if (target == null) {
+            RenderSystem.disableScissor();
+            RenderSystem.depthMask(true);
+            if (target == null || !target.useDepth) {
+                destroyTarget(target);
                 target = new TextureTarget(exportWidth, exportHeight, true, Minecraft.ON_OSX);
                 target.setClearColor(0.016f, 0.024f, 0.06f, 1);
             }
@@ -441,24 +595,69 @@ final class ReplayVideoExport {
             // Keep 2D motion graphics in the authored 1280x720 design coordinate space while
             // rendering into the native exportWidth x exportHeight framebuffer viewport.
             var canvas = new ReplayVideoCanvas(client, ReplayVideoCanvas.DESIGN_WIDTH, ReplayVideoCanvas.DESIGN_HEIGHT);
-            canvas.begin();
-            overlay.background(canvas, time, sample, shot);
+            var rawAsset = snapshot != null ? snapshot.asset() : null;
+            var camDir = cs.camera();
+            boolean isAction = sample.act() == ReplayVideoScript.Act.ACTION;
+            ReplayActorSizing heads = null;
 
-            modelView.set(shot.view());
-            RenderSystem.applyModelViewMatrix();
-            RenderSystem.setProjectionMatrix(shot.projection(), VertexSorting.DISTANCE_TO_ORIGIN);
-            RenderSystem.clear(GL11.GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX);
-            RenderSystem.setShaderColor(1, 1, 1, 1);
-            RenderSystem.enableDepthTest();
-            RenderSystem.depthMask(true);
-            RenderSystem.defaultBlendFunc();
-            FogRenderer.setupNoFog();
-            client.gameRenderer.lightTexture().turnOnLightLayer();
-            var heads = ReplayBoardRenderer.drawVideoFrame(client, model, frame, stage, sample.world(), shot, mesh, fullBody, fx,
-                    script.focusPlayer());
+            if (isAction && isFullPov(camDir)) {
+                var povCam = ReplayVideoCamera.povCameraAt(film, model, cs, time, false);
+                if (povCam != null) {
+                    var povOpts = buildPovOptions(cs, cs.replayTick());
+                    ReplayPovSceneRenderer.renderToCurrentTarget(client, model, rawAsset, mesh,
+                            cs.replayTick(), sample.world(), 0, 0, exportWidth, exportHeight, povCam, povOpts);
+                } else {
+                    heads = drawDioramaPass(client, canvas, modelView, mesh, frame, stage, sample, cs, shot, time);
+                }
+            } else if (isAction && cs.splitScreen()
+                    && (camDir == ReplayCinemaDirector.CameraDirective.SPLIT_DIORAMA_AND_POV
+                    || camDir == ReplayCinemaDirector.CameraDirective.SPLIT_HERO_SIDE_AND_POV)) {
+                double leftRatio = cs.splitLeftRatio();
+                var povCamRight = ReplayVideoCamera.povCameraAt(film, model, cs, time, true);
+                if (leftRatio <= 0.015 && povCamRight != null) {
+                    // Tier 4 has slid fully open into full-screen 1x native POV.
+                    var rightOpts = buildPovOptions(cs, cs.rightPovTick());
+                    ReplayPovSceneRenderer.renderToCurrentTarget(client, model, rawAsset, mesh,
+                            cs.rightPovTick(), sample.world(), 0, 0, exportWidth, exportHeight, povCamRight, rightOpts);
+                } else {
+                    // Left panel: classic diorama (Mode 1) or 90-115° Hero-Side (Mode 4 Tier 4)
+                    if (camDir == ReplayCinemaDirector.CameraDirective.SPLIT_HERO_SIDE_AND_POV) {
+                        var povCamLeft = ReplayVideoCamera.povCameraAt(film, model, cs, time, false);
+                        if (povCamLeft != null) {
+                            var leftOpts = buildPovOptions(cs, cs.replayTick());
+                            ReplayPovSceneRenderer.renderToCurrentTarget(client, model, rawAsset, mesh,
+                                    cs.replayTick(), sample.world(), 0, 0, exportWidth, exportHeight, povCamLeft, leftOpts);
+                        } else {
+                            heads = drawDioramaPass(client, canvas, modelView, mesh, frame, stage, sample, cs, shot, time);
+                        }
+                    } else {
+                        heads = drawDioramaPass(client, canvas, modelView, mesh, frame, stage, sample, cs, shot, time);
+                    }
+                    // Right panel: synchronized killer/hero 1st-person POV rendered in independent FBO
+                    if (leftRatio < 0.985 && povCamRight != null) {
+                        if (povTarget == null) {
+                            povTarget = new TextureTarget(exportWidth, exportHeight, true, Minecraft.ON_OSX);
+                            povTarget.setClearColor(0.016f, 0.024f, 0.06f, 1);
+                        }
+                        povTarget.clear(Minecraft.ON_OSX);
+                        povTarget.bindWrite(true);
+                        var rightOpts = buildPovOptions(cs, cs.rightPovTick());
+                        ReplayPovSceneRenderer.renderToCurrentTarget(client, model, rawAsset, mesh,
+                                cs.rightPovTick(), sample.world(), 0, 0, exportWidth, exportHeight, povCamRight, rightOpts);
+                        target.bindWrite(true);
+                        canvas.begin();
+                        float[] seam = ReplayVideoOverlay.splitSeamX(leftRatio,
+                                ReplayVideoCanvas.DESIGN_WIDTH, ReplayVideoCanvas.DESIGN_HEIGHT);
+                        canvas.drawDiagonalRightSplit(povTarget.getColorTextureId(), seam[0], seam[1], 0xFFFFFFFF);
+                    }
+                }
+            } else {
+                heads = drawDioramaPass(client, canvas, modelView, mesh, frame, stage, sample, cs, shot, time);
+            }
 
+            target.bindWrite(true);
             canvas.begin();
-            overlay.foreground(canvas, time, sample, shot, index, heads);
+            overlay.foreground(canvas, time, sample, cs, shot, index, heads);
             RenderSystem.enableDepthTest();
 
             readPixels(pboId, output);
@@ -466,6 +665,8 @@ final class ReplayVideoExport {
         } finally {
             GlStateManager._glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, draw);
             GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, read);
+            if (scissor) RenderSystem.enableScissor(scissorBox[0], scissorBox[1], scissorBox[2], scissorBox[3]);
+            else RenderSystem.disableScissor();
             RenderSystem.viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
             modelView.popMatrix();
             RenderSystem.applyModelViewMatrix();
@@ -476,6 +677,70 @@ final class ReplayVideoExport {
         }
     }
 
+    private ReplayActorSizing drawDioramaPass(Minecraft client, ReplayVideoCanvas canvas,
+                                              org.joml.Matrix4fStack modelView, SceneMeshSet mesh,
+                                              ReplayTimeline.Frame frame, ReplayStagePlan.Stage stage,
+                                              ReplayVideoScript.Sample sample,
+                                              @Nullable ReplayCinemaDirector.CinemaSample cs,
+                                              ReplayVideoCamera.Shot shot,
+                                              double time) {
+        canvas.begin();
+        overlay.background(canvas, time, sample, cs, shot);
+
+        modelView.set(shot.view());
+        RenderSystem.applyModelViewMatrix();
+        RenderSystem.setProjectionMatrix(shot.projection(), VertexSorting.DISTANCE_TO_ORIGIN);
+        RenderSystem.clear(GL11.GL_DEPTH_BUFFER_BIT, Minecraft.ON_OSX);
+        RenderSystem.setShaderColor(1, 1, 1, 1);
+        RenderSystem.enableDepthTest();
+        RenderSystem.depthMask(true);
+        RenderSystem.defaultBlendFunc();
+        FogRenderer.setupNoFog();
+        client.gameRenderer.lightTexture().turnOnLightLayer();
+        return ReplayBoardRenderer.drawVideoFrame(client, model, frame, stage, sample.world(), shot, mesh,
+                fullBody, fx, film.focusPlayer(), dynamicWorld);
+    }
+
+    private static boolean isFullPov(ReplayCinemaDirector.CameraDirective dir) {
+        return dir == ReplayCinemaDirector.CameraDirective.POV_FIRST_PERSON
+                || dir == ReplayCinemaDirector.CameraDirective.POV_OVER_SHOULDER
+                || dir == ReplayCinemaDirector.CameraDirective.POV_HERO_SIDE
+                || dir == ReplayCinemaDirector.CameraDirective.POV_ORBIT_360;
+    }
+
+    private ReplayPovSceneRenderer.RenderOptions buildPovOptions(ReplayCinemaDirector.CinemaSample cs, double matchTick) {
+        boolean showTrails = options.trailFilter() != ReplayExportContentOptions.ActorOverlayFilter.NONE;
+        boolean showNameplates = options.nameplateFilter() != ReplayExportContentOptions.ActorOverlayFilter.NONE;
+        boolean showRoles = options.identityReveal() != ReplayExportContentOptions.IdentityReveal.HIDDEN;
+        Set<UUID> revealedRoles = null;
+        if (options.identityReveal() == ReplayExportContentOptions.IdentityReveal.SUSPENSE_FOG) {
+            revealedRoles = new HashSet<>();
+            for (var actor : model.actors) {
+                if (film.isRoleRevealedAt(actor.p.id(), matchTick)) revealedRoles.add(actor.p.id());
+            }
+        }
+        Set<UUID> nameplateFilter = null;
+        if (options.nameplateFilter() == ReplayExportContentOptions.ActorOverlayFilter.FOCUS_ONLY) {
+            UUID f = film.focusPlayer() != null ? film.focusPlayer() : cs.povSubjectUuid();
+            if (f != null) nameplateFilter = Set.of(f);
+        } else if (options.nameplateFilter() == ReplayExportContentOptions.ActorOverlayFilter.FOCUS_AND_COMBAT) {
+            Set<UUID> active = new HashSet<>();
+            if (film.focusPlayer() != null) active.add(film.focusPlayer());
+            if (cs.povSubjectUuid() != null) active.add(cs.povSubjectUuid());
+            var h = cs.activeHighlight();
+            if (h != null) {
+                if (h.primaryActor() != null) active.add(h.primaryActor());
+                if (h.secondaryActor() != null) active.add(h.secondaryActor());
+            }
+            if (!active.isEmpty()) nameplateFilter = Set.copyOf(active);
+        }
+        return new ReplayPovSceneRenderer.RenderOptions(
+                options.roofCutaway(), true, showTrails, showNameplates, showRoles,
+                true, true, true, true, true,
+                null, null, 1.0f, null, nameplateFilter, revealedRoles
+        );
+    }
+
     boolean cancel() {
         if (running() && (encoder == null || encoder.cancel())) cancelled = true;
         releaseRenderResources();
@@ -484,9 +749,8 @@ final class ReplayVideoExport {
 
     void shutdown() {
         cancel();
-        if (encoder == null) return;
         try {
-            encoder.thread.join(1000);
+            if (encoder != null) encoder.thread.join(1000);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
         }
@@ -494,30 +758,42 @@ final class ReplayVideoExport {
 
     void releaseRenderResources() {
         if (audioTask != null) { audioTask.cancel(true); audioTask = null; }
+        if (stagedAudioPcm != null) {
+            try { Files.deleteIfExists(stagedAudioPcm); } catch (IOException ignored) {}
+            stagedAudioPcm = null;
+        }
         snapshot = null;
+        if (foregroundWorld != null) { foregroundWorld.detach(Minecraft.getInstance()); foregroundWorld = null; }
+        dynamicWorld = null;
+        staticExportAsset = null;
         reviewAsset = null;
         model = null;
-        script = null;
+        film = null;
         fx = null;
         overlay = null;
         exportSkins = Map.of();
         subjects = null;
         cameraStage = null;
-        if (target != null) {
-            int draw = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
-            int read = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
-            int removed = target.frameBufferId;
-            try {
-                target.destroyBuffers();
-            } finally {
-                target = null;
-                GlStateManager._glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, draw == removed ? 0 : draw);
-                GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, read == removed ? 0 : read);
-            }
-        }
+        destroyTarget(target);
+        target = null;
+        destroyTarget(povTarget);
+        povTarget = null;
         pendingPbo = -1;
         deletePbos();
         if (pixels != null) { MemoryUtil.memFree(pixels); pixels = null; }
+    }
+
+    private static void destroyTarget(@Nullable TextureTarget fbo) {
+        if (fbo == null) return;
+        int draw = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
+        int read = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
+        int removed = fbo.frameBufferId;
+        try {
+            fbo.destroyBuffers();
+        } finally {
+            GlStateManager._glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, draw == removed ? 0 : draw);
+            GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, read == removed ? 0 : read);
+        }
     }
 
     private void disablePbos(Exception failure) {
@@ -591,6 +867,14 @@ final class ReplayVideoExport {
 
         @Override public @Nullable UUID mvpId() { return model.mvp == null ? null : model.mvp.p.id(); }
 
+        @Override public @Nullable Double mvpFrontYawRad() {
+            if (model.mvp == null) return null;
+            var pose = model.mvp.track.sample(model.replay.durationTicks());
+            if (!pose.visible()) return null;
+            float yawOffset = model.rotated ? 90f : 0f;
+            return Math.toRadians(yawOffset - pose.headYawDegrees());
+        }
+
         @Override public Vector3f winners() {
             float x = 0, z = 0;
             int n = 0;
@@ -659,7 +943,7 @@ final class ReplayVideoExport {
         final boolean compress;
         final ReplayExportQuality quality;
         final @Nullable Path ffmpegExecutable;
-        short[] soundtrack;
+        @Nullable Path preMixedAudioPcm;
         final Path directory, output;
         final ArrayBlockingQueue<VideoFrame> pool;
         final ArrayBlockingQueue<VideoFrame> pending;
@@ -671,14 +955,14 @@ final class ReplayVideoExport {
 
         Encoder(Path directory, UUID round, ReplayExportResolution resolution, boolean compress,
                 ReplayExportQuality quality, @Nullable Path ffmpegExecutable, int frames,
-                short[] soundtrack, @Nullable String focusSlug) {
+                @Nullable Path preMixedAudioPcm, @Nullable String focusSlug) {
             this.directory = directory;
             this.resolution = resolution;
             this.compress = compress;
             this.quality = quality == null ? ReplayExportQuality.DEFAULT : quality;
             this.ffmpegExecutable = ffmpegExecutable;
             this.frames = frames;
-            this.soundtrack = soundtrack == null ? new short[0] : soundtrack;
+            this.preMixedAudioPcm = preMixedAudioPcm;
             int poolSize = resolution.highLoad() ? 2 : 4;
             this.pool = new ArrayBlockingQueue<>(poolSize);
             this.pending = new ArrayBlockingQueue<>(poolSize);
@@ -703,22 +987,35 @@ final class ReplayVideoExport {
             Path temp = null;
             int width = resolution.width;
             int height = resolution.height;
+            int audioFrameBytes = ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME * ReplayVideoAudioRenderer.CHANNELS * 2;
+            byte[] audioChunk = compress ? null : new byte[audioFrameBytes];
+            InputStream aviAudioStream = null;
             try {
                 byte[] row = new byte[width * 3];
                 Files.createDirectories(directory);
                 temp = Files.createTempFile(directory, ".replay-", ".part");
+                if (!compress && preMixedAudioPcm != null && Files.isRegularFile(preMixedAudioPcm)) {
+                    aviAudioStream = new BufferedInputStream(Files.newInputStream(preMixedAudioPcm), 65536);
+                }
                 try (ReplayVideoWriter writer = compress
-                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, soundtrack, quality)
+                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, preMixedAudioPcm, quality, true)
                         : new ReplayAviWriter(temp, width, height, FPS, true)) {
                     while (written < frames && !cancelled) {
                         VideoFrame frame = pending.poll(250, TimeUnit.MILLISECONDS);
                         if (frame == null) continue;
                         if (frame.aberration > 0.02f) aberrate(frame.data, row, width, height, frame.aberration);
                         writer.add(frame.data);
-                        if (!compress) {
-                            writer.addAudio(soundtrack,
-                                    written * ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME,
-                                    ReplayVideoAudioRenderer.SAMPLES_PER_VIDEO_FRAME);
+                        if (!compress && audioChunk != null) {
+                            int filled = 0;
+                            if (aviAudioStream != null) {
+                                while (filled < audioFrameBytes) {
+                                    int n = aviAudioStream.read(audioChunk, filled, audioFrameBytes - filled);
+                                    if (n < 0) break;
+                                    filled += n;
+                                }
+                            }
+                            if (filled < audioFrameBytes) Arrays.fill(audioChunk, filled, audioFrameBytes, (byte) 0);
+                            writer.addAudioBytes(audioChunk, 0, audioFrameBytes);
                         }
                         written++;
                         pool.offer(frame);
@@ -738,7 +1035,20 @@ final class ReplayVideoExport {
             } catch (IOException | RuntimeException | Error failure) {
                 recordFailure(failure);
             } finally {
-                soundtrack = null;
+                if (aviAudioStream != null) {
+                    try { aviAudioStream.close(); } catch (IOException ignored) {}
+                }
+                if (preMixedAudioPcm != null) {
+                    boolean wasInterrupted = Thread.interrupted();
+                    try {
+                        Files.deleteIfExists(preMixedAudioPcm);
+                    } catch (IOException failure) {
+                        LOGGER.warn("Could not remove temporary replay audio file", failure);
+                    } finally {
+                        if (wasInterrupted) Thread.currentThread().interrupt();
+                    }
+                    preMixedAudioPcm = null;
+                }
                 pool.clear();
                 pending.clear();
                 if (temp != null) {

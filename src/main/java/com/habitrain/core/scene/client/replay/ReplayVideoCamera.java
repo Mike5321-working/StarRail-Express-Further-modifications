@@ -1,7 +1,9 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.scene.replay.ReplayCinemaDirector;
 import com.habitrain.core.scene.replay.ReplayStagePlan;
+import com.habitrain.core.scene.replay.ReplayTrackSampler;
 import com.habitrain.core.scene.replay.ReplayVideoScript;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
@@ -55,6 +57,8 @@ final class ReplayVideoCamera {
         Vector3f event(LastMatchReplay.Node node, boolean to);
         @Nullable Vector3f mvp();
         default @Nullable UUID mvpId() { return null; }
+        /** Board-space yaw (radians) pointing out of the MVP's front face so the spotlight frames their front. */
+        default @Nullable Double mvpFrontYawRad() { return null; }
         Vector3f winners();
     }
 
@@ -138,7 +142,9 @@ final class ReplayVideoCamera {
                 if (m == null) {
                     rig.set(0, base + stage.mapH() * 0.3, 0, -0.6 + 0.6 * k, 0.5, fit * 0.7, 32, -0.3);
                 } else {
-                    rig.set(m.x, m.y + ReplayActorSizing.centerOffset(stage.headSize()) * 1.38, m.z, -0.65 + 0.8 * k, lerp(0.52, 0.4, k),
+                    Double frontYaw = subjects.mvpFrontYawRad();
+                    double yaw = frontYaw != null ? frontYaw - 0.40 + 0.80 * k : -0.65 + 0.8 * k;
+                    rig.set(m.x, m.y + ReplayActorSizing.centerOffset(stage.headSize()) * 1.38, m.z, yaw, lerp(0.52, 0.4, k),
                             lerp(1.75, 1.15, ReplayStagePlan.easeOutCubic(k)), 30, -0.34);
                     UUID id = subjects.mvpId();
                     if (id != null) focusedActors.put(id, ReplayStagePlan.smoothstep(0, 0.12, k));
@@ -148,6 +154,278 @@ final class ReplayVideoCamera {
         }
         shake(rig, script, time);
         return build(rig, stage, Map.copyOf(focusedActors));
+    }
+
+    /** Evaluates the diorama camera rig for a mode-directed {@link ReplayCinemaDirector.DirectedFilm}. */
+    static Shot at(ReplayCinemaDirector.DirectedFilm film, Subjects subjects, Stage stage, double time) {
+        var cs = film.sample(time);
+        var sample = cs.baseSample();
+        double k = sample.actProgress();
+        float fit = fitDistance(stage.half());
+        double base = ReplayBoardSite.MAP_BASE;
+        Rig rig = new Rig();
+        Map<UUID, Double> focusedActors = new HashMap<>();
+        switch (sample.act()) {
+            case TITLE -> {
+                double e = ReplayStagePlan.easeInOutQuart(k), o = ReplayStagePlan.easeOutCubic(k);
+                rig.set(0, base + stage.mapH() * 0.35, 0, lerp(-1.4, -0.55, e), lerp(1.02, 0.58, e),
+                        fit * lerp(2.15, 0.95, o), 34, 0);
+                rig.roll = lerp(-0.06, 0, e);
+            }
+            case ACTION -> {
+                UUID focusPlayer = film.focusPlayer();
+                boolean useFollow = focusPlayer != null && (cs.camera() == ReplayCinemaDirector.CameraDirective.DIORAMA_FOLLOW
+                        || film.mode() == com.habitrain.core.scene.replay.ReplayExportContentOptions.ExportMode.PERSONAL);
+                if (useFollow) {
+                    followPlayerDirected(rig, film, subjects, stage, time, fit, focusPlayer);
+                    focusedActors.put(focusPlayer, 0.7);
+                } else {
+                    overviewDirected(rig, film, subjects, stage, time, fit);
+                }
+                // Tier 1 Glimmer: keep panoramic overview unbroken, just boost focal emphasis slightly.
+                if (cs.segment() != null && cs.segment().kind() == ReplayCinemaDirector.SegmentKind.TIER1_GLIMMER
+                        && cs.activeHighlight() != null) {
+                    var h = cs.activeHighlight();
+                    if (h.primaryActor() != null) focusedActors.merge(h.primaryActor(), 0.95, Math::max);
+                    if (h.secondaryActor() != null) focusedActors.merge(h.secondaryActor(), 0.90, Math::max);
+                } else {
+                    for (var beat : film.beats()) {
+                        double w = ReplayVideoScript.influence(beat, time, 0.75, 0.85);
+                        if (w <= 0) continue;
+                        Rig close = new Rig();
+                        beat(close, beat, subjects, stage, time, overviewYawDirected(film, beat.approach()), sample.replayTick());
+                        // In split-screen Mode 1, shift diorama subject slightly left so it frames cleanly in the left 53.5% panel.
+                        if (cs.splitScreen()) {
+                            close.shift = -0.34 * cs.splitLeftRatio();
+                        }
+                        rig.mix(close, w);
+                        focusedActors.replaceAll((id, weight) -> weight * (1 - w));
+                        var node = beat.node();
+                        if (node.actor() != null) focusedActors.merge(node.actor(), w, Double::sum);
+                        if (node.target() != null && !node.target().equals(node.actor())) focusedActors.merge(node.target(), w, Double::sum);
+                        if (focusPlayer != null) focusedActors.merge(focusPlayer, 0.7, Math::max);
+                    }
+                }
+            }
+            case REVIEW -> {
+                double e = ReplayStagePlan.easeInOutQuart(k);
+                rig.set(0, base + stage.mapH() * 0.1, 0, lerp(-0.55, 0.42, e), lerp(0.72, 1.18, e), fit * lerp(0.76, 0.88, k), 34, 0);
+            }
+            case VICTORY -> {
+                var w = subjects.winners();
+                double e = ReplayStagePlan.easeInOutQuart(k);
+                rig.set(w.x * 0.45, base + stage.mapH() * 0.32, w.z * 0.45, lerp(0.55, -0.15, e), lerp(0.4, 0.3, k),
+                        fit * lerp(0.9, 0.78, ReplayStagePlan.easeOutCubic(k)), 32, 0);
+            }
+            case MVP -> {
+                Vector3f m = subjects.mvp();
+                if (m == null) {
+                    rig.set(0, base + stage.mapH() * 0.3, 0, -0.6 + 0.6 * k, 0.5, fit * 0.7, 32, -0.3);
+                } else {
+                    Double frontYaw = subjects.mvpFrontYawRad();
+                    double yaw = frontYaw != null ? frontYaw - 0.40 + 0.80 * k : -0.65 + 0.8 * k;
+                    rig.set(m.x, m.y + ReplayActorSizing.centerOffset(stage.headSize()) * 1.38, m.z, yaw, lerp(0.52, 0.4, k),
+                            lerp(1.75, 1.15, ReplayStagePlan.easeOutCubic(k)), 30, -0.34);
+                    UUID id = subjects.mvpId();
+                    if (id != null) focusedActors.put(id, ReplayStagePlan.smoothstep(0, 0.12, k));
+                }
+            }
+            case OUTRO -> rig.set(0, base + stage.mapH() * 0.2, 0, 0.35 - 0.45 * k, 0.8, fit * lerp(1.0, 1.28, k), 34, -0.42);
+        }
+        shakeBeats(rig, film.beats(), time);
+        return build(rig, stage, Map.copyOf(focusedActors));
+    }
+
+    /**
+     * Builds the 1:1 world-scale {@link ReplayPovSceneRenderer.CameraSpec} for Mode 1 right split POV,
+     * Mode 2 True Player POV, and Mode 4 Tiers 3–5 over-shoulder / hero-side / 360° master orbit shots.
+     */
+    static @Nullable ReplayPovSceneRenderer.CameraSpec povCameraAt(ReplayCinemaDirector.DirectedFilm film,
+                                                                   ReplayBoardModel model,
+                                                                   ReplayCinemaDirector.CinemaSample cs,
+                                                                   double time,
+                                                                   boolean rightSplitPanel) {
+        UUID subject = cs.povSubjectUuid() != null ? cs.povSubjectUuid() : film.focusPlayer();
+        if (subject == null) return null;
+        double tick = rightSplitPanel ? cs.rightPovTick() : cs.replayTick();
+        var seg = cs.segment();
+        if (rightSplitPanel) {
+            // Mode 1 Right Split-Screen & Mode 4 Tier 4 Right POV panel: crisp 1st-person killer/hero POV.
+            // Guard against train-tail fall kills where raw 1st-person view stares off the train into black void.
+            var h = cs.activeHighlight();
+            if (h != null && h.secondaryActor() != null && h.primaryNode() != null
+                    && h.primaryNode().detail() != null
+                    && h.primaryNode().detail().toLowerCase(java.util.Locale.ROOT).contains("fell_out_of_train")) {
+                var framed = aimedTrainFallCamera(model, subject, h.secondaryActor(), tick);
+                if (framed != null) return framed;
+            }
+            return ReplayPovSceneRenderer.CameraSpec.firstPerson(model, subject, tick, 76f, true);
+        }
+        if (seg == null) {
+            return ReplayPovSceneRenderer.CameraSpec.firstPerson(model, subject, tick, 76f, true);
+        }
+        double p = seg.progressAt(time);
+        return switch (seg.kind()) {
+            case TIER3_OVER_SHOULDER, TIER4_OVER_SHOULDER -> ReplayPovSceneRenderer.CameraSpec.overShoulder(
+                    model, subject, tick, (float) lerp(3.1, 2.3, p), 0.55f, 0.28f, 64f);
+            case TIER3_HERO_SIDE, TIER4_IMPACT_FREEZE, TIER4_DUAL_EXECUTION -> {
+                float whip = (float) (cs.whipAngleDeg() * ReplayStagePlan.easeOutCubic(Math.min(1.0, p / 0.28)));
+                float dist = (float) lerp(2.8, 2.25, p);
+                yield ReplayPovSceneRenderer.CameraSpec.heroSide(model, subject, tick, whip, dist, 50f);
+            }
+            case TIER4_POV_EXPAND -> {
+                float whip = (float) (Math.abs(cs.whipAngleDeg()) > 1.0 ? cs.whipAngleDeg() : 96.0);
+                yield ReplayPovSceneRenderer.CameraSpec.heroSide(model, subject, tick, whip, 2.25f, 50f);
+            }
+            case TIER5_SUCTION_DOLLY -> {
+                // Seamless 4.0s Dolly-In penetrating smoothly from behind the hero straight into 1st-person eyes!
+                double e = ReplayStagePlan.easeInOutQuart(p);
+                if (e >= 0.92) {
+                    yield ReplayPovSceneRenderer.CameraSpec.firstPerson(model, subject, tick, (float) lerp(68, 76, (e - 0.92) / 0.08), true);
+                }
+                float backDist = (float) lerp(3.4, 0.15, e);
+                float rightOff = (float) lerp(0.55, 0.0, e);
+                float upOff = (float) lerp(0.32, 0.0, e);
+                yield ReplayPovSceneRenderer.CameraSpec.overShoulder(model, subject, tick, backDist, rightOff, upOff, (float) lerp(62, 74, e));
+            }
+            case TIER5_POV_NATIVE, TIER5_APEX_FREEZE ->
+                    ReplayPovSceneRenderer.CameraSpec.firstPerson(model, subject, tick, 76f, true);
+            case TIER5_ORBIT_ENCORE -> {
+                // Violent pull-out into full 360-degree 3rd-person master orbit around the hero!
+                ReplayBoardModel.Actor actor = model.participant(subject);
+                ReplayTrackSampler.Pose pose = actor == null ? null : actor.track.sample(tick);
+                double cx = pose != null && pose.visible() ? pose.x() : model.source.sizeX() * 0.5;
+                double cy = pose != null && pose.visible() ? pose.y() + 1.15 : 2.0;
+                double cz = pose != null && pose.visible() ? pose.z() : model.source.sizeZ() * 0.5;
+                float startAz = pose != null ? pose.yaw() + 180f : 0f;
+                float orbitDeg = startAz + (float) (360.0 * p);
+                float elev = (float) lerp(16.0, 26.0, Math.sin(p * Math.PI));
+                float dist = (float) lerp(2.2, 4.4, ReplayStagePlan.easeOutCubic(Math.min(1.0, p / 0.25)));
+                yield ReplayPovSceneRenderer.CameraSpec.orbit360(cx, cy, cz, orbitDeg, elev, dist, 58f);
+            }
+            default -> {
+                if (cs.camera() == ReplayCinemaDirector.CameraDirective.POV_FIRST_PERSON) {
+                    yield ReplayPovSceneRenderer.CameraSpec.firstPerson(model, subject, tick, 76f, true);
+                }
+                yield ReplayPovSceneRenderer.CameraSpec.overShoulder(model, subject, tick, 2.8f, 0.45f, 0.25f, 66f);
+            }
+        };
+    }
+
+    private static @Nullable ReplayPovSceneRenderer.CameraSpec aimedTrainFallCamera(
+            ReplayBoardModel model, UUID killerId, UUID victimId, double tick) {
+        if (model == null) return null;
+        ReplayBoardModel.Actor victim = model.participant(victimId);
+        if (victim == null) return null;
+        ReplayTrackSampler.Pose vp = victim.track.sample(tick);
+        if (!vp.visible()) return null;
+        ReplayBoardModel.Actor killer = model.participant(killerId);
+        ReplayTrackSampler.Pose kp = killer == null ? null : killer.track.sample(tick);
+
+        double tx = vp.x(), ty = vp.y() + 1.05, tz = vp.z();
+        double ex, ey, ez;
+        if (kp != null && kp.visible() && Math.hypot(kp.x() - vp.x(), kp.z() - vp.z()) <= 16.0) {
+            double dx = vp.x() - kp.x(), dz = vp.z() - kp.z();
+            double horiz = Math.max(0.5, Math.hypot(dx, dz));
+            // Sit slightly behind and above the killer looking straight down the action line toward the victim.
+            ex = kp.x() - (dx / horiz) * 1.4;
+            ey = kp.y() + 2.05;
+            ez = kp.z() - (dz / horiz) * 1.4;
+        } else {
+            // Fall back to a slightly elevated view inside the map footprint aimed at the falling victim.
+            double cx = (model.source.minX() + model.source.maxX()) * 0.5 - model.replay.origin().minX();
+            double cz = (model.source.minZ() + model.source.maxZ()) * 0.5 - model.replay.origin().minZ();
+            double dx = cx - vp.x(), dz = cz - vp.z();
+            double horiz = Math.max(1.0, Math.hypot(dx, dz));
+            ex = vp.x() + (dx / horiz) * 3.2;
+            ey = vp.y() + 2.2;
+            ez = vp.z() + (dz / horiz) * 3.2;
+        }
+        double dx = tx - ex, dy = ty - ey, dz = tz - ez;
+        double horiz = Math.max(1e-5, Math.hypot(dx, dz));
+        float yaw = (float) Math.toDegrees(Math.atan2(-dx, dz));
+        float pitch = (float) Math.toDegrees(-Math.atan2(dy, horiz));
+        return new ReplayPovSceneRenderer.CameraSpec(
+                ReplayPovSceneRenderer.CameraMode.OVER_SHOULDER, killerId,
+                ex, ey, ez, yaw, pitch, 0f, 68f, false, 0f, (float) horiz);
+    }
+
+    private static void followPlayerDirected(Rig rig, ReplayCinemaDirector.DirectedFilm film, Subjects subjects, Stage stage,
+                                             double time, float fit, UUID focusPlayer) {
+        double actionStart = film.actStart(ReplayVideoScript.Act.ACTION);
+        double actionEnd = Math.max(actionStart, film.actStart(ReplayVideoScript.Act.REVIEW) - 1.0e-3);
+        int halfTaps = 36;
+        double step = FOLLOW_HALF_WINDOW / halfTaps;
+        double px = 0, py = 0, pz = 0, weight = 0;
+        for (int i = -halfTaps + 1; i < halfTaps; i++) {
+            double dt = i * step;
+            double w = smoothKernelWeight(dt, FOLLOW_HALF_WINDOW, FOLLOW_SIGMA);
+            if (w <= 0) continue;
+            var s = film.sample(Math.clamp(time + dt, actionStart, actionEnd));
+            var p = subjects.actor(focusPlayer, s.replayTick());
+            if (p == null) continue;
+            px += p.x * w; py += p.y * w; pz += p.z * w; weight += w;
+        }
+        if (weight <= 0) {
+            var direct = subjects.actor(focusPlayer, film.sample(time).replayTick());
+            if (direct == null) {
+                overviewDirected(rig, film, subjects, stage, time, fit);
+                return;
+            }
+            px = direct.x; py = direct.y; pz = direct.z;
+        } else {
+            px /= weight; py /= weight; pz /= weight;
+        }
+        double t = time - actionStart;
+        double dist = Math.clamp(fit * 0.34, 1.55, 2.75);
+        rig.set(px, py + ReplayActorSizing.centerOffset(stage.headSize()) * 1.25, pz,
+                overviewYawDirected(film, time), 0.56 + 0.03 * Math.sin(t * 0.11), dist, 33, 0);
+    }
+
+    private static void overviewDirected(Rig rig, ReplayCinemaDirector.DirectedFilm film, Subjects subjects, Stage stage,
+                                         double time, float fit) {
+        double actionStart = film.actStart(ReplayVideoScript.Act.ACTION);
+        double actionEnd = Math.max(actionStart, film.actStart(ReplayVideoScript.Act.REVIEW) - 1.0e-3);
+        int halfTaps = 16;
+        double step = OVERVIEW_HALF_WINDOW / halfTaps;
+        double cx = 0, cz = 0, weight = 0;
+        for (int i = -halfTaps + 1; i < halfTaps; i++) {
+            double dt = i * step;
+            double w = smoothKernelWeight(dt, OVERVIEW_HALF_WINDOW, OVERVIEW_SIGMA);
+            if (w <= 0) continue;
+            var s = film.sample(Math.clamp(time + dt, actionStart, actionEnd));
+            var c = subjects.centroid(s.replayTick());
+            cx += c.x * w; cz += c.z * w; weight += w;
+        }
+        if (weight > 0) { cx /= weight; cz /= weight; }
+        double t = time - actionStart;
+        rig.set(cx * 0.6, ReplayBoardSite.MAP_BASE + stage.mapH() * 0.25, cz * 0.4,
+                overviewYawDirected(film, time), 0.6 + 0.04 * Math.sin(t * 0.09), fit * 0.86, 34, 0);
+    }
+
+    private static double overviewYawDirected(ReplayCinemaDirector.DirectedFilm film, double time) {
+        return -0.55 + 0.22 * Math.sin((time - film.actStart(ReplayVideoScript.Act.ACTION)) * 0.13);
+    }
+
+    private static void shakeBeats(Rig rig, java.util.List<ReplayVideoScript.Beat> beats, double time) {
+        double env = 0;
+        for (var beat : beats) {
+            double u = beat.local(time);
+            if (u < 0 || u > 1.5) continue;
+            double strength = switch (beat.type()) {
+                case EXPLOSION -> 1.7;
+                case KILL -> 1.0 + 0.25 * (beat.streak() - 1);
+                case REVIVAL -> 0.35;
+                default -> 0.5;
+            };
+            env += strength * ReplayVideoScript.impulse(u, 5.5);
+        }
+        if (env <= 1.0e-3) return;
+        double amp = env * rig.dist * 0.012;
+        rig.tx += amp * noise(time, 1.3);
+        rig.ty += amp * noise(time, 4.1) * 0.6;
+        rig.tz += amp * noise(time, 7.7);
+        rig.roll += env * 0.012 * noise(time, 2.9);
     }
 
     private static void followPlayer(Rig rig, ReplayVideoScript script, Subjects subjects, Stage stage, double time, float fit,
