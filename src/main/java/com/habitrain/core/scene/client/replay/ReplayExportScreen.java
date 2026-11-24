@@ -80,7 +80,8 @@ final class ReplayExportScreen extends Screen {
     private Button subPrimaryButton;
     private final Button[] pacingButtons = new Button[PersonalPacing.values().length];
     private Button subSecondaryButton;
-    private Button customizerButton, videoSettingsButton, back, start, folderOrImport;
+    private Button customizerButton, videoSettingsButton, styleButton, back, start, folderOrImport;
+    private ReplayExportContentOptions.VisualStyle visualStyle = ReplayExportContentOptions.VisualStyle.BRASS;
 
     // Video & Quality settings widgets
     private Button mp4, avi, roofCut, roofFull, collapseSettingsButton;
@@ -156,13 +157,14 @@ final class ReplayExportScreen extends Screen {
         this.quality = ReplayExportQuality.fromId(ClientVisualPreferences.getReplayVideoQuality());
         this.music = ReplayMusicPlan.Level.fromId(ClientVisualPreferences.getReplayVideoMusic());
         this.preferredRoofCutaway = !ReplayBoardLocalState.fullBody();
+        this.visualStyle = ReplayExportContentOptions.VisualStyle.fromId(ClientVisualPreferences.getReplayVideoStyle());
         this.focusPlayer = initialFocusPlayer;
         ExportMode initialMode = initialFocusPlayer != null ? ExportMode.PERSONAL : ExportMode.SHORT;
         this.contentOptions = buildDefaultOptionsForMode(initialMode, initialFocusPlayer);
     }
 
     private ReplayExportContentOptions buildDefaultOptionsForMode(ExportMode mode, @Nullable UUID player) {
-        var base = ReplayExportContentOptions.defaultsFor(mode, player);
+        var base = ReplayExportContentOptions.defaultsFor(mode, player).toBuilder().visualStyle(this.visualStyle).build();
         if (mode == ExportMode.SHORT) {
             return base.toBuilder()
                     .roofCutaway(this.preferredRoofCutaway)
@@ -409,17 +411,26 @@ final class ReplayExportScreen extends Screen {
             }
         }
 
-        customizerButton = addMainWidget(new BrassButton(x, mainDrawersY, half, optH, tr("export.customizer_btn"), b -> {
+        int drawerW = (inner - GAP * 2) / 3;
+        customizerButton = addMainWidget(new BrassButton(x, mainDrawersY, drawerW, optH, tr("export.customizer_btn"), b -> {
             setCustomizerOpen(true);
             refresh();
         }));
         customizerButton.setTooltip(Tooltip.create(tr("export.customizer_btn_tip")));
 
-        videoSettingsButton = addMainWidget(new BrassButton(x + half + GAP, mainDrawersY, otherHalf, optH, tr("export.video_settings"), b -> {
+        videoSettingsButton = addMainWidget(new BrassButton(x + drawerW + GAP, mainDrawersY, drawerW, optH, tr("export.video_settings"), b -> {
             setSettingsOpen(true);
             refresh();
         }));
         videoSettingsButton.setTooltip(Tooltip.create(tr("export.video_settings_tip")));
+
+        int styleX = x + (drawerW + GAP) * 2;
+        styleButton = addMainWidget(new BrassButton(styleX, mainDrawersY, x + inner - styleX, optH, Component.empty(), b -> {
+            if (exporting()) return;
+            visualStyle = visualStyle.toggle();
+            ClientVisualPreferences.setReplayVideoStyle(visualStyle.id);
+            updateOptions(contentOptions.toBuilder().visualStyle(visualStyle).build());
+        }));
 
         int third = (inner - GAP * 2) / 3;
         back = addMainWidget(new BrassButton(x, mainButtonsY, third, 20, tr("export.back"), b -> onClose()));
@@ -1054,6 +1065,12 @@ final class ReplayExportScreen extends Screen {
         customizerButton.setY(settingsY);
         videoSettingsButton.active = !exporting;
         videoSettingsButton.setY(settingsY);
+        boolean kineticStyle = shownOpts.visualStyle() == ReplayExportContentOptions.VisualStyle.KINETIC;
+        styleButton.active = !exporting;
+        styleButton.setY(settingsY);
+        styleButton.setMessage(tr("export.style", tr(kineticStyle ? "export.style_kinetic" : "export.style_brass")));
+        styleButton.setTooltip(Tooltip.create(tr(kineticStyle ? "export.style_kinetic_tip" : "export.style_brass_tip")));
+        ((BrassButton) styleButton).selected = kineticStyle;
 
         // Customizer sub-view states
         for (int i = 0; i < 3; i++) {

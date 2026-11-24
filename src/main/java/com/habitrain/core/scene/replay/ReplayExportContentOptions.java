@@ -47,7 +47,9 @@ public record ReplayExportContentOptions(
         boolean autoDucking,
         // Category 4: Clip trim window in match ticks (trimEndTick < 0 means full duration)
         int trimStartTick,
-        int trimEndTick
+        int trimEndTick,
+        // Category 5: visual packaging style (brass Star-Night default, or the kinetic-typography MV look)
+        VisualStyle visualStyle
 ) {
     public static final float MIN_VOLUME = 0.0f;
     public static final float MAX_VOLUME = 2.0f;
@@ -67,7 +69,35 @@ public record ReplayExportContentOptions(
         if (trimEndTick >= 0 && trimEndTick < trimStartTick) {
             trimEndTick = trimStartTick;
         }
+        visualStyle = visualStyle == null ? VisualStyle.BRASS : visualStyle;
     }
+
+    /**
+     * Visual packaging of the exported film. {@link #BRASS} is the original Star-Night Express Art Deco look;
+     * {@link #KINETIC} is the paper/ink kinetic-typography music-video look, with one theme per export mode.
+     */
+    public enum VisualStyle {
+        BRASS("brass"),
+        KINETIC("kinetic");
+
+        public final String id;
+
+        VisualStyle(String id) { this.id = id; }
+
+        public VisualStyle toggle() {
+            return this == BRASS ? KINETIC : BRASS;
+        }
+
+        public static VisualStyle fromId(@Nullable String raw) {
+            if (raw != null && !raw.isBlank()) {
+                String norm = raw.trim().toLowerCase(Locale.ROOT);
+                for (VisualStyle v : values()) if (v.id.equals(norm)) return v;
+            }
+            return BRASS;
+        }
+    }
+
+    public boolean kinetic() { return visualStyle == VisualStyle.KINETIC; }
 
     /** Four top-level replay video export modes. */
     public enum ExportMode {
@@ -272,7 +302,7 @@ public record ReplayExportContentOptions(
                     true, true, true, true, IdentityReveal.OMNISCIENT,
                     ActorOverlayFilter.ALL, ActorOverlayFilter.ALL, true, true,
                     1.0f, 1.0f, ReplayMusicPlan.Level.MEDIUM, true,
-                    0, -1
+                    0, -1, VisualStyle.BRASS
             );
             case PERSONAL -> new ReplayExportContentOptions(
                     ExportMode.PERSONAL, PersonalView.TRUE_POV, PersonalPacing.SPEED_1X, PromoScope.PERSONAL_MVP,
@@ -281,7 +311,7 @@ public record ReplayExportContentOptions(
                     true, true, true, true, IdentityReveal.SUSPENSE_FOG,
                     ActorOverlayFilter.FOCUS_ONLY, ActorOverlayFilter.ALL, true, false,
                     1.0f, 1.0f, ReplayMusicPlan.Level.LOW, true,
-                    0, -1
+                    0, -1, VisualStyle.BRASS
             );
             case SANDBOX_FULL -> new ReplayExportContentOptions(
                     ExportMode.SANDBOX_FULL, PersonalView.SANDBOX_FOLLOW, PersonalPacing.SPEED_1X, PromoScope.GLOBAL_ENSEMBLE,
@@ -290,7 +320,7 @@ public record ReplayExportContentOptions(
                     true, true, true, true, IdentityReveal.OMNISCIENT,
                     ActorOverlayFilter.ALL, ActorOverlayFilter.ALL, true, false,
                     1.0f, 1.0f, ReplayMusicPlan.Level.LOW, true,
-                    0, -1
+                    0, -1, VisualStyle.BRASS
             );
             case CINEMATIC_PROMO -> new ReplayExportContentOptions(
                     ExportMode.CINEMATIC_PROMO, PersonalView.TRUE_POV, PersonalPacing.SPEED_1X,
@@ -300,7 +330,7 @@ public record ReplayExportContentOptions(
                     true, true, true, true, IdentityReveal.OMNISCIENT,
                     ActorOverlayFilter.FOCUS_AND_COMBAT, ActorOverlayFilter.FOCUS_AND_COMBAT, true, true,
                     1.0f, 1.0f, ReplayMusicPlan.Level.HIGH, true,
-                    0, -1
+                    0, -1, VisualStyle.BRASS
             );
         };
     }
@@ -346,6 +376,7 @@ public record ReplayExportContentOptions(
         private boolean autoDucking;
         private int trimStartTick;
         private int trimEndTick;
+        private VisualStyle visualStyle;
 
         public Builder(ReplayExportContentOptions base) {
             this.mode = base.mode;
@@ -375,6 +406,7 @@ public record ReplayExportContentOptions(
             this.autoDucking = base.autoDucking;
             this.trimStartTick = base.trimStartTick;
             this.trimEndTick = base.trimEndTick;
+            this.visualStyle = base.visualStyle;
         }
 
         public Builder mode(ExportMode v) { this.mode = v; return this; }
@@ -402,6 +434,7 @@ public record ReplayExportContentOptions(
         public Builder sfxVolume(float v) { this.sfxVolume = v; return this; }
         public Builder musicLevel(ReplayMusicPlan.Level v) { this.musicLevel = v; return this; }
         public Builder autoDucking(boolean v) { this.autoDucking = v; return this; }
+        public Builder visualStyle(VisualStyle v) { this.visualStyle = v; return this; }
         public Builder trimRange(int startTick, int endTick) {
             this.trimStartTick = startTick;
             this.trimEndTick = endTick;
@@ -414,7 +447,7 @@ public record ReplayExportContentOptions(
                     includeTitle, includeReview, includeVictoryMvp, includeOutro, includeLetterboxDof, includeWatermark,
                     showTimecode, showAliveMatrix, showKillFeed, showTimeline, identityReveal,
                     trailFilter, nameplateFilter, showSkillToasts, splitScreenKillPov,
-                    voiceVolume, sfxVolume, musicLevel, autoDucking, trimStartTick, trimEndTick
+                    voiceVolume, sfxVolume, musicLevel, autoDucking, trimStartTick, trimEndTick, visualStyle
             );
         }
     }

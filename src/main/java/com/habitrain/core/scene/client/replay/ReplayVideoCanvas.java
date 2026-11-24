@@ -38,6 +38,10 @@ final class ReplayVideoCanvas {
     static final int DESIGN_WIDTH = 1280, DESIGN_HEIGHT = 720;
     static final ResourceLocation BIG = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_big");
     static final ResourceLocation UI = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_ui");
+    /** Kinetic (MV style) faces: Bebas caps with a bundled CJK bold fallback, and the CJK bold body face. */
+    static final ResourceLocation MV_DISPLAY = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_mv_display");
+    static final ResourceLocation MV_TEXT = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_mv_text");
+    static final ResourceLocation MV_MONO = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_mv_mono");
     private static final Set<ResourceLocation> PREPARED = new HashSet<>();
     private static final boolean MODERN_UI = FabricLoader.getInstance().isModLoaded("modernui");
 
@@ -164,6 +168,53 @@ final class ReplayVideoCanvas {
             b.addVertex(pose, cx, cy, 0).setColor(center);
         }
         BufferUploader.drawWithShader(b.buildOrThrow());
+    }
+
+    /** Connected line strip; one draw call for the whole strip. */
+    void polyline(float[] xy, int n, float lineWidth, int color, boolean closed) {
+        if ((color >>> 24) == 0 || n < 2 || xy.length < n * 2) return;
+        prepareFlat();
+        BufferBuilder b = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
+        int segments = closed ? n : n - 1;
+        float hw = lineWidth / 2;
+        boolean opaque = (color >>> 24) >= 250;
+        for (int i = 0; i < segments; i++) {
+            int j = (i + 1) % n;
+            float x0 = xy[i * 2], y0 = xy[i * 2 + 1], x1 = xy[j * 2], y1 = xy[j * 2 + 1];
+            float dx = x1 - x0, dy = y1 - y0, len = (float) Math.sqrt(dx * dx + dy * dy);
+            if (len < 1.0e-4f) continue;
+            float ux = dx / len, uy = dy / len;
+            if (opaque) {
+                // Overlap the joints so thick strips have no notches; only safe when fully opaque.
+                float ext = Math.min(hw, len * 0.5f);
+                x0 -= ux * ext; y0 -= uy * ext; x1 += ux * ext; y1 += uy * ext;
+            }
+            float nx = -uy * hw, ny = ux * hw;
+            b.addVertex(pose, x0 + nx, y0 + ny, 0).setColor(color);
+            b.addVertex(pose, x0 - nx, y0 - ny, 0).setColor(color);
+            b.addVertex(pose, x1 - nx, y1 - ny, 0).setColor(color);
+            b.addVertex(pose, x1 + nx, y1 + ny, 0).setColor(color);
+        }
+        var mesh = b.build();
+        if (mesh != null) BufferUploader.drawWithShader(mesh);
+    }
+
+    /** Photographic negative of what is already in the framebuffer, mixed by {@code amount} (0..1). */
+    void invert(float x0, float y0, float x1, float y1, double amount) {
+        float a = (float) Math.clamp(amount, 0.0, 1.0);
+        if (a <= 0.004f) return;
+        int v = Math.round(a * 255);
+        int color = (v << 24) | (v << 16) | (v << 8) | v;
+        prepareFlat();
+        RenderSystem.blendFuncSeparate(GlStateManager.SourceFactor.ONE_MINUS_DST_COLOR, GlStateManager.DestFactor.ONE_MINUS_SRC_ALPHA,
+                GlStateManager.SourceFactor.ZERO, GlStateManager.DestFactor.ONE);
+        BufferBuilder b = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_COLOR);
+        b.addVertex(pose, x0, y0, 0).setColor(color);
+        b.addVertex(pose, x0, y1, 0).setColor(color);
+        b.addVertex(pose, x1, y1, 0).setColor(color);
+        b.addVertex(pose, x1, y0, 0).setColor(color);
+        BufferUploader.drawWithShader(b.buildOrThrow());
+        RenderSystem.defaultBlendFunc();
     }
 
     /** Diamond (rotated square) marker. */
@@ -315,6 +366,18 @@ final class ReplayVideoCanvas {
         return out;
     }
 
+    /**
+     * Applies a kinetic face to the whole text, CJK included, because the kinetic faces bundle a CJK fallback.
+     * ModernUI renders CJK with its own engine and does not fall back across custom font IDs, so under ModernUI
+     * only the Latin runs take the bundled face (same policy as {@link #font}).
+     */
+    static MutableComponent kineticFont(Component text, ResourceLocation font) {
+        if (text == null) return Component.empty();
+        if (MODERN_UI) return font(text, font);
+        if (text.getString().isEmpty()) return Component.empty();
+        return Component.empty().append(text).withStyle(style -> style.withFont(font));
+    }
+
     private static boolean isDisplayFontSafe(String s) {
         for (int i = 0; i < s.length(); i++) {
             if (!isDisplayFontChar(s.charAt(i))) return false;
@@ -353,8 +416,8 @@ final class ReplayVideoCanvas {
     private static float modernUiShift(Component text) {
         if (!MODERN_UI) return 0;
         ResourceLocation font = text.getStyle().getFont();
-        if (BIG.equals(font)) return 1f;
-        if (UI.equals(font)) return 0.5f;
+        if (BIG.equals(font) || MV_DISPLAY.equals(font)) return 1f;
+        if (UI.equals(font) || MV_MONO.equals(font)) return 0.5f;
         return 0;
     }
 

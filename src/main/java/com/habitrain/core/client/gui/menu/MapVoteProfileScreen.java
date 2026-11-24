@@ -38,6 +38,7 @@ public final class MapVoteProfileScreen extends Screen {
     private boolean profileOverride;
     private MapVotePreviewFilePicker.PreparedPreview pendingPreview;
     private Component uploadStatus = Component.empty();
+    private boolean showingInheritedStatus;
 
     private EditBox displayNameField;
     private EditBox descriptionField;
@@ -107,8 +108,12 @@ public final class MapVoteProfileScreen extends Screen {
             previewGeneration++;
             if (!profileOverride) {
                 pendingPreview = null;
+                showingInheritedStatus = true;
                 uploadStatus = Component.translatable(
                         "config.habitrain_core.map_profile.preview_inherited");
+            } else if (showingInheritedStatus) {
+                showingInheritedStatus = false;
+                uploadStatus = Component.empty();
             }
             refreshState();
             MenuSounds.playClick();
@@ -121,7 +126,9 @@ public final class MapVoteProfileScreen extends Screen {
         displayNameField.setHint(Component.literal(mapId));
         descriptionField = editBox("config.habitrain_core.map_profile.description",
                 MapVoteProfileSettings.MAX_DESCRIPTION_LENGTH, draftDescription);
+        descriptionField.setResponder(ignored -> onProfileContentEdited());
         tagsField = editBox("config.habitrain_core.map_profile.tags", 320, draftTags);
+        tagsField.setResponder(ignored -> onProfileContentEdited());
         minPlayersField = numberBox("config.habitrain_core.map_profile.min_players", draftMinPlayers);
         maxPlayersField = numberBox("config.habitrain_core.map_profile.max_players", draftMaxPlayers);
         uploadButton = addRenderableWidget(Button.builder(
@@ -171,15 +178,37 @@ public final class MapVoteProfileScreen extends Screen {
                 : "config.habitrain_core.map_profile.source_file");
     }
 
+    private void onProfileContentEdited() {
+        if (editable && !saving && !profileOverride) {
+            profileOverride = true;
+            if (showingInheritedStatus) {
+                showingInheritedStatus = false;
+                uploadStatus = Component.empty();
+            }
+        }
+        refreshState();
+    }
+
+    static boolean isUploadButtonActive(boolean editable, boolean preparingPreview, boolean saving, boolean connected) {
+        return editable && !preparingPreview && !saving && connected;
+    }
+
+    static String resolveUploadHintKey(boolean editable, boolean connected) {
+        if (!editable) return "config.habitrain_core.map_profile.read_only";
+        if (!connected) return "config.habitrain_core.map_profile.preview_offline";
+        return "config.habitrain_core.map_profile.preview_hint";
+    }
+
     private void refreshState() {
         if (displayNameField == null) return;
-        boolean profileEditable = editable && profileOverride && !saving;
-        displayNameField.setEditable(editable && !saving);
-        minPlayersField.setEditable(editable && !saving);
-        maxPlayersField.setEditable(editable && !saving);
-        descriptionField.setEditable(profileEditable);
-        tagsField.setEditable(profileEditable);
-        uploadButton.active = profileEditable && !preparingPreview && !saving && Minecraft.getInstance().getConnection() != null;
+        boolean canEdit = editable && !saving;
+        displayNameField.setEditable(canEdit);
+        minPlayersField.setEditable(canEdit);
+        maxPlayersField.setEditable(canEdit);
+        descriptionField.setEditable(canEdit);
+        tagsField.setEditable(canEdit);
+        uploadButton.active = isUploadButtonActive(
+                editable, preparingPreview, saving, Minecraft.getInstance().getConnection() != null);
         sourceButton.setMessage(sourceLabel());
         sourceButton.active = editable && !saving;
         backButton.active = !saving;
@@ -302,9 +331,8 @@ public final class MapVoteProfileScreen extends Screen {
         uploadButton.visible = y + 220 + FIELD_H > contentTop && y + 220 < contentBottom;
         Component shownStatus = !uploadStatus.getString().isEmpty()
                 ? uploadStatus
-                : Component.translatable(Minecraft.getInstance().getConnection() == null
-                        ? "config.habitrain_core.map_profile.preview_offline"
-                        : "config.habitrain_core.map_profile.preview_hint");
+                : Component.translatable(resolveUploadHintKey(
+                        editable, Minecraft.getInstance().getConnection() != null));
         int statusX = left + Math.min(170, fieldWidth);
         drawFitted(graphics, shownStatus, statusX, y + 225,
                 Math.max(20, right - statusX),
@@ -527,9 +555,13 @@ public final class MapVoteProfileScreen extends Screen {
                                MapVotePreviewFilePicker.PreparedPreview prepared, Component status) {
         preparingPreview = false;
         Minecraft client = Minecraft.getInstance();
-        if (generation == previewGeneration && profileOverride && client.screen == this
+        if (generation == previewGeneration && client.screen == this
                 && client.getConnection() == connection) {
-            if (prepared != null) pendingPreview = prepared;
+            if (prepared != null) {
+                profileOverride = true;
+                pendingPreview = prepared;
+            }
+            showingInheritedStatus = false;
             uploadStatus = status;
         }
         if (client.screen == this) refreshState();
@@ -537,13 +569,14 @@ public final class MapVoteProfileScreen extends Screen {
 
     private void choosePreview() {
         if (preparingPreview) return;
-        if (!editable || !profileOverride) {
+        if (!editable) {
             MenuPermissions.showDeniedMessage();
             return;
         }
         Minecraft client = Minecraft.getInstance();
         var connection = client.getConnection();
         if (connection == null) {
+            showingInheritedStatus = false;
             uploadStatus = Component.translatable(
                     "config.habitrain_core.map_profile.preview_offline");
             return;
@@ -552,6 +585,7 @@ public final class MapVoteProfileScreen extends Screen {
                 "config.habitrain_core.map_profile.file_dialog_title").getString();
         long generation = ++previewGeneration;
         preparingPreview = true;
+        showingInheritedStatus = false;
         uploadStatus = Component.translatable("config.habitrain_core.map_profile.preview_preparing");
         refreshState();
         boolean queued = MapVotePreviewFilePicker.submit(() -> {
@@ -566,14 +600,17 @@ public final class MapVoteProfileScreen extends Screen {
                 client.execute(() -> finishPreview(generation, connection, prepared, Component.translatable(
                             "config.habitrain_core.map_profile.preview_selected", prepared.fileName(),
                             prepared.width(), prepared.height(), prepared.kibibytes())));
-            } catch (Exception | LinkageError failure) {
+            } catch (Throwable failure) {
                 HabiTrainCore.LOGGER.warn("Failed to prepare map vote preview for '{}'", mapId, failure);
+                String reason = failure.getMessage() != null && !failure.getMessage().isBlank()
+                        ? failure.getMessage() : failure.getClass().getSimpleName();
                 client.execute(() -> finishPreview(generation, connection, null, Component.translatable(
-                            "config.habitrain_core.map_profile.preview_pick_failed", failure.getMessage())));
+                            "config.habitrain_core.map_profile.preview_pick_failed", reason)));
             }
         });
         if (!queued) {
             preparingPreview = false;
+            showingInheritedStatus = false;
             uploadStatus = Component.translatable("config.habitrain_core.map_profile.preview_busy");
             refreshState();
         }

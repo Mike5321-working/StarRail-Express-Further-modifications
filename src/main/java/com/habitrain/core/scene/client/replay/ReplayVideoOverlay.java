@@ -39,17 +39,18 @@ import static com.habitrain.core.scene.client.replay.ReplayVideoCanvas.Tex;
  */
 final class ReplayVideoOverlay {
     private static final int MAX_FEED = 5;
-    private final @Nullable ReplayVideoScript script;
-    private final @Nullable ReplayCinemaDirector.DirectedFilm film;
-    private final ReplayExportContentOptions options;
-    private final ReplayBoardModel model;
-    private final boolean compress;
-    private final ReplayExportQuality quality;
+    final @Nullable ReplayVideoScript script;
+    final @Nullable ReplayCinemaDirector.DirectedFilm film;
+    final ReplayExportContentOptions options;
+    final ReplayBoardModel model;
+    final boolean compress;
+    final ReplayExportQuality quality;
     private final Map<LastMatchReplay.Node, ReplayBoardModel.EventMark> marks = new IdentityHashMap<>();
-    private final List<ReplayBoardModel.Actor> ranking;
-    private final String date, trainNo;
-    private final int maxScore, maxKills, maxItems, maxSurvival, objectiveHighlights;
+    final List<ReplayBoardModel.Actor> ranking;
+    final String date, trainNo;
+    final int maxScore, maxKills, maxItems, maxSurvival, objectiveHighlights;
     private float w, h;
+    private final @Nullable ReplayKineticOverlay kinetic;
 
     ReplayVideoOverlay(ReplayVideoScript script, ReplayBoardModel model) {
         this(script, model, false, ReplayExportQuality.DEFAULT);
@@ -95,18 +96,19 @@ final class ReplayVideoOverlay {
         maxScore = score; maxKills = kills; maxItems = items; maxSurvival = survival;
         // Objective mode-invariant highlight count computed from the match replay itself.
         objectiveHighlights = new ReplayVideoScript(model.replay).beats().size();
+        kinetic = this.options.kinetic() && film != null ? new ReplayKineticOverlay(this) : null;
     }
 
-    private List<Beat> activeBeats() { return film != null ? film.beats() : script.beats(); }
-    private List<ReplayVideoScript.Feed> activeFeeds() { return film != null ? film.feeds() : script.feeds(); }
-    private List<ReplayVideoScript.SpanWindow> activeSpans() { return film != null ? film.spans() : script.spans(); }
-    private double totalSeconds() { return film != null ? film.total() : script.total(); }
-    private int matchDuration() { return film != null ? film.duration() : script.duration(); }
-    private int timelineEndTick() { return film != null ? film.trimEndTick() : script.actionEndTick(); }
-    private int timelineStartTick() { return film != null ? film.trimStartTick() : 0; }
-    private @Nullable UUID focusPlayer() { return film != null ? film.focusPlayer() : script.focusPlayer(); }
+    List<Beat> activeBeats() { return film != null ? film.beats() : script.beats(); }
+    List<ReplayVideoScript.Feed> activeFeeds() { return film != null ? film.feeds() : script.feeds(); }
+    List<ReplayVideoScript.SpanWindow> activeSpans() { return film != null ? film.spans() : script.spans(); }
+    double totalSeconds() { return film != null ? film.total() : script.total(); }
+    int matchDuration() { return film != null ? film.duration() : script.duration(); }
+    int timelineEndTick() { return film != null ? film.trimEndTick() : script.actionEndTick(); }
+    int timelineStartTick() { return film != null ? film.trimStartTick() : 0; }
+    @Nullable UUID focusPlayer() { return film != null ? film.focusPlayer() : script.focusPlayer(); }
     private double sampleWipe(double t) { return film != null ? film.sample(t).baseSample().wipe() : script.sample(t).wipe(); }
-    private boolean roleRevealed(UUID actorId, double matchTick) {
+    boolean roleRevealed(UUID actorId, double matchTick) {
         return film != null ? film.isRoleRevealedAt(actorId, matchTick) : options.isRoleRevealedAt(actorId, matchTick, 0);
     }
 
@@ -130,6 +132,10 @@ final class ReplayVideoOverlay {
     void background(ReplayVideoCanvas c, double t, ReplayVideoScript.Sample s,
                     @Nullable ReplayCinemaDirector.CinemaSample cs, ReplayVideoCamera.Shot shot) {
         w = c.width; h = c.height;
+        if (kinetic != null) {
+            kinetic.background(c, t, s);
+            return;
+        }
         c.rect(0, 0, w, h, 0xFF04060F, 0xFF111936);
         float yaw = (float) Math.atan2(shot.look().x, shot.look().z);
         float pitch = (float) Math.asin(Math.clamp(shot.look().y, -1, 1));
@@ -188,6 +194,10 @@ final class ReplayVideoOverlay {
                     @Nullable ReplayCinemaDirector.CinemaSample cs,
                     ReplayVideoCamera.Shot shot, int frame, @Nullable ReplayActorSizing heads) {
         w = c.width; h = c.height;
+        if (kinetic != null) {
+            kinetic.foreground(c, t, s, cs, shot, frame, heads);
+            return;
+        }
         float yaw = (float) Math.atan2(shot.look().x, shot.look().z);
         boolean dof = options.includeLetterboxDof();
         if (dof) {
@@ -1245,7 +1255,7 @@ final class ReplayVideoOverlay {
 
     // =================================================================== helpers
 
-    private Component feedLine(LastMatchReplay.Node node) {
+    Component feedLine(LastMatchReplay.Node node) {
         Component actor = ReplayBoardTexts.name(model.participantData(node.actor()));
         Component target = ReplayBoardTexts.name(model.participantData(node.target()));
         return switch (node.kind()) {
@@ -1259,7 +1269,7 @@ final class ReplayVideoOverlay {
         };
     }
 
-    private int feedColor(LastMatchReplay.Node node) {
+    int feedColor(LastMatchReplay.Node node) {
         return switch (node.kind()) {
             case KILL, TRAP_TRIGGERED, BOMB_PLANT -> RUBY;
             case GUNSHOT, GRENADE_THROWN, GRENADE_EXPLOSION, BOMB_DETONATE -> EXPLOSION;
@@ -1310,7 +1320,7 @@ final class ReplayVideoOverlay {
         };
     }
 
-    private @Nullable Component badgeSubtitle(Beat b) {
+    @Nullable Component badgeSubtitle(Beat b) {
         if (b.type() != BeatType.KILL) return null;
         Component killer = b.node().actor() == null ? ReplayBoardTexts.tr("environment") : ReplayBoardTexts.name(model.participantData(b.node().actor()));
         Component tag = b.streak() >= 2 ? tr("tag.streak", b.streak()) : b.firstBlood() ? tr("tag.first_blood")
@@ -1320,7 +1330,7 @@ final class ReplayVideoOverlay {
         return line;
     }
 
-    private static int beatColor(Beat b) {
+    static int beatColor(Beat b) {
         return switch (b.type()) {
             case KILL -> b.finalBlow() && b.streak() < 2 ? LAMP : RUBY;
             case REVIVAL -> BRASS_LIGHT;
@@ -1330,7 +1340,7 @@ final class ReplayVideoOverlay {
         };
     }
 
-    private @Nullable ReplayBoardModel.Actor subjectActor(Beat b) {
+    @Nullable ReplayBoardModel.Actor subjectActor(Beat b) {
         var node = b.node();
         return switch (b.type()) {
             case KILL, SHIELD, HIT -> model.participant(node.target() != null ? node.target() : node.actor());
@@ -1338,14 +1348,14 @@ final class ReplayVideoOverlay {
         };
     }
 
-    private @Nullable Vector3f subjectPoint(Beat b) {
+    @Nullable Vector3f subjectPoint(Beat b) {
         var mark = marks.get(b.node());
         if (mark != null) return new Vector3f(mark.tx, ReplayBoardSite.MAP_BASE + mark.ty, mark.tz);
         var actor = subjectActor(b);
         return actor == null ? null : actorPoint(actor, b.tick());
     }
 
-    private @Nullable Vector3f actorPoint(ReplayBoardModel.Actor actor, double tick) {
+    @Nullable Vector3f actorPoint(ReplayBoardModel.Actor actor, double tick) {
         var pose = actor.track.sample(tick);
         if (!pose.visible()) return null;
         float[] p = new float[3];
@@ -1353,11 +1363,11 @@ final class ReplayVideoOverlay {
         return new Vector3f(p[0], ReplayBoardSite.MAP_BASE + p[1], p[2]);
     }
 
-    private static float headSize(ReplayActorSizing heads, @Nullable ReplayBoardModel.Actor actor, Vector3f point) {
+    static float headSize(ReplayActorSizing heads, @Nullable ReplayBoardModel.Actor actor, Vector3f point) {
         return heads.size(actor == null ? null : actor.p.id(), point.x, point.y - ReplayBoardSite.MAP_BASE, point.z);
     }
 
-    private boolean onScreen(Vector3f p) {
+    boolean onScreen(Vector3f p) {
         return p.z > 0 && p.x > -40 && p.x < w + 40 && p.y > -40 && p.y < h + 40;
     }
 

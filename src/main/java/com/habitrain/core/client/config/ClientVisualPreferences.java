@@ -45,6 +45,7 @@ public final class ClientVisualPreferences {
     private static boolean replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
     private static String replayVideoQuality = DEFAULT_REPLAY_QUALITY;
     private static String replayVideoMusic = DEFAULT_REPLAY_MUSIC;
+    private static String replayVideoStyle = "brass";
     private static String replayVideoFfmpegPath = "";
     private static int requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
     private static int maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
@@ -130,6 +131,8 @@ public final class ClientVisualPreferences {
         replayVideoCompress = readBoolean(replayVideo, "compress", DEFAULT_REPLAY_COMPRESS);
         replayVideoQuality = normalizeReplayQuality(readString(replayVideo, "quality", DEFAULT_REPLAY_QUALITY));
         replayVideoMusic = ReplayMusicPlan.Level.fromId(readString(replayVideo, "music", DEFAULT_REPLAY_MUSIC)).id;
+        replayVideoStyle = com.habitrain.core.scene.replay.ReplayExportContentOptions.VisualStyle
+                .fromId(readString(replayVideo, "style", "brass")).id;
         replayVideoFfmpegPath = readString(replayVideo, "ffmpegPath", "").trim();
     }
 
@@ -143,6 +146,7 @@ public final class ClientVisualPreferences {
         replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
         replayVideoQuality = DEFAULT_REPLAY_QUALITY;
         replayVideoMusic = DEFAULT_REPLAY_MUSIC;
+        replayVideoStyle = "brass";
         replayVideoFfmpegPath = "";
         requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
         maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
@@ -432,6 +436,7 @@ public final class ClientVisualPreferences {
         replayVideo.addProperty("compress", replayVideoCompress);
         replayVideo.addProperty("quality", replayVideoQuality);
         replayVideo.addProperty("music", replayVideoMusic);
+        replayVideo.addProperty("style", replayVideoStyle);
         if (!replayVideoFfmpegPath.isBlank()) {
             replayVideo.addProperty("ffmpegPath", replayVideoFfmpegPath);
         }
@@ -518,6 +523,21 @@ public final class ClientVisualPreferences {
         replayVideoMusic = ReplayMusicPlan.Level.fromId(levelId).id;
         if (save()) return true;
         replayVideoMusic = previous;
+        return false;
+    }
+
+    /** Replay video packaging style id: {@code brass} (default) or {@code kinetic}. */
+    public static synchronized String getReplayVideoStyle() {
+        load();
+        return replayVideoStyle;
+    }
+
+    public static synchronized boolean setReplayVideoStyle(String styleId) {
+        load();
+        String previous = replayVideoStyle;
+        replayVideoStyle = com.habitrain.core.scene.replay.ReplayExportContentOptions.VisualStyle.fromId(styleId).id;
+        if (save()) return true;
+        replayVideoStyle = previous;
         return false;
     }
 

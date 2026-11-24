@@ -2,9 +2,11 @@ Fonts used by the replay video export (rendered only into exported videos):
 
 - bebas.ttf  : Bebas Neue, Copyright (c) 2010 Dharma Type.
 - oswald.ttf : Oswald (Medium), Copyright 2016 The Oswald Project Authors (https://github.com/googlefonts/OswaldFont).
+- noto_sans_sc_bold.ttf : Noto Sans SC (Bold instance, subset to ASCII + GB2312 + kana + the mod's zh_cn strings),
+  Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'. See OFL-NotoSansSC.txt.
 
-Both fonts are licensed under the SIL Open Font License, Version 1.1.
+All fonts are licensed under the SIL Open Font License, Version 1.1.
 The license text is available at https://openfontlicense.org/open-font-license-official-text/
-The fonts are bundled unmodified and are not sold on their own.
+Bebas and Oswald are bundled unmodified; Noto Sans SC is a subset/instanced Modified Version. None are sold on their own.
 
 Compressed MP4 export invokes an external FFmpeg executable (https://ffmpeg.org) installed separately by the client.
