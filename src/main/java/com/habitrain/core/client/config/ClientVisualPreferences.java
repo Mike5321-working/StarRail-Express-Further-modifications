@@ -27,6 +27,10 @@ public final class ClientVisualPreferences {
     private static final String FILE_NAME = "habitrain_core-client.json";
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
     private static final boolean DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED = true;
+    private static final boolean DEFAULT_KINETIC_BOOT_UI_ENABLED = true;
+    private static final boolean DEFAULT_KINETIC_UI_SOUND_ENABLED = true;
+    private static final float DEFAULT_KINETIC_UI_BGM_VOLUME = 1.0f;
+    private static final boolean DEFAULT_KINETIC_UI_AUTO_ENTER = false;
     private static final String SCENE_PERFORMANCE = "scenePerformance";
     private static final String REPLAY_VIDEO = "replayVideo";
     private static final String DEFAULT_REPLAY_RESOLUTION = "720p";
@@ -36,6 +40,10 @@ public final class ClientVisualPreferences {
 
     private static boolean loaded;
     private static boolean customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
+    private static boolean kineticBootUiEnabled = DEFAULT_KINETIC_BOOT_UI_ENABLED;
+    private static boolean kineticUiSoundEnabled = DEFAULT_KINETIC_UI_SOUND_ENABLED;
+    private static float kineticUiBgmVolume = DEFAULT_KINETIC_UI_BGM_VOLUME;
+    private static boolean kineticUiAutoEnter = DEFAULT_KINETIC_UI_AUTO_ENTER;
     private static boolean lightweightInventory;
     private static boolean decoratedShopEnabled = true;
     private static boolean idiotFaceOverlay = true;
@@ -87,6 +95,10 @@ public final class ClientVisualPreferences {
                 ? DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED
                 : root.get("customTitlePanoramaEnabled").isJsonPrimitive()
                         && root.get("customTitlePanoramaEnabled").getAsBoolean();
+        kineticBootUiEnabled = readBoolean(root, "kineticBootUiEnabled", DEFAULT_KINETIC_BOOT_UI_ENABLED);
+        kineticUiSoundEnabled = readBoolean(root, "kineticUiSoundEnabled", DEFAULT_KINETIC_UI_SOUND_ENABLED);
+        kineticUiBgmVolume = readUnitFloat(root, "kineticUiBgmVolume", DEFAULT_KINETIC_UI_BGM_VOLUME);
+        kineticUiAutoEnter = readBoolean(root, "kineticUiAutoEnter", DEFAULT_KINETIC_UI_AUTO_ENTER);
 
         JsonObject performance = root.has(SCENE_PERFORMANCE) && root.get(SCENE_PERFORMANCE).isJsonObject()
                 ? root.getAsJsonObject(SCENE_PERFORMANCE)
@@ -142,6 +154,10 @@ public final class ClientVisualPreferences {
         idiotFaceOverlay = idiotLargeJackpot = true;
         idiotParticles = 2;
         customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
+        kineticBootUiEnabled = DEFAULT_KINETIC_BOOT_UI_ENABLED;
+        kineticUiSoundEnabled = DEFAULT_KINETIC_UI_SOUND_ENABLED;
+        kineticUiBgmVolume = DEFAULT_KINETIC_UI_BGM_VOLUME;
+        kineticUiAutoEnter = DEFAULT_KINETIC_UI_AUTO_ENTER;
         replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
         replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
         replayVideoQuality = DEFAULT_REPLAY_QUALITY;
@@ -206,9 +222,84 @@ public final class ClientVisualPreferences {
         }
     }
 
+    private static float readUnitFloat(JsonObject root, String key, float fallback) {
+        if (!root.has(key) || !root.get(key).isJsonPrimitive()) return fallback;
+        try {
+            float v = root.get(key).getAsFloat();
+            if (!Float.isFinite(v)) return fallback;
+            return Math.max(0.0f, Math.min(1.0f, v));
+        } catch (RuntimeException e) {
+            return fallback;
+        }
+    }
+
     public static synchronized boolean isCustomTitlePanoramaEnabled() {
         load();
         return customTitlePanoramaEnabled;
+    }
+
+    public static synchronized boolean isKineticBootUiEnabled() {
+        load();
+        return kineticBootUiEnabled;
+    }
+
+    public static synchronized boolean setKineticBootUiEnabled(boolean enabled) {
+        load();
+        boolean previous = kineticBootUiEnabled;
+        kineticBootUiEnabled = enabled;
+        if (save()) return true;
+        kineticBootUiEnabled = previous;
+        return false;
+    }
+
+    public static synchronized boolean isKineticUiSoundEnabled() {
+        load();
+        return kineticUiSoundEnabled;
+    }
+
+    public static synchronized boolean setKineticUiSoundEnabled(boolean enabled) {
+        load();
+        boolean previous = kineticUiSoundEnabled;
+        kineticUiSoundEnabled = enabled;
+        if (save()) return true;
+        kineticUiSoundEnabled = previous;
+        return false;
+    }
+
+    public static synchronized float getKineticUiBgmVolume() {
+        load();
+        return kineticUiBgmVolume;
+    }
+
+    /** Updates in-memory BGM volume immediately during slider drag without spamming disk writes. */
+    public static synchronized void previewKineticUiBgmVolume(float volume) {
+        load();
+        if (!Float.isFinite(volume)) return;
+        kineticUiBgmVolume = Math.max(0.0f, Math.min(1.0f, volume));
+    }
+
+    public static synchronized boolean setKineticUiBgmVolume(float volume) {
+        load();
+        float previous = kineticUiBgmVolume;
+        float clamped = Float.isFinite(volume) ? Math.max(0.0f, Math.min(1.0f, volume)) : DEFAULT_KINETIC_UI_BGM_VOLUME;
+        kineticUiBgmVolume = clamped;
+        if (save()) return true;
+        kineticUiBgmVolume = previous;
+        return false;
+    }
+
+    public static synchronized boolean isKineticUiAutoEnter() {
+        load();
+        return kineticUiAutoEnter;
+    }
+
+    public static synchronized boolean setKineticUiAutoEnter(boolean enabled) {
+        load();
+        boolean previous = kineticUiAutoEnter;
+        kineticUiAutoEnter = enabled;
+        if (save()) return true;
+        kineticUiAutoEnter = previous;
+        return false;
     }
 
     public static synchronized boolean isLightweightInventory() {
@@ -416,6 +507,10 @@ public final class ClientVisualPreferences {
         root.addProperty("idiotLargeJackpot", idiotLargeJackpot);
         root.addProperty("idiotParticles", idiotParticles);
         root.addProperty("customTitlePanoramaEnabled", customTitlePanoramaEnabled);
+        root.addProperty("kineticBootUiEnabled", kineticBootUiEnabled);
+        root.addProperty("kineticUiSoundEnabled", kineticUiSoundEnabled);
+        root.addProperty("kineticUiBgmVolume", kineticUiBgmVolume);
+        root.addProperty("kineticUiAutoEnter", kineticUiAutoEnter);
         root.addProperty("lightweightInventory", lightweightInventory);
         root.addProperty("decoratedShopEnabled", decoratedShopEnabled);
         JsonObject performance = new JsonObject();

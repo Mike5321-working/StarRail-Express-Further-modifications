@@ -24,7 +24,7 @@ public final class ReplayExportClient {
     private static long finishedAt;
     private static long nextAccessRequest;
     private static java.util.UUID pinnedRound;
-    private static java.util.UUID foregroundId;
+    private static volatile java.util.UUID foregroundId;
     private static boolean liveMatch;
     private static Screen previousScreen;
 

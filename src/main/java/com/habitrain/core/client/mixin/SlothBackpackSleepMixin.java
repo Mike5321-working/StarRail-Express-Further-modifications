@@ -1,5 +1,6 @@
 package com.habitrain.core.client.mixin;
 
+import com.habitrain.core.client.EliminatedRestPromptState;
 import com.habitrain.core.client.gui.SlothSleepRosterView;
 import com.habitrain.core.client.gui.SlothSleepPlayerWidget;
 import com.habitrain.core.client.gui.InventoryShopLayoutAccess;
@@ -31,7 +32,8 @@ public abstract class SlothBackpackSleepMixin extends Screen implements SlothSle
     @Unique
     private boolean habitrain$isSloth() {
         var player = Minecraft.getInstance().player;
-        return player != null && HabiRoles.isHabiRole(player, SevenSins.SLOTH);
+        return player != null && !EliminatedRestPromptState.isResting()
+                && HabiRoles.isHabiRole(player, SevenSins.SLOTH);
     }
 
     @Unique

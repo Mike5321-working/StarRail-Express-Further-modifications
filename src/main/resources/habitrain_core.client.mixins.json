@@ -95,6 +95,11 @@
         "RoundWelcomeHudMixin",
         "StarRailLoadingOverlayMixin",
         "SREReceivingLevelScreenMixin",
-        "TrainLoadingScreenMixin"
+        "TrainLoadingScreenMixin",
+        "SimpleReloadInstanceMixin",
+        "MusicManagerMixin",
+        "BootSoundSuppressMixin",
+        "SoundManagerAccessor",
+        "SoundEnginePrewarmMixin"
     ]
 }

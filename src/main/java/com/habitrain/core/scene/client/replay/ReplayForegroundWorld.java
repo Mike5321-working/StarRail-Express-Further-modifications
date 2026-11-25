@@ -40,13 +40,18 @@ public final class ReplayForegroundWorld {
 
     private record Live(ClientLevel level, LocalPlayer player, Entity entity, Camera camera, net.minecraft.world.phys.Vec3 ears) {}
     private static volatile Live live;
-    private static Map<UUID,Integer> outlines = Map.of();
-    public static java.util.OptionalInt outline(Entity entity) { var color=outlines.get(entity.getUUID()); return color==null?java.util.OptionalInt.empty():java.util.OptionalInt.of(color); }
+    private static volatile Map<UUID,Integer> outlines = Map.of();
+    public static java.util.OptionalInt outline(Entity entity) {
+        if (entity == null) return java.util.OptionalInt.empty();
+        var map = outlines;
+        var color = map == null ? null : map.get(entity.getUUID());
+        return color == null ? java.util.OptionalInt.empty() : java.util.OptionalInt.of(color);
+    }
     public static boolean rendering() { return live != null; }
-    private static int filters;
+    private static volatile int filters;
     public static boolean looseEnd() { return (filters & 2)!=0; }
     private final Map<UUID,net.minecraft.client.multiplayer.PlayerInfo> bodySkins=new HashMap<>();
-    private static Map<UUID,net.minecraft.client.multiplayer.PlayerInfo> activeSkins=Map.of();
+    private static volatile Map<UUID,net.minecraft.client.multiplayer.PlayerInfo> activeSkins=Map.of();
     public static net.minecraft.client.multiplayer.PlayerInfo bodySkin(UUID id) { return id==null?null:activeSkins.get(id); }
     private void rememberSkin(UUID id) {
         if (id==null || bodySkins.containsKey(id) || bodySkins.size()>=512) return;

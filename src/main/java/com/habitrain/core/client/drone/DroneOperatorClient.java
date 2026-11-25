@@ -77,7 +77,7 @@ public final class DroneOperatorClient {
         public final UUID uuid;
         public final int entityId;
         public final int rgbColor;
-        public int remainingTicks;
+        public volatile int remainingTicks;
 
         ScanEntry(UUID uuid, int entityId, int rgbColor, int remainingTicks) {
             this.uuid = uuid;
@@ -122,7 +122,7 @@ public final class DroneOperatorClient {
     private static DroneStatePayload state = DroneStatePayload.EMPTY;
     private static final DroneInputLatch LATCH = new DroneInputLatch();
     private static final IntSet PRESSED_SCANCODES = new IntOpenHashSet();
-    private static final Map<UUID, ScanEntry> HIGHLIGHTS = new HashMap<>();
+    private static final Map<UUID, ScanEntry> HIGHLIGHTS = new java.util.concurrent.ConcurrentHashMap<>();
     private static final List<PulseWave> PULSE_WAVES = new ArrayList<>();
     private static final List<WorldBurst> WORLD_BURSTS = new ArrayList<>();
     private static final Map<Integer, Integer> DRONE_RECOIL_TICKS = new HashMap<>();
@@ -173,7 +173,10 @@ public final class DroneOperatorClient {
         ClientPlayNetworking.registerGlobalReceiver(DroneFxPayload.TYPE, (payload, ctx) ->
                 ctx.client().execute(() -> onReceiveFx(payload)));
 
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> reset());
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            if (client.isSameThread()) reset();
+            else client.execute(DroneOperatorClient::reset);
+        });
         ClientTickEvents.END_CLIENT_TICK.register(DroneOperatorClient::tickClient);
         HudRenderCallback.EVENT.register((g, delta) ->
                 DroneFpvHudRenderer.render(g, delta.getGameTimeDeltaPartialTick(false)));

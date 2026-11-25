@@ -11,7 +11,7 @@ import org.joml.Vector3f;
 import java.util.*;
 
 public final class ReplayVisualClient {
-    private static UUID round;
+    private static volatile UUID round;
     private static final byte[] EMPTY = new byte[0];
     private static byte[] previousCamera = EMPTY, previousHud = EMPTY, pendingHud = EMPTY;
     private static List<VisualFrames.Draw> commands;
@@ -21,10 +21,36 @@ public final class ReplayVisualClient {
     private static byte[] previousOutlines = EMPTY;
     private static boolean suspended;
     public static void saw(net.minecraft.world.entity.Entity target, OptionalInt color) {
-        if (recording() && color.isPresent() && seen.size()<128) seen.put(target.getUUID(),color.getAsInt());
+        if (target == null || color == null || color.isEmpty() || !com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread()) return;
+        if (recording()) recordOutline(target.getUUID(), color.getAsInt());
+    }
+    static void recordOutline(UUID id, int color) {
+        if (id == null) return;
+        synchronized (seen) {
+            if (seen.size() < 128 || seen.containsKey(id)) seen.put(id, color);
+        }
+    }
+    static byte[] drainOutlines() {
+        synchronized (seen) {
+            byte[] encoded = VisualTape.bytes(out -> {
+                out.writeShort(seen.size());
+                for (var entry : seen.entrySet()) {
+                    out.writeLong(entry.getKey().getMostSignificantBits());
+                    out.writeLong(entry.getKey().getLeastSignificantBits());
+                    out.writeInt(entry.getValue());
+                }
+            });
+            seen.clear();
+            return encoded;
+        }
+    }
+    static void clearOutlines() {
+        synchronized (seen) {
+            seen.clear();
+        }
     }
     public static double fov(double value, boolean worldLens) {
-        if (worldLens && value > 0 && value < 180) {
+        if (worldLens && value > 0 && value < 180 && com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread()) {
             if (ReplayForegroundWorld.rendering() && ReplayForegroundWorld.renderedFov > 0) return ReplayForegroundWorld.renderedFov;
             if (recording()) opticalFov = (float)value;
         }
@@ -44,10 +70,13 @@ public final class ReplayVisualClient {
             var video = ReplayExportClient.current();
             if (video != null && video.running() && video.roundId().equals(packet.round())) video.visuals.accept(packet);
         });
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> reset());
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            if (client.isSameThread()) reset();
+            else client.execute(ReplayVisualClient::reset);
+        });
         ClientTickEvents.END_CLIENT_TICK.register(ReplayVisualClient::tick);
     }
-    private static void reset() { round = null; suspended = false; commands = null; previousCamera = previousHud = pendingHud = previousOutlines = EMPTY; opticalFov = 0; seen.clear(); }
+    private static void reset() { round = null; suspended = false; commands = null; previousCamera = previousHud = pendingHud = previousOutlines = EMPTY; opticalFov = 0; clearOutlines(); }
     public static boolean recording() { return round != null && !ReplayExportClient.foreground() && !ReplayForegroundWorld.rendering(); }
     public static void begin(GuiGraphics graphics) {
         commands = null;
@@ -72,7 +101,7 @@ public final class ReplayVisualClient {
     private static void tick(Minecraft client) {
         if (round == null || client.player == null || client.level == null || !ClientPlayNetworking.canSend(VisualPackets.Frame.TYPE)) return;
         if (!recording()) {
-            if (!suspended) { suspended = true; ClientPlayNetworking.send(new VisualPackets.Frame(round,EMPTY,EMPTY,EMPTY)); previousCamera=previousHud=pendingHud=previousOutlines=EMPTY; seen.clear(); }
+            if (!suspended) { suspended = true; ClientPlayNetworking.send(new VisualPackets.Frame(round,EMPTY,EMPTY,EMPTY)); previousCamera=previousHud=pendingHud=previousOutlines=EMPTY; clearOutlines(); }
             return;
         }
         suspended=false;
@@ -87,7 +116,7 @@ public final class ReplayVisualClient {
         byte[] hud = client.screen == null && !client.options.hideGui ? pendingHud : new VisualFrames.Hud(1, 1, List.of()).encode();
         byte[] viewChange = Arrays.equals(cameraBytes, previousCamera) ? EMPTY : cameraBytes;
         byte[] hudChange = Arrays.equals(hud, previousHud) ? EMPTY : hud;
-        byte[] outlines=VisualTape.bytes(out->{out.writeShort(seen.size()); for(var entry:seen.entrySet()){out.writeLong(entry.getKey().getMostSignificantBits());out.writeLong(entry.getKey().getLeastSignificantBits());out.writeInt(entry.getValue());}}); seen.clear();
+        byte[] outlines = drainOutlines();
         byte[] colors=Arrays.equals(outlines,previousOutlines)?EMPTY:outlines; previousOutlines=outlines;
         if (viewChange.length > 0 || hudChange.length > 0 || colors.length > 0) ClientPlayNetworking.send(new VisualPackets.Frame(round, viewChange, hudChange,colors));
         previousCamera = cameraBytes; previousHud = hud;

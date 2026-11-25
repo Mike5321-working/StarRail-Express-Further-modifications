@@ -1,5 +1,6 @@
 package com.habitrain.core.client.mixin;
 
+import com.habitrain.core.client.EliminatedRestPromptState;
 import com.habitrain.core.client.gui.LustCharmPlayerWidget;
 import com.habitrain.core.client.gui.InventoryShopLayoutAccess;
 import com.habitrain.core.game.sre.role.HabiRoles;
@@ -31,7 +32,8 @@ public abstract class LustBackpackMixin extends Screen {
 
     @Unique private boolean habitrain$isLust() {
         var self = Minecraft.getInstance().player;
-        return self != null && !self.isSpectator() && HabiRoles.isHabiRole(self, SevenSins.LUST);
+        return self != null && !self.isSpectator() && !EliminatedRestPromptState.isResting()
+                && HabiRoles.isHabiRole(self, SevenSins.LUST);
     }
 
     @Unique private PlayerPaginationHelper<LustComponent.CharmEntry> habitrain$charmPages() {

@@ -19,5 +19,7 @@ abstract class ReplayInstinctMixin {
         if (ReplayForegroundWorld.rendering()) ci.setReturnValue(ReplayForegroundWorld.outline(target));
     }
     @Inject(method="getCachedInstinctHighlight",at=@At("RETURN"))
-    private static void habitrain$record(Entity target, CallbackInfoReturnable<OptionalInt> ci) { ReplayVisualClient.saw(target,ci.getReturnValue()); }
+    private static void habitrain$record(Entity target, CallbackInfoReturnable<OptionalInt> ci) {
+        if (com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread()) ReplayVisualClient.saw(target, ci.getReturnValue());
+    }
 }

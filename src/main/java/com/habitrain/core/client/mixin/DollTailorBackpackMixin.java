@@ -1,5 +1,6 @@
 package com.habitrain.core.client.mixin;
 
+import com.habitrain.core.client.EliminatedRestPromptState;
 import com.habitrain.core.client.gui.InventoryShopLayoutAccess;
 import com.habitrain.core.client.tailor.*;
 import com.habitrain.core.game.sre.role.HabiRoles;
@@ -26,7 +27,8 @@ public abstract class DollTailorBackpackMixin extends Screen implements DollTail
     @Unique private List<UUID> habitrain$rosterIds = List.of();
     protected DollTailorBackpackMixin(Component title) { super(title); }
     @Unique private boolean habitrain$isTailor() {
-        return HabiRoles.isHabiRole(Minecraft.getInstance().player, HabiRoles.DOLL_TAILOR_ID);
+        return !EliminatedRestPromptState.isResting()
+                && HabiRoles.isHabiRole(Minecraft.getInstance().player, HabiRoles.DOLL_TAILOR_ID);
     }
     @Unique private PlayerPaginationHelper<DollTailorStatePayload.Entry> habitrain$patterns() {
         if (habitrain$patterns == null) habitrain$patterns = new PlayerPaginationHelper<>(

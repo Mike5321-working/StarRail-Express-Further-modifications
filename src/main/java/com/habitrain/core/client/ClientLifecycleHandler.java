@@ -35,6 +35,8 @@ public class ClientLifecycleHandler {
     public ClientLifecycleHandler(ShaderMonitor shaderMonitor) {
 
         net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            com.habitrain.core.client.title.HabiBootAudioEngine.getInstance().shutdown();
+            com.habitrain.core.client.title.HabiKineticAtlas.getInstance().dispose();
             MapVotePreviewCache.shutdown();
             com.habitrain.core.client.render.CustomTitlePanoramaRenderer.release();
             com.habitrain.core.scene.client.SceneRenderRuntime.getInstance().reset();
@@ -58,6 +60,7 @@ public class ClientLifecycleHandler {
             client.execute(() -> {
                 if (!ClientConnectionSession.isCurrent(handler)
                         || client.getConnection() != handler || !handler.getConnection().isConnected()) return;
+                com.habitrain.core.client.title.HabiBootSession.getInstance().onWorldJoined();
                 com.habitrain.core.client.render.CustomTitlePanoramaRenderer.release();
                 // INIT 已清理上一连接；JOIN 保留刚到达的服务端 snapshot、握手与场景状态。
                 // 结束转场覆盖层独立于 resetState()（后者在 OnGameFinishedClient 当帧被调用），

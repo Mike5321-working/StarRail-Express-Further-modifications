@@ -1,5 +1,6 @@
 package com.habitrain.core.client.mixin;
 
+import com.habitrain.core.client.EliminatedRestPromptState;
 import com.habitrain.core.client.gui.TicketInventoryLayer;
 import com.habitrain.core.client.gui.TicketMenuTray;
 import com.habitrain.core.client.gui.TicketPerformanceButton;
@@ -14,10 +15,12 @@ import com.mojang.blaze3d.systems.RenderSystem;
 import io.wifi.starrailexpress.client.SREClient;
 import io.wifi.starrailexpress.client.gui.screen.ingame.LimitedHandledScreen;
 import io.wifi.starrailexpress.client.gui.screen.ingame.LimitedInventoryScreen;
+import io.wifi.starrailexpress.util.ShopEntry;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.InventoryMenu;
@@ -106,6 +109,8 @@ public abstract class LimitedInventoryTicketMixin extends LimitedHandledScreen<I
     private final Map<Button, Integer> habitrain$directRoleWidgets = new IdentityHashMap<>();
     @Unique
     private boolean habitrain$directRoleOverflow;
+    @Unique
+    private boolean habitrain$openedWhileResting;
 
     protected LimitedInventoryTicketMixin(InventoryMenu handler, Inventory inventory, Component title) {
         super(handler, inventory, title);
@@ -113,7 +118,23 @@ public abstract class LimitedInventoryTicketMixin extends LimitedHandledScreen<I
 
     @Unique
     private static boolean habitrain$gameRunning() {
-        return SREClient.gameComponent != null && SREClient.gameComponent.isRunning();
+        return !EliminatedRestPromptState.isResting()
+                && SREClient.gameComponent != null
+                && SREClient.gameComponent.isRunning();
+    }
+
+    @Inject(method = "isGameActive", at = @At("HEAD"), cancellable = true, remap = false)
+    private void habitrain$restingUsesLobbyInventory(CallbackInfoReturnable<Boolean> cir) {
+        if (EliminatedRestPromptState.isResting()) {
+            cir.setReturnValue(false);
+        }
+    }
+
+    @Inject(method = "getShopEntries", at = @At("HEAD"), cancellable = true, remap = false)
+    private void habitrain$hideShopWhileResting(CallbackInfoReturnable<List<ShopEntry>> cir) {
+        if (EliminatedRestPromptState.isResting()) {
+            cir.setReturnValue(List.of());
+        }
     }
 
     @Unique
@@ -142,6 +163,7 @@ public abstract class LimitedInventoryTicketMixin extends LimitedHandledScreen<I
     @Inject(method = "init", at = @At("HEAD"))
     private void habitrain$resetShopLayout(CallbackInfo ci) {
         habitrain$initializing = true;
+        habitrain$openedWhileResting = EliminatedRestPromptState.isResting();
         // Cleared per open; {@link #habitrain$roleSelectionVisible()} re-derives it from the widgets
         // that role screens actually added during this init, independent of injection order.
         habitrain$roleSelection = false;
@@ -242,6 +264,18 @@ public abstract class LimitedInventoryTicketMixin extends LimitedHandledScreen<I
     /** Executioner creates its heads directly instead of using PlayerPaginationHelper. */
     @Unique
     private void habitrain$syncDirectRoleWidgets() {
+        if (EliminatedRestPromptState.isResting()) {
+            for (var child : this.children()) {
+                if (child instanceof ExecutionerPlayerWidget || child instanceof BodymakerDeathReasonWidget) {
+                    Button widget = (Button) child;
+                    widget.visible = false;
+                    widget.active = false;
+                }
+            }
+            habitrain$directRoleWidgets.clear();
+            habitrain$directRoleOverflow = false;
+            return;
+        }
         habitrain$directRoleWidgets.keySet().removeIf(widget -> !this.children().contains(widget));
         boolean overflow = false;
         for (var child : this.children()) {
@@ -419,6 +453,12 @@ public abstract class LimitedInventoryTicketMixin extends LimitedHandledScreen<I
 
     @Inject(method = "tick", at = @At("TAIL"))
     private void habitrain$tickTicket(CallbackInfo ci) {
+        boolean rawGameRunning = SREClient.gameComponent != null && SREClient.gameComponent.isRunning();
+        if (EliminatedRestPromptState.shouldCloseRestingInventory(
+                habitrain$openedWhileResting, EliminatedRestPromptState.isResting(), rawGameRunning)) {
+            this.onClose();
+            return;
+        }
         habitrain$syncTicketState();
         if (habitrain$ticketView()) {
             habitrain$ticket.tick();
@@ -536,6 +576,16 @@ public abstract class LimitedInventoryTicketMixin extends LimitedHandledScreen<I
     private void habitrain$ticketSlotScale(Slot slot, CallbackInfoReturnable<Float> cir) {
         if (habitrain$slotPosition(slot) != null) {
             cir.setReturnValue(habitrain$ticket.slotScale());
+        }
+    }
+
+    /** 死亡后在休息区打开大厅背包时，隐藏对局金币 HUD，避免压在车票页上。 */
+    @WrapOperation(method = "render", at = @At(value = "INVOKE",
+            target = "Lio/wifi/starrailexpress/client/gui/StoreRenderer;renderHud(Lnet/minecraft/client/gui/Font;Lnet/minecraft/client/player/LocalPlayer;Lnet/minecraft/client/gui/GuiGraphics;F)V"))
+    private void habitrain$suppressStoreHudWhileResting(Font font, LocalPlayer player, GuiGraphics graphics,
+                                                        float delta, Operation<Void> original) {
+        if (!EliminatedRestPromptState.isResting()) {
+            original.call(font, player, graphics, delta);
         }
     }
 

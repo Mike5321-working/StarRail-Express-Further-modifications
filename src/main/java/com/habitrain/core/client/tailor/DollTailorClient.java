@@ -32,9 +32,10 @@ import java.util.*;
 
 public final class DollTailorClient {
     private static DollTailorStatePayload state = new DollTailorStatePayload(null, 0, List.of());
-    private static List<DollProtectionPayload.Link> links = List.of();
+    private static volatile List<DollProtectionPayload.Link> links = List.of();
     private static final Map<UUID, Integer> completedAt = new HashMap<>();
     private static final Map<UUID, RemotePlayer> proxies = new HashMap<>();
+    private static final Map<UUID, OptionalInt> cachedHighlights = new java.util.concurrent.ConcurrentHashMap<>();
     private static ClientLevel world;
     private static int ticks;
     private static int snapTicks;
@@ -52,13 +53,16 @@ public final class DollTailorClient {
             links = payload.links();
             if (payload.snapped()) snapTicks = 12;
         }));
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> reset());
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            if (client.isSameThread()) reset();
+            else client.execute(DollTailorClient::reset);
+        });
         ClientTickEvents.END_CLIENT_TICK.register(DollTailorClient::tick);
         HudRenderCallback.EVENT.register((g, delta) -> hud(g));
     }
     private static void reset() {
         state = new DollTailorStatePayload(null, 0, List.of()); links = List.of();
-        completedAt.clear(); proxies.clear(); snapTicks = 0; resolving = false; world = null;
+        completedAt.clear(); proxies.clear(); cachedHighlights.clear(); snapTicks = 0; resolving = false; world = null;
     }
     public static DollTailorStatePayload state() { return state; }
     public static int observed(UUID id) {
@@ -78,16 +82,31 @@ public final class DollTailorClient {
     }
     public static boolean killerViewer() {
         var mc = Minecraft.getInstance();
-        if (mc.player == null || mc.player.isSpectator() || !mc.player.isAlive() || SREClient.gameComponent == null) return false;
-        var role = SREClient.gameComponent.getRole(mc.player);
-        return role != null && !role.isVigilanteTeam() && SREClient.gameComponent.isKillerTeamRole(role);
+        var player = mc.player;
+        var game = SREClient.gameComponent;
+        if (player == null || player.isSpectator() || !player.isAlive() || game == null) return false;
+        var role = game.getRole(player);
+        return role != null && !role.isVigilanteTeam() && game.isKillerTeamRole(role);
     }
     public static boolean hidden(Entity entity) {
-        return !resolving && entity instanceof Player && killerViewer()
-                && links.stream().anyMatch(link -> link.target().equals(entity.getUUID()));
+        if (entity == null || !(entity instanceof Player)) return false;
+        if (com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread() && resolving) return false;
+        if (!killerViewer()) return false;
+        var activeLinks = links;
+        for (var link : activeLinks) {
+            if (link.target().equals(entity.getUUID())) return true;
+        }
+        return false;
     }
     public static OptionalInt highlight(TailorDollEntity doll) {
-        if (!doll.complete() || !killerViewer() || world == null || doll.targetId() == null) return OptionalInt.empty();
+        if (doll == null) return OptionalInt.empty();
+        if (!com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread()) {
+            return cachedHighlights.getOrDefault(doll.getUUID(), OptionalInt.empty());
+        }
+        if (!doll.complete() || !killerViewer() || world == null || doll.targetId() == null) {
+            cachedHighlights.remove(doll.getUUID());
+            return OptionalInt.empty();
+        }
         Player target = world.getPlayerByUUID(doll.targetId());
         if (target == null) {
             RemotePlayer proxy = proxies.computeIfAbsent(doll.getUUID(), id ->
@@ -100,10 +119,12 @@ public final class DollTailorClient {
         try {
             // Preserve the real player's role/component state while evaluating range at the substitute.
             target.setPos(doll.position());
-            return InstinctManager.getInstinctHighlight(target);
+            OptionalInt result = InstinctManager.getInstinctHighlight(target);
+            cachedHighlights.put(doll.getUUID(), result);
+            return result;
         } finally { target.setPos(originalPosition); resolving = false; }
     }
-    public static boolean resolving() { return resolving; }
+    public static boolean resolving() { return com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread() && resolving; }
     public static float cameraPitch(float partial) {
         return (casting() ? (float) Math.sin((ticks + partial) * .26) * .28F : 0)
                 + (snapTicks > 0 ? (float) Math.sin((ticks + partial) * 2.4) * snapTicks / 12F * .6F : 0);
@@ -133,6 +154,8 @@ public final class DollTailorClient {
             visible.add(doll.getUUID());
             if (doll.complete()) {
                 if (!completedAt.containsKey(doll.getUUID())) completedAt.put(doll.getUUID(), ticks - 20);
+                if (killerViewer()) highlight(doll);
+                else cachedHighlights.remove(doll.getUUID());
                 if (ticks % 35 == 0) particle(ParticleTypes.SNOWFLAKE, doll.position().add(0, 1.1, 0), new Vec3(.005, -.015, 0));
             } else {
                 completedAt.put(doll.getUUID(), ticks);
@@ -152,7 +175,7 @@ public final class DollTailorClient {
                 if (ticks % 20 == 0) sound(doll.position(), SoundEvents.WARDEN_HEARTBEAT, .12F, 1.5F);
             }
         }
-        completedAt.keySet().retainAll(visible); proxies.keySet().retainAll(visible);
+        completedAt.keySet().retainAll(visible); proxies.keySet().retainAll(visible); cachedHighlights.keySet().retainAll(visible);
         if (ticks % 4 == 0) {
             for (var link : links) {
                 if (!mc.player.getUUID().equals(link.owner()) && !mc.player.getUUID().equals(link.target())) continue;

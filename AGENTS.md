@@ -70,4 +70,4 @@ Linux Shell（当前工作区；用仓库自带的 wrapper）：
 - 哈比列车 core/api（本项目，可修改）: `/home/Mike/mc mod/哈比列车api`
 - 哈比列车功能补齐（抽奖，可修改）: `/home/Mike/mc mod/哈比列车抽奖补齐`
 - 哈比列车皮肤（可修改）: `/home/Mike/mc mod/皮肤mod`
-- 哈比列车 DLC（仅参照，不可修改）: `/home/Mike/mc mod/哈比列车dlc`
+- 哈比列车 DLC（默认仅参照，经 Mike 明确要求后可修改）: `/home/Mike/mc mod/哈比列车dlc`

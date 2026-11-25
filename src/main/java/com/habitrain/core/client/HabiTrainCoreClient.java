@@ -54,6 +54,10 @@ public class HabiTrainCoreClient implements ClientModInitializer {
                     () -> com.habitrain.core.client.role.RoleScreenDispatcher.INSTANCE);
         });
         com.habitrain.core.client.config.ClientVisualPreferences.load();
+        if (com.habitrain.core.client.config.ClientVisualPreferences.isKineticBootUiEnabled()) {
+            // Kick off async 5-stem WAV decode early so intro.wav is ready by LoadingOverlay frame 0
+            com.habitrain.core.client.title.HabiBootAudioEngine.getInstance().preloadAsync();
+        }
         // 结算纪念车票的做旧/燃烧与 MVP 人像着色器
         com.habitrain.core.client.gui.TicketShaders.register();
         com.habitrain.core.scene.client.SceneShaders.register();
