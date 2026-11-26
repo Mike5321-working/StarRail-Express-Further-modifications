@@ -48,20 +48,52 @@ final class ReplayEventPainter {
         double effectiveRate = Math.max(0.5, playbackRate);
         float elemScale = s.scale() * (float) f.focus.zoom();
         VertexConsumer glow = f.glow();
-        for (ReplayBoardModel.EventMark e : model.events) {
+        ReplayClippedConsumer clippedGlow = glow instanceof ReplayClippedConsumer c ? c : null;
+        int limit = model.eventCountUpTo(t);
+        for (int i = 0; i < limit; i++) {
+            ReplayBoardModel.EventMark e = model.events[i];
             double age = t - e.node.tick();
             if (age < 0) continue;
             double window = window(e.node.kind(), effectiveRate);
-            if (play && age <= window) {
+            boolean isLive = play && age <= window;
+            if (!isLive && !(stage.history() > 0.01 || age > window)) continue;
+            VertexConsumer targetGlow = glow;
+            if (clippedGlow != null) {
+                var clip = classifyEvent(clippedGlow, d, e, isLive, emphasis, elemScale);
+                if (clip == ReplayClippedConsumer.ClipState.OUTSIDE) continue;
+                if (clip == ReplayClippedConsumer.ClipState.INSIDE) targetGlow = clippedGlow.directOutput();
+            }
+            if (isLive) {
                 // Exported videos render dedicated video-clock 3D effects in ReplayVideoFx;
                 // skipping board live effects here avoids double beams/rings and giant frozen weapons.
-                if (!f.video) live(f, s, d, glow, e, age, window, a, emphasis, elemScale);
-            } else if (stage.history() > 0.01 || age > window) {
+                if (!f.video) live(f, s, d, targetGlow, e, age, window, a, emphasis, elemScale);
+            } else {
                 double alpha = a * (play ? 0.35 : stage.history());
-                marker(f, d, glow, e, alpha, elemScale);
+                marker(f, d, targetGlow, e, alpha, elemScale);
                 if (e.node.kind() == Kind.KILL && alpha > 0.5 && !f.video) markerWeapon(f, d, e, alpha, elemScale);
             }
         }
+    }
+
+    private static ReplayClippedConsumer.ClipState classifyEvent(ReplayClippedConsumer clipped, Matrix4f d,
+                                                                 ReplayBoardModel.EventMark e, boolean live,
+                                                                 double emphasis, float elemScale) {
+        Kind kind = e.node.kind();
+        boolean twoPoint = kind == Kind.GUNSHOT || (live && (kind == Kind.GRENADE_THROWN || (kind == Kind.KILL && e.hasFrom)));
+        float cx, cy, cz, radius;
+        if (twoPoint) {
+            cx = (e.fx + e.tx) * 0.5f;
+            cy = (e.fy + e.ty) * 0.5f;
+            cz = (e.fz + e.tz) * 0.5f;
+            float dx = e.tx - e.fx, dz = e.tz - e.fz;
+            radius = (float) Math.hypot(dx, dz) * 0.5f + (live ? (float) (0.45 * emphasis) + 0.14f * elemScale : 0.06f * elemScale);
+        } else {
+            cx = e.tx;
+            cy = e.ty;
+            cz = e.tz;
+            radius = live ? (float) (0.52 * emphasis) + 0.18f * elemScale : 0.12f + 0.05f * elemScale;
+        }
+        return clipped.classifyHorizontal(d, cx, cy, cz, radius);
     }
 
     static void paintSettledReview(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayBoardHistoryCache history) {

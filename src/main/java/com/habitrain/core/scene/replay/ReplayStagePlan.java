@@ -182,6 +182,15 @@ public final class ReplayStagePlan {
         return 1 - smoothstep(FADE_START, FADE_END, distance);
     }
 
+    /**
+     * Sub-linear scale multiplier for fine detail LOD thresholds (nameplates, rivets, full-length trails,
+     * idle cube subdivision). Keeps large boards (up to 32 blocks / 5.12x) visible at long distance while
+     * preventing detail LOD from staying pinned on at 120+ blocks away.
+     */
+    public static double detailScale(double scale) {
+        return Math.sqrt(Math.max(1.0, scale));
+    }
+
     /** Approximate replay ticks advanced per presentation tick during the fast portion of the action act. */
     public static double playbackRate(int durationTicks, int cycleTicks) {
         int action = cycleTicks - ReplayTimeline.INTRO - ReplayTimeline.REVIEW - ReplayTimeline.HONORS;

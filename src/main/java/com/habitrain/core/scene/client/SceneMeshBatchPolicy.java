@@ -16,6 +16,7 @@ import com.habitrain.core.api.scene.model.SceneBounds;
 public final class SceneMeshBatchPolicy {
 
     public static final int MAX_BATCHES = 8;
+    private static final int MAX_REPLAY_BATCHES = 36;
     /** 每翻一倍 Section 数就把批次数翻一倍，直到 {@link #MAX_BATCHES}。 */
     public static final int SECTIONS_PER_STEP = 512;
 
@@ -46,9 +47,34 @@ public final class SceneMeshBatchPolicy {
         return new Plan(1, 0, new int[]{0, 0});
     }
 
-    /** Replays retain interior faces and often zoom into one carriage of a long map. */
-    static Plan replayPlan(int sectionCount, int configuredThreshold, SceneBounds bounds) {
-        return plan(sectionCount, Math.min(configuredThreshold, 24), bounds);
+    record ReplayPlan(int columns, int rows, int sectionsX, int sectionsZ) {
+        int batchCount() { return columns * rows; }
+
+        int batchIndex(int relativeSectionX, int relativeSectionZ) {
+            int column = Math.clamp(relativeSectionX * columns / sectionsX, 0, columns - 1);
+            int row = Math.clamp(relativeSectionZ * rows / sectionsZ, 0, rows - 1);
+            return row * columns + column;
+        }
+    }
+
+    static ReplayPlan replayPlan(int sectionCount, int configuredThreshold, SceneBounds bounds) {
+        int threshold = Math.min(configuredThreshold, 24);
+        if (threshold <= 0 || bounds == null || bounds.isEmpty() || sectionCount < threshold) {
+            return new ReplayPlan(1, 1, 1, 1);
+        }
+        int sectionsX = bounds.sectionCountX();
+        int sectionsZ = bounds.sectionCountZ();
+        int target = Math.clamp(Math.ceilDiv(sectionCount, threshold), 2, MAX_REPLAY_BATCHES);
+        int columns = 1;
+        int rows = 1;
+        while (true) {
+            boolean splitX = columns < sectionsX && (columns + 1) * rows <= target;
+            boolean splitZ = rows < sectionsZ && columns * (rows + 1) <= target;
+            if (!splitX && !splitZ) break;
+            if (splitX && (!splitZ || sectionsX * rows >= sectionsZ * columns)) columns++;
+            else rows++;
+        }
+        return new ReplayPlan(columns, rows, sectionsX, sectionsZ);
     }
 
     /**

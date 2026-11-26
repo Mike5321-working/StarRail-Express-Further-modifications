@@ -48,7 +48,8 @@ final class ReplayFfmpegManager {
             "https://github.com/eugeneware/ffmpeg-static/releases/download/" + RELEASE_TAG + "/";
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(12);
     private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(25);
-    private static final long PROBE_TIMEOUT_SECONDS = 8L;
+    private static final long READ_STALL_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(25);
+    private static final long PROBE_TIMEOUT_SECONDS = 20L;
     private static final long RECHECK_INTERVAL_NS = TimeUnit.SECONDS.toNanos(2);
 
     record PlatformAsset(String id, String fileName, long expectedBytes, String sha256, boolean windows) {
@@ -190,6 +191,12 @@ final class ReplayFfmpegManager {
         };
     }
 
+    static boolean isProbing() {
+        synchronized (LOCK) {
+            return probing && cachedProbe == null;
+        }
+    }
+
     /**
      * Non-blocking check for UI screens: returns the cached verified executable if known, and triggers
      * a single background probe whenever the configured path or managed bin directory changes.
@@ -199,8 +206,12 @@ final class ReplayFfmpegManager {
         String fingerprint = candidateFingerprint(gameDir, custom);
         ProbeCache cache = cachedProbe;
         if (cache != null && cache.fingerprint().equals(fingerprint)) {
-            if (cache.executable() != null) return cache.executable();
-            if (System.nanoTime() - cache.checkedAtNs() < RECHECK_INTERVAL_NS) return null;
+            if (cache.executable() != null) {
+                if (Files.isRegularFile(cache.executable())) return cache.executable();
+                cachedProbe = null;
+            } else if (System.nanoTime() - cache.checkedAtNs() < RECHECK_INTERVAL_NS) {
+                return null;
+            }
         }
         triggerAsyncProbe(gameDir, custom, fingerprint);
         return cache != null && cache.executable() != null && Files.isRegularFile(cache.executable())
@@ -327,7 +338,7 @@ final class ReplayFfmpegManager {
             String text = output.get();
             boolean hasX264 = text.contains("libx264");
             boolean hasAac = text.contains(" aac ") || text.contains(" aac\n") || text.contains(" aac\r");
-            return hasX264 && hasAac;
+            return hasX264 && hasAac && probeEncodingPipeline(executable);
         } catch (IOException | RuntimeException failure) {
             return false;
         } catch (InterruptedException interrupted) {
@@ -337,6 +348,49 @@ final class ReplayFfmpegManager {
             if (process != null && process.isAlive()) {
                 process.destroyForcibly();
             }
+            if (drain != null && drain.isAlive()) drain.interrupt();
+        }
+    }
+
+    /** Runs a tiny 1-frame dry-run to confirm required filters and libx264 options work before export starts. */
+    private static boolean probeEncodingPipeline(Path executable) {
+        Process process = null;
+        Thread drain = null;
+        try {
+            process = new ProcessBuilder(
+                    executable.toAbsolutePath().toString(),
+                    "-hide_banner", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", "16x16", "-r", "30", "-i", "pipe:0",
+                    "-vf", "vflip,scale=in_range=full:out_color_matrix=bt709:out_range=tv",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-aq-mode", "3", "-aq-strength", "0.85",
+                    "-pix_fmt", "yuv420p", "-frames:v", "1", "-f", "null", "-"
+            ).redirectErrorStream(true).start();
+            Process running = process;
+            drain = Thread.ofPlatform().daemon().name("habitrain-ffmpeg-pipeline-probe").start(() -> {
+                try {
+                    readProcessOutputBounded(running.getInputStream(), 16 * 1024);
+                } catch (IOException ignored) {}
+            });
+            try (OutputStream stdin = process.getOutputStream()) {
+                stdin.write(new byte[16 * 16 * 3]);
+                stdin.flush();
+            } catch (IOException ignored) {}
+            boolean finished = process.waitFor(PROBE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!finished) {
+                process.destroyForcibly();
+                process.waitFor(1, TimeUnit.SECONDS);
+                return false;
+            }
+            if (drain != null) drain.join(1000);
+            return process.exitValue() == 0;
+        } catch (IOException | RuntimeException failure) {
+            return false;
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            return false;
+        } finally {
+            if (process != null && process.isAlive()) process.destroyForcibly();
             if (drain != null && drain.isAlive()) drain.interrupt();
         }
     }
@@ -536,6 +590,12 @@ final class ReplayFfmpegManager {
 
     private static void downloadAndVerifyGzip(HttpClient client, String url, Path dest,
                                               long fallbackExpectedBytes, String expectedSha256) throws IOException {
+        downloadAndVerifyGzip(client, url, dest, fallbackExpectedBytes, expectedSha256, READ_STALL_TIMEOUT_NS);
+    }
+
+    static void downloadAndVerifyGzip(HttpClient client, String url, Path dest,
+                                      long fallbackExpectedBytes, String expectedSha256,
+                                      long readStallTimeoutNs) throws IOException {
         HttpRequest request = HttpRequest.newBuilder(URI.create(url))
                 .timeout(REQUEST_TIMEOUT)
                 .header("User-Agent", "HabiTrainCore-FFmpegInstaller/1.0")
@@ -557,18 +617,50 @@ final class ReplayFfmpegManager {
         MessageDigest digest = sha256Digest();
         long received = 0L;
         byte[] buffer = new byte[65536];
+        var lastActivityNs = new java.util.concurrent.atomic.AtomicLong(System.nanoTime());
+        var stalled = new java.util.concurrent.atomic.AtomicBoolean();
+        var done = new java.util.concurrent.atomic.AtomicBoolean();
+        long effectiveStallNs = Math.max(TimeUnit.MILLISECONDS.toNanos(100), readStallTimeoutNs);
         try (InputStream raw = response.body();
              DigestInputStream in = new DigestInputStream(new BufferedInputStream(raw, 65536), digest);
              OutputStream out = Files.newOutputStream(dest)) {
-            int read;
-            while ((read = in.read(buffer)) != -1) {
-                checkCancelled();
-                out.write(buffer, 0, read);
-                received += read;
-                if (contentLength > 0) {
-                    progress = Math.min(0.88, (received / (double) contentLength) * 0.88);
+            Thread watchdog = Thread.ofPlatform().daemon().name("habitrain-ffmpeg-stall-guard").start(() -> {
+                while (!done.get()) {
+                    long elapsed = System.nanoTime() - lastActivityNs.get();
+                    if (elapsed >= effectiveStallNs) {
+                        stalled.set(true);
+                        try { raw.close(); } catch (IOException ignored) {}
+                        return;
+                    }
+                    long sleepMs = Math.clamp(TimeUnit.NANOSECONDS.toMillis(effectiveStallNs - elapsed), 25L, 500L);
+                    try { Thread.sleep(sleepMs); }
+                    catch (InterruptedException ignored) { return; }
                 }
+            });
+            try {
+                int read;
+                while ((read = in.read(buffer)) != -1) {
+                    lastActivityNs.set(System.nanoTime());
+                    checkCancelled();
+                    out.write(buffer, 0, read);
+                    received += read;
+                    if (contentLength > 0) {
+                        progress = Math.min(0.88, (received / (double) contentLength) * 0.88);
+                    }
+                }
+            } catch (IOException readFailure) {
+                if (stalled.get()) {
+                    throw new IOException("Download stalled for "
+                            + TimeUnit.NANOSECONDS.toMillis(effectiveStallNs) + " ms", readFailure);
+                }
+                throw readFailure;
+            } finally {
+                done.set(true);
+                watchdog.interrupt();
             }
+        }
+        if (stalled.get()) {
+            throw new IOException("Download stalled for " + TimeUnit.NANOSECONDS.toMillis(effectiveStallNs) + " ms");
         }
         if (received <= 0) {
             throw new IOException("Empty download response");

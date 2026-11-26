@@ -12,15 +12,19 @@ import org.joml.Vector3f;
 /** Scene-only terrain shader: camera-relative fog and world-axis directional light. */
 public final class SceneShaders {
     private static ShaderInstance terrain;
+    private static ShaderInstance unclippedTerrain;
     private static Matrix4f model;
     private static int minimumLight;
 
     private SceneShaders() {}
 
     public static void register() {
-        CoreShaderRegistrationCallback.EVENT.register(context -> context.register(
-                ResourceLocation.fromNamespaceAndPath("habitrain_core", "scene_terrain"),
-                DefaultVertexFormat.BLOCK, shader -> terrain = shader));
+        CoreShaderRegistrationCallback.EVENT.register(context -> {
+            context.register(ResourceLocation.fromNamespaceAndPath("habitrain_core", "scene_terrain"),
+                    DefaultVertexFormat.BLOCK, shader -> terrain = shader);
+            context.register(ResourceLocation.fromNamespaceAndPath("habitrain_core", "scene_terrain_unclipped"),
+                    DefaultVertexFormat.BLOCK, shader -> unclippedTerrain = shader);
+        });
     }
 
     public static ModelScope model(Matrix4f next) {
@@ -83,33 +87,51 @@ public final class SceneShaders {
     }
 
     private static ReplayFanCutaway.ShaderFans fans;
+    private static boolean unclipped;
 
     /** Scoped to one board: its display transform determines the viewer-facing fan direction. */
-    public static FanScope fans(ReplayFanCutaway.ShaderFans next) { return new FanScope(next); }
+    public static FanScope fans(ReplayFanCutaway.ShaderFans next, boolean fullyInsideClip) {
+        return new FanScope(next, fullyInsideClip);
+    }
 
     public static final class FanScope implements AutoCloseable {
         private final ReplayFanCutaway.ShaderFans previous = fans;
-        private FanScope(ReplayFanCutaway.ShaderFans next) { fans = next; }
-        @Override public void close() { fans = previous; }
+        private final boolean previousUnclipped = unclipped;
+        private FanScope(ReplayFanCutaway.ShaderFans next, boolean fullyInsideClip) {
+            fans = next;
+            unclipped = fullyInsideClip;
+        }
+        @Override public void close() {
+            fans = previous;
+            unclipped = previousUnclipped;
+        }
+    }
+
+    static boolean supportsUnclippedClipPlane(float[] plane) {
+        return plane == NO_CLIP || (plane[1] == 0.0f && plane[0] >= 0.0f && plane[2] >= 0.0f);
     }
 
     static ShaderInstance select(ShaderInstance original, float alphaCutoff) {
         if (terrain == null || model == null) return original;
+        int fanCount = fans == null ? 0 : fans.count();
+        ShaderInstance shader = unclipped && alphaCutoff == 0f && fanCount == 0
+                && supportsUnclippedClipPlane(clip) && unclippedTerrain != null
+                ? unclippedTerrain : terrain;
+        shader.safeGetUniform("SceneModelMat").set(model);
+        shader.safeGetUniform("SceneLightFloor").set(LightTexture.block(minimumLight) << 4,
+                LightTexture.sky(minimumLight) << 4);
+        if (shader == unclippedTerrain) return shader;
         // Moving scenes own this terrain pass, including when a renderer replaces
         // the vanilla programs. World-axis diffuse light takes priority by design.
-        terrain.safeGetUniform("SceneModelMat").set(model);
         terrain.safeGetUniform("AlphaCutoff").set(alphaCutoff);
         terrain.safeGetUniform("SceneClip").set(clip[0], clip[1], clip[2], clip[3]);
         terrain.safeGetUniform("SceneBounds").set(bounds[0], bounds[1], bounds[2], bounds[3]);
-        int fanCount = fans == null ? 0 : fans.count();
         terrain.safeGetUniform("ReplayFanCount").set(fanCount);
         if (fanCount > 0) {
             terrain.safeGetUniform("ReplayFanAnchors").set(fans.anchors());
             terrain.safeGetUniform("ReplayFanView").set(fans.directionX(), fans.directionZ(),
                     ReplayFanCutaway.HALF_ANGLE_TANGENT, ReplayFanCutaway.EDGE_WIDTH);
         }
-        terrain.safeGetUniform("SceneLightFloor").set(LightTexture.block(minimumLight) << 4,
-                LightTexture.sky(minimumLight) << 4);
         return terrain;
     }
 }

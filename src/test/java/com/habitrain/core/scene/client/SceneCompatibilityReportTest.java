@@ -2,13 +2,90 @@ package com.habitrain.core.scene.client;
 
 import com.habitrain.core.api.client.scene.compat.SceneMaterialKey;
 
+import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.Bootstrap;
+import net.minecraft.world.level.EmptyBlockGetter;
+import net.minecraft.world.level.block.Blocks;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 public class SceneCompatibilityReportTest {
+    @Test
+    void sequentialReplayDiagnosticsCountEachPositionOnceAndRetainOnlyIssues() {
+        var report = new SceneCompatibilityReport(false, true);
+        var first = new BlockPos(0, 0, 0);
+        report.recordNormalBlock(first, false);
+        report.recordNormalBlock(first, false);
+        report.addEntry(new SceneCompatibilityReport.Entry(first, null, null, null, 0, false, false,
+                SceneCompatibilityReport.IssueType.MISSING_TEXTURE, "", 0, null, 0, 0));
+        report.recordNormalBlock(new BlockPos(1, 0, 0), true);
+        report.recordNormalBlock(new BlockPos(2, 0, 0), false);
+        report.freeze();
+        assertEquals(3, report.totalBlocks());
+        assertEquals(1, report.normalBlocks());
+        assertEquals(1, report.adaptedBlocks());
+        assertEquals(1, report.severeBlocks());
+        assertEquals(1, report.getEntries().size());
+    }
+
+    @Test
+    void mutableBlockPosDoesNotAliasAcrossSequentialOrHashedDiagnostics() {
+        var sequential = new SceneCompatibilityReport(false, true);
+        var hashed = new SceneCompatibilityReport(false, false);
+        var cursor = new BlockPos.MutableBlockPos();
+        for (int x = 0; x < 5; x++) {
+            cursor.set(x, 2, 3);
+            sequential.recordNormalBlock(cursor, x % 2 == 0);
+            hashed.recordNormalBlock(cursor, x % 2 == 0);
+        }
+        cursor.set(9, 9, 9);
+        sequential.addEntry(new SceneCompatibilityReport.Entry(cursor, null, null, null, 0, false, false,
+                SceneCompatibilityReport.IssueType.MISSING_TEXTURE, "missing", 0, null, 0, 0));
+        cursor.set(0, 0, 0);
+        sequential.freeze();
+        hashed.freeze();
+
+        assertEquals(6, sequential.totalBlocks());
+        assertEquals(3, sequential.adaptedBlocks());
+        assertEquals(2, sequential.normalBlocks());
+        assertEquals(1, sequential.severeBlocks());
+        assertEquals(new BlockPos(9, 9, 9), sequential.getEntries().getFirst().localPos());
+        assertEquals(5, hashed.totalBlocks());
+        assertEquals(3, hashed.adaptedBlocks());
+        assertEquals(2, hashed.normalBlocks());
+    }
+
+    @Test
+    void unclippedShaderAllowsAxisScanPlanesAndRejectsVerticalOrNegativePlanes() {
+        assertTrue(SceneShaders.supportsUnclippedClipPlane(new float[]{0f, 0f, 0f, 1f}));
+        assertTrue(SceneShaders.supportsUnclippedClipPlane(new float[]{1f, 0f, 0f, 12f}));
+        assertTrue(SceneShaders.supportsUnclippedClipPlane(new float[]{0f, 0f, 1f, 12f}));
+        assertFalse(SceneShaders.supportsUnclippedClipPlane(new float[]{0f, 1f, 0f, 12f}));
+        assertFalse(SceneShaders.supportsUnclippedClipPlane(new float[]{-1f, 0f, 0f, 12f}));
+        assertFalse(SceneShaders.supportsUnclippedClipPlane(new float[]{0f, 0f, -1f, 12f}));
+    }
+
+    @Test
+    void replayOccluderAllowsOpaqueFullCubesAndRejectsNonCubesCutoutAndBlockEntities() {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
+        var pos = BlockPos.ZERO;
+        var empty = EmptyBlockGetter.INSTANCE;
+        assertTrue(SceneMeshBuilder.isReplayOccluderCandidate(Blocks.STONE.defaultBlockState()));
+        assertTrue(Blocks.STONE.defaultBlockState().isSolidRender(empty, pos));
+        assertTrue(net.minecraft.world.level.block.Block.isShapeFullBlock(Blocks.STONE.defaultBlockState().getShape(empty, pos)));
+
+        assertFalse(SceneMeshBuilder.isReplayOccluderCandidate(Blocks.GLASS.defaultBlockState()));
+        assertFalse(SceneMeshBuilder.isReplayOccluderCandidate(Blocks.OAK_LEAVES.defaultBlockState()));
+        assertFalse(SceneMeshBuilder.isReplayOccluderCandidate(Blocks.CHEST.defaultBlockState()));
+        assertFalse(SceneMeshBuilder.isReplayOccluderCandidate(Blocks.WATER.defaultBlockState()));
+        assertFalse(Blocks.OAK_STAIRS.defaultBlockState().isSolidRender(empty, pos));
+        assertFalse(SceneMeshBuilder.isReplayOccluderCandidate(Blocks.AIR.defaultBlockState()));
+    }
+
 
     @Test
     public void testEmptyReportIsCompatible() {

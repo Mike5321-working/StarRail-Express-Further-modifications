@@ -38,8 +38,10 @@ import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
@@ -69,6 +71,8 @@ final class ReplayVideoExport {
     private static final SystemToast.SystemToastId OPEN_FOLDER_TOAST = new SystemToast.SystemToastId();
     static final int FPS = 30;
     private static final long PREPARE_LIMIT_NS = TimeUnit.MINUTES.toNanos(2);
+    private static final long MAX_ACTIVE_STEP_NS = TimeUnit.SECONDS.toNanos(1);
+    private static final long MISSING_VOICE_SOURCE_FALLBACK_NS = TimeUnit.SECONDS.toNanos(5);
     private static final long SKIN_PREFETCH_WAIT_NS = TimeUnit.SECONDS.toNanos(3);
 
     final ReplayExportContentOptions options;
@@ -85,9 +89,14 @@ final class ReplayVideoExport {
     final ReplayVisualDownload visuals;
     private @Nullable ReplayForegroundWorld foregroundWorld;
     private boolean foregroundFrameReady;
+    private boolean nativeFallback;
+
+    boolean inForeground() {
+        return backend == ReplayExportBackend.NATIVE && !nativeFallback && running() && !finalizing();
+    }
 
     private boolean nativeAction() {
-        if (backend != ReplayExportBackend.NATIVE || film == null || encoder == null || submitted >= encoder.frames) return false;
+        if (backend != ReplayExportBackend.NATIVE || nativeFallback || film == null || encoder == null || submitted >= encoder.frames) return false;
         var sample = film.sample(submitted / (double) FPS);
         return sample.baseSample().act() == ReplayVideoScript.Act.ACTION && sample.camera() == ReplayCinemaDirector.CameraDirective.POV_FIRST_PERSON;
     }
@@ -95,6 +104,8 @@ final class ReplayVideoExport {
     void drawWindow(Minecraft client, java.util.function.Consumer<net.minecraft.client.DeltaTracker> drawWorld) {
         foregroundFrameReady = false;
         if (!nativeAction() || !running() || encoder.pool.isEmpty()) return;
+        var mainTarget = client.getMainRenderTarget();
+        if (mainTarget == null || mainTarget.viewWidth <= 0 || mainTarget.viewHeight <= 0) return;
         try {
             var shot = film.sample(submitted / (double) FPS);
             UUID subject = shot.povSubjectUuid() == null ? film.focusPlayer() : shot.povSubjectUuid();
@@ -102,11 +113,17 @@ final class ReplayVideoExport {
             if (foregroundWorld == null) foregroundWorld = new ReplayForegroundWorld(client, model, snapshot.asset(), visuals);
             foregroundFrameReady = foregroundWorld.draw(client, subject, shot.replayTick(), drawWorld);
             if (foregroundFrameReady) foregroundWorld.paintHud(client);
-        } catch (ReflectiveOperationException | IOException | RuntimeException failure) {
-            failed = true;
-            encoder.cancel();
-            releaseRenderResources();
-            LOGGER.warn("Could not render replay in game window", failure);
+        } catch (RuntimeException failure) {
+            LOGGER.warn("Native foreground replay rendering failed; falling back to simplified renderer", failure);
+            if (foregroundWorld != null) {
+                try { foregroundWorld.detach(client); } catch (RuntimeException ignored) {}
+                foregroundWorld = null;
+            }
+            foregroundFrameReady = false;
+            nativeFallback = true;
+            if (snapshot != null && snapshot.asset() != null) {
+                ReplayDioramaMesh.retry(snapshot.asset().fingerprint);
+            }
         }
     }
 
@@ -115,6 +132,8 @@ final class ReplayVideoExport {
     }
 
     private static void blit(com.mojang.blaze3d.pipeline.RenderTarget source, com.mojang.blaze3d.pipeline.RenderTarget destination) {
+        if (source == null || destination == null || source.viewWidth <= 0 || source.viewHeight <= 0
+                || destination.viewWidth <= 0 || destination.viewHeight <= 0) return;
         int previousRead = GL11.glGetInteger(GL30.GL_READ_FRAMEBUFFER_BINDING);
         int previousDraw = GL11.glGetInteger(GL30.GL_DRAW_FRAMEBUFFER_BINDING);
         boolean scissor = GL11.glIsEnabled(GL11.GL_SCISSOR_TEST);
@@ -139,7 +158,10 @@ final class ReplayVideoExport {
         }
     }
     private ClientReplayBoard.View snapshot;
-    private long meshDeadline;
+    private long lastRenderTickNs;
+    private long voiceWaitActiveNs;
+    private long boardVoiceMissingActiveNs;
+    private long meshWaitActiveNs;
     private long skinWaitDeadline;
     private @Nullable ReplayDioramaMesh.DynamicWorld dynamicWorld;
     private @Nullable SceneAssetCodec.AssetData staticExportAsset;
@@ -164,7 +186,6 @@ final class ReplayVideoExport {
     private @Nullable Path stagedAudioPcm;
     private int submitted;
     private int captured;
-    private final long voiceDeadline = System.nanoTime() + PREPARE_LIMIT_NS;
     private @Nullable Boolean voiceExportAllowed;
     private @Nullable String failureStatus;
     private boolean failed;
@@ -244,9 +265,10 @@ final class ReplayVideoExport {
 
     boolean preparing() { return encoder == null && running(); }
     UUID roundId() { return roundId; }
-    boolean waitingForVoiceAccess() { return preparing() && voiceExportAllowed == null; }
+    boolean wantsPlayerVoice() { return options.voiceVolume() > 0.001f; }
+    boolean waitingForVoiceAccess() { return preparing() && wantsPlayerVoice() && voiceExportAllowed == null; }
     boolean voiceExportRestricted() { return Boolean.FALSE.equals(voiceExportAllowed) || voiceUnavailable; }
-    boolean waitingForVoice() { return preparing() && !voiceExportRestricted() && !snapshot.voiceReady(); }
+    boolean waitingForVoice() { return preparing() && wantsPlayerVoice() && !voiceExportRestricted() && !snapshot.voiceReady(); }
     void setVoiceExportAllowed(boolean allowed) {
         if (waitingForVoiceAccess()) voiceExportAllowed = allowed;
     }
@@ -263,15 +285,18 @@ final class ReplayVideoExport {
 
     Component status() {
         String key;
-        if (failed()) key = failureStatus != null ? failureStatus
-                : backend == ReplayExportBackend.NATIVE ? "native_failed" : "failed";
+        if (failed()) {
+            String reason = failureStatus != null ? failureStatus : (encoder != null ? encoder.failureStatus : null);
+            key = reason != null ? reason
+                    : (backend == ReplayExportBackend.NATIVE && !nativeFallback ? "native_failed" : "failed");
+        }
         else if (cancelled()) key = "cancelled";
         else if (saved() != null) key = voiceUnavailable ? "saved_without_missing_voice" : voiceExportRestricted() ? "saved_no_player_voice" : "saved";
         else if (waitingForVoiceAccess()) key = "checking_voice_access";
         else if (waitingForVoice()) key = "waiting_for_voice";
         else if (preparing()) key = "preparing";
         else if (finalizing() && compress) key = "compressing";
-        else if (backend == ReplayExportBackend.NATIVE) key = "native_progress";
+        else if (backend == ReplayExportBackend.NATIVE && !nativeFallback) key = "native_progress";
         else key = "progress";
         return ReplayBoardTexts.tr("controls." + key, (int) (displayProgress() * 100));
     }
@@ -280,40 +305,68 @@ final class ReplayVideoExport {
         if (!running()) { releaseRenderResources(); return; }
         try {
             if (encoder != null && captured >= encoder.frames) return;
+            long now = System.nanoTime();
+            long stepNs = lastRenderTickNs == 0 ? 0L : Math.clamp(now - lastRenderTickNs, 0L, MAX_ACTIVE_STEP_NS);
+            lastRenderTickNs = now;
+
             var view = snapshot;
             if (waitingForVoice() && Boolean.TRUE.equals(voiceExportAllowed)) {
                 var liveView = voiceSource == null ? null : voiceSource.get();
-                if ((liveView == null || liveView.replay() == null || !roundId().equals(liveView.replay().roundId()))
-                        && ReplayHistoryClient.supported()) {
+                boolean liveMatches = liveView != null && liveView.replay() != null && roundId().equals(liveView.replay().roundId());
+                if (!liveMatches && ReplayHistoryClient.supported()) {
                     liveView = ReplayHistoryClient.watch(roundId());
+                    liveMatches = liveView != null && liveView.replay() != null && roundId().equals(liveView.replay().roundId());
                 }
-                if (liveView != null && liveView.voiceReady() && liveView.replay() != null
-                        && view.replay().roundId().equals(liveView.replay().roundId())) {
+                if (liveMatches && liveView.voiceReady()) {
                     snapshot = view = new ClientReplayBoard.View(view.replay(), view.timeline(), view.asset(),
                             view.presentSections(), view.totalSections(), true, liveView.voice(), true);
-                } else if (ReplayHistoryClient.voiceUnavailable(roundId())) voiceUnavailable = true;
+                    boardVoiceMissingActiveNs = 0;
+                } else if (ReplayHistoryClient.voiceUnavailable(roundId())) {
+                    voiceUnavailable = true;
+                } else if (!liveMatches && !ReplayHistoryClient.supported()) {
+                    boardVoiceMissingActiveNs += stepNs;
+                    if (boardVoiceMissingActiveNs >= MISSING_VOICE_SOURCE_FALLBACK_NS) {
+                        LOGGER.warn("Replay table left view without archive support while waiting for voice; continuing without player voice");
+                        voiceUnavailable = true;
+                    }
+                } else {
+                    boardVoiceMissingActiveNs = 0;
+                }
             }
-            if ((waitingForVoiceAccess() || waitingForVoice()) && System.nanoTime() - voiceDeadline >= 0) {
-                failureStatus = waitingForVoiceAccess() ? "voice_access_timeout" : "voice_download_timeout";
-                throw new IOException("Timed out waiting for replay voice");
+            if (waitingForVoiceAccess() || waitingForVoice()) {
+                voiceWaitActiveNs += stepNs;
+                if (voiceWaitActiveNs >= PREPARE_LIMIT_NS) {
+                    if (waitingForVoiceAccess()) {
+                        LOGGER.warn("Timed out confirming voice export permission for {}; exporting with game audio only", roundId);
+                        voiceExportAllowed = false;
+                    } else {
+                        LOGGER.warn("Timed out waiting for replay voice for {}; exporting with game audio only", roundId);
+                        voiceUnavailable = true;
+                    }
+                }
             }
             var rawAsset = view.asset();
-            if (rawAsset == null) throw new IOException("Replay map asset unavailable");
+            if (rawAsset == null) {
+                failureStatus = "mesh_failed";
+                throw new IOException("Replay map asset unavailable");
+            }
             SceneMeshSet mesh = null;
-            if (backend != ReplayExportBackend.NATIVE || (encoder != null && !nativeAction() && submitted < encoder.frames)) {
-                mesh = prepareMesh(view);
+            boolean useNative = backend == ReplayExportBackend.NATIVE && !nativeFallback;
+            if (!useNative || (encoder != null && !nativeAction() && submitted < encoder.frames)) {
+                mesh = prepareMesh(view, stepNs);
                 if (mesh == null) return;
             }
             if (encoder == null) {
                 int maxTex = RenderSystem.maxSupportedTextureSize();
                 if (resolution.width > maxTex || resolution.height > maxTex) {
+                    failureStatus = "gpu_resolution_too_large";
                     throw new IOException("Export resolution " + resolution.dimensions()
                             + " exceeds GPU max texture size " + maxTex);
                 }
                 if (waitingForVoiceAccess() || waitingForVoice()) return;
                 if (audioTask == null) {
                     model = new ReplayBoardModel(view.replay(), view.timeline());
-                    if (model.layout != null && backend != ReplayExportBackend.NATIVE) {
+                    if (model.layout != null && !useNative) {
                         dynamicWorld = ReplayDioramaMesh.prepareDynamic(
                                 rawAsset, model.layout.origin(), view.replay().blockDeltas());
                     }
@@ -322,7 +375,7 @@ final class ReplayVideoExport {
                     if (staticExportAsset != rawAsset) {
                         ReplayDioramaMesh.retry(staticExportAsset.fingerprint);
                     }
-                    if (backend != ReplayExportBackend.NATIVE && !fullBody && model.roofCutLayer > 0) {
+                    if (!useNative && !fullBody && model.roofCutLayer > 0) {
                         var cut = ReplayRoofCutaway.apply(staticExportAsset, model.roofCutLayer);
                         if (cut != staticExportAsset && !cut.sections.isEmpty()) {
                             reviewAsset = cut;
@@ -331,7 +384,7 @@ final class ReplayVideoExport {
                     }
                     ReplayHeadSkins.prefetch(model);
                     skinWaitDeadline = System.nanoTime() + SKIN_PREFETCH_WAIT_NS;
-                    ReplayVoiceData voice = voiceExportRestricted() ? ReplayVoiceData.EMPTY : view.voice();
+                    ReplayVoiceData voice = !wantsPlayerVoice() || voiceExportRestricted() ? ReplayVoiceData.EMPTY : view.voice();
                     film = ReplayCinemaDirector.direct(view.replay(), voice, options);
                     fx = new ReplayVideoFx(film, model);
                     overlay = new ReplayVideoOverlay(film, model, compress, quality);
@@ -349,7 +402,10 @@ final class ReplayVideoExport {
                 Path mixedPcm;
                 try { mixedPcm = audioTask.get(); }
                 catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IOException(interrupted); }
-                catch (java.util.concurrent.ExecutionException failure) { throw new IOException("Could not prepare replay audio", failure.getCause()); }
+                catch (java.util.concurrent.ExecutionException failure) {
+                    failureStatus = "audio_failed";
+                    throw new IOException("Could not prepare replay audio", failure.getCause());
+                }
                 audioTask = null;
                 stagedAudioPcm = mixedPcm;
                 exportSkins = ReplayHeadSkins.snapshot(model);
@@ -361,7 +417,7 @@ final class ReplayVideoExport {
                         ffmpegExecutable, film.frames(FPS), mixedPcm, combinedSlug);
                 stagedAudioPcm = null; // Ownership transferred to Encoder
                 encoder.thread.start();
-                if (backend == ReplayExportBackend.NATIVE) return;
+                if (useNative) return;
             }
 
             if (pendingPbo >= 0) {
@@ -418,7 +474,7 @@ final class ReplayVideoExport {
         }
     }
 
-    private @Nullable SceneMeshSet prepareMesh(ClientReplayBoard.View view) throws IOException {
+    private @Nullable SceneMeshSet prepareMesh(ClientReplayBoard.View view, long stepNs) throws IOException {
         var rawAsset = view.asset();
         var activeAsset = staticExportAsset != null ? staticExportAsset : rawAsset;
         if (reviewAsset != null && film != null
@@ -429,18 +485,38 @@ final class ReplayVideoExport {
         int presentSections = activeAsset == rawAsset ? view.presentSections() : expectedSections;
         ReplayDioramaMesh.update(activeAsset, presentSections, expectedSections);
         if (ReplayDioramaMesh.failed(new ReplayDioramaMesh.Key(activeAsset.fingerprint, expectedSections))) {
+            if (activeAsset == reviewAsset) {
+                LOGGER.warn("Roof-cutaway review mesh failed for {}; falling back to full export mesh", roundId);
+                reviewAsset = null;
+                meshWaitActiveNs = 0;
+                return null;
+            }
+            if (activeAsset == staticExportAsset && staticExportAsset != rawAsset) {
+                LOGGER.warn("Static dynamic-world mesh failed for {}; falling back to raw map mesh", roundId);
+                dynamicWorld = null;
+                staticExportAsset = rawAsset;
+                ReplayDioramaMesh.retry(rawAsset.fingerprint);
+                meshWaitActiveNs = 0;
+                return null;
+            }
+            failureStatus = "mesh_failed";
             throw new IOException("Could not build the complete replay map");
         }
         var key = ReplayDioramaMesh.builtKey();
         if (key == null || key.present() != expectedSections || !ReplayDioramaMesh.matches(activeAsset)) {
-            long now = System.nanoTime();
-            if (meshDeadline == 0) meshDeadline = now + PREPARE_LIMIT_NS;
-            if (now - meshDeadline >= 0) throw new IOException("Timed out preparing the replay map");
+            meshWaitActiveNs += stepNs;
+            if (meshWaitActiveNs >= PREPARE_LIMIT_NS) {
+                failureStatus = "mesh_timeout";
+                throw new IOException("Timed out preparing the replay map");
+            }
             return null;
         }
-        meshDeadline = 0;
+        meshWaitActiveNs = 0;
         var mesh = ReplayDioramaMesh.current();
-        if (mesh == null) throw new IOException("Replay map mesh unavailable");
+        if (mesh == null) {
+            failureStatus = "mesh_failed";
+            throw new IOException("Replay map mesh unavailable");
+        }
         return mesh;
     }
 
@@ -950,7 +1026,9 @@ final class ReplayVideoExport {
         final Thread thread = new Thread(this, "habitrain-replay-video");
         volatile int written;
         volatile boolean failed, cancelled;
+        volatile @Nullable String failureStatus;
         volatile Path saved;
+        private volatile @Nullable ReplayVideoWriter activeWriter;
         private boolean committing;
 
         Encoder(Path directory, UUID round, ReplayExportResolution resolution, boolean compress,
@@ -976,10 +1054,17 @@ final class ReplayVideoExport {
             thread.setDaemon(true);
         }
 
-        synchronized boolean cancel() {
-            if (committing || saved != null || failed) return false;
-            cancelled = true;
+        boolean cancel() {
+            ReplayVideoWriter writerToAbort;
+            synchronized (this) {
+                if (committing || saved != null || failed) return false;
+                cancelled = true;
+                writerToAbort = activeWriter;
+            }
             thread.interrupt();
+            if (writerToAbort != null) {
+                writerToAbort.abort();
+            }
             return true;
         }
 
@@ -998,36 +1083,45 @@ final class ReplayVideoExport {
                     aviAudioStream = new BufferedInputStream(Files.newInputStream(preMixedAudioPcm), 65536);
                 }
                 try (ReplayVideoWriter writer = compress
-                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, preMixedAudioPcm, quality, true)
+                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, preMixedAudioPcm, quality, false)
                         : new ReplayAviWriter(temp, width, height, FPS, true)) {
-                    while (written < frames && !cancelled) {
-                        VideoFrame frame = pending.poll(250, TimeUnit.MILLISECONDS);
-                        if (frame == null) continue;
-                        if (frame.aberration > 0.02f) aberrate(frame.data, row, width, height, frame.aberration);
-                        writer.add(frame.data);
-                        if (!compress && audioChunk != null) {
-                            int filled = 0;
-                            if (aviAudioStream != null) {
-                                while (filled < audioFrameBytes) {
-                                    int n = aviAudioStream.read(audioChunk, filled, audioFrameBytes - filled);
-                                    if (n < 0) break;
-                                    filled += n;
-                                }
-                            }
-                            if (filled < audioFrameBytes) Arrays.fill(audioChunk, filled, audioFrameBytes, (byte) 0);
-                            writer.addAudioBytes(audioChunk, 0, audioFrameBytes);
-                        }
-                        written++;
-                        pool.offer(frame);
+                    activeWriter = writer;
+                    if (cancelled) {
+                        writer.abort();
+                        return;
                     }
-                    if (cancelled) return;
-                    writer.finish();
+                    try {
+                        while (written < frames && !cancelled) {
+                            VideoFrame frame = pending.poll(250, TimeUnit.MILLISECONDS);
+                            if (frame == null) continue;
+                            if (frame.aberration > 0.02f) aberrate(frame.data, row, width, height, frame.aberration);
+                            writer.add(frame.data);
+                            if (!compress && audioChunk != null) {
+                                int filled = 0;
+                                if (aviAudioStream != null) {
+                                    while (filled < audioFrameBytes) {
+                                        int n = aviAudioStream.read(audioChunk, filled, audioFrameBytes - filled);
+                                        if (n < 0) break;
+                                        filled += n;
+                                    }
+                                }
+                                if (filled < audioFrameBytes) Arrays.fill(audioChunk, filled, audioFrameBytes, (byte) 0);
+                                writer.addAudioBytes(audioChunk, 0, audioFrameBytes);
+                            }
+                            written++;
+                            pool.offer(frame);
+                        }
+                        if (cancelled) return;
+                        writer.finish();
+                    } finally {
+                        activeWriter = null;
+                    }
                 }
                 synchronized (this) {
                     if (cancelled) return;
                     committing = true;
                 }
-                Files.move(temp, output);
+                moveFileWithRetry(temp, output);
                 saved = output;
             } catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
@@ -1039,26 +1133,20 @@ final class ReplayVideoExport {
                     try { aviAudioStream.close(); } catch (IOException ignored) {}
                 }
                 if (preMixedAudioPcm != null) {
-                    boolean wasInterrupted = Thread.interrupted();
                     try {
-                        Files.deleteIfExists(preMixedAudioPcm);
+                        deleteFileWithRetry(preMixedAudioPcm);
                     } catch (IOException failure) {
                         LOGGER.warn("Could not remove temporary replay audio file", failure);
-                    } finally {
-                        if (wasInterrupted) Thread.currentThread().interrupt();
                     }
                     preMixedAudioPcm = null;
                 }
                 pool.clear();
                 pending.clear();
                 if (temp != null) {
-                    boolean wasInterrupted = Thread.interrupted();
                     try {
-                        Files.deleteIfExists(temp);
+                        deleteFileWithRetry(temp);
                     } catch (IOException failure) {
                         LOGGER.warn("Could not remove partial replay video", failure);
-                    } finally {
-                        if (wasInterrupted) Thread.currentThread().interrupt();
                     }
                 }
             }
@@ -1067,8 +1155,84 @@ final class ReplayVideoExport {
         private synchronized void recordFailure(Throwable failure) {
             if (!cancelled) {
                 failed = true;
+                failureStatus = classifyEncoderFailure(failure, committing);
                 LOGGER.warn("Could not write replay video", failure);
             }
         }
+    }
+
+    static String classifyEncoderFailure(Throwable failure, boolean committing) {
+        if (failure instanceof ReplayAviWriter.AviSizeLimitException) return "avi_limit_exceeded";
+        if (failure instanceof ReplayMp4Writer.FfmpegTimeoutException) return "ffmpeg_timeout";
+        if (failure instanceof ReplayMp4Writer.FfmpegProcessException) return "ffmpeg_failed";
+        if (committing || failure instanceof java.nio.file.FileSystemException) return "disk_error";
+        return "failed";
+    }
+
+    @FunctionalInterface
+    interface FileDeleter {
+        boolean deleteIfExists(Path path) throws IOException;
+    }
+
+    static void deleteFileWithRetry(@Nullable Path path) throws IOException {
+        deleteFileWithRetry(path, new long[]{50L, 100L, 200L, 350L, 500L}, Files::deleteIfExists);
+    }
+
+    static void deleteFileWithRetry(@Nullable Path path, long[] backoffsMs, FileDeleter deleter) throws IOException {
+        if (path == null) return;
+        boolean wasInterrupted = Thread.interrupted();
+        IOException lastFailure = null;
+        try {
+            for (int attempt = 0; attempt <= backoffsMs.length; attempt++) {
+                try {
+                    deleter.deleteIfExists(path);
+                    return;
+                } catch (IOException failure) {
+                    lastFailure = failure;
+                    if (attempt == backoffsMs.length) break;
+                    long delayMs = backoffsMs[attempt];
+                    if (delayMs > 0L) {
+                        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMs);
+                        while (true) {
+                            long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime());
+                            if (remainingMs <= 0L) break;
+                            try {
+                                Thread.sleep(remainingMs);
+                            } catch (InterruptedException interrupted) {
+                                wasInterrupted = true;
+                            }
+                        }
+                    }
+                }
+            }
+            throw lastFailure;
+        } finally {
+            if (wasInterrupted) Thread.currentThread().interrupt();
+        }
+    }
+
+    static void moveFileWithRetry(Path source, Path target) throws IOException {
+        long[] backoffsMs = {100L, 200L, 400L, 600L, 800L, 1000L};
+        IOException lastFailure = null;
+        for (int attempt = 0; attempt <= backoffsMs.length; attempt++) {
+            try {
+                try {
+                    Files.move(source, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                } catch (AtomicMoveNotSupportedException unsupported) {
+                    Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+                }
+                return;
+            } catch (IOException failure) {
+                lastFailure = failure;
+                if (attempt == backoffsMs.length) break;
+                try {
+                    Thread.sleep(backoffsMs[attempt]);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Interrupted while committing replay video file", interrupted);
+                }
+            }
+        }
+        throw lastFailure;
     }
 }

@@ -133,8 +133,8 @@ final class ReplayExportScreen extends Screen {
         super(tr("export.title"));
         this.level = level;
         this.parent = null;
-        this.history = null;
         this.pos = pos.immutable();
+        this.history = ClientReplayBoard.boardHistoryRound(this.pos);
         initPrefs(initialFocusPlayer);
     }
 
@@ -180,6 +180,10 @@ final class ReplayExportScreen extends Screen {
     }
 
     @Override public void removed() {
+        if (video != null && video.failed()) {
+            ReplayExportClient.acknowledgeFailure(video);
+        }
+        ReplayExportClient.clearStartError();
         if (historyPinned) {
             ReplayHistoryClient.unpin(history);
             historyPinned = false;
@@ -310,6 +314,7 @@ final class ReplayExportScreen extends Screen {
     }
 
     private void updateOptions(ReplayExportContentOptions updated) {
+        ReplayExportClient.clearStartError();
         this.contentOptions = updated;
         this.focusPlayer = updated.focusPlayer();
         this.music = updated.musicLevel();
@@ -318,6 +323,7 @@ final class ReplayExportScreen extends Screen {
 
     private void selectMode(ExportMode mode) {
         if (exporting()) return;
+        ReplayExportClient.clearStartError();
         UUID subject = focusPlayer;
         if (mode == ExportMode.PERSONAL && subject == null && !participants.isEmpty()) {
             subject = participants.getFirst().id();
@@ -939,14 +945,21 @@ final class ReplayExportScreen extends Screen {
         return minecraft != null && ReplayFfmpegManager.isReady(minecraft.gameDirectory.toPath());
     }
 
+    private boolean probingFfmpeg() {
+        return !exporting() && compress && !ffmpegReady() && ReplayFfmpegManager.isProbing();
+    }
+
     private boolean needsFfmpegAction() {
-        return !exporting() && compress && !ffmpegReady();
+        return !exporting() && compress && !ffmpegReady() && !ReplayFfmpegManager.isProbing();
     }
 
     private void toggleExport() {
+        ReplayExportClient.clearStartError();
         var current = ReplayExportClient.current();
         if (current != null && current.running()) {
             current.cancel();
+        } else if (probingFfmpeg()) {
+            // Wait for the initial asynchronous FFmpeg detection pass instead of triggering a duplicate download.
         } else if (compress && !ffmpegReady()) {
             if (ReplayFfmpegManager.isInstalling()) {
                 ReplayFfmpegManager.cancelInstall();
@@ -961,8 +974,8 @@ final class ReplayExportScreen extends Screen {
             setCustomizerOpen(false);
             var id = history;
             var board = pos;
-            Supplier<ClientReplayBoard.View> source = id == null
-                    ? () -> ClientReplayBoard.viewAt(board) : () -> ReplayHistoryClient.watch(id);
+            Supplier<ClientReplayBoard.View> source = id != null
+                    ? () -> ReplayHistoryClient.watch(id) : () -> ClientReplayBoard.viewForBoard(board);
             ReplayExportContentOptions launchOpts = contentOptions.toBuilder()
                     .focusPlayer(focusPlayer)
                     .musicLevel(music)
@@ -980,7 +993,7 @@ final class ReplayExportScreen extends Screen {
     }
 
     private boolean validTable() {
-        if (history != null) return minecraft != null && minecraft.level != null;
+        if (pos == null) return minecraft != null && minecraft.level != null;
         if (minecraft == null || minecraft.level != level || level == null || minecraft.player == null
                 || !level.hasChunk(pos.getX() >> 4, pos.getZ() >> 4)
                 || !level.getBlockState(pos).is(SettlementSummaryBoard.BLOCK)) return false;
@@ -997,7 +1010,7 @@ final class ReplayExportScreen extends Screen {
     }
 
     private void refresh() {
-        view = history == null ? ClientReplayBoard.viewAt(pos) : ReplayHistoryClient.watch(history);
+        view = history != null ? ReplayHistoryClient.watch(history) : ClientReplayBoard.viewForBoard(pos);
         video = ReplayExportClient.forScreen(video);
         syncParticipants(view == null ? null : view.replay());
         boolean exporting = exporting();
@@ -1160,6 +1173,7 @@ final class ReplayExportScreen extends Screen {
         }
 
         // Start / Cancel & Folder / FFmpeg buttons
+        boolean probing = probingFfmpeg();
         boolean needFfmpeg = needsFfmpegAction();
         boolean installing = ReplayFfmpegManager.isInstalling();
         boolean importing = ReplayFfmpegManager.isImporting();
@@ -1168,6 +1182,11 @@ final class ReplayExportScreen extends Screen {
             start.setMessage(tr("controls.cancel"));
             ((BrassButton) start).accent = true;
             start.active = true;
+            start.setTooltip(null);
+        } else if (probing) {
+            start.setMessage(tr("export.ffmpeg_probing"));
+            ((BrassButton) start).accent = false;
+            start.active = false;
             start.setTooltip(null);
         } else if (needFfmpeg) {
             start.setMessage(installing ? tr("export.ffmpeg_cancel") : tr("export.ffmpeg_install"));
@@ -1237,6 +1256,9 @@ final class ReplayExportScreen extends Screen {
     private Component exportStatus() {
         if (folderFailed) return tr("controls.folder_error");
         if (video == null) {
+            Component startError = ReplayExportClient.lastStartError();
+            if (startError != null) return startError;
+            if (probingFfmpeg()) return tr("export.ffmpeg_probing");
             if (needsFfmpegAction()) return ReplayFfmpegManager.statusText();
             if (history != null && ReplayHistoryClient.voiceUnavailable(history)) return tr("controls.missing_voice_hint");
             if (history != null && !ReplayExportClient.mapReady(view)) return ReplayHistoryScreen.loadStatus(history, view);

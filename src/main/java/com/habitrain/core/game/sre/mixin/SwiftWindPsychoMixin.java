@@ -10,6 +10,7 @@ import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.entity.player.Player;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
@@ -20,6 +21,8 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /** Keep the upstream armour, global count and stop lifecycle, replacing only Swift Wind's weapon and duration. */
 @Mixin(value = SREPlayerPsychoComponent.class, remap = false)
 public abstract class SwiftWindPsychoMixin {
+    @Unique
+    private static final float HABITRAIN$SWIFT_WIND_PSYCHO_VOLUME = 3.0f;
     @ModifyVariable(method = "startPsycho_time", at = @At("HEAD"), argsOnly = true, ordinal = 0)
     private int habitrain$thirtySecondFrenzy(int time) {
         Player player = ((SREPlayerPsychoComponent) (Object) this).getPlayer();
@@ -42,8 +45,10 @@ public abstract class SwiftWindPsychoMixin {
             SREAbilityPlayerComponent.KEY.get(player).resetAllCooldowns();
             SwiftWindComponent.refreshPsychoKnifeCooldown(player);
             if (player instanceof ServerPlayer self) {
-                self.serverLevel().playSound(null, self.blockPosition(),
-                        HabiTrainCore.SWIFT_WIND_PSYCHO_SOUND, SoundSource.PLAYERS, 1.0f, 1.0f);
+                for (ServerPlayer listener : self.serverLevel().players()) {
+                    listener.playNotifySound(HabiTrainCore.SWIFT_WIND_PSYCHO_SOUND,
+                            SoundSource.MASTER, HABITRAIN$SWIFT_WIND_PSYCHO_VOLUME, 1.0f);
+                }
             }
         }
     }

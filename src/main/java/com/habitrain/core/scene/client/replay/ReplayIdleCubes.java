@@ -134,7 +134,7 @@ final class ReplayIdleCubes {
 
         // 3. Emit & depth-sort all beveled-frame and smoked-crystal sub-quads back-to-front into FILL,
         //    plus subtle specular reflections into GLOW
-        boolean middleDetail = detail && s.distance() >= MIDDLE_DETAIL_DISTANCE * Math.max(1f, s.scale());
+        boolean middleDetail = detail && s.distance() >= MIDDLE_DETAIL_DISTANCE * com.habitrain.core.scene.replay.ReplayStagePlan.detailScale(s.scale());
         paintSortedSculptedFaces(fill, glow, masterAlpha, detail, middleDetail);
 
         // 4. Crisp depth-cued glowing outer edges, inner window bevel trims & round vertex jewels
@@ -142,10 +142,12 @@ final class ReplayIdleCubes {
             paintHeroCubeEdges(f, glow, HERO[i], i, t, cubeWorldScale, masterAlpha, detail);
         }
 
-        // 5. Exact live 3D exterior intersection seams (∂Cube_i ∩ ∂Cube_j) where cubes slice through each other
-        for (int i = 0; i < HERO_CUBES; i++) {
-            for (int j = i + 1; j < HERO_CUBES; j++) {
-                paintSurfaceIntersections(f, glow, board, HERO[i], HERO[j], cubeWorldScale, masterAlpha, detail);
+        // 5. Exact live 3D exterior intersection seams (∂Cube_i ∩ ∂Cube_j) when within detail distance
+        if (detail) {
+            for (int i = 0; i < HERO_CUBES; i++) {
+                for (int j = i + 1; j < HERO_CUBES; j++) {
+                    paintSurfaceIntersections(f, glow, board, HERO[i], HERO[j], cubeWorldScale, masterAlpha, !middleDetail);
+                }
             }
         }
 

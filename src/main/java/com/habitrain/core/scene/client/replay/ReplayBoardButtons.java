@@ -685,11 +685,9 @@ public final class ReplayBoardButtons {
                     ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.90 * a));
         }
 
-        // Kill ruby diamond markers & explosion amber diamonds
-        for (ReplayBoardModel.EventMark mark : model.events) {
+        // Kill ruby diamond markers & explosion amber diamonds (pre-filtered highlight array)
+        for (ReplayBoardModel.EventMark mark : model.timelineHighlights) {
             LastMatchReplay.Kind kind = mark.node.kind();
-            if (kind != LastMatchReplay.Kind.KILL && kind != LastMatchReplay.Kind.BOMB_DETONATE
-                    && kind != LastMatchReplay.Kind.GRENADE_EXPLOSION) continue;
             float ex = x0 + spanW * Mth.clamp((float) mark.node.tick() / duration, 0f, 1f);
             boolean past = mark.node.tick() <= surf.displayTick();
             boolean isKill = kind == LastMatchReplay.Kind.KILL;
@@ -784,15 +782,27 @@ public final class ReplayBoardButtons {
         int duration = Math.max(1, surf.model().replay.durationTicks());
 
         Component label = Component.literal(ReplayStagePlan.clock(targetTick));
-        // Find nearest kill/major highlight within 3.5% of the bar for rich hover preview
+        // Find nearest kill/major highlight within 3.5% of the bar via O(log K) binary search
         double bestDist = Math.max(30.0, duration * 0.035);
         LastMatchReplay.Node nearest = null;
-        for (ReplayBoardModel.EventMark mark : surf.model().events) {
-            if (mark.node.kind() != LastMatchReplay.Kind.KILL
-                    && mark.node.kind() != LastMatchReplay.Kind.BOMB_DETONATE
-                    && mark.node.kind() != LastMatchReplay.Kind.GRENADE_EXPLOSION) continue;
-            double d = Math.abs(mark.node.tick() - targetTick);
-            if (d < bestDist) { bestDist = d; nearest = mark.node; }
+        ReplayBoardModel.EventMark[] highlights = surf.model().timelineHighlights;
+        if (highlights.length > 0) {
+            int lo = 0, hi = highlights.length;
+            while (lo < hi) {
+                int mid = (lo + hi) >>> 1;
+                if (highlights[mid].node.tick() < targetTick) lo = mid + 1;
+                else hi = mid;
+            }
+            if (lo > 0) {
+                LastMatchReplay.Node left = highlights[lo - 1].node;
+                double d = Math.abs(left.tick() - targetTick);
+                if (d < bestDist) { bestDist = d; nearest = left; }
+            }
+            if (lo < highlights.length) {
+                LastMatchReplay.Node right = highlights[lo].node;
+                double d = Math.abs(right.tick() - targetTick);
+                if (d < bestDist) { nearest = right; }
+            }
         }
         if (nearest != null) {
             Component actor = nearest.actor() == null ? ReplayBoardTexts.tr("environment")

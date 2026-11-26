@@ -7,7 +7,9 @@ import com.habitrain.core.network.replay.ReplayPackets;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
+import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.server.level.TicketType;
 import net.minecraft.world.level.ChunkPos;
@@ -23,8 +25,11 @@ import java.util.*;
 /** Takes only geometry, never block entity NBT, and never synchronously loads a chunk. */
 public final class ReplayMapCapture {
     private static final int TICK_BUDGET_NS = 2_000_000;
-    private static final int MAX_TICKETS = 8;
-    private static final long TIMEOUT_TICKS = 200;
+    private static final int MAX_TICKETS = 12;
+    private static final long MIN_TIMEOUT_TICKS = 200;
+    private static final long MAX_TIMEOUT_TICKS = 1200;
+    private static final int DEFERRED_OVERFLOW_SLACK = 512;
+    private static final long MAX_ENCODED_MAP_BYTES = 64L * 1024 * 1024;
     private static final TicketType<ChunkPos> TICKET = TicketType.create("habitrain_replay_map",
             Comparator.comparingLong(ChunkPos::toLong));
 
@@ -34,10 +39,14 @@ public final class ReplayMapCapture {
     private final long deadline;
     private final ArrayDeque<ChunkWork> pending = new ArrayDeque<>();
     private final Set<ChunkPos> tickets = new HashSet<>();
-    private final List<ReplaySectionGeometry.Snapshot> snapshots = new ArrayList<>();
+    private final List<CapturedSection> captured = new ArrayList<>();
     private final Set<Long> remaining = new HashSet<>();
     private final Map<Long, PalettedContainer<BlockState>> original = new HashMap<>();
     private boolean failed;
+
+    /** Lightweight main-thread snapshot: only copies immutable section states and 4 KiB light nibbles. */
+    public record CapturedSection(int sx, int sy, int sz, PalettedContainer<BlockState> states,
+                                  byte[] skyLight, byte[] blockLight) {}
 
     private static final class ChunkWork {
         final ChunkPos pos;
@@ -55,7 +64,8 @@ public final class ReplayMapCapture {
         this.level = level;
         this.clip = clip;
         this.map = map;
-        this.deadline = level.getGameTime() + TIMEOUT_TICKS;
+        long timeoutTicks = Math.clamp(Math.max(1L, clip.totalSections()) / 4L, MIN_TIMEOUT_TICKS, MAX_TIMEOUT_TICKS);
+        this.deadline = level.getGameTime() + timeoutTicks;
         if (!ReplaySectionGeometry.supported(clip)) {
             failed = true;
             return;
@@ -91,10 +101,25 @@ public final class ReplayMapCapture {
             var liveChunk = chunk != null ? chunk : level.getChunkSource().getChunkNow(work.pos.x, work.pos.z);
             if (liveChunk != null) initial.accept(liveChunk, work.y);
             original.remove(key);
-            var section = frozen != null ? ReplaySectionGeometry.capture(work.pos.x, work.y, work.pos.z, frozen, clip, level)
-                    : ReplaySectionGeometry.capture(chunk, work.y, clip);
+            PalettedContainer<BlockState> states = frozen;
+            if (states == null && chunk != null) {
+                int index = chunk.getSectionIndexFromSectionY(work.y);
+                if (index >= 0 && index < chunk.getSections().length) {
+                    LevelChunkSection sec = chunk.getSections()[index];
+                    if (!sec.hasOnlyAir()) states = sec.getStates().copy();
+                }
+            }
+            if (states != null) {
+                if (captured.size() >= ReplayMapManifest.MAX_SECTIONS + DEFERRED_OVERFLOW_SLACK) {
+                    cancel();
+                    return true;
+                }
+                SectionPos sectionPos = SectionPos.of(work.pos.x, work.y, work.pos.z);
+                byte[] sky = ReplaySectionGeometry.captureLightBytes(level, LightLayer.SKY, sectionPos);
+                byte[] block = ReplaySectionGeometry.captureLightBytes(level, LightLayer.BLOCK, sectionPos);
+                captured.add(new CapturedSection(work.pos.x, work.y, work.pos.z, states, sky, block));
+            }
             work.y++;
-            if (section != null) snapshots.add(section);
             if (work.y <= clip.maxSectionY()) pending.addFirst(work);
             else release(work.pos);
             misses = pending.size();
@@ -124,39 +149,60 @@ public final class ReplayMapCapture {
         pending.clear();
         remaining.clear();
         original.clear();
-        snapshots.clear();
+        captured.clear();
         for (ChunkPos pos : List.copyOf(tickets)) release(pos);
     }
 
     /** Seal the geometry already captured, without reading chunks after the round ends. */
     public @Nullable Raw finish() {
         try {
-            if (failed || snapshots.isEmpty()) return null;
+            if (failed || captured.isEmpty()) return null;
             // Keep the play area's scale even if we captured only a small fragment.
             SceneBounds partialBounds = pending.isEmpty() ? null : clip;
-            return new Raw(map, level.dimension().location().toString(), List.copyOf(snapshots), partialBounds);
+            return new Raw(map, level.dimension().location().toString(), List.of(), partialBounds,
+                    List.copyOf(captured), clip);
         } finally {
             releaseCapture();
         }
     }
 
     public record Raw(String map, String dimension, List<ReplaySectionGeometry.Snapshot> sections,
-                      @Nullable SceneBounds partialBounds) {}
+                      @Nullable SceneBounds partialBounds, List<CapturedSection> deferred,
+                      @Nullable SceneBounds clip) {
+        public Raw(String map, String dimension, List<ReplaySectionGeometry.Snapshot> sections,
+                   @Nullable SceneBounds partialBounds) {
+            this(map, dimension, sections, partialBounds, List.of(), null);
+        }
+    }
     public record Result(ReplayMapManifest manifest, List<byte[]> patches, long bytes) {}
 
     /** The compressed blobs are shared by every viewer and reused if a later capture matches. */
     public static Result encode(Raw raw, Map<String, Result> recent) throws IOException {
         SceneBounds bounds = raw.partialBounds;
-        if (raw.sections.isEmpty()) throw new IOException("Empty replay map");
+        var sections = new ArrayList<ReplaySectionGeometry.Snapshot>(raw.sections.size() + raw.deferred.size());
+        sections.addAll(raw.sections);
+        if (!raw.deferred.isEmpty()) {
+            SceneBounds clipBounds = raw.clip != null ? raw.clip : raw.partialBounds;
+            if (clipBounds == null) throw new IOException("Missing clip bounds for deferred replay capture");
+            for (CapturedSection item : raw.deferred) {
+                var snapshot = ReplaySectionGeometry.captureFromCopied(
+                        item.sx(), item.sy(), item.sz(), item.states(), clipBounds, item.skyLight(), item.blockLight());
+                if (snapshot != null) {
+                    sections.add(snapshot);
+                    if (sections.size() > ReplayMapManifest.MAX_SECTIONS) throw new IOException("Too many replay sections");
+                }
+            }
+        }
+        if (sections.isEmpty()) throw new IOException("Empty replay map");
+        if (sections.size() > ReplayMapManifest.MAX_SECTIONS) throw new IOException("Too many replay sections");
         if (bounds == null) {
-            for (var s : raw.sections) {
+            for (var s : sections) {
                 SceneBounds p = s.occupied();
                 bounds = bounds == null ? p : new SceneBounds(Math.min(bounds.minX(), p.minX()), Math.min(bounds.minY(), p.minY()),
                         Math.min(bounds.minZ(), p.minZ()), Math.max(bounds.maxX(), p.maxX()), Math.max(bounds.maxY(), p.maxY()),
                         Math.max(bounds.maxZ(), p.maxZ()));
             }
         }
-        var sections = new ArrayList<>(raw.sections);
         sections.sort(Comparator.comparingInt((ReplaySectionGeometry.Snapshot s) -> s.data().relX)
                 .thenComparingInt(s -> s.data().relY).thenComparingInt(s -> s.data().relZ));
         var entries = new ArrayList<ReplayMapManifest.Entry>(sections.size());
@@ -195,7 +241,7 @@ public final class ReplayMapCapture {
             byte[] encoded = SceneAssetCodec.encode(ReplaySectionGeometry.asset(manifest, List.of(section)));
             if (encoded.length > ReplayPackets.MAX_SECTION_BYTES) throw new IOException("Replay section exceeds wire limit");
             size += encoded.length;
-            if (size > 32 * 1024 * 1024) throw new IOException("Replay map exceeds memory limit");
+            if (size > MAX_ENCODED_MAP_BYTES) throw new IOException("Replay map exceeds memory limit");
             patches.add(encoded);
         }
         return new Result(manifest, List.copyOf(patches), size);

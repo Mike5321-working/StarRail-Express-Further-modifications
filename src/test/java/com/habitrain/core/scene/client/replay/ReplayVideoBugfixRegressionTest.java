@@ -184,6 +184,133 @@ class ReplayVideoBugfixRegressionTest {
         assertEquals(ReplayPovSceneRenderer.CameraMode.HERO_SIDE, leftCam.mode());
     }
 
+    @Test
+    void mutedPlayerVoiceSkipsVoiceAccessAndDownloadWait() {
+        var replay = ReplayVideoScriptTest.replay(600, List.of(), List.of());
+        var view = new com.habitrain.core.scene.client.ClientReplayBoard.View(
+                replay, new ReplayTimeline(replay), null, 0, 0, true, ReplayVoiceData.EMPTY, false);
+        var mutedOpts = ReplayExportContentOptions.defaultsFor(ReplayExportContentOptions.ExportMode.SHORT)
+                .toBuilder().voiceVolume(0.0f).build();
+        var export = new ReplayVideoExport(view, mutedOpts, ReplayExportResolution.P720, false,
+                ReplayExportQuality.DEFAULT, null, ReplayExportBackend.SIMPLE);
+        assertFalse(export.wantsPlayerVoice());
+        assertFalse(export.waitingForVoiceAccess());
+        assertFalse(export.waitingForVoice());
+    }
+
+    @Test
+    void cancelledMeshBuildDoesNotPoisonFailedKey() {
+        var slot = new ReplayDioramaMesh.Slot(true);
+        var key = new ReplayDioramaMesh.Key("map-fingerprint", 4);
+        slot.installBuilt(key, null, new java.util.concurrent.CompletionException(
+                new java.util.concurrent.CancellationException("Level switched")));
+        assertNull(slot.installedKey());
+        assertFalse(slot.hasFailed(key), "CancellationException from level change must not poison failedKey");
+
+        slot.installBuilt(key, null, new RuntimeException("Real build failure"));
+        assertTrue(slot.hasFailed(key), "Real mesh build failure should still mark failedKey");
+
+        assertTrue(ReplayExportResolution.P1080.aviSupported());
+        assertFalse(ReplayExportResolution.P1440.aviSupported());
+        assertFalse(ReplayExportResolution.P2160.aviSupported());
+        assertEquals(120L, ReplayMp4Writer.finishTimeoutSeconds(0, 1280));
+        assertTrue(ReplayMp4Writer.finishTimeoutSeconds(36_000, 2560) > 120L);
+        assertEquals(600L, ReplayMp4Writer.finishTimeoutSeconds(100_000, 3840));
+        assertEquals("avi_limit_exceeded", ReplayVideoExport.classifyEncoderFailure(
+                new ReplayAviWriter.AviSizeLimitException("limit"), false));
+        assertEquals("ffmpeg_timeout", ReplayVideoExport.classifyEncoderFailure(
+                new ReplayMp4Writer.FfmpegTimeoutException("timeout"), false));
+        assertEquals("ffmpeg_failed", ReplayVideoExport.classifyEncoderFailure(
+                new ReplayMp4Writer.FfmpegProcessException("exit 1"), false));
+        assertEquals("disk_error", ReplayVideoExport.classifyEncoderFailure(
+                new java.io.IOException("locked"), true));
+    }
+
+    @Test
+    void moveFileWithRetryReplacesExistingOutput(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws Exception {
+        var src = tempDir.resolve(".replay-test.part");
+        var dst = tempDir.resolve("replay-final.mp4");
+        java.nio.file.Files.writeString(src, "new-video-bytes");
+        java.nio.file.Files.writeString(dst, "stale-file");
+        ReplayVideoExport.moveFileWithRetry(src, dst);
+        assertFalse(java.nio.file.Files.exists(src));
+        assertEquals("new-video-bytes", java.nio.file.Files.readString(dst));
+    }
+
+    @Test
+    void deleteFileWithRetryHandlesTransientFileLockEvenWhenThreadIsInterrupted(@org.junit.jupiter.api.io.TempDir java.nio.file.Path tempDir) throws Exception {
+        var pcm = tempDir.resolve(".replay-stream-audio-test.pcm");
+        java.nio.file.Files.writeString(pcm, "pcm-bytes");
+        var attempts = new java.util.concurrent.atomic.AtomicInteger();
+        Thread.currentThread().interrupt();
+        try {
+            ReplayVideoExport.deleteFileWithRetry(pcm, new long[]{5L, 5L, 5L}, path -> {
+                if (attempts.incrementAndGet() < 3) {
+                    throw new java.nio.file.FileSystemException(path.toString(), null, "locked by ffmpeg");
+                }
+                return java.nio.file.Files.deleteIfExists(path);
+            });
+            assertTrue(Thread.currentThread().isInterrupted(), "Interrupt status must be restored after cleanup");
+        } finally {
+            Thread.interrupted();
+        }
+        assertEquals(3, attempts.get());
+        assertFalse(java.nio.file.Files.exists(pcm));
+
+        var persistent = tempDir.resolve(".replay-stuck.pcm");
+        java.nio.file.Files.writeString(persistent, "stuck");
+        var failAttempts = new java.util.concurrent.atomic.AtomicInteger();
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(java.nio.file.FileSystemException.class, () ->
+                    ReplayVideoExport.deleteFileWithRetry(persistent, new long[]{1L, 1L}, path -> {
+                        failAttempts.incrementAndGet();
+                        throw new java.nio.file.FileSystemException(path.toString(), null, "still locked");
+                    }));
+            assertTrue(Thread.currentThread().isInterrupted(), "Interrupt status must be restored even on failure");
+        } finally {
+            Thread.interrupted();
+        }
+        assertEquals(3, failAttempts.get());
+    }
+
+    @Test
+    void awaitProcessExitUninterruptiblyWaitsForTerminatingProcessWhenInterrupted() {
+        var waitCalls = new java.util.concurrent.atomic.AtomicInteger();
+        var alive = new java.util.concurrent.atomic.AtomicBoolean(true);
+        Process stub = new Process() {
+            @Override public java.io.OutputStream getOutputStream() { return java.io.OutputStream.nullOutputStream(); }
+            @Override public java.io.InputStream getInputStream() { return java.io.InputStream.nullInputStream(); }
+            @Override public java.io.InputStream getErrorStream() { return java.io.InputStream.nullInputStream(); }
+            @Override public int waitFor() { return 0; }
+            @Override public boolean waitFor(long timeout, java.util.concurrent.TimeUnit unit) throws InterruptedException {
+                if (Thread.interrupted()) {
+                    throw new InterruptedException("calling thread was still interrupted");
+                }
+                if (waitCalls.incrementAndGet() == 1) {
+                    throw new InterruptedException("spurious mid-wait interrupt");
+                }
+                alive.set(false);
+                return true;
+            }
+            @Override public int exitValue() { return 0; }
+            @Override public void destroy() { alive.set(false); }
+            @Override public boolean isAlive() { return alive.get(); }
+        };
+
+        Thread.currentThread().interrupt();
+        boolean exited;
+        try {
+            exited = ReplayMp4Writer.awaitProcessExitUninterruptibly(stub, 1_000L);
+            assertTrue(Thread.currentThread().isInterrupted(), "Interrupt status must be preserved after waiting");
+        } finally {
+            Thread.interrupted();
+        }
+        assertTrue(exited, "Should finish waiting for process termination despite prior and mid-wait interrupts");
+        assertFalse(stub.isAlive());
+        assertEquals(2, waitCalls.get());
+    }
+
     private static double luminance(int argb) {
         int r = (argb >> 16) & 0xFF;
         int g = (argb >> 8) & 0xFF;

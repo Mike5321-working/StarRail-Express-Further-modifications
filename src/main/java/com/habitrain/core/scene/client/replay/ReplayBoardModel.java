@@ -2,6 +2,7 @@ package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.MatchWinFaction;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.api.match.replay.ReplayEntityTrack;
 import com.habitrain.core.api.match.replay.ReplayProjection;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.api.scene.model.SceneBounds;
@@ -27,7 +28,7 @@ import java.util.UUID;
 
 /**
  * Everything derived from one {@link LastMatchReplay} that does not change per frame: the diorama
- * frame, per-player samplers with pre-projected trail points, event anchors and text. Rebuilt only
+ * frame, per-player samplers, event anchors and text. Rebuilt only
  * when the client receives a new summary object.
  *
  * <p>"Diorama frame" (D): origin at the centre of the tray surface, +X along the map's long axis
@@ -51,8 +52,12 @@ final class ReplayBoardModel {
     private final Map<UUID, List<Integer>> revivals = new HashMap<>();
     final Map<UUID, Actor> byId = new HashMap<>();
     final EventMark[] events;
+    final boolean eventsSorted;
+    final EventMark[] timelineHighlights;
     final List<EventMark> feedEvents;
-    private List<ReplaySkillEffectRegistry.SkillSignal> dioramaSkills, worldSkills;
+    final EntityTrackEntry[] entityTracks;
+    final int[] entityTrackMaxEndPrefix;
+    private ReplaySkillEffectRegistry.SkillIndex dioramaSkillIndex, worldSkillIndex;
     final double rate, comet;
     final Component title, subtitle, modeLabel;
     final int winColor;
@@ -83,18 +88,13 @@ final class ReplayBoardModel {
         for (int i = 0; i < participants.size(); i++) {
             var p = participants.get(i);
             var sampler = new ReplayTrackSampler(p.track());
-            float[] xs = new float[sampler.size()], ys = new float[sampler.size()], zs = new float[sampler.size()];
-            for (int s = 0; s < sampler.size(); s++) {
-                project(sampler.x(s), sampler.y(s), sampler.z(s), tmp);
-                xs[s] = tmp[0]; ys[s] = tmp[1]; zs[s] = tmp[2];
-            }
             int fallback = switch (p.faction()) {
                 case KILLER -> ReplayPalette.KILLER;
                 case NEUTRAL -> ReplayPalette.NEUTRAL;
                 default -> ReplayPalette.PASSENGER;
             };
-            Actor actor = new Actor(i, p, sampler, xs, ys, zs, ReplayPalette.opaque(p.endColor(), fallback),
-                    p.id().equals(replay.mvp()));
+            Actor actor = new Actor(i, p, sampler, ReplayPalette.opaque(p.endColor(), fallback),
+                    p.id().equals(replay.mvp()), this, tmp);
             actors[i] = actor;
             byId.put(p.id(), actor);
             survival = Math.max(survival, p.survivalSeconds());
@@ -110,8 +110,12 @@ final class ReplayBoardModel {
         }
 
         List<EventMark> marks = new ArrayList<>();
+        boolean sortedEvents = true;
+        int prevEventTick = Integer.MIN_VALUE;
         for (LastMatchReplay.Node node : replay.events()) {
             if (node.from() == null && node.to() == null) continue;
+            if (node.tick() < prevEventTick) sortedEvents = false;
+            prevEventTick = node.tick();
             marks.add(new EventMark(node, this, tmp));
             if (node.kind() == LastMatchReplay.Kind.PLAYER_REVIVAL) {
                 if (node.actor() != null) revivals.computeIfAbsent(node.actor(), ignored -> new ArrayList<>()).add(node.tick());
@@ -121,8 +125,36 @@ final class ReplayBoardModel {
             }
         }
         events = marks.toArray(EventMark[]::new);
+        eventsSorted = sortedEvents;
+        timelineHighlights = marks.stream()
+                .filter(mark -> {
+                    var k = mark.node.kind();
+                    return k == LastMatchReplay.Kind.KILL || k == LastMatchReplay.Kind.BOMB_DETONATE
+                            || k == LastMatchReplay.Kind.GRENADE_EXPLOSION;
+                })
+                .sorted(Comparator.comparingInt(mark -> mark.node.tick()))
+                .toArray(EventMark[]::new);
         feedEvents = marks.stream().filter(mark -> ReplayEventPainter.isFeedEvent(mark.node))
                 .sorted(Comparator.comparingInt(mark -> mark.node.tick())).toList();
+
+        List<ReplayEntityTrack> rawTracks = replay.entityTracks();
+        List<EntityTrackEntry> indexedTracks = new ArrayList<>(rawTracks.size());
+        for (ReplayEntityTrack track : rawTracks) {
+            var samples = track.samples();
+            if (samples.isEmpty()) continue;
+            int first = samples.getFirst().tick();
+            var tail = samples.getLast();
+            int end = tail.has(ReplayEntityTrack.FLAG_ACTIVE) ? Integer.MAX_VALUE : tail.tick();
+            indexedTracks.add(new EntityTrackEntry(track, first, end));
+        }
+        indexedTracks.sort(Comparator.comparingInt(EntityTrackEntry::firstTick));
+        entityTracks = indexedTracks.toArray(EntityTrackEntry[]::new);
+        entityTrackMaxEndPrefix = new int[entityTracks.length];
+        int runningMaxEnd = Integer.MIN_VALUE;
+        for (int i = 0; i < entityTracks.length; i++) {
+            if (entityTracks[i].endTick > runningMaxEnd) runningMaxEnd = entityTracks[i].endTick;
+            entityTrackMaxEndPrefix[i] = runningMaxEnd;
+        }
 
         title = ReplayBoardTexts.winTitle(replay);
         subtitle = ReplayBoardTexts.winSubtitle(replay);
@@ -190,42 +222,146 @@ final class ReplayBoardModel {
     }
 
     List<ReplaySkillEffectRegistry.SkillSignal> skillSignals(boolean diorama) {
-        if (diorama) {
-            if (dioramaSkills == null) dioramaSkills = ReplaySkillEffectRegistry.buildSignals(this, true);
-            return dioramaSkills;
-        }
-        if (worldSkills == null) worldSkills = ReplaySkillEffectRegistry.buildSignals(this, false);
-        return worldSkills;
+        return skillIndex(diorama).signals();
     }
+
+    ReplaySkillEffectRegistry.SkillIndex skillIndex(boolean diorama) {
+        if (diorama) {
+            if (dioramaSkillIndex == null) {
+                dioramaSkillIndex = ReplaySkillEffectRegistry.SkillIndex.of(ReplaySkillEffectRegistry.buildSignals(this, true));
+            }
+            return dioramaSkillIndex;
+        }
+        if (worldSkillIndex == null) {
+            worldSkillIndex = ReplaySkillEffectRegistry.SkillIndex.of(ReplaySkillEffectRegistry.buildSignals(this, false));
+        }
+        return worldSkillIndex;
+    }
+
+    /** Number of events with {@code tick <= t} when {@link #eventsSorted} is true, computed in O(log N). */
+    int eventCountUpTo(double t) {
+        if (!eventsSorted) return events.length;
+        int lo = 0, hi = events.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (events[mid].node.tick() <= t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    /** Number of entity tracks with {@code firstTick <= t}, computed in O(log N). */
+    int entityTrackCountUpTo(double t) {
+        int lo = 0, hi = entityTracks.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (entityTracks[mid].firstTick <= t) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    record EntityTrackEntry(ReplayEntityTrack track, int firstTick, int endTick) {}
 
     record Drone(ReplayTrackSampler track, @Nullable Actor owner) {}
 
     static final class Actor {
+        /** Minimum diorama-unit displacement before a trail vertex is emitted in real-time board view. */
+        private static final float TRAIL_MIN_STEP_SQ = 0.014f * 0.014f;
+        /** Maximum collinear deviation (diorama units) allowed when merging consecutive straight points. */
+        private static final float TRAIL_COLLINEAR_TOL_SQ = 0.0045f * 0.0045f;
+        /** Cap single merged span length so comet gradient alpha/color remains smooth. */
+        private static final float TRAIL_MAX_SPAN_SQ = 0.28f * 0.28f;
+
         final int index;
         final LastMatchReplay.Participant p;
         final ReplayTrackSampler track;
-        final float[] xs, ys, zs;
         final int[] trailEnds;
+        final float[] projX, projY, projZ;
+        final int[] visualNext;
         final int color;
         final boolean mvp;
         final Component name, role;
 
-        Actor(int index, LastMatchReplay.Participant p, ReplayTrackSampler track, float[] xs, float[] ys, float[] zs,
-              int color, boolean mvp) {
+        Actor(int index, LastMatchReplay.Participant p, ReplayTrackSampler track, int color, boolean mvp) {
+            this(index, p, track, color, mvp, null, null);
+        }
+
+        Actor(int index, LastMatchReplay.Participant p, ReplayTrackSampler track, int color, boolean mvp,
+              @Nullable ReplayBoardModel model, float @Nullable [] scratch) {
             this.index = index;
             this.p = p;
             this.track = track;
-            this.xs = xs;
-            this.ys = ys;
-            this.zs = zs;
-            trailEnds = new int[track.size()];
-            for (int i = trailEnds.length - 1; i >= 0; i--) {
+            int n = track.size();
+            trailEnds = new int[n];
+            projX = new float[n];
+            projY = new float[n];
+            projZ = new float[n];
+            for (int i = n - 1; i >= 0; i--) {
                 trailEnds[i] = track.connects(i + 1) ? trailEnds[i + 1] : i;
             }
+            if (model != null && scratch != null) {
+                for (int i = 0; i < n; i++) {
+                    model.project(track.x(i), track.y(i), track.z(i), scratch);
+                    projX[i] = scratch[0];
+                    projY[i] = scratch[1];
+                    projZ[i] = scratch[2];
+                }
+            } else {
+                for (int i = 0; i < n; i++) {
+                    projX[i] = (float) track.x(i);
+                    projY[i] = (float) track.y(i);
+                    projZ[i] = (float) track.z(i);
+                }
+            }
+            visualNext = buildVisualTrailChain(n, trailEnds, projX, projY, projZ);
             this.color = color;
             this.mvp = mvp;
             this.name = ReplayBoardTexts.name(p);
             this.role = ReplayBoardTexts.role(p.endRole());
+        }
+
+        private static int[] buildVisualTrailChain(int n, int[] trailEnds, float[] px, float[] py, float[] pz) {
+            int[] next = new int[n];
+            int segStart = 0;
+            while (segStart < n) {
+                int segEnd = trailEnds[segStart];
+                int anchor = segStart;
+                int prevKept = segStart;
+                for (int i = segStart + 1; i <= segEnd; i++) {
+                    boolean keep = (i == segEnd);
+                    if (!keep) {
+                        float dx = px[i] - px[anchor], dy = py[i] - py[anchor], dz = pz[i] - pz[anchor];
+                        float distSq = dx * dx + dy * dy + dz * dz;
+                        if (distSq >= TRAIL_MIN_STEP_SQ) {
+                            if (distSq >= TRAIL_MAX_SPAN_SQ) {
+                                keep = true;
+                            } else {
+                                // Check whether point i bends away from chord anchor -> i+1
+                                float cx = px[i + 1] - px[anchor], cy = py[i + 1] - py[anchor], cz = pz[i + 1] - pz[anchor];
+                                float chordSq = cx * cx + cy * cy + cz * cz;
+                                if (chordSq < 1.0e-8f) {
+                                    keep = true;
+                                } else {
+                                    float crx = dy * cz - dz * cy;
+                                    float cry = dz * cx - dx * cz;
+                                    float crz = dx * cy - dy * cx;
+                                    float crossSq = crx * crx + cry * cry + crz * crz;
+                                    if (crossSq > TRAIL_COLLINEAR_TOL_SQ * chordSq) keep = true;
+                                }
+                            }
+                        }
+                    }
+                    if (keep) {
+                        for (int fill = prevKept; fill < i; fill++) next[fill] = i;
+                        anchor = i;
+                        prevKept = i;
+                    }
+                }
+                next[segEnd] = segEnd + 1;
+                segStart = segEnd + 1;
+            }
+            return next;
         }
 
         int nextTrailPoint(int current, int recent, int stride) {
@@ -233,6 +369,24 @@ final class ReplayBoardModel {
             if (stride <= 1 || next >= recent || next > trailEnds[current]) return next;
             int nextOnStride = current + stride - current % stride;
             return Math.min(recent, Math.min(nextOnStride, trailEnds[current]));
+        }
+
+        /**
+         * Advances along the pre-simplified trail chain for real-time board rendering, skipping
+         * stationary jitter and collinear interior points while preserving segment breaks,
+         * corners, the comet boundary and the current tail endpoint.
+         */
+        int nextVisualTrailPoint(int current, int recent, int last, int stride) {
+            int end = Math.min(last, trailEnds[current]);
+            if (current >= end) return current + 1;
+            int vNext = visualNext[current];
+            if (vNext > end) vNext = end;
+            if (current < recent && stride > 1) {
+                int nextOnStride = current + stride - current % stride;
+                int target = Math.max(vNext, nextOnStride);
+                return Math.min(recent, Math.min(target, end));
+            }
+            return vNext;
         }
 
         int factionColor() {

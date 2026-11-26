@@ -55,7 +55,7 @@ class ReplayTableSessionPlayerTest {
         var track = new ReplayTrackSampler(samples);
         var participant = new LastMatchReplay.Participant(UUID.randomUUID(), "Passenger", "", 0, "", 0,
                 MatchWinFaction.PASSENGER, false, 0, 0, 0, 0, samples);
-        var actor = new ReplayBoardModel.Actor(0, participant, track, new float[0], new float[0], new float[0], 0, false);
+        var actor = new ReplayBoardModel.Actor(0, participant, track, 0, false);
 
         for (int recent : new int[]{300, 214, 39, 360}) {
             int last = recent + 23;

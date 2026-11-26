@@ -29,6 +29,10 @@ import java.util.Map;
 import java.util.UUID;
 
 public final class ReplayForegroundWorld {
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(ReplayForegroundWorld.class);
+    private static final long TERRAIN_WARMUP_FALLBACK_NS = 8_000_000_000L;
+    private static final int TERRAIN_WARMUP_MAX_FRAMES = 120;
+
     public interface RendererFields {
         void habitrain$camera(Camera camera);
         void habitrain$hands(ItemInHandRenderer renderer);
@@ -95,13 +99,14 @@ public final class ReplayForegroundWorld {
     private int lastHandTick = Integer.MIN_VALUE;
     private UUID lastSubject;
 
-    ReplayForegroundWorld(Minecraft client, ReplayBoardModel model, SceneAssetCodec.AssetData asset, ReplayVisualDownload visuals) throws ReflectiveOperationException, java.io.IOException {
+    ReplayForegroundWorld(Minecraft client, ReplayBoardModel model, SceneAssetCodec.AssetData asset, ReplayVisualDownload visuals) {
         this.model = model;
         this.visuals = visuals;
         var real = client.level;
         int radius = Math.clamp(client.options.getEffectiveRenderDistance() + 1, 4, 33);
-        var key = net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION,
-                ResourceLocation.parse(asset.dimensionId));
+        ResourceLocation dimLoc = asset.dimensionId == null ? null : ResourceLocation.tryParse(asset.dimensionId);
+        if (dimLoc == null) dimLoc = real.dimension().location();
+        var key = net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION, dimLoc);
         net.minecraft.core.Holder<net.minecraft.world.level.dimension.DimensionType> type = real.registryAccess().registryOrThrow(net.minecraft.core.registries.Registries.DIMENSION_TYPE)
                 .getHolder(net.minecraft.resources.ResourceKey.create(net.minecraft.core.registries.Registries.DIMENSION_TYPE, key.location()))
                 .map(holder -> (net.minecraft.core.Holder<net.minecraft.world.level.dimension.DimensionType>) holder)
@@ -114,7 +119,15 @@ public final class ReplayForegroundWorld {
         chunks = new ReplayForegroundChunks(level, asset, model.replay.origin(), model.replay.blockDeltas(), radius);
         particleState.level = level;
         chunks.visualEvents(visuals.events(com.habitrain.core.network.replay.VisualTape.WORLD));
-        worldEntities=new RecordedEntities(visuals.events(com.habitrain.core.network.replay.VisualTape.WORLD));
+        RecordedEntities entities;
+        try {
+            entities = new RecordedEntities(visuals.events(com.habitrain.core.network.replay.VisualTape.WORLD));
+        } catch (java.io.IOException | RuntimeException failure) {
+            LOGGER.warn("Could not decode recorded world entities for replay export; continuing without them", failure);
+            try { entities = new RecordedEntities(java.util.List.of()); }
+            catch (java.io.IOException impossible) { throw new IllegalStateException(impossible); }
+        }
+        worldEntities = entities;
         pov = new RecordedPlayer(client, level);
         observerMood = new io.wifi.starrailexpress.cca.SREPlayerMoodComponent(pov) {
             @Override public boolean isLowerThanDepressed() { return (filters & 1)!=0; }
@@ -123,17 +136,26 @@ public final class ReplayForegroundWorld {
         mode = new MultiPlayerGameMode(client, client.getConnection());
     }
 
-    boolean draw(Minecraft client, UUID subject, double tick, java.util.function.Consumer<net.minecraft.client.DeltaTracker> render) throws ReflectiveOperationException, java.io.IOException {
+    boolean draw(Minecraft client, UUID subject, double tick, java.util.function.Consumer<net.minecraft.client.DeltaTracker> render) {
         var actor = model.participant(subject);
         if (actor == null) throw new IllegalStateException("Missing replay viewpoint");
         var sample = actor.track.sample(tick);
         if (view == null || !subject.equals(lastSubject)) {
-            view = new RecordedView(visuals.events(com.habitrain.core.network.replay.VisualTape.WORLD), visuals.events(subject));
+            try {
+                view = new RecordedView(visuals.events(com.habitrain.core.network.replay.VisualTape.WORLD), visuals.events(subject));
+            } catch (java.io.IOException | RuntimeException failure) {
+                LOGGER.warn("Could not decode recorded viewpoint {}; falling back to replay track", subject, failure);
+                try { view = new RecordedView(java.util.List.of(), java.util.List.of()); }
+                catch (java.io.IOException impossible) { throw new IllegalStateException(impossible); }
+            }
             particleState.clear();
         }
-        camera.recorded = view.camera(tick);
-        hud = view.hud((int)tick);
-        outlines = view.outlines((int)tick);
+        try { camera.recorded = view.camera(tick); }
+        catch (RuntimeException failure) { camera.recorded = null; LOGGER.debug("Skipped recorded camera on tick {}", (int) tick, failure); }
+        try { hud = view.hud((int) tick); }
+        catch (java.io.IOException | RuntimeException failure) { hud = null; LOGGER.debug("Skipped recorded HUD on tick {}", (int) tick, failure); }
+        try { outlines = view.outlines((int) tick); }
+        catch (java.io.IOException | RuntimeException failure) { outlines = Map.of(); LOGGER.debug("Skipped recorded outlines on tick {}", (int) tick, failure); }
         var body = client.player;
         var real = client.level;
         var oldCamera = client.gameRenderer.getMainCamera();
@@ -163,7 +185,12 @@ public final class ReplayForegroundWorld {
             client.options.setCameraType(CameraType.FIRST_PERSON);
             client.options.hideGui = !sample.visible() || sample.state() != ReplayTrackSampler.State.ALIVE;
             posePlayer(pov, actor, sample, tick);
-            pov.spectator = view.body(pov,(int)tick,camera.recorded != null && camera.recorded.spectator());
+            boolean recordedSpectator = camera.recorded != null && camera.recorded.spectator();
+            try { pov.spectator = view.body(pov, (int) tick, recordedSpectator); }
+            catch (java.io.IOException | RuntimeException failure) {
+                pov.spectator = recordedSpectator;
+                LOGGER.debug("Skipped recorded body state on tick {}", (int) tick, failure);
+            }
             if (camera.recorded != null) {
                 renderedFov = camera.recorded.fov(); client.options.hideGui = camera.recorded.hideGui() || pov.spectator;
                 pov.setPos(camera.recorded.x(),camera.recorded.y()-pov.getEyeHeight(),camera.recorded.z());
@@ -202,7 +229,8 @@ public final class ReplayForegroundWorld {
             camera.setup(level, pov, false, false, 1f);
             if (warmFrames == 0 || handTick != cameraTick) camera.tick();
             cameraTick = handTick;
-            view.time(level, handTick);
+            try { view.time(level, handTick); }
+            catch (java.io.IOException | RuntimeException failure) { LOGGER.debug("Skipped recorded world time on tick {}", handTick, failure); }
             boolean loaded = chunks.prepare(new ChunkPos(pov.blockPosition()), tick);
             if (loaded && lastBlockTick != handTick) {
                 int steps = lastBlockTick < 0 || handTick<=lastBlockTick ? 1 : Math.min(8,handTick-lastBlockTick);
@@ -228,15 +256,21 @@ public final class ReplayForegroundWorld {
                 } else posePlayer(player, other, otherPose, tick);
             }
             for (var track : model.replay.entityTracks()) if (!worldEntities.contains(track.entityId())) updateEntity(track, tick);
-            worldEntities.draw(level,tick);
-            view.particles(level, client.particleEngine, handTick);
+            try { worldEntities.draw(level, tick); }
+            catch (RuntimeException failure) { LOGGER.debug("Skipped recorded world entities on tick {}", handTick, failure); }
+            try { view.particles(level, client.particleEngine, handTick); }
+            catch (java.io.IOException | RuntimeException failure) { LOGGER.debug("Skipped recorded particles on tick {}", handTick, failure); }
             render.accept(new FrameClock((float)(tick - Math.floor(tick))));
             if (!loaded) { warmFrames = 0; warmingSince = 0; return false; }
             if (warmingSince == 0) warmingSince = System.nanoTime();
             if (++warmFrames < 3) return false;
             if (warmFrames > 3 && client.levelRenderer.hasRenderedAllSections()) return true;
             if (warmFrames > 8 && client.levelRenderer.countRenderedSections() > 0) return true;
-            if (System.nanoTime() - warmingSince > 30_000_000_000L) throw new IllegalStateException("Replay terrain did not become visible");
+            if (System.nanoTime() - warmingSince > TERRAIN_WARMUP_FALLBACK_NS || warmFrames >= TERRAIN_WARMUP_MAX_FRAMES) {
+                LOGGER.warn("Replay terrain warmup reached fallback after {} frames (renderedSections={}); proceeding",
+                        warmFrames, client.levelRenderer.countRenderedSections());
+                return true;
+            }
             return false;
         } finally {
             io.wifi.starrailexpress.client.SREClient.moodComponent=oldMood; filters=0; activeSkins=Map.of();
@@ -266,6 +300,7 @@ public final class ReplayForegroundWorld {
     void paintHud(Minecraft client) {
         if (hud == null || hud.draws().isEmpty()) return;
         var window = client.getWindow();
+        if (window.getGuiScaledWidth() <= 0 || window.getGuiScaledHeight() <= 0) return;
         var stack = com.mojang.blaze3d.systems.RenderSystem.getModelViewStack();
         com.mojang.blaze3d.systems.RenderSystem.backupProjectionMatrix(); stack.pushMatrix();
         try {

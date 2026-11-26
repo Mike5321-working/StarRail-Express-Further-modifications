@@ -59,32 +59,61 @@ final class ReplayActorPainter {
             float actorDim = highlight.brightnessFor(actor.p.id());
             double alpha = baseAlpha * actorDim;
 
-            if (!singleFocus || focusedTrail) {
-                double trailAlpha = mvpMode ? (isMvp ? alpha * 0.22 : alpha * 0.05) : alpha;
-                if (trailAlpha > 0.015) {
-                    var live = pose.state() == ReplayTrackSampler.State.ALIVE ? position : null;
-                    if (history == null) {
-                        trails(f, glow, d, actor, t, trailAlpha, stage.history(), review, elemScale,
-                                live, trailPoint, s.detail(), focusedTrail);
-                    } else if (!history.emit(scope, actor.index)) {
-                        history.record(scope, actor.index, target -> trails(f, target, d, actor, t, trailAlpha,
-                                stage.history(), review, elemScale, live, trailPoint, s.detail(), false));
-                    }
-                }
-            }
-            if (position == null || position.size() <= 0) continue;
-            float size = position.size() * highlight.scaleFor(actor.p.id());
-            float x = position.x(), y = position.y() + 0.006f, z = position.z();
-            if (!heads.visible(x, y, z, size)) continue;
-            ReplayHeadSkins.rememberName(actor.p.id(), actor.p.name());
+            boolean drawBody = position != null && position.size() > 0;
+            float size = drawBody ? position.size() * highlight.scaleFor(actor.p.id()) : 0f;
+            float x = drawBody ? position.x() : 0f;
+            float y = drawBody ? position.y() + 0.006f : 0f;
+            float z = drawBody ? position.z() : 0f;
+            if (drawBody && !heads.visible(x, y, z, size)) drawBody = false;
             boolean alive = pose.state() == ReplayTrackSampler.State.ALIVE;
             int ringColor = alive ? actor.color : ReplayPalette.GHOST;
             double ringA = alive ? 0.85 : 0.35;
             if (review && actor.p.winner()) ringColor = ReplayPalette.BRASS_LIGHT;
             if (actorDim < 0.99f) ringColor = ReplayPalette.scale(ringColor, actorDim);
 
-            ReplayDraw.ring(glow, d, x, y, z, size * 0.58f, size * 0.12f, 20, ReplayPalette.alpha(ringColor, ringA * alpha),
-                    ReplayPalette.alpha(ringColor, ringA * 0.25 * alpha));
+            boolean wantTrail = (!singleFocus || focusedTrail);
+            double trailAlpha = mvpMode ? (isMvp ? alpha * 0.22 : alpha * 0.05) : alpha;
+            boolean emitTrail = wantTrail && trailAlpha > 0.015;
+            if (history != null) {
+                // Settled review caches both the full trail and the static floor ring/disc in one replay slot.
+                if (!history.emit(scope, actor.index)) {
+                    boolean recordRing = position != null && position.size() > 0;
+                    float rSize = recordRing ? position.size() * highlight.scaleFor(actor.p.id()) : 0f;
+                    float rx = recordRing ? position.x() : 0f;
+                    float ry = recordRing ? position.y() + 0.006f : 0f;
+                    float rz = recordRing ? position.z() : 0f;
+                    int rColor = ringColor;
+                    double rAlpha = ringA;
+                    history.record(scope, actor.index, target -> {
+                        if (emitTrail) {
+                            var live = alive ? position : null;
+                            trails(f, target, d, actor, t, trailAlpha, stage.history(), review, elemScale,
+                                    live, trailPoint, s.detail(), false);
+                        }
+                        if (recordRing) {
+                            ReplayDraw.ring(target, d, rx, ry, rz, rSize * 0.58f, rSize * 0.12f, 20,
+                                    ReplayPalette.alpha(rColor, rAlpha * alpha),
+                                    ReplayPalette.alpha(rColor, rAlpha * 0.25 * alpha));
+                            ReplayDraw.disc(target, d, rx, ry - 0.001f, rz, rSize * 0.5f, 16,
+                                    ReplayPalette.alpha(rColor, 0.18 * alpha),
+                                    ReplayPalette.alpha(rColor, 0));
+                        }
+                    });
+                }
+            } else if (emitTrail) {
+                var live = alive ? position : null;
+                trails(f, glow, d, actor, t, trailAlpha, stage.history(), review, elemScale,
+                        live, trailPoint, s.detail(), focusedTrail);
+            }
+            if (!drawBody) continue;
+            ReplayHeadSkins.rememberName(actor.p.id(), actor.p.name());
+
+            if (history == null) {
+                ReplayDraw.ring(glow, d, x, y, z, size * 0.58f, size * 0.12f, 20, ReplayPalette.alpha(ringColor, ringA * alpha),
+                        ReplayPalette.alpha(ringColor, ringA * 0.25 * alpha));
+                ReplayDraw.disc(glow, d, x, y - 0.001f, z, size * 0.5f, 16, ReplayPalette.alpha(ringColor, 0.18 * alpha),
+                        ReplayPalette.alpha(ringColor, 0));
+            }
             if (focusedTrail) {
                 ReplayDraw.ring(glow, d, x, y + 0.002f, z, size * 0.82f, size * 0.11f, 24,
                         ReplayPalette.alpha(ReplayPalette.FOCUS_TRAIL, 0.9 * alpha),
@@ -94,8 +123,6 @@ final class ReplayActorPainter {
                 ReplayFullPlayerRenderer.emitSpotlightAura(glow, d, x, y, z, size * 0.96f, size * 2.4f,
                         actor.factionColor(), f.anim, baseAlpha);
             }
-            ReplayDraw.disc(glow, d, x, y - 0.001f, z, size * 0.5f, 16, ReplayPalette.alpha(ringColor, 0.18 * alpha),
-                    ReplayPalette.alpha(ringColor, 0));
             if (alive) aliveActor(f, s, d, actor, pose, x, y, z, alpha, actorDim, elemScale, size);
             else deadActor(f, s, d, actor, pose, x, y, z, alpha, actorDim, elemScale, size);
         }
@@ -171,7 +198,7 @@ final class ReplayActorPainter {
         if (s.detail() && !f.video) {
             Vector3f top = d.transformPosition(x, topY, z, new Vector3f());
             float dist = top.length();
-            float distScale = Math.max(1f, s.scale());
+            float distScale = (float) ReplayStagePlan.detailScale(s.scale());
             if (pose.has(LastMatchReplay.ASLEEP) || pose.hasStatus(LastMatchReplay.STATUS_ASLEEP)) {
                 f.billboardText(new Vector3f(top).add(0, 0.03f * elemScale, 0), Component.literal("z Z"), 0.0035f * elemScale,
                         ReplayPalette.alpha(ReplayPalette.PASSENGER, alpha));
@@ -308,9 +335,12 @@ final class ReplayActorPainter {
         int stride = f.video ? 1 : Math.max(1, (recent + 95) / 96);
         float trailScale = focused ? (videoReview ? elemScale * 1.45f : elemScale) : (videoReview ? elemScale * 1.65f : elemScale);
         float yLift = focused ? 0.014f : 0.012f;
+        float[] px = actor.projX, py = actor.projY, pz = actor.projZ;
         int n = 0;
         int cap = widths.length - 1;
-        for (int i = first; i <= last; i = actor.nextTrailPoint(i, recent, stride)) {
+        for (int i = first; i <= last; i = f.video
+                ? actor.nextTrailPoint(i, recent, stride)
+                : actor.nextVisualTrailPoint(i, recent, last, stride)) {
             boolean startsSegment = i == first || !track.connects(i);
             if (startsSegment) {
                 if (n >= 2) emitTrail(fill, glow, n, focused);
@@ -326,7 +356,7 @@ final class ReplayActorPainter {
                 }
                 n = 1;
             }
-            d.transformPosition(actor.xs[i], actor.ys[i] + yLift, actor.zs[i], tmp);
+            d.transformPosition(px[i], py[i] + yLift, pz[i], tmp);
             if (focused) {
                 putFocused(n++, tmp, track.tick(i), cometStart, t, alpha, videoReview, trailScale);
             } else {

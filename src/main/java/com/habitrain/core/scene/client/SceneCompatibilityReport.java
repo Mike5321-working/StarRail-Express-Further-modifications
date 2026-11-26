@@ -86,7 +86,7 @@ public final class SceneCompatibilityReport {
             int maxLight
     ) {
         public Entry {
-            if (localPos == null) localPos = BlockPos.ZERO;
+            localPos = localPos == null ? BlockPos.ZERO : localPos.immutable();
             if (blockId == null) blockId = ResourceLocation.withDefaultNamespace("air");
             if (issueType == null) issueType = IssueType.NONE;
             if (description == null) description = "";
@@ -119,8 +119,11 @@ public final class SceneCompatibilityReport {
 
     /** 保留的抽样条目；正常条目在非详细模式下每位置至多一条。 */
     private final List<Entry> retained;
-    /** 每个位置出现过的状态位。 */
-    private final Map<BlockPos, Long> positionMask = new HashMap<>();
+    /** 任意顺序的诊断条目需要跨方块去重；网格构建器按方块连续提交时仅需单点位键去重。 */
+    private Map<BlockPos, Long> positionMask;
+    private boolean hasLastPos;
+    private long lastPosKey;
+    private long lastMask;
     /** 出现过正常/适配 NONE 条目的位置，用于「每位置至多一条」判定。 */
     private final java.util.Set<BlockPos> noneRetained = new java.util.HashSet<>();
 
@@ -148,9 +151,22 @@ public final class SceneCompatibilityReport {
     }
 
     public SceneCompatibilityReport(boolean detailed, int issueSampleLimit) {
+        this(detailed, issueSampleLimit, false);
+    }
+
+    SceneCompatibilityReport(boolean detailed, boolean sequentialBlocks) {
+        this(detailed, DEFAULT_ISSUE_SAMPLE_LIMIT, sequentialBlocks);
+    }
+
+    private SceneCompatibilityReport(boolean detailed, int issueSampleLimit, boolean sequentialBlocks) {
         this.detailed = detailed;
+        this.positionMask = sequentialBlocks ? null : new HashMap<>();
         this.issueSampleLimit = Math.max(0, issueSampleLimit);
         this.retained = new ArrayList<>(Math.min(this.issueSampleLimit, 256));
+    }
+
+    void recordNormalBlock(BlockPos pos, boolean adapted) {
+        if (!frozen) recordMask(pos, (1L << IssueType.NONE.ordinal()) | (adapted ? ADAPTER_NONE_BIT : PLAIN_NONE_BIT));
     }
 
     public void addEntry(Entry entry) {
@@ -162,20 +178,7 @@ public final class SceneCompatibilityReport {
         }
 
         BlockPos pos = entry.localPos();
-        Long previous = positionMask.get(pos);
-        long before = previous == null ? 0L : previous;
-        long after = before | maskOf(entry);
-        positionMask.put(pos, after);
-
-        if (previous == null) distinctPositions++;
-        adaptedPositions += adjust(isAdapted(before), isAdapted(after));
-        normalPositions += adjust(isNormal(before), isNormal(after));
-        warningPositions += adjust(isWarning(before), isWarning(after));
-        severePositions += adjust(isSevere(before), isSevere(after));
-        strictBlockingPositions += adjust(isBlocking(before, STRICT_BLOCKING_BITS),
-                isBlocking(after, STRICT_BLOCKING_BITS));
-        skipWarnBlockingPositions += adjust(isBlocking(before, SKIP_WARN_BLOCKING_BITS),
-                isBlocking(after, SKIP_WARN_BLOCKING_BITS));
+        recordMask(pos, maskOf(entry));
 
         if (entry.isIssue()) {
             totalIssues++;
@@ -215,6 +218,10 @@ public final class SceneCompatibilityReport {
      */
     public void freeze() {
         if (frozen) return;
+        positionMask = null;
+        hasLastPos = false;
+        lastPosKey = 0L;
+        noneRetained.clear();
         frozen = true;
     }
 
@@ -224,6 +231,32 @@ public final class SceneCompatibilityReport {
 
     public boolean isDetailed() {
         return detailed;
+    }
+
+    private void recordMask(BlockPos pos, long mask) {
+        long posKey = positionMask == null ? pos.asLong() : 0L;
+        long before = positionMask == null
+                ? (hasLastPos && lastPosKey == posKey ? lastMask : 0L)
+                : positionMask.getOrDefault(pos, 0L);
+        long after = before | mask;
+        if (before == after) return;
+        if (positionMask == null) {
+            hasLastPos = true;
+            lastPosKey = posKey;
+            lastMask = after;
+        } else {
+            positionMask.put(pos.immutable(), after);
+        }
+
+        if (before == 0L) distinctPositions++;
+        adaptedPositions += adjust(isAdapted(before), isAdapted(after));
+        normalPositions += adjust(isNormal(before), isNormal(after));
+        warningPositions += adjust(isWarning(before), isWarning(after));
+        severePositions += adjust(isSevere(before), isSevere(after));
+        strictBlockingPositions += adjust(isBlocking(before, STRICT_BLOCKING_BITS),
+                isBlocking(after, STRICT_BLOCKING_BITS));
+        skipWarnBlockingPositions += adjust(isBlocking(before, SKIP_WARN_BLOCKING_BITS),
+                isBlocking(after, SKIP_WARN_BLOCKING_BITS));
     }
 
     private static long maskOf(Entry entry) {

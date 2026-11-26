@@ -328,24 +328,33 @@ public final class ClientReplayBoard {
     }
 
     /**
-     * Returns the replay shown by a board, including a historical round shared to that board.
-     * Controls opened from a shared board use the board's active round instead of the latest round.
+     * Returns the archived round ID displayed on a replay board when the board is currently playing
+     * a shared or non-latest historical round, or {@code null} when it shows the latest round.
      */
-    public static View viewForBoard(BlockPos pos) {
+    public static @Nullable UUID boardHistoryRound(BlockPos pos) {
         var client = Minecraft.getInstance();
         if (client.level != null && client.level.getBlockEntity(pos) instanceof SettlementSummaryBoard.Marker marker) {
             ReplayBoardSessionState session = boardSession(pos, marker);
             if (session != null && session.active()
                     && (session.shared() || !session.roundId().equals(available.roundId()))) {
-                return ReplayHistoryClient.watch(session.roundId());
+                return session.roundId();
             }
             var playback = marker.playback();
             if (playback != null && playback.pendingOrPlaying(client.level.getGameTime())
                     && (playback.shared() || !playback.roundId().equals(available.roundId()))) {
-                return ReplayHistoryClient.watch(playback.roundId());
+                return playback.roundId();
             }
         }
-        return viewAt(pos);
+        return null;
+    }
+
+    /**
+     * Returns the replay shown by a board, including a historical round shared to that board.
+     * Controls opened from a shared board use the board's active round instead of the latest round.
+     */
+    public static View viewForBoard(BlockPos pos) {
+        UUID archived = boardHistoryRound(pos);
+        return archived != null ? ReplayHistoryClient.watch(archived) : viewAt(pos);
     }
 
     public static UUID availableRound() { return available.roundId(); }
@@ -536,10 +545,12 @@ public final class ClientReplayBoard {
         final TreeMap<Integer, SceneAssetCodec.SectionData> parts;
         final Map<Integer, Fragment> partial = new HashMap<>();
         final BitSet decoding = new BitSet();
+        final BitSet received = new BitSet();
         BitSet requested = new BitSet();
         final long localDeadline = System.nanoTime() + 1_000_000_000L;
-        long retryAt, nextBatch;
+        long retryAt;
         private int attemptsWithoutProgress;
+        private boolean localChecked;
         boolean diskLoading = true, saved;
         boolean failed;
         long retryAfter;
@@ -549,9 +560,11 @@ public final class ClientReplayBoard {
         MapData(ReplayMapManifest manifest, TreeMap<Integer, SceneAssetCodec.SectionData> parts) {
             this.manifest = manifest;
             this.parts = parts;
+            parts.keySet().forEach(received::set);
         }
         void add(int index, SceneAssetCodec.SectionData s) {
             if (parts.putIfAbsent(index, s) == null) {
+                received.set(index);
                 assembled = null;
                 attemptsWithoutProgress = 0;
             }
@@ -609,7 +622,6 @@ public final class ClientReplayBoard {
                 attemptsWithoutProgress = 0;
                 retryAfter = 0;
                 retryAt = 0;
-                nextBatch = 0;
                 requested.clear();
                 partial.clear();
             }
@@ -621,28 +633,33 @@ public final class ClientReplayBoard {
                 return;
             }
             var entries = manifest.sections();
-            BitSet missing = new BitSet(entries.size());
-            int count = 0;
-            for (int i = 0; i < entries.size(); i++) {
-                if (parts.containsKey(i)) continue;
-                var local = LOCAL.lookup(manifest, entries.get(i));
-                if (local != null) add(i, ReplaySectionGeometry.relative(local.data(), manifest.sourceBounds()));
-                else if (!decoding.get(i) && count < MAX_REQUESTED) {
-                    missing.set(i);
-                    count++;
+            if (diskLoading || decoding.cardinality() >= MAX_REQUESTED) return;
+            boolean finalizingLocal = LOCAL.finalizingGeometry();
+            if (finalizingLocal && now - localDeadline < 0) return;
+            if (!localChecked) {
+                for (int index = received.nextClearBit(0); index < entries.size(); index = received.nextClearBit(index + 1)) {
+                    if (decoding.get(index)) continue;
+                    var local = LOCAL.lookup(manifest, entries.get(index));
+                    if (local != null) add(index, ReplaySectionGeometry.relative(local.data(), manifest.sourceBounds()));
                 }
+                localChecked = !finalizingLocal;
             }
-            if (parts.size() == entries.size()) {
+            if (complete()) {
                 persistIfComplete();
                 return;
             }
-            if (diskLoading || missing.isEmpty() || LOCAL.finalizingGeometry() && now - localDeadline < 0
-                    || nextBatch != 0 && now - nextBatch < 0) return;
-            if (send.test(missing)) {
+            BitSet missing = new BitSet(entries.size());
+            int count = 0;
+            for (int index = received.nextClearBit(0); index < entries.size() && count < MAX_REQUESTED;
+                 index = received.nextClearBit(index + 1)) {
+                if (decoding.get(index)) continue;
+                missing.set(index);
+                count++;
+            }
+            if (!missing.isEmpty() && send.test(missing)) {
                 requested = (BitSet) missing.clone();
                 attemptsWithoutProgress++;
                 retryAt = now + RETRY_NS;
-                nextBatch = now + 600_000_000L;
             }
         }
 

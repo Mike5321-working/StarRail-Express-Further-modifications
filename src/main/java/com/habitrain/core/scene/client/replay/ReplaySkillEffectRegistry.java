@@ -110,6 +110,8 @@ public final class ReplaySkillEffectRegistry {
 
     private static final List<NamedAdapter> ADAPTERS = new ArrayList<>();
     private static final Map<String, EffectAdapter> EXACT_ADAPTERS = new LinkedHashMap<>();
+    private static final EffectAdapter[] NO_ADAPTERS = new EffectAdapter[0];
+    private static volatile int registryVersion;
 
     static {
         registerDefaults();
@@ -119,11 +121,98 @@ public final class ReplaySkillEffectRegistry {
     public static void registerExact(String skillOrItemId, EffectAdapter adapter) {
         if (skillOrItemId == null || skillOrItemId.isBlank() || adapter == null) return;
         EXACT_ADAPTERS.put(skillOrItemId.toLowerCase(Locale.ROOT), adapter);
+        registryVersion++;
     }
 
     /** Registers a pattern-matched skill visual adapter. */
     public static void registerMatcher(String key, Predicate<SkillSignal> matcher, EffectAdapter adapter) {
         ADAPTERS.add(new NamedAdapter(key, matcher, adapter));
+        registryVersion++;
+    }
+
+    /**
+     * Time-sorted signal index cached per {@link ReplayBoardModel}: narrows per-frame painting,
+     * flashbang whiteout queries, and fallback toast scans to the active tick window and caches
+     * adapter resolution across frames.
+     */
+    static final class SkillIndex {
+        private final List<SkillSignal> signals;
+        private final List<SkillSignal> flashbangs;
+        private final double[] durations;
+        private final double maxDurationTicks;
+        private EffectAdapter[][] resolvedAdapters;
+        private int resolvedVersion = -1;
+
+        private SkillIndex(List<SkillSignal> signals, List<SkillSignal> flashbangs,
+                           double[] durations, double maxDurationTicks) {
+            this.signals = signals;
+            this.flashbangs = flashbangs;
+            this.durations = durations;
+            this.maxDurationTicks = maxDurationTicks;
+        }
+
+        static SkillIndex of(List<SkillSignal> raw) {
+            if (raw.isEmpty()) {
+                return new SkillIndex(List.of(), List.of(), new double[0], 0.0);
+            }
+            List<SkillSignal> sorted = new ArrayList<>(raw);
+            sorted.sort(java.util.Comparator.comparingInt(SkillSignal::tick));
+            double[] durs = new double[sorted.size()];
+            double maxDur = 0.0;
+            List<SkillSignal> flashes = new ArrayList<>();
+            for (int i = 0; i < sorted.size(); i++) {
+                SkillSignal s = sorted.get(i);
+                double dur = Math.max(12.0, s.durationTicks() > 0 ? s.durationTicks() : defaultDurationTicks(s));
+                durs[i] = dur;
+                if (dur > maxDur) maxDur = dur;
+                if (isFlashbang(s)) flashes.add(s);
+            }
+            return new SkillIndex(List.copyOf(sorted), flashes.isEmpty() ? List.of() : List.copyOf(flashes), durs, maxDur);
+        }
+
+        List<SkillSignal> signals() { return signals; }
+        List<SkillSignal> flashbangs() { return flashbangs; }
+        double durationAt(int index) { return durations[index]; }
+        double maxDurationTicks() { return maxDurationTicks; }
+
+        EffectAdapter[] adaptersAt(int index) {
+            ensureResolved();
+            return resolvedAdapters[index];
+        }
+
+        private void ensureResolved() {
+            int version = registryVersion;
+            if (resolvedAdapters != null && resolvedVersion == version) return;
+            EffectAdapter[][] table = new EffectAdapter[signals.size()][];
+            List<EffectAdapter> matched = new ArrayList<>(2);
+            for (int i = 0; i < signals.size(); i++) {
+                SkillSignal s = signals.get(i);
+                if (s.forceFallback()) {
+                    table[i] = NO_ADAPTERS;
+                    continue;
+                }
+                matched.clear();
+                String lower = s.id() == null ? "" : s.id().toLowerCase(Locale.ROOT);
+                EffectAdapter exact = lower.isEmpty() ? null : EXACT_ADAPTERS.get(lower);
+                if (exact != null) matched.add(exact);
+                for (NamedAdapter adapter : ADAPTERS) {
+                    if (adapter.matcher().test(s)) matched.add(adapter.adapter());
+                }
+                table[i] = matched.isEmpty() ? NO_ADAPTERS : matched.toArray(EffectAdapter[]::new);
+            }
+            resolvedAdapters = table;
+            resolvedVersion = version;
+        }
+
+        static int lowerBound(List<SkillSignal> list, double minTick) {
+            int lo = 0, hi = list.size();
+            while (lo < hi) {
+                int mid = (lo + hi) >>> 1;
+                if (list.get(mid).tick() < minTick) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo;
+        }
     }
 
     /** Returns true if a dedicated native/wildcard visual adapter exists for this signal. */
@@ -155,7 +244,7 @@ public final class ReplaySkillEffectRegistry {
                 Math.max(0.01f, elemScale),
                 alpha, godView, f, null, null
         );
-        paintSignals(ctx, f.model.skillSignals(true), f.video);
+        paintSignals(ctx, f.model.skillIndex(true), f.video);
     }
 
     /**
@@ -187,7 +276,7 @@ public final class ReplaySkillEffectRegistry {
                 1.0f, 1.0f, alpha, godView, null, worldStack, worldBuffers,
                 povSubjectUuid, firstPersonPov
         );
-        paintSignals(ctx, model.skillSignals(false), false);
+        paintSignals(ctx, model.skillIndex(false), false);
     }
 
     /**
@@ -202,20 +291,27 @@ public final class ReplaySkillEffectRegistry {
         if (viewerPose != null && viewerPose.visible() && viewerPose.hasStatus(LastMatchReplay.STATUS_FLASHED)) {
             peak = Math.max(peak, 0.86f);
         }
-        for (SkillSignal s : model.skillSignals(false)) {
-            double age = matchTick - s.tick();
-            if (age < 0 || age > 55.0 || !isFlashbang(s)) continue;
-            float distFactor = 1.0f;
-            if (viewerPose != null && viewerPose.visible() && (s.hasTo() || s.hasFrom())) {
-                float fx = s.hasTo() ? s.toX() : s.fromX();
-                float fy = s.hasTo() ? s.toY() : s.fromY();
-                float fz = s.hasTo() ? s.toZ() : s.fromZ();
-                double dist = Math.hypot(Math.hypot(viewerPose.x() - fx, viewerPose.y() - fy), viewerPose.z() - fz);
-                if (dist > 14.0) continue;
-                distFactor = (float) Mth.clamp(1.0 - dist / 14.0, 0.0, 1.0);
+        List<SkillSignal> flashbangs = model.skillIndex(false).flashbangs();
+        if (!flashbangs.isEmpty()) {
+            int start = SkillIndex.lowerBound(flashbangs, matchTick - 55.0);
+            for (int i = start; i < flashbangs.size(); i++) {
+                SkillSignal s = flashbangs.get(i);
+                double age = matchTick - s.tick();
+                if (age < 0) break;
+                if (age > 55.0) continue;
+                float distFactor = 1.0f;
+                if (viewerPose != null && viewerPose.visible() && (s.hasTo() || s.hasFrom())) {
+                    float fx = s.hasTo() ? s.toX() : s.fromX();
+                    float fy = s.hasTo() ? s.toY() : s.fromY();
+                    float fz = s.hasTo() ? s.toZ() : s.fromZ();
+                    double dx = viewerPose.x() - fx, dy = viewerPose.y() - fy, dz = viewerPose.z() - fz;
+                    double distSq = dx * dx + dy * dy + dz * dz;
+                    if (distSq > 196.0) continue;
+                    distFactor = (float) Mth.clamp(1.0 - Math.sqrt(distSq) / 14.0, 0.0, 1.0);
+                }
+                float env = age < 3.0 ? (float) (age / 3.0) : (float) Math.max(0.0, 1.0 - (age - 3.0) / 52.0);
+                peak = Math.max(peak, env * env * distFactor);
             }
-            float env = age < 3.0 ? (float) (age / 3.0) : (float) Math.max(0.0, 1.0 - (age - 3.0) / 52.0);
-            peak = Math.max(peak, env * env * distFactor);
         }
         return Mth.clamp(peak, 0f, 1f);
     }
@@ -226,14 +322,20 @@ public final class ReplaySkillEffectRegistry {
     public static List<ReplaySkillFallbackHud.ToastEntry> collectFallbackToasts(
             ReplayBoardModel model, double matchTick, @Nullable Predicate<ReplaySkillFallbackHud.ToastEntry> filter) {
         if (model == null) return List.of();
+        SkillIndex index = model.skillIndex(false);
+        List<SkillSignal> signals = index.signals();
+        if (signals.isEmpty()) return List.of();
         List<ReplaySkillFallbackHud.ToastEntry> out = new ArrayList<>();
-        for (SkillSignal s : model.skillSignals(false)) {
+        int start = SkillIndex.lowerBound(signals, matchTick - ReplaySkillFallbackHud.TOAST_DURATION_TICKS);
+        for (int i = start; i < signals.size(); i++) {
+            SkillSignal s = signals.get(i);
             double age = matchTick - s.tick();
-            if (age < 0 || age > ReplaySkillFallbackHud.TOAST_DURATION_TICKS) continue;
+            if (age < 0) break;
+            if (age > ReplaySkillFallbackHud.TOAST_DURATION_TICKS) continue;
             boolean needsToast = s.forceFallback()
                     || ((s.nodeKind() == null
                     || s.nodeKind() == LastMatchReplay.Kind.SKILL_RELEASE
-                    || s.nodeKind() == LastMatchReplay.Kind.ITEM_USED) && !hasNativeAdapter(s));
+                    || s.nodeKind() == LastMatchReplay.Kind.ITEM_USED) && index.adaptersAt(i).length == 0);
             if (!needsToast) continue;
             ReplayBoardModel.Actor actor = model.participant(s.actorUuid());
             String actorName = actor != null ? actor.p.name() : "Unknown";
@@ -250,31 +352,29 @@ public final class ReplaySkillEffectRegistry {
         return out;
     }
 
-    private static void paintSignals(RenderContext ctx, List<SkillSignal> signals, boolean video) {
-        for (SkillSignal s : signals) {
-            double age = ctx.matchTick() - s.tick();
-            double dur = Math.max(12.0, s.durationTicks() > 0 ? s.durationTicks() : defaultDurationTicks(s));
-            if (age < 0 || age > dur) continue;
+    private static void paintSignals(RenderContext ctx, SkillIndex index, boolean video) {
+        List<SkillSignal> signals = index.signals();
+        if (signals.isEmpty()) return;
+        double matchTick = ctx.matchTick();
+        int start = SkillIndex.lowerBound(signals, matchTick - index.maxDurationTicks());
+        for (int i = start; i < signals.size(); i++) {
+            SkillSignal s = signals.get(i);
+            double age = matchTick - s.tick();
+            if (age < 0) break;
+            double dur = index.durationAt(i);
+            if (age > dur) continue;
 
+            EffectAdapter[] adapters = index.adaptersAt(i);
             // ReplayVideoFx already paints standard node effects during export.
             if (video && s.nodeKind() != null && !s.forceFallback()
                     && ((s.nodeKind() != LastMatchReplay.Kind.SKILL_RELEASE
-                    && s.nodeKind() != LastMatchReplay.Kind.ITEM_USED) || hasNativeAdapter(s))) continue;
+                    && s.nodeKind() != LastMatchReplay.Kind.ITEM_USED) || adapters.length > 0)) continue;
 
             boolean handled = false;
-            if (!s.forceFallback()) {
-                String lower = s.id() == null ? "" : s.id().toLowerCase(Locale.ROOT);
-                EffectAdapter exact = lower.isEmpty() ? null : EXACT_ADAPTERS.get(lower);
-                if (exact != null) {
-                    handled = exact.render(ctx, s, age, dur);
-                }
-                if (!handled) {
-                    for (NamedAdapter adapter : ADAPTERS) {
-                        if (adapter.matcher().test(s) && adapter.adapter().render(ctx, s, age, dur)) {
-                            handled = true;
-                            break;
-                        }
-                    }
+            for (EffectAdapter adapter : adapters) {
+                if (adapter.render(ctx, s, age, dur)) {
+                    handled = true;
+                    break;
                 }
             }
             if (!handled) {

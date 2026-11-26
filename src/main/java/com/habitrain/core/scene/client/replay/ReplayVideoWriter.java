@@ -12,6 +12,9 @@ interface ReplayVideoWriter extends AutoCloseable {
 
     void finish() throws IOException;
 
+    /** Best-effort asynchronous abort to unblock a stalled writer thread on cancellation. */
+    default void abort() {}
+
     @Override
     void close() throws IOException;
 }

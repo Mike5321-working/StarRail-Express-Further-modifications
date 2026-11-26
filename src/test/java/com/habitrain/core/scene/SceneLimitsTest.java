@@ -9,9 +9,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class SceneLimitsTest {
     @Test
-    void axisLimitIsExactlyThirtyTwoChunks() {
-        assertEquals(32, SceneLimits.MAX_AXIS_CHUNKS);
-        assertEquals(512, SceneLimits.MAX_AXIS_LENGTH);
+    void axisLimitCoversSixteenChunkViewDistanceWithHeadroom() {
+        assertEquals(36, SceneLimits.MAX_AXIS_CHUNKS);
+        assertEquals(576, SceneLimits.MAX_AXIS_LENGTH);
     }
 
     @Test

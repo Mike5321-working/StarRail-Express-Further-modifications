@@ -100,6 +100,39 @@ class ReplayFfmpegManagerTest {
         assertFalse(ReplayFfmpegManager.probeExecutable(bogus));
     }
 
+    @Test
+    void stalledDownloadAbortsPromptlySoMirrorFailoverCanProceed(@TempDir Path tempDir) throws Exception {
+        var releaseServer = new java.util.concurrent.CountDownLatch(1);
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/stalled", ex -> {
+            ex.sendResponseHeaders(200, 1024 * 1024);
+            ex.getResponseBody().write(new byte[]{1, 2, 3, 4});
+            ex.getResponseBody().flush();
+            try {
+                releaseServer.await(5, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            try { ex.close(); } catch (RuntimeException ignored) {}
+        });
+        server.start();
+        try {
+            int port = server.getAddress().getPort();
+            var client = java.net.http.HttpClient.newHttpClient();
+            Path dest = tempDir.resolve("stalled.gz.part");
+            long startNs = System.nanoTime();
+            IOException ex = assertThrows(IOException.class, () -> ReplayFfmpegManager.downloadAndVerifyGzip(
+                    client, "http://127.0.0.1:" + port + "/stalled", dest,
+                    1024 * 1024, "0".repeat(64), java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(250)));
+            long elapsedMs = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
+            assertTrue(ex.getMessage().contains("stalled"), "Expected stall message, got: " + ex.getMessage());
+            assertTrue(elapsedMs < 3000, "Stalled download should abort well under 3s, took " + elapsedMs + " ms");
+        } finally {
+            releaseServer.countDown();
+            server.stop(0);
+        }
+    }
+
     private static byte[] gzip(byte[] raw) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         try (GZIPOutputStream gz = new GZIPOutputStream(out)) {

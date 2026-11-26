@@ -17,6 +17,7 @@ import com.habitrain.core.scene.replay.ReplayVoiceData.RecordedVoicePolicy;
 import com.habitrain.core.scene.replay.ReplayVoiceData.SpeakerStateSpan;
 import com.habitrain.core.scene.replay.ReplayVoiceData.VoiceTimelineMeta;
 import com.habitrain.core.scene.replay.ReplayVoiceData.VoiceUtterance;
+import com.habitrain.core.scene.server.SceneBandwidthGovernor;
 import io.netty.buffer.Unpooled;
 import net.minecraft.network.FriendlyByteBuf;
 import org.junit.jupiter.api.Test;
@@ -37,6 +38,28 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class GlobalVoiceAndSoundArchiveTest {
     @TempDir Path tempDir;
+
+    @Test
+    void archiveGroupsSmallSectionPacketsInOrderWithinBandwidth() {
+        var lane = new ReplayArchiveService.TransferLane<Integer>(1);
+        UUID player = UUID.randomUUID();
+        long[] time = {0};
+        var bandwidth = new SceneBandwidthGovernor(() -> time[0], 4_000_000);
+        var sent = new ArrayList<Integer>();
+        var input = List.of(7001, 7002, 7003, 7004, 7005);
+        assertTrue(lane.installIfCurrent(player, lane.begin(player), input.iterator()));
+        Runnable drain = () -> lane.drain(id -> true, id -> false, Integer::intValue, packet -> true,
+                bandwidth, 1_000_000, (id, packet) -> sent.add(packet));
+
+        drain.run();
+        assertEquals(input.subList(0, 3), sent);
+        drain.run();
+        assertEquals(input.subList(0, 3), sent);
+        time[0] = 25_000_000;
+        drain.run();
+        assertEquals(input, sent);
+        assertFalse(lane.hasActive(player));
+    }
 
     @Test
     void voiceDeliveryClipsPrivateAudioAtGroupBoundaryAndRejectsObservers() {

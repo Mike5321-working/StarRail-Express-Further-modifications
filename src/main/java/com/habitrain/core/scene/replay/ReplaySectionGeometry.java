@@ -2,7 +2,6 @@ package com.habitrain.core.scene.replay;
 
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
 import com.habitrain.core.api.scene.asset.SceneAssetCodec;
-import com.habitrain.core.api.scene.SceneLimits;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.scene.server.SceneCaptureService;
 import net.minecraft.SharedConstants;
@@ -37,9 +36,7 @@ public final class ReplaySectionGeometry {
     }
 
     public static boolean supported(SceneBounds bounds) {
-        return !bounds.isEmpty() && bounds.totalSections() <= ReplayMapManifest.MAX_SECTIONS
-                && bounds.sizeX() <= SceneLimits.MAX_AXIS_LENGTH && bounds.sizeY() <= SceneLimits.MAX_AXIS_LENGTH
-                && bounds.sizeZ() <= SceneLimits.MAX_AXIS_LENGTH;
+        return ReplayMapManifest.supportsBounds(bounds);
     }
 
     public record Snapshot(SceneAssetCodec.SectionData data, int crc, SceneBounds occupied) {}
@@ -58,15 +55,39 @@ public final class ReplaySectionGeometry {
 
     public static @Nullable Snapshot capture(int sx, int sy, int sz, PalettedContainer<BlockState> states,
                                              SceneBounds clip, @Nullable Level level) {
+        byte[] sky;
+        byte[] block;
+        if (level == null) {
+            sky = defaultSkyLight();
+            block = new byte[2048];
+        } else {
+            SectionPos sectionPos = SectionPos.of(sx, sy, sz);
+            sky = captureLightBytes(level, LightLayer.SKY, sectionPos);
+            block = captureLightBytes(level, LightLayer.BLOCK, sectionPos);
+        }
+        return captureFromCopied(sx, sy, sz, states, clip, sky, block);
+    }
+
+    /**
+     * Pure off-thread-safe geometry extraction from an already-copied {@link PalettedContainer} and
+     * pre-captured light byte arrays. Never touches {@link Level} or live chunks.
+     */
+    public static @Nullable Snapshot captureFromCopied(int sx, int sy, int sz, PalettedContainer<BlockState> states,
+                                                       SceneBounds clip, byte[] sky, byte[] block) {
         int x0 = sx << 4, y0 = sy << 4, z0 = sz << 4;
+        int yStart = Math.max(0, clip.minY() - y0), yEnd = Math.min(16, clip.maxY() - y0);
+        int zStart = Math.max(0, clip.minZ() - z0), zEnd = Math.min(16, clip.maxZ() - z0);
+        int xStart = Math.max(0, clip.minX() - x0), xEnd = Math.min(16, clip.maxX() - x0);
+        if (yStart >= yEnd || zStart >= zEnd || xStart >= xEnd) return null;
         int xMin = 16, yMin = 16, zMin = 16, xMax = 0, yMax = 0, zMax = 0;
         var ids = new IdentityHashMap<BlockState, Short>();
         var palette = new ArrayList<String>();
         palette.add(SceneAssetCodec.AIR_BLOCK_ID);
         short[] cells = new short[4096];
-        for (int y = Math.max(0, clip.minY() - y0); y < Math.min(16, clip.maxY() - y0); y++) {
-            for (int z = Math.max(0, clip.minZ() - z0); z < Math.min(16, clip.maxZ() - z0); z++) {
-                for (int x = Math.max(0, clip.minX() - x0); x < Math.min(16, clip.maxX() - x0); x++) {
+        for (int y = yStart; y < yEnd; y++) {
+            for (int z = zStart; z < zEnd; z++) {
+                int row = (y << 8) | (z << 4);
+                for (int x = xStart; x < xEnd; x++) {
                     BlockState state = states.get(x, y, z);
                     if (state.isAir()) continue;
                     Short id = ids.get(state);
@@ -75,29 +96,30 @@ public final class ReplaySectionGeometry {
                         ids.put(state, id);
                         palette.add(SceneCaptureService.serializeBlockState(state));
                     }
-                    cells[(y << 8) | (z << 4) | x] = id;
-                    xMin = Math.min(xMin, x); yMin = Math.min(yMin, y); zMin = Math.min(zMin, z);
-                    xMax = Math.max(xMax, x + 1); yMax = Math.max(yMax, y + 1); zMax = Math.max(zMax, z + 1);
+                    cells[row | x] = id;
+                    if (x < xMin) xMin = x;
+                    if (y < yMin) yMin = y;
+                    if (z < zMin) zMin = z;
+                    if (x + 1 > xMax) xMax = x + 1;
+                    if (y + 1 > yMax) yMax = y + 1;
+                    if (z + 1 > zMax) zMax = z + 1;
                 }
             }
         }
         if (ids.isEmpty()) return null;
-        byte[] sky;
-        byte[] block;
-        if (level == null) {
-            sky = new byte[2048];
-            Arrays.fill(sky, (byte) 0xff);
-            block = new byte[2048];
-        } else {
-            SectionPos sectionPos = SectionPos.of(sx, sy, sz);
-            sky = captureLight(level, LightLayer.SKY, sectionPos);
-            block = captureLight(level, LightLayer.BLOCK, sectionPos);
-        }
-        var data = new SceneAssetCodec.SectionData(sx, sy, sz, List.copyOf(palette), cells, sky, block);
+        byte[] safeSky = sky != null && sky.length == 2048 ? sky : defaultSkyLight();
+        byte[] safeBlock = block != null && block.length == 2048 ? block : new byte[2048];
+        var data = new SceneAssetCodec.SectionData(sx, sy, sz, List.copyOf(palette), cells, safeSky, safeBlock);
         return new Snapshot(data, crc(data), new SceneBounds(x0 + xMin, y0 + yMin, z0 + zMin, x0 + xMax, y0 + yMax, z0 + zMax));
     }
 
-    private static byte[] captureLight(Level level, LightLayer layer, SectionPos section) {
+    public static byte[] defaultSkyLight() {
+        byte[] sky = new byte[2048];
+        Arrays.fill(sky, (byte) 0xff);
+        return sky;
+    }
+
+    public static byte[] captureLightBytes(Level level, LightLayer layer, SectionPos section) {
         var data = level.getLightEngine().getLayerListener(layer).getDataLayerData(section);
         if (data != null) return data.copy().getData();
 

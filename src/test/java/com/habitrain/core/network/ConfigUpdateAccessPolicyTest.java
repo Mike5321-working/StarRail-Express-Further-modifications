@@ -194,15 +194,16 @@ class ConfigUpdateAccessPolicyTest {
 
     @SuppressWarnings("deprecation")
     @Test
-    void sceneBoundsAcceptThirtyTwoChunksButRejectOneExtraBlock() {
+    void sceneBoundsAcceptConfiguredMaxChunksButRejectOneExtraBlock() {
+        int maxAxis = com.habitrain.core.api.scene.SceneLimits.MAX_AXIS_LENGTH;
         JsonObject authoritative = parse("{\"profiles\":{}}");
         String accepted = "{\"sceneMotion\":{\"profiles\":{\"map\":{"
-                + "\"sourceBounds\":{\"min\":[0,0,0],\"maxExclusive\":[512,16,16]}}}}}";
+                + "\"sourceBounds\":{\"min\":[0,0,0],\"maxExclusive\":[" + maxAxis + ",16,16]}}}}}";
         assertDoesNotThrow(() -> ConfigUpdateAccessPolicy.filterAdminSceneProfile(
                 accepted, "map", authoritative));
 
         String rejected = "{\"sceneMotion\":{\"profiles\":{\"map\":{"
-                + "\"sourceBounds\":{\"min\":[0,0,0],\"maxExclusive\":[513,16,16]}}}}}";
+                + "\"sourceBounds\":{\"min\":[0,0,0],\"maxExclusive\":[" + (maxAxis + 1) + ",16,16]}}}}}";
         assertThrows(IllegalArgumentException.class, () ->
                 ConfigUpdateAccessPolicy.filterAdminSceneProfile(rejected, "map", authoritative));
     }

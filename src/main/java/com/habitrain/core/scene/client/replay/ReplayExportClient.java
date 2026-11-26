@@ -21,6 +21,7 @@ import java.util.function.Supplier;
 public final class ReplayExportClient {
     private static ReplayVideoExport video;
     private static Supplier<ClientReplayBoard.View> voiceSource;
+    private static @Nullable Component lastStartError;
     private static long finishedAt;
     private static long nextAccessRequest;
     private static java.util.UUID pinnedRound;
@@ -44,9 +45,14 @@ public final class ReplayExportClient {
 
     public static void tickForeground(Minecraft client) {
         if (!foreground()) return;
-        if (video == null || !video.running() || video.finalizing()) { leaveForeground(client, true); return; }
+        if (video == null || !video.inForeground()) { leaveForeground(client, true); return; }
         if (client.level == null || client.player == null || client.getOverlay() != null) return;
         if (!(client.screen instanceof PlaybackScreen)) {
+            if (client.screen instanceof net.minecraft.client.gui.screens.ReceivingLevelScreen
+                    || client.screen instanceof net.minecraft.client.gui.screens.ProgressScreen
+                    || client.screen instanceof net.minecraft.client.gui.screens.GenericMessageScreen) {
+                return;
+            }
             if (client.screen instanceof net.minecraft.client.gui.screens.DeathScreen) {
                 video.cancel();
                 leaveForeground(client, false);
@@ -103,8 +109,19 @@ public final class ReplayExportClient {
 
     static ReplayVideoExport current() { return video; }
 
+    static @Nullable Component lastStartError() { return lastStartError; }
+
+    static void clearStartError() { lastStartError = null; }
+
+    static void acknowledgeFailure(@Nullable ReplayVideoExport seen) {
+        if (seen != null && video == seen && seen.failed() && !seen.encoderBusy()) {
+            video = null;
+            finishedAt = 0;
+        }
+    }
+
     static ReplayVideoExport forScreen(ReplayVideoExport shown) {
-        return video != null && (video == shown || video.running()) ? video : null;
+        return video != null && (video == shown || video.running() || video.failed()) ? video : null;
     }
 
     static boolean canStart() {
@@ -151,13 +168,29 @@ public final class ReplayExportClient {
     static @Nullable ReplayVideoExport start(ClientReplayBoard.View view, ReplayExportContentOptions options,
                                              ReplayExportResolution resolution, boolean compress, ReplayExportQuality quality,
                                              Supplier<ClientReplayBoard.View> source, boolean preferSimple) {
-        if (!canStart() || !mapReady(view) || (!compress && !resolution.aviSupported())) return null;
+        lastStartError = null;
+        if (!canStart()) {
+            lastStartError = ReplayBoardTexts.tr("export.start_busy");
+            return null;
+        }
+        if (!mapReady(view)) {
+            lastStartError = ReplayBoardTexts.tr("export.start_map_not_ready");
+            return null;
+        }
+        if (!compress && !resolution.aviSupported()) {
+            lastStartError = ReplayBoardTexts.tr("export.start_avi_unsupported");
+            return null;
+        }
         java.nio.file.Path ffmpeg = null;
         if (compress) {
             Minecraft mc = Minecraft.getInstance();
             java.nio.file.Path gameDir = mc != null ? mc.gameDirectory.toPath() : null;
-            ffmpeg = ReplayFfmpegManager.resolveAvailable(gameDir);
-            if (ffmpeg == null) return null;
+            ffmpeg = ReplayFfmpegManager.peekAvailable(gameDir);
+            if (ffmpeg == null) {
+                lastStartError = ReplayBoardTexts.tr(
+                        ReplayFfmpegManager.isProbing() ? "export.ffmpeg_probing" : "export.start_ffmpeg_missing");
+                return null;
+            }
         }
         releasePinnedRound();
         video = new ReplayVideoExport(view, options, resolution, compress, quality, ffmpeg,
@@ -168,7 +201,7 @@ public final class ReplayExportClient {
         nextAccessRequest = 0;
         if (!ClientPlayNetworking.canSend(RequestVoiceExportC2S.TYPE)) video.setVoiceExportAllowed(false);
         finishedAt = 0;
-        if (video.backend == ReplayExportBackend.NATIVE) {
+        if (video.inForeground()) {
             var client = Minecraft.getInstance();
             foregroundId = java.util.UUID.randomUUID();
             previousScreen = client.screen;
@@ -196,6 +229,7 @@ public final class ReplayExportClient {
         releasePinnedRound();
         video = null;
         voiceSource = null;
+        lastStartError = null;
         finishedAt = 0;
     }
 
@@ -248,7 +282,7 @@ public final class ReplayExportClient {
             nextAccessRequest = now + TimeUnit.SECONDS.toNanos(3);
         }
         if (video.running()) video.renderNext(client, voiceSource);
-        if (foreground() && (!video.running() || video.finalizing())) leaveForeground(client, true);
+        if (foreground() && !video.inForeground()) leaveForeground(client, true);
         if (!video.waitingForVoice()) voiceSource = null;
 
         if (!video.running() && finishedAt == 0) {

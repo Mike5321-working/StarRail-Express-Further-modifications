@@ -9,6 +9,21 @@ import static org.junit.jupiter.api.Assertions.*;
  * 分批策略的边界：小场景必须保持单份网格（与历史行为一致），大场景才按最长轴切。
  */
 class SceneMeshBatchPolicyTest {
+    @Test
+    void largeReplayUsesBalancedChunkAlignedBatchesOnBothHorizontalAxes() {
+        var bounds = new SceneBounds(-191, 0, 17, 0, 112, 208);
+        var plan = SceneMeshBatchPolicy.replayPlan(1008, 512, bounds);
+        assertEquals(6, plan.columns());
+        assertEquals(6, plan.rows());
+        var sectionsPerBatch = new int[plan.batchCount()];
+        for (int relZ = 0; relZ < 12; relZ++) {
+            for (int relX = 0; relX < 12; relX++) {
+                sectionsPerBatch[plan.batchIndex(relX, relZ)] += 7;
+            }
+        }
+        for (int sections : sectionsPerBatch) assertEquals(28, sections);
+    }
+
 
     /** 64 格见方：真实资产里最大的那种（64 个 Section）。 */
     private static final SceneBounds SMALL = new SceneBounds(0, 0, 0, 64, 64, 64);

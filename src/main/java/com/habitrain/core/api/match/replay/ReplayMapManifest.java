@@ -1,5 +1,6 @@
 package com.habitrain.core.api.match.replay;
 
+import com.habitrain.core.api.scene.SceneLimits;
 import com.habitrain.core.api.scene.model.SceneBounds;
 
 import java.util.BitSet;
@@ -11,14 +12,14 @@ import java.util.function.Function;
 /** The stable list index is the section's wire identifier. Offsets are relative to sourceBounds.minSection*. */
 public record ReplayMapManifest(String mapKey, String dimension, SceneBounds sourceBounds,
                                 String hash, List<Entry> sections) {
-    public static final int MAX_SECTIONS = 1024;
+    public static final int MAX_SECTIONS = 6144;
 
     public ReplayMapManifest {
         Objects.requireNonNull(mapKey);
         Objects.requireNonNull(dimension);
         Objects.requireNonNull(sourceBounds);
         if (!hash.matches("[0-9a-f]{64}") || sections.isEmpty() || sections.size() > MAX_SECTIONS
-                || sourceBounds.totalSections() > MAX_SECTIONS) {
+                || !supportsBounds(sourceBounds)) {
             throw new IllegalArgumentException("Invalid replay manifest");
         }
         sections = List.copyOf(sections);
@@ -31,6 +32,12 @@ public record ReplayMapManifest(String mapKey, String dimension, SceneBounds sou
                 throw new IllegalArgumentException("Invalid replay section position");
             }
         }
+    }
+
+    public static boolean supportsBounds(SceneBounds bounds) {
+        return !bounds.isEmpty() && bounds.totalSections() <= SceneLimits.MAX_MESH_SECTIONS
+                && bounds.sizeX() <= SceneLimits.MAX_AXIS_LENGTH && bounds.sizeY() <= SceneLimits.MAX_AXIS_LENGTH
+                && bounds.sizeZ() <= SceneLimits.MAX_AXIS_LENGTH;
     }
 
     public BitSet missing(Function<Section, Integer> cachedFingerprint) {

@@ -61,7 +61,26 @@ final class ReplayDioramaMesh {
     static @Nullable Key builtKey() { return selected == null ? null : selected.builtKey; }
     static boolean matches(@Nullable SceneAssetCodec.AssetData asset) { return selected != null && selected.matches(asset); }
 
-    static boolean failed(Key key) { return selected != null && key.equals(selected.failedKey); }
+    /** Returns an already-built neighbor-culled replay mesh matching {@code asset} without triggering a new build. */
+    static @Nullable SceneMeshSet readyCutaway(@Nullable SceneAssetCodec.AssetData asset) {
+        if (asset == null) return null;
+        Slot slot = slots.get(asset.fingerprint);
+        return slot != null && slot.matches(asset) ? slot.current() : null;
+    }
+
+    /**
+     * Resolves the shared neighbor-culled 2D-batched mesh for 1:1 POV views. Because replay table
+     * meshes now use standard neighbor culling as well, both views share one GPU VBO slot pool.
+     */
+    static @Nullable SceneMeshSet resolveSolid(@Nullable SceneAssetCodec.AssetData asset, int present, int total) {
+        if (asset == null || asset.sections.isEmpty()) return null;
+        Slot slot = slots.computeIfAbsent(asset.fingerprint, key -> new Slot(false));
+        while (slots.size() > 5) slots.pollFirstEntry().getValue().reset();
+        slot.update(asset, present, total);
+        return slot.matches(asset) ? slot.current() : null;
+    }
+
+    static boolean failed(Key key) { return selected != null && selected.hasFailed(key); }
 
     static void retry(String fingerprint) {
         Slot slot = slots.get(fingerprint);
@@ -70,7 +89,7 @@ final class ReplayDioramaMesh {
 
     /**
      * Prepares (and caches) a {@link DynamicWorld} combining an immutable static base asset (with
-     * dynamic coordinates masked out so surrounding faces stay closed via {@code retainHiddenFaces})
+     * dynamic coordinates masked out so surrounding faces stay closed under neighbor culling)
      * and an O(log N) tick-indexed dynamic block state overlay for seek-safe door/wall replay.
      */
     static @Nullable DynamicWorld prepareDynamic(@Nullable SceneAssetCodec.AssetData baseAsset,
@@ -85,7 +104,7 @@ final class ReplayDioramaMesh {
         if (cached != null) return cached;
         DynamicWorld created = DynamicWorld.create(baseAsset, origin, deltas, cacheKey);
         dynamicCache.put(cacheKey, created);
-        while (dynamicCache.size() > 6) dynamicCache.pollFirstEntry();
+        while (dynamicCache.size() > 6) dynamicCache.pollFirstEntry().getValue().close();
         return created;
     }
 
@@ -117,12 +136,16 @@ final class ReplayDioramaMesh {
 
     static void tickIdle() {
         long now = System.nanoTime();
-        var iterator = slots.values().iterator();
+        evictIdle(slots, now, true);
+    }
+
+    private static void evictIdle(Map<String, Slot> map, long now, boolean clearSelected) {
+        var iterator = map.values().iterator();
         while (iterator.hasNext()) {
             var slot = iterator.next();
             if (now - slot.lastUse > IDLE_RELEASE_NS) {
                 slot.reset();
-                if (slot == selected) selected = null;
+                if (clearSelected && slot == selected) selected = null;
                 iterator.remove();
             }
         }
@@ -131,6 +154,7 @@ final class ReplayDioramaMesh {
     static void reset() {
         slots.values().forEach(Slot::reset);
         slots.clear();
+        dynamicCache.values().forEach(DynamicWorld::close);
         dynamicCache.clear();
         ReplayPovTerrain.reset();
         ReplayFirstPersonHands.reset();
@@ -158,6 +182,17 @@ final class ReplayDioramaMesh {
         private final Map<Long, DoorBlockEntity> replayDoors = new HashMap<>();
         private int cachedRevision = -1;
         private Map<Long, ResolvedBlock> cachedStates = Map.of();
+        private int bakedMeshRevision = -1;
+        private @Nullable SceneMeshSet bakedMesh;
+        private List<ResolvedBlock> bakedFallbacks = List.of();
+
+        void close() {
+            SceneMeshSet old = bakedMesh;
+            bakedMesh = null;
+            bakedMeshRevision = -1;
+            bakedFallbacks = List.of();
+            if (old != null) old.close();
+        }
 
         private record BlockChange(int tick, ResolvedBlock state) {}
 
@@ -317,6 +352,86 @@ final class ReplayDioramaMesh {
         }
 
         /**
+         * Renders all standard model dynamic blocks via a revision-cached static {@link SceneMeshSet}
+         * inside the active {@code SceneShaders} scope (sharing terrain lighting, blackout dim, scan clip
+         * and fan cutaway), rebuilding only when the block-delta revision changes.
+         */
+        void renderStaticBatched(Minecraft mc, Matrix4f modelView, Matrix4f projection, ReplayFanCutaway fans,
+                                 float minX, float minZ, float maxX, float maxZ, int scanAxis, float scanLimit,
+                                 double matchTick) {
+            if (sortedDeltas.isEmpty() || mc == null) return;
+            ensureBakedMesh(mc, matchTick);
+            if (bakedMesh != null && !bakedMesh.isEmpty() && !bakedMesh.isClosed()) {
+                ReplayTerrainRenderer.draw(bakedMesh, modelView, projection, fans,
+                        minX, minZ, maxX, maxZ, scanAxis, scanLimit);
+            }
+        }
+
+        /** Renders only non-static animated block-entity fallbacks (if any) for the current revision. */
+        void renderDynamicFallbacks(Minecraft mc, Matrix4f modelToCamera, MultiBufferSource buffers,
+                                    double matchTick, @Nullable ReplayFanCutaway fanCutaway, int packedLight) {
+            if (sortedDeltas.isEmpty() || mc == null) return;
+            ensureBakedMesh(mc, matchTick);
+            if (bakedFallbacks.isEmpty()) return;
+            BlockRenderDispatcher dispatcher = mc.getBlockRenderer();
+            int fallbackLight = packedLight == 0 ? LightTexture.FULL_BRIGHT : packedLight;
+            PoseStack stack = new PoseStack();
+            for (int i = 0; i < bakedFallbacks.size(); i++) {
+                ResolvedBlock rb = bakedFallbacks.get(i);
+                if (fanCutaway != null && fanCutaway.removes(rb.localX() + 0.5, rb.localY() + 0.5, rb.localZ() + 0.5)) {
+                    continue;
+                }
+                BlockState state = parsedCache.computeIfAbsent(rb.stateString(), SceneMeshBuilder::parseBlockState);
+                if (state == null || state.isAir() || state.getBlock() == Blocks.AIR) continue;
+                stack.pushPose();
+                stack.mulPose(modelToCamera);
+                stack.translate(rb.localX(), rb.localY(), rb.localZ());
+                if (isSreOpenDoor(state)) applyOpenDoorSwing(stack, state);
+                dispatcher.renderSingleBlock(state, stack, buffers, fallbackLight, OverlayTexture.NO_OVERLAY);
+                stack.popPose();
+            }
+        }
+
+        private void ensureBakedMesh(Minecraft mc, double matchTick) {
+            Map<Long, ResolvedBlock> active = resolveAt(matchTick);
+            if (bakedMeshRevision == cachedRevision) return;
+            SceneMeshSet previous = bakedMesh;
+            bakedMesh = null;
+            bakedMeshRevision = cachedRevision;
+            if (previous != null) previous.close();
+            if (active.isEmpty()) {
+                bakedFallbacks = List.of();
+                return;
+            }
+            List<SceneMeshBuilder.DynamicBlockSpec> specs = new ArrayList<>(active.size());
+            List<ResolvedBlock> fallbacks = null;
+            for (ResolvedBlock rb : active.values()) {
+                BlockState state = parsedCache.computeIfAbsent(rb.stateString(), SceneMeshBuilder::parseBlockState);
+                if (state == null || state.isAir() || state.getBlock() == Blocks.AIR) continue;
+                if (state.getRenderShape() == net.minecraft.world.level.block.RenderShape.MODEL) {
+                    float yaw = 0f, hx = 0f, hz = 0f;
+                    if (isSreOpenDoor(state)) {
+                        net.minecraft.core.Direction facing = state.hasProperty(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING)
+                                ? state.getValue(net.minecraft.world.level.block.state.properties.BlockStateProperties.HORIZONTAL_FACING)
+                                : net.minecraft.core.Direction.NORTH;
+                        hx = 0.5f + facing.getClockWise().getStepX() * 0.44f;
+                        hz = 0.5f + facing.getClockWise().getStepZ() * 0.44f;
+                        yaw = 88f;
+                    }
+                    specs.add(new SceneMeshBuilder.DynamicBlockSpec(
+                            rb.localX(), rb.localY(), rb.localZ(), state, yaw, hx, hz));
+                } else {
+                    if (fallbacks == null) fallbacks = new ArrayList<>();
+                    fallbacks.add(rb);
+                }
+            }
+            bakedFallbacks = fallbacks == null ? List.of() : List.copyOf(fallbacks);
+            if (!specs.isEmpty()) {
+                bakedMesh = SceneMeshBuilder.buildDynamicBlocksMesh(staticAsset, specs);
+            }
+        }
+
+        /**
          * Renders all active non-air dynamic blocks (doors, windows, breakable walls) at {@code matchTick}
          * in the exact same local source coordinate frame as the static {@link SceneMeshSet}.
          */
@@ -397,6 +512,7 @@ final class ReplayDioramaMesh {
     }
 
     static final class Slot {
+        private final boolean cutaway;
         private @Nullable SceneMeshSet mesh;
         private @Nullable Key builtKey;
         private @Nullable Key failedKey;
@@ -405,6 +521,10 @@ final class ReplayDioramaMesh {
         private Object ticket = new Object();
         private long lastSubmit, lastUse;
         private long retryAfter;
+
+        Slot() { this(true); }
+
+        Slot(boolean cutaway) { this.cutaway = cutaway; }
 
 
 
@@ -440,7 +560,9 @@ final class ReplayDioramaMesh {
             lastSubmit = System.nanoTime();
             CompletableFuture<SceneMeshBuilder.MeshBuildResult> future;
             try {
-                future = SceneMeshBuilder.buildCutawayMeshAsync(asset, SceneBuildScheduler.Priority.ADDITIONAL);
+                future = cutaway
+                        ? SceneMeshBuilder.buildCutawayMeshAsync(asset, SceneBuildScheduler.Priority.ADDITIONAL)
+                        : SceneMeshBuilder.buildSolidReplayMeshAsync(asset, SceneBuildScheduler.Priority.ADDITIONAL);
             } catch (RuntimeException failure) {
                 failedKey = key;
                 retryAfter = System.nanoTime() + FAILURE_RETRY_NS;
@@ -470,15 +592,23 @@ final class ReplayDioramaMesh {
 
         @Nullable Key installedKey() { return builtKey; }
 
+        boolean hasFailed(Key key) { return key.equals(failedKey); }
+
         void installBuilt(Key key, @Nullable SceneMeshSet built, @Nullable Throwable failure) {
             if (failure != null || built == null || built.isClosed() || built.isEmpty()) {
                 if (built != null) built.close();
-                if (failure != null && !(failure instanceof java.util.concurrent.CancellationException)) {
-                    LOGGER.warn("Replay diorama mesh build failed", failure);
+                Throwable cause = failure instanceof java.util.concurrent.CompletionException ce && ce.getCause() != null
+                        ? ce.getCause() : failure;
+                if (cause instanceof java.util.concurrent.CancellationException) {
+                    // Aborted across a level switch or superseded build: keep failedKey clear so the new level rebuilds cleanly.
+                    return;
+                }
+                if (cause != null) {
+                    LOGGER.warn("Replay diorama mesh build failed", cause);
                 }
                 // Remember the key so a failing input does not resubmit every frame.
                 failedKey = key;
-                retryAfter = failure == null ? 0 : System.nanoTime() + FAILURE_RETRY_NS;
+                retryAfter = cause == null ? 0 : System.nanoTime() + FAILURE_RETRY_NS;
                 return;
             }
             SceneMeshSet previous = mesh;

@@ -24,6 +24,11 @@ final class SceneVertexBounds {
 
     double maxY() { return maxY; }
 
+    void reset() {
+        minX = minY = minZ = Double.POSITIVE_INFINITY;
+        maxX = maxY = maxZ = Double.NEGATIVE_INFINITY;
+    }
+
     SceneMeshSet.Batch batch(SceneMeshSet mesh) {
         // A tiny margin also keeps planar geometry from producing a zero-volume box.
         double margin = 0.001;

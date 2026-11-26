@@ -37,21 +37,27 @@ final class ReplayForegroundChunks {
     private final Deque<ChunkPos> pending = new ArrayDeque<>();
     private final Map<ChunkPos, List<com.habitrain.core.network.replay.VisualTape.Event>> visualEvents = new HashMap<>();
     private final Map<ChunkPos, Integer> cursors = new HashMap<>();
+    private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(ReplayForegroundChunks.class);
     private final Map<BlockPos, io.wifi.starrailexpress.content.block_entity.DoorBlockEntity> animating = new HashMap<>();
     private int visualTick = -1;
     private int lastRecordedState = -1;
+    private boolean sodiumFailed;
 
-    void visualEvents(List<com.habitrain.core.network.replay.VisualTape.Event> events) throws java.io.IOException {
+    void visualEvents(List<com.habitrain.core.network.replay.VisualTape.Event> events) {
         for (var event : events) {
             if (event.kind() != com.habitrain.core.network.replay.VisualTape.BLOCK && event.kind() != com.habitrain.core.network.replay.VisualTape.TILE && event.kind() != com.habitrain.core.network.replay.VisualTape.STATE) continue;
-            if (event.kind()==com.habitrain.core.network.replay.VisualTape.STATE) lastRecordedState=event.tick();
-            var pos = BlockPos.of(event.input().readLong());
-            visualEvents.computeIfAbsent(new ChunkPos(pos), ignored -> new ArrayList<>()).add(event);
+            try {
+                if (event.kind()==com.habitrain.core.network.replay.VisualTape.STATE) lastRecordedState=event.tick();
+                var pos = BlockPos.of(event.input().readLong());
+                visualEvents.computeIfAbsent(new ChunkPos(pos), ignored -> new ArrayList<>()).add(event);
+            } catch (java.io.IOException | RuntimeException failure) {
+                LOGGER.debug("Skipped malformed replay visual block event at tick {}", event.tick(), failure);
+            }
         }
     }
 
     ReplayForegroundChunks(ClientLevel level, SceneAssetCodec.AssetData asset, SceneBounds origin,
-                           List<ReplayBlockDelta> deltas, int radius) throws ReflectiveOperationException {
+                           List<ReplayBlockDelta> deltas, int radius) {
         this.level = level;
         this.source = asset.sourceBounds;
         this.origin = origin;
@@ -61,14 +67,25 @@ final class ReplayForegroundChunks {
             var pos = new ChunkPos(source.minSectionX() + section.relX, source.minSectionZ() + section.relZ);
             columns.computeIfAbsent(pos, ignored -> new ArrayList<>()).add(section);
         }
+        Object sodiumTracker = null;
+        java.lang.reflect.Method sodiumLightReady = null;
         if (FabricLoader.getInstance().isModLoaded("sodium")) {
-            Class<?> holder = Class.forName("net.caffeinemc.mods.sodium.client.render.chunk.map.ChunkTrackerHolder");
-            tracker = holder.getMethod("sodium$getTracker").invoke(level);
-            lightReady = tracker.getClass().getMethod("onChunkStatusAdded", int.class, int.class, int.class);
-        } else { tracker = null; lightReady = null; }
+            try {
+                Class<?> holder = Class.forName("net.caffeinemc.mods.sodium.client.render.chunk.map.ChunkTrackerHolder");
+                sodiumTracker = holder.getMethod("sodium$getTracker").invoke(level);
+                sodiumLightReady = sodiumTracker == null ? null
+                        : sodiumTracker.getClass().getMethod("onChunkStatusAdded", int.class, int.class, int.class);
+            } catch (ReflectiveOperationException | LinkageError | RuntimeException failure) {
+                LOGGER.warn("Could not bind Sodium chunk tracker for replay export; continuing with vanilla chunk updates", failure);
+                sodiumTracker = null;
+                sodiumLightReady = null;
+            }
+        }
+        tracker = sodiumTracker;
+        lightReady = sodiumLightReady;
     }
 
-    boolean prepare(ChunkPos eye, double tick) throws ReflectiveOperationException, java.io.IOException {
+    boolean prepare(ChunkPos eye, double tick) {
         if ((int)tick < visualTick && !visualEvents.isEmpty()) {
             for (var pos : loaded) level.getChunkSource().drop(pos);
             loaded.clear(); cursors.clear(); animating.clear(); changes.clear(); originals.clear(); cursor = 0; center = null;
@@ -117,7 +134,13 @@ final class ReplayForegroundChunks {
         for (var pos : loaded) {
             var events = visualEvents.get(pos); if (events == null) continue;
             int index = cursors.getOrDefault(pos, 0);
-            while (index < events.size() && events.get(index).tick() <= tick) applyVisual(events.get(index++));
+            while (index < events.size() && events.get(index).tick() <= tick) {
+                var event = events.get(index++);
+                try { applyVisual(event); }
+                catch (java.io.IOException | RuntimeException failure) {
+                    LOGGER.debug("Skipped replay visual event at tick {}", event.tick(), failure);
+                }
+            }
             cursors.put(pos, index);
         }
         return pending.isEmpty();
@@ -152,7 +175,7 @@ final class ReplayForegroundChunks {
         level.setBlock(pos, state, 11);
     }
 
-    private void importColumn(ChunkPos pos) throws ReflectiveOperationException {
+    private void importColumn(ChunkPos pos) {
         var chunk = new LevelChunk(level, pos);
         List<BlockPos> entityPositions = new ArrayList<>();
         var sections = columns.getOrDefault(pos, List.of());
@@ -195,7 +218,14 @@ final class ReplayForegroundChunks {
         }
         engine.propagateLightSources(pos);
         installed.setLightCorrect(true);
-        if (tracker != null) lightReady.invoke(tracker, pos.x, pos.z, 3);
+        if (tracker != null && lightReady != null && !sodiumFailed) {
+            try {
+                lightReady.invoke(tracker, pos.x, pos.z, 3);
+            } catch (ReflectiveOperationException | RuntimeException failure) {
+                sodiumFailed = true;
+                LOGGER.warn("Sodium chunk light notification failed during replay export; continuing without it", failure);
+            }
+        }
         loaded.add(pos);
         changes.getOrDefault(pos, Map.of()).forEach(this::apply);
     }

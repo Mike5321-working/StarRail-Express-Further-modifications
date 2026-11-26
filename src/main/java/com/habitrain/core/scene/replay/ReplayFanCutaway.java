@@ -77,6 +77,16 @@ public final class ReplayFanCutaway {
 
     /** Conservatively reject openings which cannot reach any fragment in this batch. */
     public ShaderFans shaderFans(double minX, double minZ, double maxX, double maxY, double maxZ) {
+        int kept = selectAnchorsInto(minX, minZ, maxX, maxY, maxZ, selected);
+        return new ShaderFans(selected, kept, directionX, directionZ);
+    }
+
+    /**
+     * Conservatively selects fan anchors affecting the given AABB into caller-provided {@code dest}
+     * (length &ge; {@link #PACKED_FLOATS}) and returns the kept fan count.
+     */
+    public int selectAnchorsInto(double minX, double minZ, double maxX, double maxY, double maxZ, float[] dest) {
+        if (count == 0) return 0;
         projectAnchors();
         // The fragment shader moves its XZ sample halfway towards the owning voxel centre.
         double cx = (minX + maxX) * 0.5, cz = (minZ + maxZ) * 0.5;
@@ -91,9 +101,9 @@ public final class ReplayFanCutaway {
             double forward = forwardMax - projected[i];
             double sideways = Math.abs(side - projected[i + 2]) - sideExtent;
             if (forward < -radius || sideways > radius + Math.max(0, forward) * HALF_ANGLE_TANGENT) continue;
-            System.arraycopy(projected, i, selected, kept++ * 4, 4);
+            System.arraycopy(projected, i, dest, kept++ * 4, 4);
         }
-        return new ShaderFans(selected, kept, directionX, directionZ);
+        return kept;
     }
 
     private void projectAnchors() {

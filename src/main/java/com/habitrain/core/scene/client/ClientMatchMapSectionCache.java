@@ -106,6 +106,7 @@ final class ClientMatchMapSectionCache {
             int x = chunk.getPos().x, z = chunk.getPos().z;
             if (x < clip.minSectionX() || x > clip.maxSectionX() || z < clip.minSectionZ() || z > clip.maxSectionZ()) return;
             for (int y = clip.minSectionY(); y <= clip.maxSectionY(); y++) {
+                if (sections.size() + held.size() >= ReplayMapManifest.MAX_SECTIONS) return;
                 long key = SectionPos.asLong(x, y, z);
                 if (visited.contains(key) || held.containsKey(key)) continue;
                 int i = chunk.getSectionIndexFromSectionY(y);
@@ -138,7 +139,7 @@ final class ClientMatchMapSectionCache {
 
         void put(long key, ReplaySectionGeometry.Snapshot section) {
             visited.add(key);
-            if (section != null) sections.put(key, section);
+            if (section != null && sections.size() < ReplayMapManifest.MAX_SECTIONS) sections.put(key, section);
         }
     }
 }

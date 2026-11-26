@@ -138,4 +138,21 @@ public class SceneMeshBuilderPipelineTest {
         assertEquals(0x80202008,
                 SceneMeshBuilder.shadeArgb(0x80404010, 0.5f));
     }
+
+    @Test
+    public void testIsQuotaExceededUnwrapsReportedException() {
+        var direct = new SceneMeshBuilder.QuotaExceededException("Scene VBO vertex data exceeds configured mesh quota (512 MiB)");
+        assertTrue(SceneMeshBuilder.isQuotaExceeded(direct));
+
+        var wrapped = new net.minecraft.ReportedException(
+                net.minecraft.CrashReport.forThrowable(direct, "Tesselating block in world"));
+        assertTrue(SceneMeshBuilder.isQuotaExceeded(wrapped),
+                "ReportedException wrapping QuotaExceededException must be detected");
+
+        var deeplyWrapped = new RuntimeException("outer", wrapped);
+        assertTrue(SceneMeshBuilder.isQuotaExceeded(deeplyWrapped));
+
+        assertFalse(SceneMeshBuilder.isQuotaExceeded(new IllegalStateException("other error")));
+        assertFalse(SceneMeshBuilder.isQuotaExceeded(null));
+    }
 }

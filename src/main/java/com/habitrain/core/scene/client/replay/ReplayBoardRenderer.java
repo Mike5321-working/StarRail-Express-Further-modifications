@@ -177,6 +177,8 @@ public final class ReplayBoardRenderer {
             ReplayAudioPlaybackController.endBoardFrame(mc, Set.of());
             return;
         }
+        var profiler = mc.getProfiler();
+        profiler.push("habitrainReplayBoards");
         try {
             renderBoards(context, mc, level, loaded);
         } catch (RuntimeException failure) {
@@ -186,6 +188,8 @@ public final class ReplayBoardRenderer {
             releaseBuffers();
             ReplayAudioPlaybackController.endBoardFrame(mc, Set.of());
             LOGGER.error("Settlement board rendering paused after an unexpected failure", failure);
+        } finally {
+            profiler.pop();
         }
     }
 
@@ -460,7 +464,7 @@ public final class ReplayBoardRenderer {
                 Matrix4f display = ReplayBoardPlacement.displayMatrix(table, c.settings(), ReplayBoardSite.MAP_BASE);
                 var site = new ReplayBoardSite(c.pos(), c.facing(), c.distance(), display, table, c.settings().scale(),
                         WORLD_TRAY_HALF_SIZE, WORLD_TRAY_HALF_SIZE, fade,
-                        c.distance() < ReplayStagePlan.DETAIL_DISTANCE * distScale, light);
+                        c.distance() < ReplayStagePlan.DETAIL_DISTANCE * ReplayStagePlan.detailScale(c.settings().scale()), light);
 
                 BoardAnimState animState = linearActive || legacyActive || exitAnim != null
                         ? BOARD_STATES.computeIfAbsent(c.pos(), k -> new BoardAnimState()) : null;
@@ -652,7 +656,10 @@ public final class ReplayBoardRenderer {
             }
         }
         var world = mc.getMainRenderTarget();
-        boolean isolated = honors && HONORS_LAYER.captureWorldDepth(world);
+        int[] honorsRect = honors ? computeHonorsBlitRect(context.positionMatrix(), context.projectionMatrix(),
+                boards, world.width, world.height) : null;
+        boolean honorsHasPixels = honors && (honorsRect == null || (honorsRect[2] > honorsRect[0] && honorsRect[3] > honorsRect[1]));
+        boolean isolated = honorsHasPixels && HONORS_LAYER.captureWorldDepth(world, honorsRect);
         if (isolated) lastHonorsDraw = System.nanoTime();
         if (!boards.isEmpty()) TRAY_MESHES.beginPass();
         for (var board : boards) {
@@ -677,7 +684,7 @@ public final class ReplayBoardRenderer {
             }
             drawFrame(context.positionMatrix(), context.projectionMatrix(), board, mesh, dynamicWorld);
         }
-        if (!honors) return;
+        if (!honorsHasPixels) return;
         Runnable paint = () -> {
             for (var board : boards.reversed()) {
                 if (!ReplayHonorsPainter.visible(board.frame())) continue;
@@ -685,8 +692,37 @@ public final class ReplayBoardRenderer {
                 flushBoardPasses(board.frame());
             }
         };
-        if (isolated) HONORS_LAYER.drawOver(world, paint);
+        if (isolated) HONORS_LAYER.drawOver(world, honorsRect, paint);
         else paint.run();
+    }
+
+    private static int @Nullable [] computeHonorsBlitRect(Matrix4f view, Matrix4f projection,
+                                                          List<BoardDraw> boards, int width, int height) {
+        if (width <= 0 || height <= 0) return null;
+        Matrix4f viewProj = new Matrix4f(projection).mul(view);
+        Vector3f anchor = new Vector3f();
+        int minX = width, minY = height, maxX = 0, maxY = 0;
+        for (var board : boards) {
+            if (!ReplayHonorsPainter.visible(board.frame())) continue;
+            var site = board.site();
+            site.board().transformPosition(0f, ReplayHonorsPainter.anchorHeight(site.hw()), 0f, anchor);
+            float r = ReplayHonorsPainter.PANEL_RADIUS * ReplayHonorsPainter.honorsWorldScale(site.scale(), site.hw());
+            int[] rect = ReplayHonorsLayer.projectBlitRect(viewProj,
+                    anchor.x - r, anchor.y - r, anchor.z - r,
+                    anchor.x + r, anchor.y + r, anchor.z + r,
+                    width, height, ReplayHonorsLayer.blitMarginPx());
+            if (rect == null) return null; // Corner behind near plane -> safe full-screen fallback
+            if (rect[2] > rect[0] && rect[3] > rect[1]) {
+                if (rect[0] < minX) minX = rect[0];
+                if (rect[1] < minY) minY = rect[1];
+                if (rect[2] > maxX) maxX = rect[2];
+                if (rect[3] > maxY) maxY = rect[3];
+            }
+        }
+        if (maxX <= minX || maxY <= minY) return new int[]{0, 0, 0, 0};
+        long area = (long) (maxX - minX) * (maxY - minY);
+        if (area >= (long) width * height * 85L / 100L) return null;
+        return new int[]{minX, minY, maxX, maxY};
     }
 
     // ------------------------------------------------------------------ Video & Preview entry points
@@ -729,18 +765,18 @@ public final class ReplayBoardRenderer {
         var source = f.buffers;
         ReplayTrayPainter.tray(f, site);
         source.endBatch(trayType);
-        drawMap(shot.view(), shot.projection(), f, site, mesh, fullBody, diorama, heads, FollowTransform.NONE, focusPlayer);
+        drawMap(shot.view(), shot.projection(), f, site, mesh, dynamicWorld, fullBody, diorama, heads, FollowTransform.NONE, focusPlayer);
         ReplayTrayPainter.lights(f, site);
         ReplayTrayPainter.plaque(f, site);
         if (fx != null) fx.environment(f, site);
         if (current.layout != null) {
             float sink = (float) stage.mapSink() * 0.2f;
             try (var mapScope = f.mapScope(site)) {
-                if (dynamicWorld != null && dynamicWorld.hasDynamics()) {
+                if (dynamicWorld != null && dynamicWorld.hasDynamics() && mesh != null) {
                     Matrix4f dynModel = new Matrix4f(diorama).mul(sourceToDiorama(current));
-                    f.model(dynModel, pose -> dynamicWorld.render(
+                    f.model(dynModel, pose -> dynamicWorld.renderDynamicFallbacks(
                             mc, pose.last().pose(), f.modelBuffers(), f.replayTick,
-                            0, fullBody ? null : FAN_CUTAWAY, site.light()));
+                            fullBody ? null : FAN_CUTAWAY, site.light()));
                 }
                 ReplayTrayPainter.overlays(f, site, diorama, sink);
                 ReplayActorPainter.paint(f, site, diorama, heads);
@@ -769,14 +805,19 @@ public final class ReplayBoardRenderer {
                 && stage != null && stage.actors() == 1.0 && stage.history() == 1.0;
     }
 
-    private static @Nullable ReplayBoardHistoryCache settledHistory(BoardDraw board, Matrix4f diorama) {
+    private static @Nullable ReplayBoardHistoryCache settledHistory(BoardDraw board) {
         if (!canReuseReview(board)) return null;
         var f = board.frame();
         var site = board.site();
         var cache = SETTLED_HISTORY.computeIfAbsent(site.pos(), ignored -> new ReplayBoardHistoryCache());
-        var view = new ReplayBoardHistoryCache.View(f.model, f.replayTick, site.board(), diorama, site.scale(),
+        var boardMat = site.board();
+        var basis = new Matrix4f(boardMat).setTranslation(0, 0, 0);
+        var localDiorama = diorama(f, new Matrix4f(basis), board.followTransform());
+        var viewDir = new Matrix4f(basis).invert().transformDirection(
+                new Vector3f(-boardMat.m30(), -boardMat.m31(), -boardMat.m32()));
+        var view = new ReplayBoardHistoryCache.View(f.model, f.replayTick, basis, localDiorama, site.scale(),
                 site.fade(), site.hw(), site.hd(), site.detail(), f.focus.zoom(), f.highlight);
-        return cache.prepare(view, System.nanoTime()) ? cache : null;
+        return cache.prepare(view, viewDir, System.nanoTime()) ? cache : null;
     }
 
     private static void drawFrame(Matrix4f view, Matrix4f projection, BoardDraw board,
@@ -787,9 +828,15 @@ public final class ReplayBoardRenderer {
         FollowTransform followTransform = board.followTransform();
         var source = f.buffers;
 
-        if (ReplayBoardSettingsScreen.previewAt(site.pos()) != null || !TRAY_MESHES.draw(trayType, site)) {
-            ReplayTrayPainter.tray(f, site);
-            source.endBatch(trayType);
+        var profiler = f.mc.getProfiler();
+        profiler.push("tray");
+        try {
+            if (!TRAY_MESHES.draw(trayType, site)) {
+                ReplayTrayPainter.tray(f, site);
+                source.endBatch(trayType);
+            }
+        } finally {
+            profiler.pop();
         }
 
         if (f.model != null && f.model.layout != null && f.stage != null) {
@@ -798,17 +845,17 @@ public final class ReplayBoardRenderer {
             float currentZoom = followTransform.isActive() ? followTransform.zoom() : (float) f.focus.zoom();
             var heads = new ReplayActorSizing(f.model.scale, site.scale() * currentZoom, d, view, projection,
                     f.focusSample::emphasis, false);
-            drawMap(view, projection, f, site, mesh, fullBody, d, heads, followTransform, board.followPlayerUuid());
+            drawMap(view, projection, f, site, mesh, dynamicWorld, fullBody, d, heads, followTransform, board.followPlayerUuid());
             try (var mapScope = f.mapScope(site)) {
                 if (mesh == null && f.stage.scan() > 0.01) loadingOutline(f, site, d, f.model);
-                if (dynamicWorld != null && dynamicWorld.hasDynamics() && f.stage.scan() > 0.01) {
+                if (dynamicWorld != null && dynamicWorld.hasDynamics() && mesh != null && f.stage.scan() > 0.01) {
                     Matrix4f dynModel = new Matrix4f(d).mul(sourceToDiorama(f.model));
-                    f.model(dynModel, pose -> dynamicWorld.render(
+                    f.model(dynModel, pose -> dynamicWorld.renderDynamicFallbacks(
                             f.mc, pose.last().pose(), f.modelBuffers(), f.replayTick,
-                            0, fullBody ? null : FAN_CUTAWAY, site.light()));
+                            fullBody ? null : FAN_CUTAWAY, site.light()));
                 }
                 ReplayTrayPainter.overlays(f, site, d, sink);
-                var history = settledHistory(board, d);
+                var history = settledHistory(board);
                 ReplayActorPainter.paint(f, site, d, heads, history);
                 ReplayDronePainter.paint(f, site, d);
                 if (!f.entitiesPainted) ReplayEntityPainter.paintDiorama(f, site, d);
@@ -840,8 +887,12 @@ public final class ReplayBoardRenderer {
     }
 
     private static Matrix4f diorama(ReplayFrame frame, ReplayBoardSite site, FollowTransform followTransform) {
+        return diorama(frame, new Matrix4f(site.board()), followTransform);
+    }
+
+    private static Matrix4f diorama(ReplayFrame frame, Matrix4f base, FollowTransform followTransform) {
         float sink = frame.stage == null ? 0 : (float) frame.stage.mapSink() * 0.2f;
-        Matrix4f base = new Matrix4f(site.board()).translate(0, ReplayBoardSite.MAP_BASE - sink, 0);
+        base.translate(0, ReplayBoardSite.MAP_BASE - sink, 0);
         if (followTransform != null && followTransform.isActive()) {
             return followTransform.apply(base);
         }
@@ -869,7 +920,8 @@ public final class ReplayBoardRenderer {
     }
 
     private static void drawMap(Matrix4f view, Matrix4f projection, ReplayFrame f, ReplayBoardSite s,
-                                @Nullable SceneMeshSet mesh, boolean fullBody, Matrix4f diorama, ReplayActorSizing heads,
+                                @Nullable SceneMeshSet mesh, @Nullable ReplayDioramaMesh.DynamicWorld dynamicWorld,
+                                boolean fullBody, Matrix4f diorama, ReplayActorSizing heads,
                                 FollowTransform followTransform, @Nullable UUID followPlayerUuid) {
         FAN_CUTAWAY.clear();
         ReplayBoardModel current = f.model;
@@ -900,14 +952,18 @@ public final class ReplayBoardRenderer {
         boolean clip = stage.scan() < 0.999;
         int axisLength = current.rotated ? src.sizeZ() : src.sizeX();
         float threshold = (float) (stage.scan() * (axisLength + 1.0)) - 0.5f;
+        int scanAxis = clip ? (current.rotated ? 2 : 0) : -1;
         try (var scope = SceneShaders.model(modelMat, s.light());
              var boundsScope = SceneShaders.bounds(bounds.minX(), bounds.minZ(), bounds.maxX(), bounds.maxZ());
              var clipScope = clip ? (current.rotated ? SceneShaders.clip(0, 0, 1, threshold) : SceneShaders.clip(1, 0, 0, threshold))
                      : SceneShaders.clip(0, 0, 0, 1)) {
             RenderSystem.setShaderColor(r, g, b, 1f);
             ReplayTerrainRenderer.draw(mesh, modelView, projection, FAN_CUTAWAY,
-                    bounds.minX(), bounds.minZ(), bounds.maxX(), bounds.maxZ(),
-                    clip ? (current.rotated ? 2 : 0) : -1, threshold);
+                    bounds.minX(), bounds.minZ(), bounds.maxX(), bounds.maxZ(), scanAxis, threshold);
+            if (dynamicWorld != null && dynamicWorld.hasDynamics()) {
+                dynamicWorld.renderStaticBatched(f.mc, modelView, projection, FAN_CUTAWAY,
+                        bounds.minX(), bounds.minZ(), bounds.maxX(), bounds.maxZ(), scanAxis, threshold, f.replayTick);
+            }
         } finally {
             RenderSystem.setShaderColor(previous[0], previous[1], previous[2], previous[3]);
         }

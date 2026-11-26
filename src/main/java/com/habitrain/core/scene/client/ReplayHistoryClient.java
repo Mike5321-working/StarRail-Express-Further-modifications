@@ -348,8 +348,14 @@ public final class ReplayHistoryClient {
                 try { install(r, ReplayArchiveData.decode(r.cached)); }
                 catch (RuntimeException invalid) { r.cached = null; r.requested = 0; r.attempts = 0; }
             }
-            case MISSING -> r.phase = Phase.MISSING;
-            case ERROR -> r.phase = Phase.FAILED;
+            case MISSING -> {
+                r.phase = Phase.MISSING;
+                stopVoiceRequests(r);
+            }
+            case ERROR -> {
+                r.phase = Phase.FAILED;
+                stopVoiceRequests(r);
+            }
         }
     }
 
@@ -361,6 +367,7 @@ public final class ReplayHistoryClient {
             save(r, data);
         } catch (RuntimeException malformed) {
             r.phase = Phase.FAILED;
+            stopVoiceRequests(r);
         }
     }
 
@@ -384,7 +391,7 @@ public final class ReplayHistoryClient {
         for (Round r : List.copyOf(rounds.values()).reversed()) {
             if (now - r.watched > WATCH_NS) continue;
             if (r.phase == Phase.LOADING && !r.reading && (r.requested == 0 || now - r.requested >= RETRY_NS)) {
-                if (r.attempts >= 12) { r.phase = Phase.FAILED; continue; }
+                if (r.attempts >= 12) { r.phase = Phase.FAILED; stopVoiceRequests(r); continue; }
                 if (send(Request.lookup(r.id, r.cached == null ? "" : ReplayArchiveData.digest(r.cached)), now)) {
                     r.requested = now;
                     r.attempts++;
@@ -396,6 +403,7 @@ public final class ReplayHistoryClient {
                 } else if (r.map.stalled(now)) {
                     r.map.markFailed(now);
                     r.phase = Phase.FAILED;
+                    stopVoiceRequests(r);
                 } else {
                     r.map.step(now, bits -> send(Request.sections(r.id, bits), now));
                 }

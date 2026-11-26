@@ -241,6 +241,7 @@ public final class ReplayArchiveService {
             final long epoch;
             @Nullable Iterator<T> packets;
             @Nullable T next;
+            final ArrayList<T> batch = new ArrayList<>();
             long readyAtNanos;
 
             Slot(long epoch) {
@@ -320,17 +321,19 @@ public final class ReplayArchiveService {
             Slot<T> slot = slots.get(player);
             if (slot == null || slot.packets == null) return null;
             T out;
-            if (slot.next != null) {
+            if (!slot.batch.isEmpty()) {
+                out = slot.batch.removeFirst();
+                if (slot.batch.isEmpty()) slot.readyAtNanos = 0L;
+            } else if (slot.next != null) {
                 out = slot.next;
                 slot.next = null;
-                slot.readyAtNanos = 0L;
             } else if (slot.packets.hasNext()) {
                 out = slot.packets.next();
             } else {
                 slots.remove(player);
                 return null;
             }
-            if (!slot.packets.hasNext()) {
+            if (slot.batch.isEmpty() && slot.next == null && !slot.packets.hasNext()) {
                 slots.remove(player);
             }
             return out;
@@ -339,6 +342,7 @@ public final class ReplayArchiveService {
         void drain(Predicate<UUID> alive,
                    Predicate<UUID> defer,
                    ToIntFunction<T> byteEstimator,
+                   Predicate<T> sectionPacket,
                    SceneBandwidthGovernor bandwidth,
                    long rateBytesPerSec,
                    BiConsumer<UUID, T> sender) {
@@ -353,23 +357,35 @@ public final class ReplayArchiveService {
                 }
                 if (slot.packets == null) continue;
                 if (defer.test(id)) continue;
-                if (slot.next == null) {
-                    if (!slot.packets.hasNext()) {
+                if (slot.batch.isEmpty()) {
+                    if (slot.next == null && !slot.packets.hasNext()) {
                         iterator.remove();
                         continue;
                     }
-                    T next = slot.packets.next();
-                    slot.next = next;
-                    slot.readyAtNanos = bandwidth.reserve(id, byteEstimator.applyAsInt(next), rateBytesPerSec);
+                    T first = slot.next == null ? slot.packets.next() : slot.next;
+                    slot.next = null;
+                    slot.batch.add(first);
+                    int bytes = byteEstimator.applyAsInt(first);
+                    if (sectionPacket.test(first)) {
+                        while (slot.batch.size() < ReplayPackets.SECTION_BATCH_FRAGMENTS && slot.packets.hasNext()) {
+                            T next = slot.packets.next();
+                            int size = byteEstimator.applyAsInt(next);
+                            if (bytes + size > ReplayPackets.SECTION_BATCH_BYTES || !sectionPacket.test(next)) {
+                                slot.next = next;
+                                break;
+                            }
+                            bytes += size;
+                            slot.batch.add(next);
+                        }
+                    }
+                    slot.readyAtNanos = bandwidth.reserve(id, bytes, rateBytesPerSec);
                 }
                 if (bandwidth.nowNanos() - slot.readyAtNanos < 0) continue;
-                T toSend = slot.next;
-                slot.next = null;
-                slot.readyAtNanos = 0L;
-                if (!slot.packets.hasNext()) {
+                for (T packet : slot.batch) sender.accept(id, packet);
+                slot.batch.clear();
+                if (slot.next == null && !slot.packets.hasNext()) {
                     iterator.remove();
                 }
-                sender.accept(id, toSend);
             }
         }
     }
@@ -737,6 +753,11 @@ public final class ReplayArchiveService {
         }
 
         void sendExportAccess(ServerPlayer player, UUID round, boolean allowed) {
+            if (allowed) {
+                var recent = viewed.computeIfAbsent(player.getUUID(), ignored -> new LinkedHashSet<>());
+                recent.addLast(round);
+                if (recent.size() > 32) recent.removeFirst();
+            }
             ServerPlayNetworking.send(player, new ReplayPackets.VoiceExportAccessS2C(round, allowed));
         }
 
@@ -896,6 +917,7 @@ public final class ReplayArchiveService {
                     // without ever cancelling or starving the voice lane.
                     id -> isVoiceLane && summaryLane.hasReady(id),
                     State::estimateBytes,
+                    payload -> payload instanceof Section,
                     bandwidth,
                     RATE,
                     (id, payload) -> {

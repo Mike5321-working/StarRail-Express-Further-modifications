@@ -19,4 +19,13 @@ class ReplayTerrainRendererTest {
         assertFalse(ReplayTerrainRenderer.visible(visible, frustum, -50, -50, 50, 50, 0, 0.5f));
         assertFalse(ReplayTerrainRenderer.visible(outside, frustum, -50, -50, 50, 50, -1, 0));
     }
+
+    @Test void unclippedShaderRequiresTheWholeBatchInsideTrayAndScan() {
+        var batch = new SceneMeshSet.Batch(new SceneMeshSet(), 1, -1, -10, 3, 1, -8);
+        assertTrue(ReplayTerrainRenderer.fullyInsideClip(batch, 1, -10, 3, -8, -1, 0));
+        assertTrue(ReplayTerrainRenderer.fullyInsideClip(batch, 0, -12, 5, -6, 2, -8));
+        assertFalse(ReplayTerrainRenderer.fullyInsideClip(batch, 0, -12, 5, -6, 2, -9));
+        assertFalse(ReplayTerrainRenderer.fullyInsideClip(batch, 0, -12, 5, -6, 0, 2));
+        assertFalse(ReplayTerrainRenderer.fullyInsideClip(batch, 2, -12, 5, -6, -1, 0));
+    }
 }

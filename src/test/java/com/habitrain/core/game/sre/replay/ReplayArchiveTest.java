@@ -44,6 +44,18 @@ class ReplayArchiveTest {
         assertArrayEquals(right, loaded.get(1));
     }
 
+    @Test void preservesLargeMapSectionIndicesAcrossRestart() throws Exception {
+        Path root = world.resolve("archive");
+        var store = new ReplayArchive(root);
+        UUID round = UUID.randomUUID();
+        assertTrue(store.save(round, 1, "a".repeat(64), new byte[]{1},
+                java.util.Collections.nCopies(1152, new byte[]{42}), new byte[0]));
+        var requested = new BitSet();
+        requested.set(1151);
+        var reopened = new ReplayArchive(root);
+        assertArrayEquals(new byte[]{42}, reopened.sections(round, requested).get(1151));
+    }
+
     @Test void reducingQuotaEvictsOldestRoundsAndOnlyUnreferencedMaps() throws Exception {
         Path archive = world.resolve("archive");
         Path text = world.resolve("old-match.json");

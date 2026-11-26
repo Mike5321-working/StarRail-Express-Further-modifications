@@ -3,17 +3,21 @@ package com.habitrain.core.scene.client.replay;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import org.joml.Matrix4fc;
+import org.joml.Vector3f;
+import org.joml.Vector3fc;
 
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.function.Consumer;
 
-/** Reuses clipped, camera-relative glow vertices while a table holds a settled review. */
+/** Reuses clipped glow vertices relative to the board origin during a settled review. */
 final class ReplayBoardHistoryCache {
     private static final long STABLE_VIEW_NS = 200_000_000L;
+    /** Camera-facing trail ribbons remain visually consistent within +/-22.5 deg of the baked view vector. */
+    static final float MIN_VIEW_DIR_DOT = (float) Math.cos(Math.toRadians(22.5));
     // The fixed replay glow pass uses 3 floats and one packed color per vertex.
-    private static final int MAX_VERTICES = 96 * 1024;
+    private static final int MAX_VERTICES = 256 * 1024;
     private static final Geometry EMPTY = new Geometry(new int[0], 0);
     private static final Geometry TOO_LARGE = new Geometry(new int[0], 0);
 
@@ -25,14 +29,23 @@ final class ReplayBoardHistoryCache {
     record Markers(int from, int to, int weapon) {}
 
     private View view;
+    private Vector3f bakedViewDir;
     private long changedAt;
     private Geometry[] geometry;
     private List<Markers> markers;
     private int reserved;
 
     boolean prepare(View next, long now) {
-        if (!next.equals(view)) {
+        return prepare(next, new Vector3f(0f, 1f, 0f), now);
+    }
+
+    boolean prepare(View next, Vector3fc viewDirection, long now) {
+        Vector3f dir = normalizeViewDir(viewDirection);
+        boolean viewChanged = !next.equals(view);
+        boolean angleChanged = bakedViewDir == null || bakedViewDir.dot(dir) < MIN_VIEW_DIR_DOT;
+        if (viewChanged || angleChanged) {
             view = next;
+            bakedViewDir = dir;
             changedAt = now;
             geometry = null;
             markers = null;
@@ -45,6 +58,13 @@ final class ReplayBoardHistoryCache {
             geometry = new Geometry[next.model().actors.length + markers.size()];
         }
         return true;
+    }
+
+    private static Vector3f normalizeViewDir(Vector3fc raw) {
+        if (raw == null) return new Vector3f(0f, 1f, 0f);
+        float lenSq = raw.lengthSquared();
+        if (!Float.isFinite(lenSq) || lenSq < 1.0e-8f) return new Vector3f(0f, 1f, 0f);
+        return new Vector3f(raw).div((float) Math.sqrt(lenSq));
     }
 
     List<Markers> markers() {
@@ -74,7 +94,7 @@ final class ReplayBoardHistoryCache {
         if (cached != EMPTY) {
             // Finish the preceding clipped primitive before replaying directly into the same layer.
             scope.glow.close();
-            cached.emit(scope.glowBuffer);
+            cached.emit(scope.glowBuffer, scope.originX, scope.originY, scope.originZ);
         }
         return true;
     }
@@ -85,7 +105,7 @@ final class ReplayBoardHistoryCache {
             return;
         }
         scope.glow.close();
-        var recording = new Recording(scope.glowBuffer);
+        var recording = new Recording(scope);
         try (var clipped = scope.clipGlow(recording)) {
             draw.accept(clipped);
         }
@@ -93,10 +113,10 @@ final class ReplayBoardHistoryCache {
     }
 
     private record Geometry(int[] vertices, int size) {
-        void emit(VertexConsumer out) {
+        void emit(VertexConsumer out, float originX, float originY, float originZ) {
             for (int i = 0; i < size; i += 4) {
-                out.addVertex(Float.intBitsToFloat(vertices[i]), Float.intBitsToFloat(vertices[i + 1]),
-                        Float.intBitsToFloat(vertices[i + 2])).setColor(vertices[i + 3]);
+                out.addVertex(Float.intBitsToFloat(vertices[i]) + originX, Float.intBitsToFloat(vertices[i + 1]) + originY,
+                        Float.intBitsToFloat(vertices[i + 2]) + originZ).setColor(vertices[i + 3]);
             }
         }
     }
@@ -104,12 +124,16 @@ final class ReplayBoardHistoryCache {
     /** Records the output of the normal clip path while submitting this frame's geometry. */
     private final class Recording implements VertexConsumer {
         private final VertexConsumer target;
+        private final float originX, originY, originZ;
         private int[] data = EMPTY.vertices();
         private int size;
         private boolean overBudget;
 
-        Recording(VertexConsumer target) {
-            this.target = target;
+        Recording(ReplayFrame.MapScope scope) {
+            this.target = scope.glowBuffer;
+            this.originX = scope.originX;
+            this.originY = scope.originY;
+            this.originZ = scope.originZ;
         }
 
         @Override
@@ -129,9 +153,9 @@ final class ReplayBoardHistoryCache {
                 }
             }
             if (!overBudget) {
-                data[size++] = Float.floatToRawIntBits(x);
-                data[size++] = Float.floatToRawIntBits(y);
-                data[size++] = Float.floatToRawIntBits(z);
+                data[size++] = Float.floatToRawIntBits(x - originX);
+                data[size++] = Float.floatToRawIntBits(y - originY);
+                data[size++] = Float.floatToRawIntBits(z - originZ);
                 data[size++] = -1;
             }
             return this;

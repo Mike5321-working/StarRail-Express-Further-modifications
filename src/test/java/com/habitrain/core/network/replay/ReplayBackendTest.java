@@ -300,6 +300,33 @@ class ReplayBackendTest {
         assertThrows(IllegalArgumentException.class, () -> new ReplaySectionPatchS2C(ROUND, 0, 0, MAX_SECTION_BYTES + 1, new byte[FRAGMENT_BYTES]));
     }
 
+    @Test void largeMapAndSectionRequestsSupportIndicesAboveTheOldLimit() {
+        var bounds = new SceneBounds(0, 0, 0, 192, 128, 192);
+        var entries = new ArrayList<ReplayMapManifest.Entry>();
+        for (int sectionX = 0; sectionX < 12; sectionX++) {
+            for (int sectionY = 0; sectionY < 8; sectionY++) {
+                for (int sectionZ = 0; sectionZ < 12; sectionZ++) {
+                    entries.add(new ReplayMapManifest.Entry(new ReplayMapManifest.Section(sectionX, sectionY, sectionZ), 0));
+                }
+            }
+        }
+        var manifest = new ReplayMapManifest("12x12", "minecraft:overworld", bounds, HASH, entries);
+        assertTrue(ReplaySectionGeometry.supported(bounds));
+        assertEquals(1152, manifest.sections().size());
+        var missing = new BitSet();
+        missing.set(1088, 1152);
+        var buf = new FriendlyByteBuf(Unpooled.buffer());
+        try {
+            ReplayMissingSectionsC2S.CODEC.encode(buf, new ReplayMissingSectionsC2S(BlockPos.ZERO, ROUND, missing));
+            assertEquals(missing, ReplayMissingSectionsC2S.CODEC.decode(buf).missing());
+            var patch = new ReplaySectionPatchS2C(ROUND, 1151, 0, 1, new byte[]{42});
+            ReplaySectionPatchS2C.CODEC.encode(buf, patch);
+            assertEquals(1151, ReplaySectionPatchS2C.CODEC.decode(buf).index());
+        } finally {
+            buf.release();
+        }
+    }
+
     @Test void dedicatedReplayBytecodeHasNoClientLinks() throws Exception {
         var pkg = "com/habitrain/core/";
         for (String name : List.of("api/match/replay/LastMatchReplay", "api/match/replay/ReplayMapManifest",

@@ -30,7 +30,9 @@ public final class ReplayPackets {
     public static final int MAX_SUMMARY = 960 * 1024;
     public static final int FRAGMENT_BYTES = 24 * 1024;
     public static final int MAX_SECTION_BYTES = 256 * 1024;
-    public static final int MAX_REQUESTED = 16;
+    public static final int MAX_REQUESTED = 64;
+    public static final int SECTION_BATCH_BYTES = FRAGMENT_BYTES + 64;
+    public static final int SECTION_BATCH_FRAGMENTS = 16;
     private static final int BITSET_BYTES = ReplayMapManifest.MAX_SECTIONS / 8;
     private static final int SUMMARY_V2_MAGIC = 0x48525632; // "HRV2"
     private static final int SUMMARY_V2_VERSION = 2;

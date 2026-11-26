@@ -156,11 +156,58 @@ public final class SceneMeshSet implements AutoCloseable {
             buffer.bind();
             sort(buffer, layerSorts.get(layer));
             drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, chunkOffsetX, chunkOffsetY, chunkOffsetZ,
-                    layer == Layer.CUTOUT_MIPPED ? 0.5f : layer == Layer.CUTOUT ? 0.1f : 0.0f);
+                    alphaCutoffFor(layer), RenderSystem.getShader());
         } finally {
             VertexBuffer.unbind();
             renderType.clearRenderState();
         }
+    }
+
+    public boolean hasLayer(Layer layer) {
+        return !closed && buffers.get(layer) != null;
+    }
+
+    /**
+     * Draws {@code layer} assuming the caller has already called {@code renderType.setupRenderState()}
+     * and will call {@code VertexBuffer.unbind()} + {@code renderType.clearRenderState()} after the batch loop.
+     */
+    public void drawBoundLayer(Layer layer, Matrix4f modelViewMatrix, Matrix4f projectionMatrix, ShaderInstance baseShader) {
+        if (closed) return;
+        VertexBuffer buffer = buffers.get(layer);
+        if (buffer == null) return;
+        buffer.bind();
+        sort(buffer, layerSorts.get(layer));
+        drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, 0.0f, 0.0f, 0.0f,
+                alphaCutoffFor(layer), baseShader);
+    }
+
+    public void collectCustomOpaqueKeys(java.util.Set<SceneMaterialKey> out) {
+        if (closed || customBuffers.isEmpty()) return;
+        for (Map.Entry<SceneMaterialKey, VertexBuffer> entry : customBuffers.entrySet()) {
+            if (entry.getValue() != null && !entry.getKey().isTranslucent()) {
+                out.add(entry.getKey());
+            }
+        }
+    }
+
+    public void drawBoundCustomMaterial(SceneMaterialKey key, Matrix4f modelViewMatrix,
+                                        Matrix4f projectionMatrix, ShaderInstance baseShader) {
+        if (closed) return;
+        VertexBuffer buffer = customBuffers.get(key);
+        if (buffer == null) return;
+        buffer.bind();
+        sort(buffer, customSorts.get(key));
+        drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, 0.0f, 0.0f, 0.0f,
+                alphaCutoffFor(key), baseShader);
+    }
+
+    private static float alphaCutoffFor(Layer layer) {
+        return layer == Layer.CUTOUT_MIPPED ? 0.5f : layer == Layer.CUTOUT ? 0.1f : 0.0f;
+    }
+
+    private static float alphaCutoffFor(SceneMaterialKey key) {
+        return key.blendMode() == SceneMaterialKey.BlendMode.CUTOUT_MIPPED ? 0.5f
+                : key.blendMode() == SceneMaterialKey.BlendMode.CUTOUT ? 0.1f : 0.0f;
     }
 
     public void renderCustomBatches(Matrix4f modelViewMatrix, Matrix4f projectionMatrix, boolean renderTranslucent) {
@@ -204,8 +251,7 @@ public final class SceneMeshSet implements AutoCloseable {
                 buffer.bind();
                 sort(buffer, customSorts.get(key));
                 drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, chunkOffsetX, chunkOffsetY, chunkOffsetZ,
-                        key.blendMode() == SceneMaterialKey.BlendMode.CUTOUT_MIPPED ? 0.5f
-                                : key.blendMode() == SceneMaterialKey.BlendMode.CUTOUT ? 0.1f : 0.0f);
+                        alphaCutoffFor(key), RenderSystem.getShader());
             } finally {
                 VertexBuffer.unbind();
                 renderType.clearRenderState();
@@ -215,8 +261,8 @@ public final class SceneMeshSet implements AutoCloseable {
 
     private static void drawBufferWithChunkOffset(VertexBuffer buffer, Matrix4f modelViewMatrix,
                                                   Matrix4f projectionMatrix,
-                                                  float chunkOffsetX, float chunkOffsetY, float chunkOffsetZ, float alphaCutoff) {
-        ShaderInstance original = RenderSystem.getShader();
+                                                  float chunkOffsetX, float chunkOffsetY, float chunkOffsetZ,
+                                                  float alphaCutoff, ShaderInstance original) {
         ShaderInstance shader = SceneShaders.select(original, alphaCutoff);
         if (shader != original) {
             buffer.drawWithShader(modelViewMatrix, projectionMatrix, shader);

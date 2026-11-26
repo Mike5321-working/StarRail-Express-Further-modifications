@@ -88,7 +88,9 @@ final class ReplayDraw {
                      int segments, int inner, int outer) {
         float r0 = Math.max(0, radius - thickness * 0.5f), r1 = radius + thickness * 0.5f;
         if (vc instanceof ReplayClippedConsumer clipped) {
-            vc = clipped.horizontalArea(m, cx, cy, cz, Math.max(r0, Math.abs(r1)));
+            var state = clipped.classifyHorizontal(m, cx, cy, cz, Math.max(r0, Math.abs(r1)));
+            if (state == ReplayClippedConsumer.ClipState.OUTSIDE) return;
+            if (state == ReplayClippedConsumer.ClipState.INSIDE) vc = clipped.directOutput();
         }
         float c0 = Mth.cos(0), s0 = Mth.sin(0);
         for (int i = 0; i < segments; i++) {
@@ -104,7 +106,11 @@ final class ReplayDraw {
     /** Filled disc in the local XZ plane, bright centre fading out. */
     static void disc(VertexConsumer vc, Matrix4f m, float cx, float cy, float cz, float radius, int segments,
                      int center, int edge) {
-        if (vc instanceof ReplayClippedConsumer clipped) vc = clipped.horizontalArea(m, cx, cy, cz, radius);
+        if (vc instanceof ReplayClippedConsumer clipped) {
+            var state = clipped.classifyHorizontal(m, cx, cy, cz, radius);
+            if (state == ReplayClippedConsumer.ClipState.OUTSIDE) return;
+            if (state == ReplayClippedConsumer.ClipState.INSIDE) vc = clipped.directOutput();
+        }
         float x0 = cx + Mth.cos(0) * radius, z0 = cz + Mth.sin(0) * radius;
         for (int i = 0; i < segments; i++) {
             float a1 = Mth.TWO_PI * (i + 1) / segments;
@@ -273,6 +279,15 @@ final class ReplayDraw {
      */
     static void ribbon(VertexConsumer vc, float[] xyz, int n, float[] widths, int[] colors) {
         if (n < 2) return;
+        if (vc instanceof ReplayClippedConsumer clipped) {
+            clipped.ribbon(xyz, n, widths, colors);
+            return;
+        }
+        ribbonDirect(vc, xyz, n, widths, colors);
+    }
+
+    static void ribbonDirect(VertexConsumer vc, float[] xyz, int n, float[] widths, int[] colors) {
+        if (n < 2) return;
         float pax = 0, pay = 0, paz = 0, pbx = 0, pby = 0, pbz = 0;
         for (int i = 0; i < n; i++) {
             int o = i * 3;
@@ -289,11 +304,7 @@ final class ReplayDraw {
             if (i > 0) {
                 int cPrev = colors[i - 1], cCur = colors[i];
                 if (((cPrev | cCur) >>> 24) != 0) {
-                    if (vc instanceof ReplayClippedConsumer clipped) {
-                        clipped.ribbonQuad(pax, pay, paz, pbx, pby, pbz, bx, by, bz, ax, ay, az, cPrev, cCur);
-                    } else {
-                        ribbonQuad(vc, pax, pay, paz, pbx, pby, pbz, bx, by, bz, ax, ay, az, cPrev, cCur);
-                    }
+                    ribbonQuad(vc, pax, pay, paz, pbx, pby, pbz, bx, by, bz, ax, ay, az, cPrev, cCur);
                 }
             }
             pax = ax; pay = ay; paz = az; pbx = bx; pby = by; pbz = bz;
@@ -359,8 +370,27 @@ final class ReplayDraw {
         }
     }
 
+    private static final float[] COS_12 = unitCircle(12, true);
+    private static final float[] SIN_12 = unitCircle(12, false);
+    private static final float[] COS_8 = unitCircle(8, true);
+    private static final float[] SIN_8 = unitCircle(8, false);
+
+    private static float[] unitCircle(int segments, boolean cos) {
+        float[] table = new float[segments + 1];
+        for (int i = 0; i <= segments; i++) {
+            double angle = Math.PI * 2.0 * i / segments;
+            table[i] = (float) (cos ? Math.cos(angle) : Math.sin(angle));
+        }
+        return table;
+    }
+
     /** Camera-facing filled quad centred on a camera-relative point. */
     static void billboard(VertexConsumer vc, Vector3f c, Vector3f right, Vector3f up, float halfW, float halfH, int color) {
+        if (vc instanceof ReplayClippedConsumer clipped) {
+            var state = clipped.classifyCameraSphere(c.x, c.y, c.z, (float) Math.hypot(halfW, halfH));
+            if (state == ReplayClippedConsumer.ClipState.OUTSIDE) return;
+            if (state == ReplayClippedConsumer.ClipState.INSIDE) vc = clipped.directOutput();
+        }
         float rx = right.x * halfW, ry = right.y * halfW, rz = right.z * halfW;
         float ux = up.x * halfH, uy = up.y * halfH, uz = up.z * halfH;
         vc.addVertex(c.x - rx - ux, c.y - ry - uy, c.z - rz - uz).setColor(color);
@@ -375,31 +405,47 @@ final class ReplayDraw {
      */
     static void softBillboard(VertexConsumer vc, Vector3f c, Vector3f right, Vector3f up,
                               float radiusX, float radiusY, int color, float nearCullDist, float nearFullDist) {
+        softBillboard(vc, c, right, up, radiusX, radiusY, color, nearCullDist, nearFullDist, 12);
+    }
+
+    static void softBillboard(VertexConsumer vc, Vector3f c, Vector3f right, Vector3f up,
+                              float radiusX, float radiusY, int color, float nearCullDist, float nearFullDist, int segs) {
         if ((color >>> 24) == 0 || radiusX <= 1e-5f || radiusY <= 1e-5f) return;
-        float dist = c.length();
-        if (dist <= nearCullDist) return;
+        float distSq = c.lengthSquared();
+        if (distSq <= nearCullDist * nearCullDist) return;
+        if (vc instanceof ReplayClippedConsumer clipped) {
+            var state = clipped.classifyCameraSphere(c.x, c.y, c.z, Math.max(radiusX, radiusY));
+            if (state == ReplayClippedConsumer.ClipState.OUTSIDE) return;
+            if (state == ReplayClippedConsumer.ClipState.INSIDE) vc = clipped.directOutput();
+        }
         int center = color;
-        if (dist < nearFullDist && nearFullDist > nearCullDist) {
+        if (distSq < nearFullDist * nearFullDist && nearFullDist > nearCullDist) {
+            float dist = (float) Math.sqrt(distSq);
             double k = (dist - nearCullDist) / (nearFullDist - nearCullDist);
             k = k * k * (3.0 - 2.0 * k);
             center = ReplayPalette.fade(color, k);
             if ((center >>> 24) == 0) return;
         }
         int edge = ReplayPalette.alpha(center, 0);
-        int segs = 12;
-        for (int i = 0; i < segs; i++) {
-            float a0 = Mth.TWO_PI * i / segs, a1 = Mth.TWO_PI * (i + 1) / segs;
-            float c0 = Mth.cos(a0), s0 = Mth.sin(a0), c1 = Mth.cos(a1), s1 = Mth.sin(a1);
-            float x0 = c.x + right.x * (c0 * radiusX) + up.x * (s0 * radiusY);
-            float y0 = c.y + right.y * (c0 * radiusX) + up.y * (s0 * radiusY);
-            float z0 = c.z + right.z * (c0 * radiusX) + up.z * (s0 * radiusY);
-            float x1 = c.x + right.x * (c1 * radiusX) + up.x * (s1 * radiusY);
-            float y1 = c.y + right.y * (c1 * radiusX) + up.y * (s1 * radiusY);
-            float z1 = c.z + right.z * (c1 * radiusX) + up.z * (s1 * radiusY);
+        boolean low = segs <= 8;
+        int count = low ? 8 : 12;
+        float[] cosT = low ? COS_8 : COS_12;
+        float[] sinT = low ? SIN_8 : SIN_12;
+        float rRx = right.x * radiusX, rRy = right.y * radiusX, rRz = right.z * radiusX;
+        float uRx = up.x * radiusY, uRy = up.y * radiusY, uRz = up.z * radiusY;
+        float x0 = c.x + rRx * cosT[0] + uRx * sinT[0];
+        float y0 = c.y + rRy * cosT[0] + uRy * sinT[0];
+        float z0 = c.z + rRz * cosT[0] + uRz * sinT[0];
+        for (int i = 0; i < count; i++) {
+            float c1 = cosT[i + 1], s1 = sinT[i + 1];
+            float x1 = c.x + rRx * c1 + uRx * s1;
+            float y1 = c.y + rRy * c1 + uRy * s1;
+            float z1 = c.z + rRz * c1 + uRz * s1;
             vc.addVertex(c.x, c.y, c.z).setColor(center);
             vc.addVertex(c.x, c.y, c.z).setColor(center);
             vc.addVertex(x1, y1, z1).setColor(edge);
             vc.addVertex(x0, y0, z0).setColor(edge);
+            x0 = x1; y0 = y1; z0 = z1;
         }
     }
 
@@ -435,26 +481,31 @@ final class ReplayDraw {
         if (lu < 1.0e-5f || lv < 1.0e-5f) return;
         int nu = Math.max(1, Math.min(48, (int) Math.ceil(lu / tile - 1.0e-3f)));
         int nvv = Math.max(1, Math.min(48, (int) Math.ceil(lv / tile - 1.0e-3f)));
+        Matrix4f matrix = pose.pose();
+        var normal = pose.transformNormal(nx, ny, nz, new Vector3f());
+        var position = new Vector3f();
+        float u0 = sprite.getU(0), v0 = sprite.getV(0);
         for (int i = 0; i < nu; i++) {
             float a0 = i * tile / lu, a1 = Math.min(1f, (i + 1) * tile / lu);
-            float ua1 = (a1 - a0) * lu / tile;
+            float u1 = sprite.getU(Math.min(1f, (a1 - a0) * lu / tile));
+            float x0 = ox + eux * a0, y0 = oy + euy * a0, z0 = oz + euz * a0;
+            float x1 = ox + eux * a1, y1 = oy + euy * a1, z1 = oz + euz * a1;
             for (int j = 0; j < nvv; j++) {
                 float b0 = j * tile / lv, b1 = Math.min(1f, (j + 1) * tile / lv);
-                float vb1 = (b1 - b0) * lv / tile;
-                float u0 = sprite.getU(0), u1 = sprite.getU(Math.min(1f, ua1));
-                float v0 = sprite.getV(0), v1 = sprite.getV(Math.min(1f, vb1));
-                vertex(vc, pose, ox + eux * a0 + evx * b0, oy + euy * a0 + evy * b0, oz + euz * a0 + evz * b0, tint, u0, v0, light, nx, ny, nz);
-                vertex(vc, pose, ox + eux * a1 + evx * b0, oy + euy * a1 + evy * b0, oz + euz * a1 + evz * b0, tint, u1, v0, light, nx, ny, nz);
-                vertex(vc, pose, ox + eux * a1 + evx * b1, oy + euy * a1 + evy * b1, oz + euz * a1 + evz * b1, tint, u1, v1, light, nx, ny, nz);
-                vertex(vc, pose, ox + eux * a0 + evx * b1, oy + euy * a0 + evy * b1, oz + euz * a0 + evz * b1, tint, u0, v1, light, nx, ny, nz);
+                float v1 = sprite.getV(Math.min(1f, (b1 - b0) * lv / tile));
+                vertex(vc, matrix, position, normal, x0 + evx * b0, y0 + evy * b0, z0 + evz * b0, tint, u0, v0, light);
+                vertex(vc, matrix, position, normal, x1 + evx * b0, y1 + evy * b0, z1 + evz * b0, tint, u1, v0, light);
+                vertex(vc, matrix, position, normal, x1 + evx * b1, y1 + evy * b1, z1 + evz * b1, tint, u1, v1, light);
+                vertex(vc, matrix, position, normal, x0 + evx * b1, y0 + evy * b1, z0 + evz * b1, tint, u0, v1, light);
             }
         }
     }
 
-    static void vertex(VertexConsumer vc, PoseStack.Pose pose, float x, float y, float z, int color, float u, float v,
-                       int light, float nx, float ny, float nz) {
-        vc.addVertex(pose, x, y, z).setColor(color).setUv(u, v).setOverlay(OverlayTexture.NO_OVERLAY)
-                .setLight(light).setNormal(pose, nx, ny, nz);
+    private static void vertex(VertexConsumer vc, Matrix4f matrix, Vector3f position, Vector3f normal,
+                               float x, float y, float z, int color, float u, float v, int light) {
+        matrix.transformPosition(x, y, z, position);
+        vc.addVertex(position.x, position.y, position.z, color, u, v,
+                OverlayTexture.NO_OVERLAY, light, normal.x, normal.y, normal.z);
     }
 
     private static int scaleTint(int tint, float k) {

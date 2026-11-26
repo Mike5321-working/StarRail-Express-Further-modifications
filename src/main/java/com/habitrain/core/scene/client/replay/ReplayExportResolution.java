@@ -33,9 +33,9 @@ enum ReplayExportResolution {
         return width >= 2560;
     }
 
-    /** AVI 1.0 has no large-file index support in the bundled writer. */
+    /** AVI 1.0 has a 2 GiB file limit; 1440p and 2160p MJPEG + PCM quickly exceed it. */
     boolean aviSupported() {
-        return this != P2160;
+        return this != P1440 && this != P2160;
     }
 
     String dimensions() {

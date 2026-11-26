@@ -1,5 +1,6 @@
 package com.habitrain.core.game.sre.replay;
 
+import com.habitrain.core.api.match.replay.ReplayMapManifest;
 import com.habitrain.core.network.replay.ReplayPackets;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import org.slf4j.LoggerFactory;
@@ -216,7 +217,7 @@ final class ReplayArchive {
         }
         byte[] v = voiceData == null ? new byte[0] : voiceData;
         if (!map.matches("[0-9a-f]{64}") || summary.length < 1 || summary.length > MAX_SUMMARY ||
-                patches.isEmpty() || patches.size() > 1024 || v.length > ReplayVoiceData.MAX_VOICE_BYTES) {
+                patches.isEmpty() || patches.size() > ReplayMapManifest.MAX_SECTIONS || v.length > ReplayVoiceData.MAX_VOICE_BYTES) {
             throw new IOException("Invalid replay archive input");
         }
         long mapBytes = 4L + 8L * patches.size();
@@ -343,7 +344,8 @@ final class ReplayArchive {
         if (!Files.isRegularFile(p, NOFOLLOW_LINKS)) throw new IOException("Missing replay map");
         try (var file = new RandomAccessFile(p.toFile(), "r")) {
             int count = file.readInt();
-            if (count < 1 || count > 1024 || requested.length() > count) throw new IOException("Invalid replay section index");
+            if (count < 1 || count > ReplayMapManifest.MAX_SECTIONS || requested.length() > count)
+                throw new IOException("Invalid replay section index");
             Map<Integer, byte[]> parts = new LinkedHashMap<>();
             for (int index = requested.nextSetBit(0); index >= 0; index = requested.nextSetBit(index + 1)) {
                 file.seek(4L + 8L * index);

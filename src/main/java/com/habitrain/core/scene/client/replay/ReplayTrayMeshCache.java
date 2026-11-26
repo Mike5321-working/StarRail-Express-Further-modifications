@@ -27,6 +27,7 @@ final class ReplayTrayMeshCache {
     }
 
     private final LinkedHashMap<Key, VertexBuffer> meshes = new LinkedHashMap<>(16, .75f, true);
+    private ByteBufferBuilder uploadScratch;
     private boolean compatiblePass;
     private boolean canUpload;
     private boolean failed;
@@ -72,34 +73,31 @@ final class ReplayTrayMeshCache {
     }
 
     private static boolean clearOfFog(ReplayBoardSite site) {
-        // The entity shader measures fog from Position before ModelViewMat. Require the entire tray
-        // to be inside FogStart both at its local origin and at its camera-relative position.
+        // The entity shader measures fog from Position before ModelViewMat. Use the tight tray+plaque
+        // bounding radius so large boards (up to 32 blocks) keep VBO caching hot at normal lobby distances.
         var board = site.board();
         double x = board.m30(), y = board.m31(), z = board.m32();
-        double radius = site.scale() * (Math.hypot(site.hw() + 1.0, site.hd() + 1.0) + 1.0);
+        double radius = site.scale() * Math.hypot(site.hw() + 0.25, site.hd() + 0.25);
         return Math.sqrt(x * x + y * y + z * z) + radius <= RenderSystem.getShaderFogStart();
     }
 
-    private static VertexBuffer upload(RenderType type, ReplayBoardSite site) {
+    private VertexBuffer upload(RenderType type, ReplayBoardSite site) {
         // Draw time supplies only translation. Bake the display basis so the entity shader sees
         // the same world-facing normals as the immediate tray (including custom display rotation).
         var basis = new Matrix4f(site.board()).setTranslation(0f, 0f, 0f);
-        try (var scratch = new ByteBufferBuilder(1 << 17)) {
-            var builder = new BufferBuilder(scratch, type.mode(), type.format());
+        if (uploadScratch == null) uploadScratch = new ByteBufferBuilder(1 << 19);
+        var buffer = new VertexBuffer(VertexBuffer.Usage.STATIC);
+        try {
+            var builder = new BufferBuilder(uploadScratch, type.mode(), type.format());
             ReplayTrayPainter.tray(builder, basis, site.hw(), site.hd(), site.detail(), site.light());
+            buffer.bind();
             try (var data = builder.buildOrThrow()) {
-                var buffer = new VertexBuffer(VertexBuffer.Usage.STATIC);
-                try {
-                    buffer.bind();
-                    buffer.upload(data);
-                    return buffer;
-                } catch (RuntimeException failure) {
-                    buffer.close();
-                    throw failure;
-                } finally {
-                    VertexBuffer.unbind();
-                }
+                buffer.upload(data);
             }
+            return buffer;
+        } catch (RuntimeException failure) {
+            buffer.close();
+            throw failure;
         }
     }
 
@@ -110,6 +108,10 @@ final class ReplayTrayMeshCache {
         }
         for (var mesh : meshes.values()) mesh.close();
         meshes.clear();
+        if (uploadScratch != null) {
+            uploadScratch.close();
+            uploadScratch = null;
+        }
         compatiblePass = false;
         canUpload = false;
         failed = false;

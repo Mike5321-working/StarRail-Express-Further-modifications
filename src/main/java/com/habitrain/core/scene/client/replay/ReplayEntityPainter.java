@@ -34,6 +34,10 @@ public final class ReplayEntityPainter {
     private static final int SMOKE_GRAY = 0xFF94A3B8;
     private static final int CHICK_YELLOW = 0xFFFFE57F;
     private static final int CHICK_BEAK = 0xFFFF8F2B;
+    /** Client render-thread scratch containers to avoid per-frame list/array churn. */
+    private static final List<ActiveEntity> SCRATCH_ENTITIES = new ArrayList<>();
+    private static final float[] SCRATCH_PROJ = new float[3];
+    private static final Vector3f SCRATCH_POS = new Vector3f();
 
     private ReplayEntityPainter() {}
 
@@ -69,13 +73,50 @@ public final class ReplayEntityPainter {
         float alpha = (float) (site.fade() * f.stage.actors());
         float u = Math.max(0.05f, f.model.scale);
         float elemScale = site.scale() * (float) f.focus.zoom();
-        List<ActiveEntity> entities = collectActive(f.model, f.replayTick, true);
-        if (entities.isEmpty()) return;
+        collectActiveInto(f.model, f.replayTick, true, SCRATCH_ENTITIES, SCRATCH_PROJ);
+        if (SCRATCH_ENTITIES.isEmpty()) return;
         float yawOffset = f.model.rotated ? 90f : 0f;
-        for (ActiveEntity e : entities) {
-            renderOne(e, f.model, f.replayTick, true, diorama, f.glow(), f.fill(), f.right, f.up, f.anim, u, elemScale, yawOffset, alpha, true, f, null, null);
+        boolean detail = site.detail();
+        VertexConsumer glowBase = f.glow();
+        VertexConsumer fillBase = f.fill();
+        ReplayClippedConsumer clippedGlow = glowBase instanceof ReplayClippedConsumer c ? c : null;
+        ReplayClippedConsumer clippedFill = fillBase instanceof ReplayClippedConsumer c ? c : null;
+        try {
+            for (int i = 0; i < SCRATCH_ENTITIES.size(); i++) {
+                ActiveEntity entity = SCRATCH_ENTITIES.get(i);
+                VertexConsumer glowTarget = glowBase;
+                VertexConsumer fillTarget = fillBase;
+                if (clippedGlow != null && !(entity.kind() == VisualKind.CORPSE && entity.dragged())) {
+                    float cullRadius = dioramaCullRadius(entity, u, elemScale);
+                    var clip = clippedGlow.classifyHorizontal(diorama, entity.x(), entity.y(), entity.z(), cullRadius);
+                    if (clip == ReplayClippedConsumer.ClipState.OUTSIDE) continue;
+                    if (clip == ReplayClippedConsumer.ClipState.INSIDE) {
+                        glowTarget = clippedGlow.directOutput();
+                        if (clippedFill != null) fillTarget = clippedFill.directOutput();
+                    }
+                }
+                renderOne(entity, f.model, f.replayTick, true, diorama, glowTarget, fillTarget,
+                        f.right, f.up, f.anim, u, elemScale, yawOffset, alpha, true, detail, f, null, null);
+            }
+        } finally {
+            SCRATCH_ENTITIES.clear();
         }
         f.entitiesPainted = true;
+    }
+
+    private static float dioramaCullRadius(ActiveEntity e, float u, float elemScale) {
+        return switch (e.kind()) {
+            case ZONE_SMOKE, ZONE_FOG -> {
+                float rad = Math.max(1.8f, e.radius()) * u;
+                yield rad * (0.95f + 0.65f * elemScale) + 0.15f * u;
+            }
+            case ZONE_FIRE -> Math.max(1.4f, e.radius()) * u * 1.05f + 0.35f * u * elemScale;
+            case ZONE_SLIME -> Math.max(1.5f, e.radius()) * u * 1.1f + 0.2f * u * elemScale;
+            case ZONE_POISON -> Math.max(1.6f, e.radius()) * u * 1.05f + 0.35f * u * elemScale;
+            case PROJECTILE -> 0.85f * u + 0.15f * u * elemScale;
+            case CORPSE, TAILOR_DOLL -> 1.15f * u;
+            default -> Math.max(0.75f, e.radius()) * u + 0.25f * u * elemScale;
+        };
     }
 
     /** Paints all non-player entities and persistent zones in 1:1 POV world space. */
@@ -83,9 +124,15 @@ public final class ReplayEntityPainter {
                                   Matrix4f worldToCam, Vector3f right, Vector3f up, ReplayBoardModel model,
                                   double matchTick, double animSec, float alpha, boolean godView) {
         if (model == null || alpha <= 0.01f) return;
-        List<ActiveEntity> entities = collectActive(model, matchTick, false);
-        for (ActiveEntity e : entities) {
-            renderOne(e, model, matchTick, false, worldToCam, glow, fill, right, up, animSec, 1.0f, 1.0f, 0f, alpha, godView, null, stack, buffers);
+        collectActiveInto(model, matchTick, false, SCRATCH_ENTITIES, SCRATCH_PROJ);
+        if (SCRATCH_ENTITIES.isEmpty()) return;
+        try {
+            for (int i = 0; i < SCRATCH_ENTITIES.size(); i++) {
+                renderOne(SCRATCH_ENTITIES.get(i), model, matchTick, false, worldToCam, glow, fill,
+                        right, up, animSec, 1.0f, 1.0f, 0f, alpha, godView, true, null, stack, buffers);
+            }
+        } finally {
+            SCRATCH_ENTITIES.clear();
         }
     }
 
@@ -93,20 +140,58 @@ public final class ReplayEntityPainter {
      * Collects active non-player entities at {@code matchTick} from {@code LastMatchReplay.entityTracks()}.
      */
     static List<ActiveEntity> collectActive(ReplayBoardModel model, double matchTick, boolean projectToDiorama) {
-        if (model == null || model.replay == null) return List.of();
-        List<ReplayEntityTrack> tracks = model.replay.entityTracks();
-        if (tracks.isEmpty()) return List.of();
+        if (model == null || model.entityTracks.length == 0) return List.of();
         List<ActiveEntity> out = new ArrayList<>();
-        float[] tmp = new float[3];
-        for (ReplayEntityTrack track : tracks) {
-            ReplayEntityTrack.Sampled s = track.sampleAt(matchTick);
-            if (s == null || !s.active()) continue;
+        collectActiveInto(model, matchTick, projectToDiorama, out, new float[3]);
+        return out;
+    }
+
+    static void collectActiveInto(ReplayBoardModel model, double matchTick, boolean projectToDiorama,
+                                  List<ActiveEntity> out, float[] tmp) {
+        out.clear();
+        if (model == null || model.entityTracks.length == 0) return;
+        int upper = model.entityTrackCountUpTo(matchTick);
+        if (upper == 0) return;
+        ReplayBoardModel.EntityTrackEntry[] indexed = model.entityTracks;
+        int[] maxEndPrefix = model.entityTrackMaxEndPrefix;
+        for (int i = upper - 1; i >= 0; i--) {
+            if (maxEndPrefix[i] <= matchTick) break;
+            ReplayBoardModel.EntityTrackEntry entry = indexed[i];
+            if (entry.endTick() <= matchTick) continue;
+            ReplayEntityTrack track = entry.track();
+            List<ReplayEntityTrack.EntitySample> samples = track.samples();
+            int firstTick = entry.firstTick();
+
+            double sx, sy, sz;
+            float yawDeg, pitchDeg;
+            int flags;
+            ReplayEntityTrack.EntitySample tail = samples.getLast();
+            if (matchTick >= tail.tick()) {
+                // O(1) tail fast path: skip binary search & Sampled allocation for persistent tracks.
+                if (!tail.has(ReplayEntityTrack.FLAG_ACTIVE)) continue;
+                sx = tail.position().blockX();
+                sy = tail.position().blockY();
+                sz = tail.position().blockZ();
+                yawDeg = tail.yawDegrees();
+                pitchDeg = tail.pitchDegrees();
+                flags = tail.flags();
+            } else {
+                ReplayEntityTrack.Sampled s = track.sampleAt(matchTick);
+                if (s == null || !s.active()) continue;
+                sx = s.x();
+                sy = s.y();
+                sz = s.z();
+                yawDeg = s.yawDeg();
+                pitchDeg = s.pitchDeg();
+                flags = s.flags();
+            }
+
             float x, y, z;
             if (projectToDiorama) {
-                model.project(s.x(), s.y(), s.z(), tmp);
+                model.project(sx, sy, sz, tmp);
                 x = tmp[0]; y = tmp[1]; z = tmp[2];
             } else {
-                x = (float) s.x(); y = (float) s.y(); z = (float) s.z();
+                x = (float) sx; y = (float) sy; z = (float) sz;
             }
             VisualKind kind = mapKind(track.kind());
             String targetName = null;
@@ -114,20 +199,19 @@ public final class ReplayEntityPainter {
                 ReplayBoardModel.Actor targetActor = model.participant(track.targetUuid());
                 if (targetActor != null) targetName = targetActor.p.name();
             }
-            double ageSec = Math.max(0.0, (matchTick - track.firstTick()) / 20.0);
+            double ageSec = Math.max(0.0, (matchTick - firstTick) / 20.0);
             out.add(new ActiveEntity(
                     track.entityId(), kind, track.entityTypeId(),
                     track.ownerUuid(), track.targetUuid(), targetName,
-                    x, y, z, s.yawDeg(), s.pitchDeg(), track.radius(), 0.0,
-                    s.has(ReplayEntityTrack.FLAG_DRAGGED),
-                    s.has(ReplayEntityTrack.FLAG_CORRUPTED),
-                    s.has(ReplayEntityTrack.FLAG_HIDDEN),
-                    s.has(ReplayEntityTrack.FLAG_ARMED),
-                    s.has(ReplayEntityTrack.FLAG_COMPLETE),
+                    x, y, z, yawDeg, pitchDeg, track.radius(), 0.0,
+                    (flags & ReplayEntityTrack.FLAG_DRAGGED) != 0,
+                    (flags & ReplayEntityTrack.FLAG_CORRUPTED) != 0,
+                    (flags & ReplayEntityTrack.FLAG_HIDDEN) != 0,
+                    (flags & ReplayEntityTrack.FLAG_ARMED) != 0,
+                    (flags & ReplayEntityTrack.FLAG_COMPLETE) != 0,
                     ageSec
             ));
         }
-        return out;
     }
 
     private static VisualKind mapKind(ReplayEntityTrack.EntityKind kind) {
@@ -153,7 +237,7 @@ public final class ReplayEntityPainter {
     private static void renderOne(ActiveEntity e, ReplayBoardModel model, double matchTick, boolean dioramaSpace,
                                   Matrix4f frame, VertexConsumer glow, VertexConsumer fill,
                                   Vector3f right, Vector3f up, double animSec, float u, float lineScale,
-                                  float yawOffset, float alpha, boolean godView,
+                                  float yawOffset, float alpha, boolean godView, boolean detail,
                                   @Nullable ReplayFrame replayFrame,
                                   @Nullable PoseStack worldStack, @Nullable MultiBufferSource worldBuffers) {
         if (e.hidden() && !godView) return;
@@ -177,12 +261,12 @@ public final class ReplayEntityPainter {
                 if (item.isEmpty()) item = new ItemStack(Items.CROSSBOW);
                 renderSpinningItem(e, frame, glow, item, BRASS_LIGHT, animSec, u * 0.55f, effAlpha, replayFrame, worldStack, worldBuffers);
             }
-            case PLACED_C4 -> renderPlacedC4(e, frame, fill, glow, right, up, animSec, u, lineScale, yawOffset, effAlpha);
+            case PLACED_C4 -> renderPlacedC4(e, frame, fill, glow, right, up, animSec, u, lineScale, yawOffset, effAlpha, detail);
             case TRAP -> renderTrap(e, frame, fill, glow, animSec, u, lineScale, yawOffset, effAlpha);
-            case ZONE_SMOKE, ZONE_FOG -> renderSmokeZone(e, frame, fill, glow, right, up, animSec, u, lineScale, effAlpha);
-            case ZONE_FIRE -> renderFireZone(e, frame, glow, right, up, animSec, u, lineScale, effAlpha);
-            case ZONE_SLIME -> renderSlimeZone(e, frame, fill, glow, right, up, animSec, u, lineScale, effAlpha);
-            case ZONE_POISON -> renderPoisonZone(e, frame, fill, glow, right, up, animSec, u, lineScale, effAlpha);
+            case ZONE_SMOKE, ZONE_FOG -> renderSmokeZone(e, frame, fill, glow, right, up, animSec, u, lineScale, effAlpha, detail);
+            case ZONE_FIRE -> renderFireZone(e, frame, glow, right, up, animSec, u, lineScale, effAlpha, detail);
+            case ZONE_SLIME -> renderSlimeZone(e, frame, fill, glow, right, up, animSec, u, lineScale, effAlpha, detail);
+            case ZONE_POISON -> renderPoisonZone(e, frame, fill, glow, right, up, animSec, u, lineScale, effAlpha, detail);
         }
     }
 
@@ -196,7 +280,7 @@ public final class ReplayEntityPainter {
         if (stack.isEmpty()) stack = new ItemStack(Items.FIRE_CHARGE);
         renderItemModel(frame, e.x(), e.y() + 0.14f * u, e.z(), (float) (animSec * 6.0), 0.36f * u, stack, rf, ws, wb);
         boolean blink = Math.sin(animSec * 18.0) > 0;
-        Vector3f c = frame.transformPosition(e.x(), e.y() + 0.22f * u, e.z(), new Vector3f());
+        Vector3f c = frame.transformPosition(e.x(), e.y() + 0.22f * u, e.z(), SCRATCH_POS);
         ReplayDraw.billboard(glow, c, right, up, 0.14f * u * lineScale, 0.14f * u * lineScale,
                 alpha(accent, (blink ? 0.92 : 0.35) * alpha));
     }
@@ -298,9 +382,8 @@ public final class ReplayEntityPainter {
                     if (dp.visible()) {
                         float dx, dy, dz;
                         if (dioramaSpace) {
-                            float[] tmp = new float[3];
-                            model.project(dp.x(), dp.y(), dp.z(), tmp);
-                            dx = tmp[0]; dy = tmp[1]; dz = tmp[2];
+                            model.project(dp.x(), dp.y(), dp.z(), SCRATCH_PROJ);
+                            dx = SCRATCH_PROJ[0]; dy = SCRATCH_PROJ[1]; dz = SCRATCH_PROJ[2];
                         } else {
                             dx = (float) dp.x(); dy = (float) dp.y(); dz = (float) dp.z();
                         }
@@ -325,16 +408,16 @@ public final class ReplayEntityPainter {
 
     private static void renderPlacedC4(ActiveEntity e, Matrix4f frame, VertexConsumer fill, VertexConsumer glow,
                                        Vector3f right, Vector3f up, double animSec, float u, float lineScale,
-                                       float yawOffset, float alpha) {
+                                       float yawOffset, float alpha, boolean detail) {
         Matrix4f m = new Matrix4f(frame).translate(e.x(), e.y(), e.z())
                 .rotateY((float) Math.toRadians(yawOffset - e.yawDeg())).scale(u);
         ReplayDraw.solidBox(fill, m, -0.22f, 0f, -0.16f, 0.22f, 0.14f, 0.16f, alpha(0xFF3A3F4B, alpha));
         boolean blink = Math.sin(animSec * (e.armed() ? 16.0 : 5.0)) > 0;
-        Vector3f led = frame.transformPosition(e.x(), e.y() + 0.18f * u, e.z(), new Vector3f());
+        Vector3f led = frame.transformPosition(e.x(), e.y() + 0.18f * u, e.z(), SCRATCH_POS);
         float lr = 0.18f * u * lineScale;
         ReplayDraw.softBillboard(glow, led, right, up, lr, lr,
-                alpha(RUBY, (blink ? 0.96 : 0.22) * alpha), 0.45f * u, 1.25f * u);
-        ReplayDraw.ring(glow, frame, e.x(), e.y() + 0.02f * u, e.z(), 0.55f * u, 0.06f * u, 20,
+                alpha(RUBY, (blink ? 0.96 : 0.22) * alpha), 0.45f * u, 1.25f * u, detail ? 12 : 8);
+        ReplayDraw.ring(glow, frame, e.x(), e.y() + 0.02f * u, e.z(), 0.55f * u, 0.06f * u, detail ? 20 : 12,
                 alpha(RUBY, (blink ? 0.8 : 0.3) * alpha), alpha(RUBY, 0));
     }
 
@@ -354,68 +437,80 @@ public final class ReplayEntityPainter {
     }
 
     private static void renderSmokeZone(ActiveEntity e, Matrix4f frame, VertexConsumer fill, VertexConsumer glow,
-                                        Vector3f right, Vector3f up, double animSec, float u, float lineScale, float alpha) {
+                                        Vector3f right, Vector3f up, double animSec, float u, float lineScale,
+                                        float alpha, boolean detail) {
         float rad = Math.max(1.8f, e.radius()) * u;
         int seed = e.entityId().hashCode();
-        for (int i = 0; i < 12; i++) {
+        int step = detail ? 1 : 2;
+        int segs = detail ? 12 : 8;
+        int col = alpha(e.kind() == VisualKind.ZONE_FOG ? 0xFF64748B : SMOKE_GRAY, (detail ? 0.34 : 0.42) * alpha);
+        for (int i = 0; i < 12; i += step) {
             float a = i * Mth.TWO_PI / 12f + (float) (animSec * 0.22 + (seed & 7));
             float rr = rad * (0.25f + 0.55f * ((i * 37 % 10) / 10f));
             float py = (0.35f + (i % 4) * 0.48f + (float) Math.sin(animSec * 1.4 + i) * 0.14f) * u;
-            Vector3f p = frame.transformPosition(e.x() + Mth.cos(a) * rr, e.y() + py, e.z() + Mth.sin(a) * rr, new Vector3f());
+            Vector3f p = frame.transformPosition(e.x() + Mth.cos(a) * rr, e.y() + py, e.z() + Mth.sin(a) * rr, SCRATCH_POS);
             float puff = rad * (0.40f + 0.12f * (i % 3)) * lineScale;
-            ReplayDraw.softBillboard(fill, p, right, up, puff, puff * 0.85f,
-                    alpha(e.kind() == VisualKind.ZONE_FOG ? 0xFF64748B : SMOKE_GRAY, 0.34 * alpha), 0.85f * u, 2.2f * u);
+            ReplayDraw.softBillboard(fill, p, right, up, puff, puff * 0.85f, col, 0.85f * u, 2.2f * u, segs);
         }
-        ReplayDraw.ring(glow, frame, e.x(), e.y() + 0.04f * u, e.z(), rad, 0.10f * u, 28,
+        ReplayDraw.ring(glow, frame, e.x(), e.y() + 0.04f * u, e.z(), rad, 0.10f * u, detail ? 28 : 16,
                 alpha(SMOKE_GRAY, 0.35 * alpha), alpha(SMOKE_GRAY, 0));
     }
 
     private static void renderFireZone(ActiveEntity e, Matrix4f frame, VertexConsumer glow, Vector3f right, Vector3f up,
-                                       double animSec, float u, float lineScale, float alpha) {
+                                       double animSec, float u, float lineScale, float alpha, boolean detail) {
         float rad = Math.max(1.4f, e.radius()) * u;
-        ReplayDraw.disc(glow, frame, e.x(), e.y() + 0.03f * u, e.z(), rad, 24,
+        ReplayDraw.disc(glow, frame, e.x(), e.y() + 0.03f * u, e.z(), rad, detail ? 24 : 14,
                 alpha(EXPLOSION, 0.44 * alpha), alpha(LAMP, 0));
-        for (int i = 0; i < 10; i++) {
+        int step = detail ? 1 : 2;
+        int segs = detail ? 12 : 8;
+        for (int i = 0; i < 10; i += step) {
             float a = i * Mth.TWO_PI / 10f;
             float rr = rad * (0.2f + 0.65f * ((i % 3) / 2f));
             float h = (float) (0.55 + 0.48 * Math.abs(Math.sin(animSec * 9.5 + i * 1.7))) * u;
-            Vector3f p = frame.transformPosition(e.x() + Mth.cos(a) * rr, e.y() + h * 0.5f, e.z() + Mth.sin(a) * rr, new Vector3f());
+            Vector3f p = frame.transformPosition(e.x() + Mth.cos(a) * rr, e.y() + h * 0.5f, e.z() + Mth.sin(a) * rr, SCRATCH_POS);
             ReplayDraw.softBillboard(glow, p, right, up, 0.32f * u * lineScale, h * 1.1f * lineScale,
-                    alpha(i % 2 == 0 ? EXPLOSION : LAMP, 0.60 * alpha), 0.70f * u, 1.85f * u);
+                    alpha(i % 2 == 0 ? EXPLOSION : LAMP, 0.60 * alpha), 0.70f * u, 1.85f * u, segs);
         }
     }
 
     private static void renderSlimeZone(ActiveEntity e, Matrix4f frame, VertexConsumer fill, VertexConsumer glow,
-                                        Vector3f right, Vector3f up, double animSec, float u, float lineScale, float alpha) {
+                                        Vector3f right, Vector3f up, double animSec, float u, float lineScale,
+                                        float alpha, boolean detail) {
         float rad = Math.max(1.5f, e.radius()) * u;
-        ReplayDraw.disc(fill, frame, e.x(), e.y() + 0.03f * u, e.z(), rad, 24,
+        int ringSegs = detail ? 24 : 14;
+        ReplayDraw.disc(fill, frame, e.x(), e.y() + 0.03f * u, e.z(), rad, ringSegs,
                 alpha(EMERALD, 0.45 * alpha), alpha(POISON, 0.14 * alpha));
-        ReplayDraw.ring(glow, frame, e.x(), e.y() + 0.05f * u, e.z(), rad, 0.12f * u, 24,
+        ReplayDraw.ring(glow, frame, e.x(), e.y() + 0.05f * u, e.z(), rad, 0.12f * u, ringSegs,
                 alpha(EMERALD, 0.78 * alpha), alpha(EMERALD, 0));
-        for (int i = 0; i < 5; i++) {
-            float a = i * Mth.TWO_PI / 5f + (float) animSec;
+        int count = detail ? 5 : 3;
+        int segs = detail ? 12 : 8;
+        for (int i = 0; i < count; i++) {
+            float a = i * Mth.TWO_PI / count + (float) animSec;
             float rise = (float) ((animSec * 1.1 + i * 0.23) % 1.0);
             Vector3f p = frame.transformPosition(e.x() + Mth.cos(a) * rad * 0.55f, e.y() + (0.08f + rise * 0.55f) * u,
-                    e.z() + Mth.sin(a) * rad * 0.55f, new Vector3f());
+                    e.z() + Mth.sin(a) * rad * 0.55f, SCRATCH_POS);
             float bs = (0.14f * (1f - rise * 0.5f)) * u * lineScale;
             ReplayDraw.softBillboard(glow, p, right, up, bs, bs,
-                    alpha(EMERALD, (1f - rise) * 0.76 * alpha), 0.70f * u, 1.85f * u);
+                    alpha(EMERALD, (1f - rise) * 0.76 * alpha), 0.70f * u, 1.85f * u, segs);
         }
     }
 
     private static void renderPoisonZone(ActiveEntity e, Matrix4f frame, VertexConsumer fill, VertexConsumer glow,
-                                         Vector3f right, Vector3f up, double animSec, float u, float lineScale, float alpha) {
+                                         Vector3f right, Vector3f up, double animSec, float u, float lineScale,
+                                         float alpha, boolean detail) {
         float rad = Math.max(1.6f, e.radius()) * u;
-        ReplayDraw.disc(fill, frame, e.x(), e.y() + 0.03f * u, e.z(), rad, 24,
+        ReplayDraw.disc(fill, frame, e.x(), e.y() + 0.03f * u, e.z(), rad, detail ? 24 : 14,
                 alpha(POISON, 0.34 * alpha), alpha(POISON, 0.05 * alpha));
-        for (int i = 0; i < 8; i++) {
+        int step = detail ? 1 : 2;
+        int segs = detail ? 12 : 8;
+        int col = alpha(POISON, 0.48 * alpha);
+        for (int i = 0; i < 8; i += step) {
             float a = i * Mth.TWO_PI / 8f + (float) (animSec * 0.9);
             float py = (0.3f + (float) ((animSec * 0.7 + i * 0.2) % 1.2)) * u;
             Vector3f p = frame.transformPosition(e.x() + Mth.cos(a) * rad * 0.52f, e.y() + py,
-                    e.z() + Mth.sin(a) * rad * 0.52f, new Vector3f());
+                    e.z() + Mth.sin(a) * rad * 0.52f, SCRATCH_POS);
             float pr = 0.28f * u * lineScale;
-            ReplayDraw.softBillboard(glow, p, right, up, pr, pr,
-                    alpha(POISON, 0.48 * alpha), 0.80f * u, 2.0f * u);
+            ReplayDraw.softBillboard(glow, p, right, up, pr, pr, col, 0.80f * u, 2.0f * u, segs);
         }
     }
 

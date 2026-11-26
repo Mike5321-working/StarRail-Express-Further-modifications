@@ -136,6 +136,13 @@ public final class ReplayWsolaTimeStretch {
         int searchRadius = Math.max(16, Math.min(windowLen / 2, (int) Math.round(sr * SEARCH_SECONDS)));
         int maxStart = input.length - windowLen;
         float[] hann = buildHannWindow(windowLen);
+        double[] prefixSq = new double[input.length + 1];
+        double acc = 0.0;
+        for (int i = 0; i < input.length; i++) {
+            double v = input[i];
+            acc += v * v;
+            prefixSq[i + 1] = acc;
+        }
         float[] output = new float[outputLength];
 
         int firstNominal = clampStart(Math.round(sourceIndexAtOutputSample.applyAsDouble(0)), maxStart);
@@ -152,13 +159,17 @@ public final class ReplayWsolaTimeStretch {
         int coarseDecim = sr >= 40_000 ? 4 : 2;
         int fineDecim = sr >= 40_000 ? 2 : 1;
 
+        int frameIndex = 0;
         for (int outPos = hop; outPos < outputLength; outPos += hop) {
+            if ((frameIndex++ & 7) == 0 && Thread.currentThread().isInterrupted()) {
+                return new float[0];
+            }
             boolean isLast = outPos + hop >= outputLength;
             int nominal = clampStart(Math.round(sourceIndexAtOutputSample.applyAsDouble(outPos)), maxStart);
             int natural = prevChosen + hop;
             int chosen;
             if (natural >= 0 && natural <= maxStart) {
-                chosen = findBestMatch(input, natural, nominal, searchRadius, windowLen, maxStart,
+                chosen = findBestMatch(input, prefixSq, natural, nominal, searchRadius, windowLen, maxStart,
                         coarseStep, coarseDecim, fineDecim);
             } else {
                 chosen = nominal;
@@ -191,29 +202,30 @@ public final class ReplayWsolaTimeStretch {
         return Math.clamp(speed, MIN_SPEED, MAX_SPEED);
     }
 
-    private static int findBestMatch(float[] src, int natural, int nominal, int radius, int windowLen, int maxStart,
+    private static int findBestMatch(float[] src, double[] prefixSq, int natural, int nominal, int radius,
+                                     int windowLen, int maxStart,
                                      int coarseStep, int coarseDecim, int fineDecim) {
         int lo = Math.max(0, nominal - radius);
         int hi = Math.min(maxStart, nominal + radius);
         if (lo >= hi) return lo;
 
-        // If the natural continuation is already inside the search range and equals nominal, fast path.
-        double refEnergyCoarse = energy(src, natural, windowLen, coarseDecim);
-        if (refEnergyCoarse < 1.0e-7) {
+        // O(1) window energy via prefix sums; silent frames skip correlation search completely.
+        double refEnergy = prefixSq[natural + windowLen] - prefixSq[natural];
+        if (refEnergy < 1.0e-7) {
             return Math.clamp(nominal, lo, hi);
         }
 
         int bestCand = Math.clamp(nominal, lo, hi);
         double bestScore = Double.NEGATIVE_INFINITY;
         for (int cand = lo; cand <= hi; cand += coarseStep) {
-            double score = normalizedCrossCorrelation(src, natural, cand, windowLen, coarseDecim, refEnergyCoarse);
+            double score = signedSquaredCorrelation(src, prefixSq, natural, cand, windowLen, coarseDecim);
             if (score > bestScore) {
                 bestScore = score;
                 bestCand = cand;
             }
         }
         if ((hi - lo) % coarseStep != 0) {
-            double score = normalizedCrossCorrelation(src, natural, hi, windowLen, coarseDecim, refEnergyCoarse);
+            double score = signedSquaredCorrelation(src, prefixSq, natural, hi, windowLen, coarseDecim);
             if (score > bestScore) {
                 bestCand = hi;
             }
@@ -221,13 +233,10 @@ public final class ReplayWsolaTimeStretch {
 
         int fineLo = Math.max(lo, bestCand - coarseStep);
         int fineHi = Math.min(hi, bestCand + coarseStep);
-        double refEnergyFine = fineDecim == coarseDecim ? refEnergyCoarse : energy(src, natural, windowLen, fineDecim);
-        if (refEnergyFine < 1.0e-7) return bestCand;
-
         int exactBest = bestCand;
         double exactScore = Double.NEGATIVE_INFINITY;
         for (int cand = fineLo; cand <= fineHi; cand++) {
-            double score = normalizedCrossCorrelation(src, natural, cand, windowLen, fineDecim, refEnergyFine);
+            double score = signedSquaredCorrelation(src, prefixSq, natural, cand, windowLen, fineDecim);
             if (score > exactScore) {
                 exactScore = score;
                 exactBest = cand;
@@ -236,27 +245,20 @@ public final class ReplayWsolaTimeStretch {
         return exactBest;
     }
 
-    private static double energy(float[] src, int start, int len, int decim) {
-        double sum = 0.0;
-        for (int i = 0; i < len; i += decim) {
-            double v = src[start + i];
-            sum += v * v;
-        }
-        return sum;
-    }
-
-    private static double normalizedCrossCorrelation(float[] src, int refStart, int candStart,
-                                                     int len, int decim, double refEnergy) {
-        double dot = 0.0;
-        double candEnergy = 0.0;
-        for (int i = 0; i < len; i += decim) {
-            double r = src[refStart + i];
-            double c = src[candStart + i];
-            dot += r * c;
-            candEnergy += c * c;
-        }
+    /**
+     * Strictly monotonic proxy for normalized cross-correlation {@code dot / sqrt(refE * candE)}:
+     * omits constant {@code refE}, avoids {@code Math.sqrt} per candidate, and reads {@code candE} in O(1).
+     */
+    private static double signedSquaredCorrelation(float[] src, double[] prefixSq, int refStart, int candStart,
+                                                   int len, int decim) {
+        double candEnergy = prefixSq[candStart + len] - prefixSq[candStart];
         if (candEnergy < 1.0e-9) return -2.0;
-        return dot / Math.sqrt(refEnergy * candEnergy);
+        float dot = 0.0f;
+        for (int i = 0; i < len; i += decim) {
+            dot += src[refStart + i] * src[candStart + i];
+        }
+        double d = dot;
+        return (d >= 0.0 ? d * d : -(d * d)) / candEnergy;
     }
 
     private static float[] buildHannWindow(int n) {

@@ -22,6 +22,7 @@ import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import net.fabricmc.fabric.api.renderer.v1.mesh.QuadView;
 import net.fabricmc.fabric.api.renderer.v1.model.SpriteFinder;
 import net.fabricmc.fabric.api.util.TriState;
@@ -80,6 +81,7 @@ public final class SceneMeshBuilder {
     private static final int MAX_SECTIONS = SceneLimits.MAX_MESH_SECTIONS;
     /** {@link DefaultVertexFormat#BLOCK} 在 1.21.1 中每个顶点占 32 字节。 */
     private static final int BLOCK_VERTEX_BYTES = 32;
+    private static final Direction[] DIRECTIONS = Direction.values();
     private static final AtomicBoolean FABRIC_CONTEXT_FALLBACK_WARNED = new AtomicBoolean();
     /**
      * 运行/预取路径默认只做统计与异常抽样；发布诊断与管理员检查会显式要求详细模式。
@@ -91,6 +93,156 @@ public final class SceneMeshBuilder {
     private SceneMeshBuilder() {}
 
     public record MeshBuildResult(SceneMeshSet meshSet, SceneCompatibilityReport report) {}
+
+    static final class QuotaExceededException extends IllegalStateException {
+        QuotaExceededException(String message) {
+            super(message);
+        }
+    }
+
+    /** 沿异常链解包配额超限异常，兼容原版 {@code BlockRenderDispatcher} 包装的 {@code ReportedException}。 */
+    static boolean isQuotaExceeded(Throwable failure) {
+        Throwable cursor = failure;
+        for (int depth = 0; cursor != null && depth < 16; depth++) {
+            if (cursor instanceof QuotaExceededException) return true;
+            Throwable cause = cursor.getCause();
+            if (cause == cursor) break;
+            cursor = cause;
+        }
+        return false;
+    }
+
+    /** One dynamic replay block baked into a lightweight revision-cached {@link SceneMeshSet}. */
+    public record DynamicBlockSpec(int localX, int localY, int localZ, BlockState state,
+                                   float swingYawDeg, float pivotX, float pivotZ) {}
+
+    /**
+     * Synchronously bakes a small set of dynamic replay blocks (doors, windows, destructible walls)
+     * into a revision-cached {@link SceneMeshSet} compatible with {@link SceneShaders}.
+     */
+    public static SceneMeshSet buildDynamicBlocksMesh(SceneAssetCodec.AssetData staticAsset,
+                                                      List<DynamicBlockSpec> blocks) {
+        SceneMeshSet result = new SceneMeshSet();
+        if (staticAsset == null || blocks == null || blocks.isEmpty()) return result;
+        Minecraft client = Minecraft.getInstance();
+        if (client == null || client.level == null) return result;
+        BlockRenderDispatcher dispatcher = client.getBlockRenderer();
+        SnapshotBlockView blockView = new SnapshotBlockView(staticAsset, client.level);
+        Map<SceneMeshSet.Layer, ByteBufferBuilder> byteBuilders = new EnumMap<>(SceneMeshSet.Layer.class);
+        Map<SceneMeshSet.Layer, BufferBuilder> builders = new EnumMap<>(SceneMeshSet.Layer.class);
+        Map<BufferBuilder, VertexConsumer> consumers = new IdentityHashMap<>();
+        PoseStack poses = new PoseStack();
+        RandomSource random = RandomSource.create(42L);
+        BlockPos.MutableBlockPos cursor = new BlockPos.MutableBlockPos();
+        try {
+            for (DynamicBlockSpec spec : blocks) {
+                BlockState state = spec.state();
+                if (state == null || state.isAir() || state.getRenderShape() != RenderShape.MODEL) continue;
+                SceneMeshSet.Layer layer = resolveLayer(state);
+                BufferBuilder builder = builders.get(layer);
+                if (builder == null) {
+                    ByteBufferBuilder bb = new ByteBufferBuilder(16384);
+                    byteBuilders.put(layer, bb);
+                    builder = new BufferBuilder(bb, com.mojang.blaze3d.vertex.VertexFormat.Mode.QUADS, DefaultVertexFormat.BLOCK);
+                    builders.put(layer, builder);
+                }
+                VertexConsumer consumer = consumers.computeIfAbsent(builder, DynamicBlockVertexConsumer::new);
+                cursor.set(spec.localX(), spec.localY(), spec.localZ());
+                poses.pushPose();
+                try {
+                    poses.translate(spec.localX(), spec.localY(), spec.localZ());
+                    if (spec.swingYawDeg() != 0f) {
+                        poses.translate(spec.pivotX(), 0f, spec.pivotZ());
+                        poses.mulPose(com.mojang.math.Axis.YP.rotationDegrees(spec.swingYawDeg()));
+                        poses.translate(-spec.pivotX(), 0f, -spec.pivotZ());
+                    }
+                    dispatcher.renderBatched(state, cursor, blockView, poses, consumer, false, random);
+                } finally {
+                    poses.popPose();
+                }
+            }
+            for (Map.Entry<SceneMeshSet.Layer, BufferBuilder> entry : builders.entrySet()) {
+                MeshData data = entry.getValue().build();
+                if (data == null) continue;
+                try (data) {
+                    SceneMeshSet.Layer layer = entry.getKey();
+                    int stride = data.drawState().format().getVertexSize();
+                    SceneTransparencySort sort = null;
+                    if (layer == SceneMeshSet.Layer.TRANSLUCENT) {
+                        ByteBufferBuilder bb = byteBuilders.get(layer);
+                        if (bb != null) {
+                            float sortX = staticAsset.sourceBounds != null ? staticAsset.sourceBounds.sizeX() * 0.5f : 0f;
+                            float sortY = staticAsset.sourceBounds != null ? staticAsset.sourceBounds.sizeY() * 0.5f : 0f;
+                            float sortZ = staticAsset.sourceBounds != null ? staticAsset.sourceBounds.sizeZ() * 0.5f : 0f;
+                            sort = SceneTransparencySort.capture(data, bb,
+                                    com.mojang.blaze3d.vertex.VertexSorting.byDistance(sortX, sortY, sortZ));
+                        }
+                    }
+                    long bytes = (long) data.drawState().vertexCount() * stride;
+                    if (sort != null) bytes += sort.indexBytes();
+                    else if (data.indexBuffer() != null) bytes += data.indexBuffer().remaining();
+                    VertexBuffer vbo = new VertexBuffer(VertexBuffer.Usage.STATIC);
+                    try {
+                        vbo.bind();
+                        try {
+                            vbo.upload(data);
+                        } finally {
+                            VertexBuffer.unbind();
+                        }
+                    } catch (Throwable uploadFailure) {
+                        vbo.close();
+                        throw uploadFailure;
+                    }
+                    result.setSortState(layer, null, sort);
+                    result.setEstimatedBytes(result.estimatedBytes() + bytes);
+                    result.setBuffer(layer, vbo);
+                }
+            }
+            return result;
+        } catch (Throwable failure) {
+            result.close();
+            LOGGER.warn("构建动态回放方块静态网格失败", failure);
+            return new SceneMeshSet();
+        } finally {
+            for (ByteBufferBuilder bb : byteBuilders.values()) {
+                if (bb != null) bb.close();
+            }
+        }
+    }
+
+    private static final class DynamicBlockVertexConsumer implements VertexConsumer {
+        private final VertexConsumer delegate;
+        private int diffuseCode = 4;
+
+        private DynamicBlockVertexConsumer(VertexConsumer delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void putBulkData(PoseStack.Pose pose, net.minecraft.client.renderer.block.model.BakedQuad quad,
+                                float[] brightness, float red, float green, float blue, float alpha,
+                                int[] light, int overlay, boolean useQuadColor) {
+            int previous = diffuseCode;
+            diffuseCode = quad.isShade() ? shadeCode(quad.getDirection()) : 0;
+            try {
+                VertexConsumer.super.putBulkData(pose, quad, brightness, red, green, blue, alpha,
+                        light, overlay, useQuadColor);
+            } finally {
+                diffuseCode = previous;
+            }
+        }
+
+        @Override public VertexConsumer addVertex(float x, float y, float z) { delegate.addVertex(x, y, z); return this; }
+        @Override public VertexConsumer setColor(int r, int g, int b, int a) { delegate.setColor(r, g, b, a); return this; }
+        @Override public VertexConsumer setUv(float u, float v) { delegate.setUv(u, v); return this; }
+        @Override public VertexConsumer setUv1(int u, int v) { delegate.setUv1(u, v); return this; }
+        @Override public VertexConsumer setUv2(int u, int v) { delegate.setUv2((u & ~15) | diffuseCode, v); return this; }
+        @Override public VertexConsumer setNormal(float x, float y, float z) {
+            float[] n = sanitizeNormal(x, y, z);
+            delegate.setNormal(n[0], n[1], n[2]);
+            return this;
+        }
+    }
 
     public static CompletableFuture<MeshBuildResult> buildMeshWithReportAsync(SceneAssetCodec.AssetData assetData) {
         return buildMeshWithReportAsync(assetData, DEFAULT_DETAILED_DIAGNOSTICS,
@@ -116,18 +268,25 @@ public final class SceneMeshBuilder {
     public static CompletableFuture<MeshBuildResult> buildMeshWithReportAsync(SceneAssetCodec.AssetData assetData,
                                                                              boolean detailedDiagnostics,
                                                                              SceneBuildScheduler.Priority priority) {
-        return buildMeshWithReportAsync(assetData, detailedDiagnostics, priority, false);
+        return buildMeshWithReportAsync(assetData, detailedDiagnostics, priority, false, false);
     }
 
-    /** Replay-only mesh: retain solid neighbour faces so moving voxel cuts expose closed surfaces. */
+    /** Replay-only 2D-batched mesh using standard neighbor culling (cuts VBO footprint ~62% vs hidden-face shell). */
     public static CompletableFuture<MeshBuildResult> buildCutawayMeshAsync(SceneAssetCodec.AssetData assetData,
                                                                           SceneBuildScheduler.Priority priority) {
-        return buildMeshWithReportAsync(assetData, false, priority, true);
+        return buildMeshWithReportAsync(assetData, false, priority, true, false);
+    }
+
+    /** Replay-only 2D-batched mesh using standard neighbor culling (for 1:1 POV views without cutaway). */
+    public static CompletableFuture<MeshBuildResult> buildSolidReplayMeshAsync(SceneAssetCodec.AssetData assetData,
+                                                                               SceneBuildScheduler.Priority priority) {
+        return buildMeshWithReportAsync(assetData, false, priority, true, false);
     }
 
     private static CompletableFuture<MeshBuildResult> buildMeshWithReportAsync(SceneAssetCodec.AssetData assetData,
                                                                               boolean detailedDiagnostics,
                                                                               SceneBuildScheduler.Priority priority,
+                                                                              boolean replayMesh,
                                                                               boolean retainHiddenFaces) {
         if (assetData == null || assetData.sections.isEmpty()) {
             SceneCompatibilityReport empty = new SceneCompatibilityReport(detailedDiagnostics);
@@ -145,7 +304,7 @@ public final class SceneMeshBuilder {
             CompletableFuture<MeshBuildResult> outer = new CompletableFuture<>();
             client.execute(() -> {
                 if (outer.isCancelled()) return;
-                var inner = buildMeshWithReportAsync(assetData, detailedDiagnostics, priority, retainHiddenFaces);
+                var inner = buildMeshWithReportAsync(assetData, detailedDiagnostics, priority, replayMesh, retainHiddenFaces);
                 outer.whenComplete((value, error) -> { if (outer.isCancelled()) inner.cancel(false); });
                 inner.whenComplete((value, error) -> {
                     if (error != null) outer.completeExceptionally(error);
@@ -164,7 +323,7 @@ public final class SceneMeshBuilder {
         // BuildState 的构造已经很轻（调色板改为惰性解析），因此仍同步建好再交给调度器。
         CompletableFuture<MeshBuildResult> result = new CompletableFuture<>();
         try {
-            BuildState buildState = new BuildState(assetData, result, detailedDiagnostics, retainHiddenFaces);
+            BuildState buildState = new BuildState(assetData, result, detailedDiagnostics, replayMesh, retainHiddenFaces);
             result.whenComplete((res, ex) -> {
                 if (result.isCancelled()) {
                     if (client.isSameThread()) SceneBuildScheduler.getInstance().cancel(buildState);
@@ -191,9 +350,12 @@ public final class SceneMeshBuilder {
 
         private final SceneAssetCodec.AssetData asset;
         private final CompletableFuture<MeshBuildResult> result;
-        private final SceneCompatibilityReport report;
-        private final boolean retainHiddenFaces;
+        private SceneCompatibilityReport report;
+        private final boolean replayMesh;
+        private boolean keepCutawayShell;
         private final SceneMeshBatchPolicy.Plan batchPlan;
+        private final SceneMeshBatchPolicy.ReplayPlan replayBatchPlan;
+        private final int batchCount;
         /** 单份场景与客户端“网格缓存配额”共享同一容量边界，避免另设冲突的 256 MiB 硬上限。 */
         private final int meshQuotaMiB;
         private final long maxVertices;
@@ -213,6 +375,11 @@ public final class SceneMeshBuilder {
         private final Map<BufferBuilder, VertexConsumer> budgetedConsumers = new IdentityHashMap<>();
         /** 当前 section 所属的批次。 */
         private int activeBatch;
+        /** 当前正在烘焙的原版方块是否跳过数学上永不因扇形剖切暴露的底面。 */
+        private boolean skipDownFace;
+        private final BlockPos.MutableBlockPos cursorPos = new BlockPos.MutableBlockPos();
+        private final BlockPos.MutableBlockPos occlusionNeighbor = new BlockPos.MutableBlockPos();
+        private final Map<BlockState, Boolean> replaySolidStates = new IdentityHashMap<>();
         private final Map<BlockPos, SceneBlockPayloadEntry> payloadMap = new HashMap<>();
         private final BlockRenderDispatcher dispatcher = Minecraft.getInstance().getBlockRenderer();
         private final RandomSource random = RandomSource.create(42L);
@@ -244,11 +411,13 @@ public final class SceneMeshBuilder {
         private final SceneVertexBounds replayUnbatchedBounds = new SceneVertexBounds();
 
         private BuildState(SceneAssetCodec.AssetData asset, CompletableFuture<MeshBuildResult> result,
-                           boolean detailedDiagnostics, boolean retainHiddenFaces) {
+                           boolean detailedDiagnostics, boolean replayMesh, boolean retainHiddenFaces) {
             this.asset = asset;
             this.result = result;
-            this.report = new SceneCompatibilityReport(detailedDiagnostics);
-            this.retainHiddenFaces = retainHiddenFaces;
+            // stepSections 始终严格按 section -> y -> z -> x 顺序访问每个坐标一次，所有构建路径均可免除百万级 HashMap 分配。
+            this.report = new SceneCompatibilityReport(detailedDiagnostics, true);
+            this.replayMesh = replayMesh;
+            this.keepCutawayShell = retainHiddenFaces;
             ClientLevel level = Minecraft.getInstance().level;
             if (level == null) {
                 throw new IllegalStateException("Cannot build a scene mesh without a client level");
@@ -256,12 +425,18 @@ public final class SceneMeshBuilder {
             this.blockView = new SnapshotBlockView(asset, level);
             this.blockSpriteFinder = SpriteFinder.get(
                     Minecraft.getInstance().getModelManager().getAtlas(net.minecraft.world.inventory.InventoryMenu.BLOCK_ATLAS));
-            this.meshQuotaMiB = ClientVisualPreferences.getMeshCacheQuotaMiB();
-            this.maxVertices = vertexBudgetForMiB(meshQuotaMiB);
+            int configuredQuotaMiB = ClientVisualPreferences.getMeshCacheQuotaMiB();
+            // 16-chunk (33x33x4) dense replay maps reach ~576 MiB even with neighbor culling; guarantee headroom.
+            this.meshQuotaMiB = replayMesh ? Math.max(configuredQuotaMiB, 768) : configuredQuotaMiB;
+            this.maxVertices = vertexBudgetForMiB(this.meshQuotaMiB);
             int batchThreshold = ClientVisualPreferences.getMeshBatchMinSections();
-            this.batchPlan = retainHiddenFaces
+            this.replayBatchPlan = replayMesh
                     ? SceneMeshBatchPolicy.replayPlan(asset.sections.size(), batchThreshold, asset.sourceBounds)
-                    : SceneMeshBatchPolicy.plan(asset.sections.size(), batchThreshold, asset.sourceBounds);
+                    : null;
+            this.batchPlan = replayBatchPlan == null
+                    ? SceneMeshBatchPolicy.plan(asset.sections.size(), batchThreshold, asset.sourceBounds)
+                    : SceneMeshBatchPolicy.single();
+            this.batchCount = replayBatchPlan == null ? batchPlan.batchCount() : replayBatchPlan.batchCount();
             if (asset.blockPayloads != null) {
                 for (SceneBlockPayloadEntry entry : asset.blockPayloads) {
                     payloadMap.put(new BlockPos(entry.localX(), entry.localY(), entry.localZ()), entry);
@@ -298,10 +473,27 @@ public final class SceneMeshBuilder {
             } catch (Throwable t) {
                 closeCpuBuilders();
                 closeUploadedMeshes();
+                if (isQuotaExceeded(t) && keepCutawayShell) {
+                    LOGGER.debug("回放桌剖切网格超出配额，使用邻面剔除重新构建: sections={}", asset.sections.size());
+                    keepCutawayShell = false;
+                    cpuBuildersClosed = false;
+                    skipDownFace = false;
+                    report = new SceneCompatibilityReport(report.isDetailed(), true);
+                    sectionIndex = 0;
+                    activeSection = null;
+                    activePalette = null;
+                    activeLayer = 0;
+                    sectionsDone = false;
+                    pendingUploads = List.of();
+                    uploadCursor = 0;
+                    replayUnbatchedBounds.reset();
+                    vertexCount = 0;
+                    return false;
+                }
                 LOGGER.error("构建场景顶点网格失败", t);
                 // 失败路径同样要冻结：部分统计信息对诊断仍然有价值。
                 report.freeze();
-                if (retainHiddenFaces) result.completeExceptionally(t);
+                if (replayMesh) result.completeExceptionally(t);
                 else result.complete(new MeshBuildResult(new SceneMeshSet(), report));
                 return true;
             }
@@ -313,7 +505,11 @@ public final class SceneMeshBuilder {
             closeUploadedMeshes();
             if (!result.isDone()) {
                 report.freeze();
-                result.complete(new MeshBuildResult(new SceneMeshSet(), report));
+                if (replayMesh) {
+                    result.completeExceptionally(new java.util.concurrent.CancellationException("Replay mesh build aborted"));
+                } else {
+                    result.complete(new MeshBuildResult(new SceneMeshSet(), report));
+                }
             }
         }
 
@@ -334,11 +530,11 @@ public final class SceneMeshBuilder {
          * 缓冲里，绘制顺序与分批功能上线前逐字节一致。</p>
          */
         private BufferBuilder builderFor(SceneMeshSet.Layer layer) {
-            int slot = (batchPlan.isBatched() && layer != SceneMeshSet.Layer.TRANSLUCENT) ? activeBatch : 0;
+            int slot = layer != SceneMeshSet.Layer.TRANSLUCENT ? activeBatch : 0;
             BufferBuilder[] array = builders.computeIfAbsent(layer,
-                    ignored -> new BufferBuilder[batchPlan.batchCount()]);
+                    ignored -> new BufferBuilder[batchCount]);
             ByteBufferBuilder[] byteArray = byteBuilders.computeIfAbsent(layer,
-                    ignored -> new ByteBufferBuilder[batchPlan.batchCount()]);
+                    ignored -> new ByteBufferBuilder[batchCount]);
             BufferBuilder builder = array[slot];
             if (builder == null) {
                 ByteBufferBuilder bytes = new ByteBufferBuilder(131072);
@@ -351,11 +547,11 @@ public final class SceneMeshBuilder {
         }
 
         private BufferBuilder getOrCreateCustomBuilder(SceneMaterialKey material) {
-            int slot = (batchPlan.isBatched() && !material.isTranslucent()) ? activeBatch : 0;
+            int slot = !material.isTranslucent() ? activeBatch : 0;
             BufferBuilder[] array = customBuilders.computeIfAbsent(material,
-                    ignored -> new BufferBuilder[batchPlan.batchCount()]);
+                    ignored -> new BufferBuilder[batchCount]);
             ByteBufferBuilder[] byteArray = customByteBuilders.computeIfAbsent(material,
-                    ignored -> new ByteBufferBuilder[batchPlan.batchCount()]);
+                    ignored -> new ByteBufferBuilder[batchCount]);
             BufferBuilder builder = array[slot];
             if (builder == null) {
                 ByteBufferBuilder bytes = new ByteBufferBuilder(65536);
@@ -488,8 +684,10 @@ public final class SceneMeshBuilder {
                 activeBaseY = localSectionOrigin(section.relY, asset.sourceBounds.minY());
                 activeBaseZ = localSectionOrigin(section.relZ, asset.sourceBounds.minZ());
                 // 批次只在 section 边界上变化：section 内的方块共用同一个包围盒，不需要逐块判断。
-                activeBatch = batchPlan.batchIndex(SceneMeshBatchPolicy.axisCoordinate(
-                        batchPlan, activeBaseX, activeBaseY, activeBaseZ));
+                activeBatch = replayBatchPlan != null
+                        ? replayBatchPlan.batchIndex(section.relX, section.relZ)
+                        : batchPlan.batchIndex(SceneMeshBatchPolicy.axisCoordinate(
+                                batchPlan, activeBaseX, activeBaseY, activeBaseZ));
                 activeLayer = 0;
                 return true;
             }
@@ -526,15 +724,16 @@ public final class SceneMeshBuilder {
                         int worldZ = asset.sourceBounds.minZ() + localZ;
                         if (!asset.sourceBounds.contains(worldX, worldY, worldZ)) continue;
 
-                        BlockPos localPos = new BlockPos(localX, localY, localZ);
+                        cursorPos.set(localX, localY, localZ);
+                        BlockPos localPos = cursorPos;
                         ResourceLocation blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock());
-                        String modelClassName = null;
+                        BakedModel model = null;
                         try {
-                            BakedModel m = dispatcher.getBlockModel(state);
-                            if (m != null) modelClassName = m.getClass().getSimpleName();
+                            model = dispatcher.getBlockModel(state);
                         } catch (Throwable ignored) {}
+                        String modelClassName = model == null ? null : model.getClass().getSimpleName();
 
-                        SceneBlockPayloadEntry entry = payloadMap.get(localPos);
+                        SceneBlockPayloadEntry entry = payloadMap.isEmpty() ? null : payloadMap.get(localPos);
                         SceneRenderPayload payload = entry != null ? entry.payload() : null;
                         boolean legacyStaticModelHint = entry != null
                                 && BuiltinSceneAdapters.BUILTIN_STATIC_MODEL_ID.equals(entry.adapterId());
@@ -606,8 +805,9 @@ public final class SceneMeshBuilder {
                             }
                         }
                         if (adapter != null) {
-                            MaterialSinkImpl sink = new MaterialSinkImpl(localPos);
-                            SceneBakeContext ctx = new SceneBakeContext(localPos, state, payload, blockView);
+                            BlockPos immutablePos = localPos.immutable();
+                            MaterialSinkImpl sink = new MaterialSinkImpl(immutablePos);
+                            SceneBakeContext ctx = new SceneBakeContext(immutablePos, state, payload, blockView);
                             SceneBakeResult bakeResult;
                             try {
                                 bakeResult = adapter.emitStaticMesh(ctx, sink);
@@ -619,7 +819,8 @@ public final class SceneMeshBuilder {
                             }
 
                             if (bakeResult == SceneBakeResult.SUCCESS && sink.hasEmitted()) {
-                                report.addEntry(new SceneCompatibilityReport.Entry(
+                                if (!report.isDetailed()) report.recordNormalBlock(localPos, true);
+                                else report.addEntry(new SceneCompatibilityReport.Entry(
                                         localPos, blockId, modelClassName, adapter.adapterId(),
                                         entry != null ? entry.adapterVersion() : adapter.dataVersion(),
                                         state.hasBlockEntity(), payload != null,
@@ -679,7 +880,7 @@ public final class SceneMeshBuilder {
                         }
 
                         // 3. 检查缺失模型
-                        BakedModel model = dispatcher.getBlockModel(state);
+                        if (model == null) model = dispatcher.getBlockModel(state);
                         if (model == dispatcher.getBlockModelShaper().getModelManager().getMissingModel()) {
                             report.addEntry(new SceneCompatibilityReport.Entry(
                                     localPos, blockId, modelClassName, null, 0,
@@ -693,7 +894,7 @@ public final class SceneMeshBuilder {
                         //    对这种模型调用一次 vanilla renderBatched 会把所有 pass 压进预选层。
                         if (SceneFabricModelCollector.isEnhanced(model)) {
                             FabricBakeOutcome outcome = bakeFabricModel(
-                                    model, state, localPos, blockId, modelClassName, sky, block);
+                                    model, state, localPos.immutable(), blockId, modelClassName, sky, block);
                             if (outcome == FabricBakeOutcome.EMITTED) {
                                 reportBlockEntityStaticFallback(
                                         state, localPos, blockId, modelClassName, true, sky, block);
@@ -706,14 +907,22 @@ public final class SceneMeshBuilder {
                         //    兼容回退。让活动渲染器创建自己的上下文，避免手工 getQuads
                         //    丢掉 Wathe 等模型的面、材质层和嵌套模型。
                         SceneMeshSet.Layer blockLayer = resolveLayer(state);
-                        boolean keepHidden = retainHiddenFaces && blockLayer != SceneMeshSet.Layer.TRANSLUCENT;
+                        int occlusionClass = keepCutawayShell && blockLayer == SceneMeshSet.Layer.SOLID
+                                ? replayOcclusionClass(state, localPos) : 0;
+                        boolean keepHidden = keepCutawayShell && blockLayer != SceneMeshSet.Layer.TRANSLUCENT
+                                && occlusionClass != 2;
                         BufferBuilder builder = builderFor(blockLayer);
                         long verticesBeforeModel = vertexCount;
+                        skipDownFace = keepHidden && occlusionClass == 1;
                         poses.pushPose();
-                        poses.translate(localX, localY, localZ);
-                        dispatcher.renderBatched(state, localPos, blockView, poses,
-                                budgeted(builder), !keepHidden, random);
-                        poses.popPose();
+                        try {
+                            poses.translate(localX, localY, localZ);
+                            dispatcher.renderBatched(state, localPos, blockView, poses,
+                                    budgeted(builder), !keepHidden, random);
+                        } finally {
+                            skipDownFace = false;
+                            poses.popPose();
+                        }
                         long modelVertexCount = vertexCount - verticesBeforeModel;
 
                         FluidState fluidState = state.getFluidState();
@@ -729,14 +938,15 @@ public final class SceneMeshBuilder {
                                 state, localPos, blockId, modelClassName,
                                 hasStaticModelFallback(state, model, modelVertexCount), sky, block);
 
-                        report.addEntry(new SceneCompatibilityReport.Entry(
+                        if (!report.isDetailed()) report.recordNormalBlock(localPos, false);
+                        else report.addEntry(new SceneCompatibilityReport.Entry(
                                 localPos, blockId, modelClassName, null, 0,
                                 state.hasBlockEntity(), false,
                                 SceneCompatibilityReport.IssueType.NONE,
                                 legacyStaticModelHint
                                         ? "旧版静态模型标记已通过活动渲染器兼容烘焙"
                                         : "原版静态模型快速路径",
-                                0, SceneMaterialKey.fromLayerName(layerNameOf(resolveLayer(state))), sky, block
+                                0, SceneMaterialKey.fromLayerName(layerNameOf(blockLayer)), sky, block
                         ));
                     }
                 }
@@ -751,6 +961,32 @@ public final class SceneMeshBuilder {
             return false;
         }
 
+        /**
+         * Classifies a SOLID block for cutaway face retention:
+         * <ul>
+         *   <li>{@code 0}: non-occluder or resting on non-occluder (keep full cutaway shell)</li>
+         *   <li>{@code 1}: occluder stacked on another occluder with at least one other exposed neighbor
+         *       (keep shell, skip mathematically unexposable {@link Direction#DOWN} face)</li>
+         *   <li>{@code 2}: fully surrounded on all 6 faces by occluders (fall back to normal neighbor culling)</li>
+         * </ul>
+         */
+        private int replayOcclusionClass(BlockState state, BlockPos pos) {
+            if (!isReplayOccluder(state, pos)) return 0;
+            occlusionNeighbor.setWithOffset(pos, Direction.DOWN);
+            if (!isReplayOccluder(blockView.getBlockState(occlusionNeighbor), occlusionNeighbor)) return 0;
+            for (Direction face : DIRECTIONS) {
+                if (face == Direction.DOWN) continue;
+                occlusionNeighbor.setWithOffset(pos, face);
+                if (!isReplayOccluder(blockView.getBlockState(occlusionNeighbor), occlusionNeighbor)) return 1;
+            }
+            return 2;
+        }
+
+        private boolean isReplayOccluder(BlockState state, BlockPos pos) {
+            return replaySolidStates.computeIfAbsent(state, SceneMeshBuilder::isReplayOccluderCandidate)
+                    && isReplayFullCube(state, blockView, pos);
+        }
+
         private FabricBakeOutcome bakeFabricModel(BakedModel model,
                                                   BlockState state,
                                                   BlockPos localPos,
@@ -762,7 +998,9 @@ public final class SceneMeshBuilder {
             List<String> materialFailures = new java.util.ArrayList<>();
             long seed = state.getSeed(localPos);
             try {
-                boolean keepHiddenFabric = retainHiddenFaces && resolveLayer(state) != SceneMeshSet.Layer.TRANSLUCENT;
+                SceneMeshSet.Layer defaultLayer = resolveLayer(state);
+                boolean keepHiddenFabric = keepCutawayShell && defaultLayer != SceneMeshSet.Layer.TRANSLUCENT
+                        && (defaultLayer != SceneMeshSet.Layer.SOLID || replayOcclusionClass(state, localPos) != 2);
                 SceneFabricModelCollector.CollectionResult collection = SceneFabricModelCollector.collect(
                         model,
                         blockView,
@@ -808,7 +1046,8 @@ public final class SceneMeshBuilder {
                     return FabricBakeOutcome.TERMINAL;
                 }
 
-                for (Map.Entry<SceneMaterialKey, Integer> material : verticesByMaterial.entrySet()) {
+                if (!report.isDetailed()) report.recordNormalBlock(localPos, false);
+                else for (Map.Entry<SceneMaterialKey, Integer> material : verticesByMaterial.entrySet()) {
                     report.addEntry(new SceneCompatibilityReport.Entry(
                             localPos, blockId, modelClassName, null, 0,
                             state.hasBlockEntity(), false,
@@ -943,12 +1182,6 @@ public final class SceneMeshBuilder {
             }
         }
 
-        private static final class QuotaExceededException extends IllegalStateException {
-            QuotaExceededException(String message) {
-                super(message);
-            }
-        }
-
         /**
          * 原版与 Sodium/Indium 的活动渲染器最终都写向这个代理。预算因而只统计真正通过
          * 遮挡剔除并写入缓冲的顶点，而不是把每个实心方块的六个理论方向面全部算进去。
@@ -961,6 +1194,7 @@ public final class SceneMeshBuilder {
             public void putBulkData(PoseStack.Pose pose, net.minecraft.client.renderer.block.model.BakedQuad quad,
                                     float[] brightness, float red, float green, float blue, float alpha,
                                     int[] light, int overlay, boolean useQuadColor) {
+                if (skipDownFace && quad.getDirection() == Direction.DOWN) return;
                 int previous = diffuseCode;
                 diffuseCode = quad.isShade() ? shadeCode(quad.getDirection()) : 0;
                 try {
@@ -1046,7 +1280,7 @@ public final class SceneMeshBuilder {
             boolean translucent = upload.material() != null
                     ? upload.material().isTranslucent()
                     : upload.layer() == SceneMeshSet.Layer.TRANSLUCENT;
-            if (!batchPlan.isBatched() || translucent) {
+            if (batchCount == 1 || translucent) {
                 uploadTarget.setSortState(upload.layer(), upload.material(), sort);
                 uploadTarget.setEstimatedBytes(uploadTarget.estimatedBytes() + bytes);
                 if (upload.material() != null) {
@@ -1090,7 +1324,7 @@ public final class SceneMeshBuilder {
                         boolean translucent = upload.material() != null
                                 ? upload.material().isTranslucent()
                                 : upload.layer() == SceneMeshSet.Layer.TRANSLUCENT;
-                        boolean batched = batchPlan.isBatched() && !translucent;
+                        boolean batched = batchCount > 1 && !translucent;
                         try (data) {
                             int stride = data.drawState().format().getVertexSize();
                             SceneTransparencySort sort = null;
@@ -1101,11 +1335,11 @@ public final class SceneMeshBuilder {
                                 sort = SceneTransparencySort.capture(data, upload.byteBuilder(),
                                         com.mojang.blaze3d.vertex.VertexSorting.byDistance(sortX, sortY, sortZ));
                             }
-                            if (batched || retainHiddenFaces) {
+                            if (batched || replayMesh) {
                                 var bounds = batched ? batchBounds.computeIfAbsent(upload.batch(), ignored -> new SceneVertexBounds())
                                         : replayUnbatchedBounds;
                                 bounds.include(data.vertexBuffer(), data.drawState().vertexCount(), stride);
-                                if (retainHiddenFaces) uploadTarget.includeReplayCeiling(bounds.maxY());
+                                if (replayMesh) uploadTarget.includeReplayCeiling(bounds.maxY());
                             }
                             long bytes = (long) data.drawState().vertexCount() * stride;
                             if (sort != null) bytes += sort.indexBytes();
@@ -1157,12 +1391,14 @@ public final class SceneMeshBuilder {
                 }
             }
             byteBuilders.clear();
+            builders.clear();
             for (ByteBufferBuilder[] array : customByteBuilders.values()) {
                 for (ByteBufferBuilder bytes : array) {
                     if (bytes != null) bytes.close();
                 }
             }
             customByteBuilders.clear();
+            customBuilders.clear();
             budgetedConsumers.clear();
         }
     }
@@ -1275,6 +1511,23 @@ public final class SceneMeshBuilder {
         return (alpha << 24) | (red << 16) | (green << 8) | blue;
     }
 
+    static boolean isReplayOccluderCandidate(BlockState state) {
+        return state.getRenderShape() == RenderShape.MODEL
+                && state.canOcclude()
+                && !state.hasBlockEntity()
+                && state.getFluidState().isEmpty()
+                && resolveLayer(state) == SceneMeshSet.Layer.SOLID;
+    }
+
+    static boolean isReplayFullCube(BlockState state, BlockAndTintGetter view, BlockPos pos) {
+        return state.isSolidRender(view, pos)
+                && net.minecraft.world.level.block.Block.isShapeFullBlock(state.getShape(view, pos));
+    }
+
+    static boolean isReplayOccluderState(BlockState state, BlockAndTintGetter view, BlockPos pos) {
+        return isReplayOccluderCandidate(state) && isReplayFullCube(state, view, pos);
+    }
+
     private static SceneMeshSet.Layer resolveLayer(BlockState state) {
         RenderType type = ItemBlockRenderTypes.getChunkRenderType(state);
         if (type == RenderType.translucent()) return SceneMeshSet.Layer.TRANSLUCENT;
@@ -1303,8 +1556,8 @@ public final class SceneMeshBuilder {
         private final ClientLevel level;
         private final Biome defaultBiome;
         private final LevelLightEngine snapshotLightEngine;
-        private final Map<SectionKey, SceneAssetCodec.SectionData> rawSections = new HashMap<>();
-        private final Map<SectionKey, SnapshotSection> sections = new HashMap<>();
+        private final Long2ObjectOpenHashMap<SceneAssetCodec.SectionData> rawSections = new Long2ObjectOpenHashMap<>();
+        private final Long2ObjectOpenHashMap<SnapshotSection> sections = new Long2ObjectOpenHashMap<>();
 
         private SnapshotBlockView(SceneAssetCodec.AssetData asset, ClientLevel level) {
             this.bounds = asset.sourceBounds;
@@ -1344,16 +1597,12 @@ public final class SceneMeshBuilder {
                 }
             };
             for (SceneAssetCodec.SectionData section : asset.sections) {
-                rawSections.put(new SectionKey(section.relX, section.relY, section.relZ), section);
+                rawSections.put(SectionPos.asLong(section.relX, section.relY, section.relZ), section);
             }
         }
 
         private SnapshotSection getSection(int relX, int relY, int relZ) {
-            return sectionFor(new SectionKey(relX, relY, relZ));
-        }
-
-        /** 全部访问都在客户端线程上（构建步骤与活动渲染器），因此普通 HashMap 即可。 */
-        private SnapshotSection sectionFor(SectionKey key) {
+            long key = SectionPos.asLong(relX, relY, relZ);
             SnapshotSection cached = sections.get(key);
             if (cached != null) return cached;
             SceneAssetCodec.SectionData raw = rawSections.get(key);
@@ -1373,11 +1622,14 @@ public final class SceneMeshBuilder {
             // selected geometry as air so vanilla and FRAPI face-culling cannot remove a
             // boundary face merely because the source build continues beyond the selection.
             if (!containsLocalGeometry(bounds, pos)) return Blocks.AIR.defaultBlockState();
-            BlockLookup lookup = lookup(pos);
-            if (lookup == null) return Blocks.AIR.defaultBlockState();
-            int paletteIndex = lookup.section.blockIndices[lookup.flatIndex];
-            return paletteIndex >= 0 && paletteIndex < lookup.section.palette.length
-                    ? lookup.section.palette[paletteIndex]
+            int sourceX = bounds.minX() + pos.getX();
+            int sourceY = bounds.minY() + pos.getY();
+            int sourceZ = bounds.minZ() + pos.getZ();
+            SnapshotSection section = sourceSection(sourceX, sourceY, sourceZ);
+            if (section == null) return Blocks.AIR.defaultBlockState();
+            int paletteIndex = section.blockIndices[sectionFlatIndex(sourceX & 15, sourceY & 15, sourceZ & 15)];
+            return paletteIndex >= 0 && paletteIndex < section.palette.length
+                    ? section.palette[paletteIndex]
                     : Blocks.AIR.defaultBlockState();
         }
 
@@ -1456,16 +1708,16 @@ public final class SceneMeshBuilder {
             int sourceZ = bounds.minZ() + localPos.getZ();
             if (!haloBounds.contains(sourceX, sourceY, sourceZ)) return null;
 
-            int relX = SectionPos.blockToSectionCoord(sourceX) - bounds.minSectionX();
-            int relY = SectionPos.blockToSectionCoord(sourceY) - bounds.minSectionY();
-            int relZ = SectionPos.blockToSectionCoord(sourceZ) - bounds.minSectionZ();
-            SnapshotSection section = getSection(relX, relY, relZ);
+            SnapshotSection section = sourceSection(sourceX, sourceY, sourceZ);
             if (section == null) return null;
 
-            int x = Math.floorMod(sourceX, 16);
-            int y = Math.floorMod(sourceY, 16);
-            int z = Math.floorMod(sourceZ, 16);
-            return new BlockLookup(section, (y << 8) | (z << 4) | x);
+            return new BlockLookup(section, sectionFlatIndex(sourceX & 15, sourceY & 15, sourceZ & 15));
+        }
+
+        private SnapshotSection sourceSection(int sourceX, int sourceY, int sourceZ) {
+            return getSection(SectionPos.blockToSectionCoord(sourceX) - bounds.minSectionX(),
+                    SectionPos.blockToSectionCoord(sourceY) - bounds.minSectionY(),
+                    SectionPos.blockToSectionCoord(sourceZ) - bounds.minSectionZ());
         }
     }
 
@@ -1475,8 +1727,6 @@ public final class SceneMeshBuilder {
                 && localPos.getY() >= 0 && localPos.getY() < bounds.sizeY()
                 && localPos.getZ() >= 0 && localPos.getZ() < bounds.sizeZ();
     }
-
-    private record SectionKey(int x, int y, int z) {}
 
     private record SnapshotSection(BlockState[] palette, short[] blockIndices,
                                    byte[] skyLight, byte[] blockLight) {}

@@ -259,17 +259,32 @@ public final class ReplayPovSceneRenderer {
         var subject = model.participant(camera.subjectUuid());
         var subjectPose = subject == null ? null : sample(poses, subject, matchTick);
 
+        // A first-person eye must see the same walls and roof that the recorded player saw.
+        boolean roofCutaway = opts.roofCutawayFor(camera.mode());
+
         // Prepare dynamic blocks (doors/windows/broken walls) at matchTick
         ReplayDioramaMesh.DynamicWorld dynamicWorld = ReplayDioramaMesh.prepareDynamic(
                 baseAsset, origin, model.replay.blockDeltas());
         SceneMeshSet terrainMesh = fallbackMesh;
         if (dynamicWorld != null && dynamicWorld.hasDynamics()) {
             var staticAsset = dynamicWorld.staticAsset();
-            ReplayDioramaMesh.update(staticAsset, staticAsset.sections.size(), staticAsset.sections.size());
-            if (ReplayDioramaMesh.matches(staticAsset)) {
-                SceneMeshSet ready = ReplayDioramaMesh.current();
+            if (roofCutaway) {
+                ReplayDioramaMesh.update(staticAsset, staticAsset.sections.size(), staticAsset.sections.size());
+                if (ReplayDioramaMesh.matches(staticAsset)) {
+                    SceneMeshSet ready = ReplayDioramaMesh.current();
+                    if (ready != null) terrainMesh = ready;
+                }
+            } else {
+                // Non-cutaway 1:1 POV views reuse an already-resident mesh if present, otherwise build
+                // a standard neighbor-culled solid mesh instead of retaining 6x hidden interior faces.
+                SceneMeshSet ready = ReplayDioramaMesh.readyCutaway(staticAsset);
+                if (ready == null) {
+                    ready = ReplayDioramaMesh.resolveSolid(staticAsset, staticAsset.sections.size(), staticAsset.sections.size());
+                }
                 if (ready != null) terrainMesh = ready;
             }
+        } else if (terrainMesh == null && baseAsset != null && !roofCutaway) {
+            terrainMesh = ReplayDioramaMesh.resolveSolid(baseAsset, baseAsset.sections.size(), baseAsset.sections.size());
         }
 
         // Resolve wall-collision-safe camera eye for non-first-person cameras
@@ -343,8 +358,6 @@ public final class ReplayPovSceneRenderer {
             float dimG = blackout ? 0.25f : 1.0f;
             float dimB = blackout ? 0.36f : 1.0f;
 
-            // A first-person eye must see the same walls and roof that the recorded player saw.
-            boolean roofCutaway = opts.roofCutawayFor(camera.mode());
             POV_FANS.clear();
             if (roofCutaway && subjectPose != null && subjectPose.visible()) {
                 POV_FANS.faceViewer(sourceModel, lookDir, source);

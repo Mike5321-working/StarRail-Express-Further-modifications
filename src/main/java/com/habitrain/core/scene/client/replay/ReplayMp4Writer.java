@@ -23,10 +23,20 @@ import java.util.concurrent.TimeUnit;
  * via a temporary file to prevent dual-pipe deadlocks and maintain exact A/V sync.</p>
  */
 final class ReplayMp4Writer implements ReplayVideoWriter {
+    static final class FfmpegTimeoutException extends IOException {
+        FfmpegTimeoutException(String message) { super(message); }
+    }
+
+    static final class FfmpegProcessException extends IOException {
+        FfmpegProcessException(String message) { super(message); }
+        FfmpegProcessException(String message, Throwable cause) { super(message, cause); }
+    }
+
     private static final int AUDIO_SAMPLE_RATE = 48_000;
     private static final int AUDIO_CHANNELS = 2;
     private static final int MAX_LOG_BYTES = 16 * 1024;
-    private static final long FINISH_TIMEOUT_SECONDS = 60L;
+    private static final long MIN_FINISH_TIMEOUT_SECONDS = 120L;
+    private static final long MAX_FINISH_TIMEOUT_SECONDS = 600L;
 
     private final Process process;
     private final OutputStream videoOut;
@@ -35,6 +45,8 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
     private final @Nullable Path tempAudioPcm;
     private final boolean deleteAudioOnClose;
     private final int expectedBytes;
+    private final int width;
+    private int writtenFrames;
     private boolean finished;
     private boolean closed;
 
@@ -67,6 +79,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
             throw new IllegalArgumentException("FPS must be positive: " + fps);
         }
         this.expectedBytes = Math.multiplyExact(Math.multiplyExact(width, height), 3);
+        this.width = width;
 
         Path parent = path.toAbsolutePath().normalize().getParent();
         if (parent != null) Files.createDirectories(parent);
@@ -87,6 +100,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         } catch (IOException | RuntimeException | Error failure) {
             if (started != null) {
                 started.destroyForcibly();
+                awaitProcessExitUninterruptibly(started, 1_000L);
             }
             if (deleteAudioOnClose) deleteQuietly(preMixedAudioPcmFile);
             throw failure;
@@ -224,6 +238,11 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         }
     }
 
+    static long finishTimeoutSeconds(int frames, int width) {
+        long dynamic = MIN_FINISH_TIMEOUT_SECONDS + Math.max(0, frames) / 60L + (width >= 2560 ? 60L : 0L);
+        return Math.clamp(dynamic, MIN_FINISH_TIMEOUT_SECONDS, MAX_FINISH_TIMEOUT_SECONDS);
+    }
+
     @Override
     public void add(byte[] bottomUpBgr) throws IOException {
         if (bottomUpBgr.length != expectedBytes) {
@@ -231,11 +250,15 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         }
         try {
             videoOut.write(bottomUpBgr);
+            writtenFrames++;
         } catch (IOException writeFailure) {
             waitBrieflyForLog();
             String details = capturedLog();
             if (!details.isEmpty()) {
-                throw new IOException("FFmpeg pipe failed: " + details, writeFailure);
+                throw new FfmpegProcessException("FFmpeg pipe failed: " + details, writeFailure);
+            }
+            if (!process.isAlive()) {
+                throw new FfmpegProcessException("FFmpeg exited early with code " + process.exitValue(), writeFailure);
             }
             throw writeFailure;
         }
@@ -252,16 +275,27 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
             waitBrieflyForLog();
             String details = capturedLog();
             if (!details.isEmpty()) {
-                throw new IOException("FFmpeg input close failed: " + details, closeFailure);
+                throw new FfmpegProcessException("FFmpeg input close failed: " + details, closeFailure);
             }
             throw closeFailure;
         }
         int exitCode;
+        long timeoutSeconds = finishTimeoutSeconds(writtenFrames, width);
+        long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
         try {
-            if (!process.waitFor(FINISH_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+            boolean exited = false;
+            while (true) {
+                long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime());
+                if (remainingMs <= 0L) break;
+                if (process.waitFor(Math.min(1000L, remainingMs), TimeUnit.MILLISECONDS)) {
+                    exited = true;
+                    break;
+                }
+            }
+            if (!exited) {
                 process.destroyForcibly();
                 process.waitFor(3, TimeUnit.SECONDS);
-                throw new IOException("Timed out waiting for FFmpeg to finalize MP4");
+                throw new FfmpegTimeoutException("Timed out after " + timeoutSeconds + "s waiting for FFmpeg to finalize MP4");
             }
             exitCode = process.exitValue();
             logDrainThread.join(3000);
@@ -272,50 +306,90 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         }
         if (exitCode != 0) {
             String details = capturedLog();
-            throw new IOException("FFmpeg exited with code " + exitCode
+            throw new FfmpegProcessException("FFmpeg exited with code " + exitCode
                     + (details.isEmpty() ? "" : ": " + details));
         }
+    }
+
+    @Override
+    public void abort() {
+        try {
+            videoOut.close();
+        } catch (IOException ignored) {}
+        process.destroyForcibly();
     }
 
     @Override
     public void close() throws IOException {
         if (closed) return;
         closed = true;
+        boolean wasInterrupted = Thread.interrupted();
         try {
             try {
                 videoOut.close();
             } catch (IOException ignored) {}
             if (process.isAlive()) {
                 process.destroyForcibly();
+            }
+            awaitProcessExitUninterruptibly(process, 3_000L);
+            joinUninterruptibly(logDrainThread, 1_000L);
+        } finally {
+            try {
+                if (deleteAudioOnClose) deleteQuietly(tempAudioPcm);
+            } finally {
+                if (wasInterrupted) Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    static boolean awaitProcessExitUninterruptibly(@Nullable Process process, long timeoutMs) {
+        if (process == null) return true;
+        boolean wasInterrupted = Thread.interrupted();
+        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+        try {
+            while (process.isAlive()) {
+                long remainingNs = deadlineNs - System.nanoTime();
+                if (remainingNs <= 0L) return !process.isAlive();
                 try {
-                    process.waitFor(3, TimeUnit.SECONDS);
+                    if (process.waitFor(remainingNs, TimeUnit.NANOSECONDS)) return true;
                 } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
+                    wasInterrupted = true;
                 }
             }
-            try {
-                logDrainThread.join(1000);
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
+            return true;
+        } finally {
+            if (wasInterrupted) Thread.currentThread().interrupt();
+        }
+    }
+
+    private static void joinUninterruptibly(@Nullable Thread thread, long timeoutMs) {
+        if (thread == null) return;
+        boolean wasInterrupted = Thread.interrupted();
+        long deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.max(0L, timeoutMs));
+        try {
+            while (thread.isAlive()) {
+                long remainingMs = TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime());
+                if (remainingMs <= 0L) return;
+                try {
+                    thread.join(remainingMs);
+                } catch (InterruptedException interrupted) {
+                    wasInterrupted = true;
+                }
             }
         } finally {
-            if (deleteAudioOnClose) deleteQuietly(tempAudioPcm);
+            if (wasInterrupted) Thread.currentThread().interrupt();
         }
     }
 
     private void waitBrieflyForLog() {
-        try {
-            process.waitFor(1, TimeUnit.SECONDS);
-            logDrainThread.join(500);
-        } catch (InterruptedException interrupted) {
-            Thread.currentThread().interrupt();
-        }
+        awaitProcessExitUninterruptibly(process, 1_000L);
+        joinUninterruptibly(logDrainThread, 500L);
     }
 
     private static void deleteQuietly(@Nullable Path path) {
         if (path == null) return;
         try {
-            Files.deleteIfExists(path);
+            ReplayVideoExport.deleteFileWithRetry(path);
         } catch (IOException ignored) {}
     }
 }

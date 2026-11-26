@@ -188,9 +188,13 @@ final class ReplayAviWriter implements ReplayVideoWriter {
         patch(offset, uint32(out.getFilePointer() - offset - 4));
     }
 
+    static final class AviSizeLimitException extends IOException {
+        AviSizeLimitException(String message) { super(message); }
+    }
+
     private static int uint32(long value) throws IOException {
         if (value < 0 || value > 0x7FFF_FFFFL) {
-            throw new IOException("AVI 1.0 chunk exceeds 2 GiB compatibility limit (" + value
+            throw new AviSizeLimitException("AVI 1.0 chunk exceeds 2 GiB compatibility limit (" + value
                     + "); enable compression (MP4/H.264) for long high-resolution exports");
         }
         return (int) value;
