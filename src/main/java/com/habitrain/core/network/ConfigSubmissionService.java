@@ -80,8 +80,11 @@ public final class ConfigSubmissionService {
                                 com.habitrain.core.scene.server.SceneAssetStore.getInstance().deleteConfiguredAsset(key);
                             }
                         }
-                        if (!Objects.equals(beforeModeMapVote, manager.getModeMapVoteSettings().toJson())) broadcastMapProfiles(server, manager);
-                        FullConfigSyncPayload.broadcastToAll(server);
+                        if (!Objects.equals(beforeModeMapVote, manager.getModeMapVoteSettings().toJson())) {
+                            com.habitrain.core.vote.MapFileMonitor.invalidateIntroCache();
+                            broadcastMapProfiles(server, manager);
+                        }
+                        FullConfigSyncPayload.broadcastToAllExcept(server, player);
                     } catch (RuntimeException error) {
                         com.habitrain.core.HabiTrainCore.LOGGER.error("配置已保存，后续发布失败", error);
                         result = new ConfigSaveResult(ConfigSaveResult.Status.SAVED, result.message() + "；配置发布失败，请查看服务器日志");
@@ -128,8 +131,14 @@ public final class ConfigSubmissionService {
         return keys;
     }
     private static void broadcastMapProfiles(MinecraftServer server, ConfigManager manager) {
+        var overworld = server.overworld();
+        if (overworld == null) return;
         var maps = manager.getModeMapVoteSettings().maps;
-        var profiles = com.habitrain.core.vote.MapVoteProfileStore.loadProfiles(server.overworld(), maps.keySet(), maps);
-        for (var fragment : MapVoteProfilePayload.fragment(profiles)) for (var player : server.getPlayerList().getPlayers()) ServerPlayNetworking.send(player, fragment);
+        var fragments = com.habitrain.core.vote.MapVoteProfileStore.loadProfileFragments(overworld, maps, manager.revision());
+        for (var fragment : fragments) {
+            for (var player : server.getPlayerList().getPlayers()) {
+                ServerPlayNetworking.send(player, fragment);
+            }
+        }
     }
 }

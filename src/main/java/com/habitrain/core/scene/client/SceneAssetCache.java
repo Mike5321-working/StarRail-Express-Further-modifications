@@ -64,21 +64,29 @@ public final class SceneAssetCache {
     public static final long MAX_SINGLE_ASSET_BYTES = 64L * 1024L * 1024L;
 
     /** 整文件校验/解码：会被移动、读取大文件，因此与写盘分开，避免互相堵住。 */
-    private static final ExecutorService IO_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "HabiTrain-SceneCache-IO");
-        t.setDaemon(true);
-        return t;
-    });
+    private static final ExecutorService IO_EXECUTOR = createSingleDaemonExecutor("HabiTrain-SceneCache-IO");
 
     /**
      * 分片写盘线程。必须与 {@link #IO_EXECUTOR} 分开：一次 32 MiB 的整文件校验会把
      * 小写入堵上几秒，那期间下载会因为请求超时而反复重发。
      */
-    private static final ExecutorService WRITE_EXECUTOR = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "HabiTrain-SceneCache-Writer");
-        t.setDaemon(true);
-        return t;
-    });
+    private static final ExecutorService WRITE_EXECUTOR = createSingleDaemonExecutor("HabiTrain-SceneCache-Writer");
+
+    private static ExecutorService createSingleDaemonExecutor(String name) {
+        var exec = new java.util.concurrent.ThreadPoolExecutor(1, 1, 30L, TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<>(), r -> {
+                    Thread t = new Thread(r, name);
+                    t.setDaemon(true);
+                    return t;
+                });
+        exec.allowCoreThreadTimeOut(true);
+        return exec;
+    }
+
+    private static void shutdownExecutors() {
+        IO_EXECUTOR.shutdownNow();
+        WRITE_EXECUTOR.shutdownNow();
+    }
 
     private static final SceneAssetCache INSTANCE = new SceneAssetCache();
 
@@ -1155,6 +1163,17 @@ public final class SceneAssetCache {
      * 且 {@code .hscene} 文件仍在磁盘上，下次未命中走的是「重新读盘 + 解码」而不是重新下载。
      * <b>解码缓存是纯性能缓存，绝不是正确性依赖。</b></p>
      */
+    /** GPU 网格烘焙完成后调用：若已解码缓存超出配额，立即淘汰不再需要 CPU 资产的已烘焙条目。 */
+    public void trimMemoryCacheIfOverQuota() {
+        if (!memoryBudget.isOverQuota()) return;
+        Minecraft mc = Minecraft.getInstance();
+        if (mc != null && !mc.isSameThread()) {
+            mc.execute(() -> evictMemoryIfNeeded(null));
+        } else {
+            evictMemoryIfNeeded(null);
+        }
+    }
+
     private void evictMemoryIfNeeded(String justAddedHash) {
         if (!memoryBudget.isOverQuota()) return;
         Set<String> protectedHashes = new HashSet<>();
@@ -1168,7 +1187,7 @@ public final class SceneAssetCache {
             }
         }
         protectedHashes.addAll(pinnedHashes);
-        protectedHashes.addAll(SceneRenderRuntime.getInstance().activeAssetHashes());
+        protectedHashes.addAll(SceneRenderRuntime.getInstance().activeCpuBuildAssetHashes());
         if (justAddedHash != null) protectedHashes.add(justAddedHash);
 
         List<String> victims = memoryBudget.selectEvictions(protectedHashes);
@@ -1337,6 +1356,8 @@ public final class SceneAssetCache {
             }).get(2_000L, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
             LOGGER.debug("客户端停机刷写场景缓存索引超时或异常", e);
+        } finally {
+            shutdownExecutors();
         }
     }
 

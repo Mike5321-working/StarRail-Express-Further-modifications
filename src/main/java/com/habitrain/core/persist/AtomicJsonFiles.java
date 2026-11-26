@@ -40,8 +40,16 @@ public final class AtomicJsonFiles {
     public enum SourceState { ABSENT, INVALID_TYPE, UNREADABLE, INVALID_CONTENT, VALID, NOT_CHECKED }
     private record Candidate<T>(T value, SourceState state) {}
     private static final Logger LOGGER = LoggerFactory.getLogger("habitrain_core|AtomicJsonFiles");
-    private static final ConcurrentMap<Path, Object> FILE_LOCKS = new ConcurrentHashMap<>();
+    private static final int LOCK_STRIPES = 64;
+    private static final Object[] FILE_LOCKS = new Object[LOCK_STRIPES];
+    private static final int MAX_BAD_PRIMARY_ENTRIES = 256;
     private static final Set<Path> UNQUARANTINED_BAD_PRIMARY = ConcurrentHashMap.newKeySet();
+
+    static {
+        for (int i = 0; i < LOCK_STRIPES; i++) {
+            FILE_LOCKS[i] = new Object();
+        }
+    }
 
     private AtomicJsonFiles() {
     }
@@ -51,7 +59,15 @@ public final class AtomicJsonFiles {
     }
 
     private static Object lockFor(Path target) {
-        return FILE_LOCKS.computeIfAbsent(normalizeKey(target), k -> new Object());
+        int hash = normalizeKey(target).hashCode();
+        return FILE_LOCKS[(hash & 0x7fffffff) % LOCK_STRIPES];
+    }
+
+    private static void markBadPrimary(Path normKey) {
+        if (UNQUARANTINED_BAD_PRIMARY.size() >= MAX_BAD_PRIMARY_ENTRIES) {
+            UNQUARANTINED_BAD_PRIMARY.clear();
+        }
+        UNQUARANTINED_BAD_PRIMARY.add(normKey);
     }
 
     public static Path bakPath(Path target) {
@@ -78,7 +94,7 @@ public final class AtomicJsonFiles {
         if (backup && Files.isRegularFile(target) && !UNQUARANTINED_BAD_PRIMARY.contains(normalizeKey(target))) {
             Candidate<com.google.gson.JsonElement> existing = readCandidate(target,
                     com.google.gson.JsonElement.class, gson, primaryValidator);
-            if (existing.state != SourceState.VALID) UNQUARANTINED_BAD_PRIMARY.add(normalizeKey(target));
+            if (existing.state != SourceState.VALID) markBadPrimary(normalizeKey(target));
         }
         return write(target, out -> {
             // Do not close `out` here: the outer write() still fsyncs/flushes it.
@@ -151,14 +167,14 @@ public final class AtomicJsonFiles {
                     quarantined = quarantine(target);
                 }
                 if (Files.isRegularFile(target)) {
-                    UNQUARANTINED_BAD_PRIMARY.add(normKey);
+                    markBadPrimary(normKey);
                 } else {
                     UNQUARANTINED_BAD_PRIMARY.remove(normKey);
                 }
                 return JsonLoad.fromBackup(backup.value, quarantined).withSources(primary.state, backup.state);
             }
             if (Files.isRegularFile(target) && primary.state != SourceState.ABSENT) {
-                UNQUARANTINED_BAD_PRIMARY.add(normKey);
+                markBadPrimary(normKey);
             }
             LOGGER.warn("JSON recovery failed for {}: primary={}, backup={}", target, primary.state, backup.state);
             JsonLoad<T> result = primary.state == SourceState.ABSENT && backup.state == SourceState.ABSENT

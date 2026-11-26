@@ -26,7 +26,7 @@ float replayCoverage(vec3 cell, vec2 sampleXZ) {
     vec2 view = ReplayFanView.xy;
     vec2 point = vec2(dot(sampleXZ, view), dot(sampleXZ, vec2(view.y, -view.x)));
     for (int i = 0; i < ReplayFanCount; ++i) {
-        vec4 anchor = ReplayFanAnchors[i / 4][i % 4];
+        vec4 anchor = ReplayFanAnchors[i >> 2][i & 3];
         if (cell.y <= anchor.y + 0.01) continue;
         vec2 delta = point - anchor.xz;
         float distance;

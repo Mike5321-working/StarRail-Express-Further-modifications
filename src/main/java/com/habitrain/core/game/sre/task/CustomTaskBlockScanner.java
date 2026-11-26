@@ -133,6 +133,7 @@ public final class CustomTaskBlockScanner {
 
         void tick() {
             if (context == null) return;
+            if (scan == null && server.getTickCount() % 10 != 0) return;
             if (!context.matches()) {
                 clear(true);
                 return;

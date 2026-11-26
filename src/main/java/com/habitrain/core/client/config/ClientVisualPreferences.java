@@ -9,8 +9,14 @@ import com.habitrain.core.scene.replay.ReplayMusicPlan;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.fabricmc.loader.api.FabricLoader;
+import org.jetbrains.annotations.Nullable;
 
 import java.nio.file.Path;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 
 /**
  * Client-only visual preferences that must not be synchronized with a server.
@@ -21,6 +27,10 @@ import java.nio.file.Path;
  *
  * <p>场景传输/性能项放在同一个文件的 {@code scenePerformance} 子对象里，而不是另起一个
  * 配置类：两个类同时读写同一个 JSON 文件会在读-改-写之间互相覆盖。</p>
+ *
+ * <p>All getters read an immutable {@code volatile Snapshot} with zero lock contention on
+ * the render thread; setters publish the new snapshot immediately and coalesce disk writes
+ * asynchronously on a daemon worker (no {@code fsync} stall on UI sliders or toggles).</p>
  */
 @Environment(EnvType.CLIENT)
 public final class ClientVisualPreferences {
@@ -37,144 +47,539 @@ public final class ClientVisualPreferences {
     private static final boolean DEFAULT_REPLAY_COMPRESS = true;
     private static final String DEFAULT_REPLAY_QUALITY = "balanced";
     private static final String DEFAULT_REPLAY_MUSIC = ReplayMusicPlan.Level.MEDIUM.id;
+    private static final String DEFAULT_REPLAY_STYLE = "brass";
+    private static final long SAVE_DEBOUNCE_MS = 150L;
 
-    private static boolean loaded;
-    private static boolean customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
-    private static boolean kineticBootUiEnabled = DEFAULT_KINETIC_BOOT_UI_ENABLED;
-    private static boolean kineticUiSoundEnabled = DEFAULT_KINETIC_UI_SOUND_ENABLED;
-    private static float kineticUiBgmVolume = DEFAULT_KINETIC_UI_BGM_VOLUME;
-    private static boolean kineticUiAutoEnter = DEFAULT_KINETIC_UI_AUTO_ENTER;
-    private static boolean lightweightInventory;
-    private static boolean decoratedShopEnabled = true;
-    private static boolean idiotFaceOverlay = true;
-    private static boolean idiotLargeJackpot = true;
-    private static int idiotParticles = 2;
-    private static String replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
-    private static boolean replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
-    private static String replayVideoQuality = DEFAULT_REPLAY_QUALITY;
-    private static String replayVideoMusic = DEFAULT_REPLAY_MUSIC;
-    private static String replayVideoStyle = "brass";
-    private static String replayVideoFfmpegPath = "";
-    private static int requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
-    private static int maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
-    private static int diskCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB;
-    private static boolean partialResumeEnabled = SceneClientPerformanceRules.DEFAULT_PARTIAL_RESUME_ENABLED;
-    private static int partialCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_PARTIAL_CACHE_QUOTA_MIB;
-    private static int partialExpiryHours = SceneClientPerformanceRules.DEFAULT_PARTIAL_EXPIRY_HOURS;
-    private static int transferWindowChunks = SceneClientPerformanceRules.DEFAULT_TRANSFER_WINDOW_CHUNKS;
-    private static int meshBatchMinSections = SceneClientPerformanceRules.DEFAULT_MESH_BATCH_MIN_SECTIONS;
-    private static int meshBuildBudgetMsPerFrame =
-            SceneClientPerformanceRules.DEFAULT_MESH_BUILD_BUDGET_MS_PER_FRAME;
-    private static int memoryCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_MEMORY_CACHE_QUOTA_MIB;
-    private static int meshCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_MESH_CACHE_QUOTA_MIB;
+    private record Snapshot(
+            boolean customTitlePanoramaEnabled,
+            boolean kineticBootUiEnabled,
+            boolean kineticUiSoundEnabled,
+            float kineticUiBgmVolume,
+            boolean kineticUiAutoEnter,
+            boolean lightweightInventory,
+            boolean decoratedShopEnabled,
+            boolean idiotFaceOverlay,
+            boolean idiotLargeJackpot,
+            int idiotParticles,
+            String replayVideoResolution,
+            boolean replayVideoCompress,
+            String replayVideoQuality,
+            String replayVideoMusic,
+            String replayVideoStyle,
+            String replayVideoFfmpegPath,
+            int requestTimeoutMs,
+            int maxChunkRetries,
+            int diskCacheQuotaMiB,
+            boolean partialResumeEnabled,
+            int partialCacheQuotaMiB,
+            int partialExpiryHours,
+            int transferWindowChunks,
+            int meshBatchMinSections,
+            int meshBuildBudgetMsPerFrame,
+            int memoryCacheQuotaMiB,
+            int meshCacheQuotaMiB
+    ) {
+        static Snapshot defaults() {
+            return new Snapshot(
+                    DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED,
+                    DEFAULT_KINETIC_BOOT_UI_ENABLED,
+                    DEFAULT_KINETIC_UI_SOUND_ENABLED,
+                    DEFAULT_KINETIC_UI_BGM_VOLUME,
+                    DEFAULT_KINETIC_UI_AUTO_ENTER,
+                    false,
+                    true,
+                    true,
+                    true,
+                    2,
+                    DEFAULT_REPLAY_RESOLUTION,
+                    DEFAULT_REPLAY_COMPRESS,
+                    DEFAULT_REPLAY_QUALITY,
+                    DEFAULT_REPLAY_MUSIC,
+                    DEFAULT_REPLAY_STYLE,
+                    "",
+                    SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS,
+                    SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES,
+                    SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB,
+                    SceneClientPerformanceRules.DEFAULT_PARTIAL_RESUME_ENABLED,
+                    SceneClientPerformanceRules.DEFAULT_PARTIAL_CACHE_QUOTA_MIB,
+                    SceneClientPerformanceRules.DEFAULT_PARTIAL_EXPIRY_HOURS,
+                    SceneClientPerformanceRules.DEFAULT_TRANSFER_WINDOW_CHUNKS,
+                    SceneClientPerformanceRules.DEFAULT_MESH_BATCH_MIN_SECTIONS,
+                    SceneClientPerformanceRules.DEFAULT_MESH_BUILD_BUDGET_MS_PER_FRAME,
+                    SceneClientPerformanceRules.DEFAULT_MEMORY_CACHE_QUOTA_MIB,
+                    SceneClientPerformanceRules.DEFAULT_MESH_CACHE_QUOTA_MIB
+            );
+        }
+
+        Snapshot withCustomTitlePanoramaEnabled(boolean v) {
+            return new Snapshot(v, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withKineticBootUiEnabled(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, v, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withKineticUiSoundEnabled(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, v, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withKineticUiBgmVolume(float v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, v, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withKineticUiAutoEnter(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, v,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withLightweightInventory(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    v, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withDecoratedShopEnabled(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, v, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withIdiotFaceOverlay(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, v, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withIdiotLargeJackpot(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, v, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withIdiotParticles(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, v,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withReplayVideoResolution(String v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    v, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withReplayVideoCompress(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, v, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withReplayVideoQuality(String v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, v, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withReplayVideoMusic(String v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, v, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withReplayVideoStyle(String v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, v,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withReplayVideoFfmpegPath(String v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    v, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withRequestTimeoutMs(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, v, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withMaxChunkRetries(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, v, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withDiskCacheQuotaMiB(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, v, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withPartialResumeEnabled(boolean v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, v,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withPartialCacheQuotaMiB(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    v, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withPartialExpiryHours(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, v, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withTransferWindowChunks(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, v, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withMeshBuildBudgetMsPerFrame(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    v, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withMemoryCacheQuotaMiB(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, v, meshCacheQuotaMiB);
+        }
+
+        Snapshot withMeshCacheQuotaMiB(int v) {
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, v);
+        }
+
+        JsonObject toJson() {
+            JsonObject root = new JsonObject();
+            root.addProperty("idiotFaceOverlay", idiotFaceOverlay);
+            root.addProperty("idiotLargeJackpot", idiotLargeJackpot);
+            root.addProperty("idiotParticles", idiotParticles);
+            root.addProperty("customTitlePanoramaEnabled", customTitlePanoramaEnabled);
+            root.addProperty("kineticBootUiEnabled", kineticBootUiEnabled);
+            root.addProperty("kineticUiSoundEnabled", kineticUiSoundEnabled);
+            root.addProperty("kineticUiBgmVolume", kineticUiBgmVolume);
+            root.addProperty("kineticUiAutoEnter", kineticUiAutoEnter);
+            root.addProperty("lightweightInventory", lightweightInventory);
+            root.addProperty("decoratedShopEnabled", decoratedShopEnabled);
+            JsonObject performance = new JsonObject();
+            performance.addProperty("requestTimeoutMs", requestTimeoutMs);
+            performance.addProperty("maxChunkRetries", maxChunkRetries);
+            performance.addProperty("diskCacheQuotaMiB", diskCacheQuotaMiB);
+            performance.addProperty("partialResumeEnabled", partialResumeEnabled);
+            performance.addProperty("partialCacheQuotaMiB", partialCacheQuotaMiB);
+            performance.addProperty("partialExpiryHours", partialExpiryHours);
+            performance.addProperty("transferWindowChunks", transferWindowChunks);
+            performance.addProperty("meshBuildBudgetMsPerFrame", meshBuildBudgetMsPerFrame);
+            performance.addProperty("meshBatchMinSections", meshBatchMinSections);
+            performance.addProperty("memoryCacheQuotaMiB", memoryCacheQuotaMiB);
+            performance.addProperty("meshCacheQuotaMiB", meshCacheQuotaMiB);
+            root.add(SCENE_PERFORMANCE, performance);
+            JsonObject replayVideo = new JsonObject();
+            replayVideo.addProperty("resolution", replayVideoResolution);
+            replayVideo.addProperty("compress", replayVideoCompress);
+            replayVideo.addProperty("quality", replayVideoQuality);
+            replayVideo.addProperty("music", replayVideoMusic);
+            replayVideo.addProperty("style", replayVideoStyle);
+            if (!replayVideoFfmpegPath.isBlank()) {
+                replayVideo.addProperty("ffmpegPath", replayVideoFfmpegPath);
+            }
+            root.add(REPLAY_VIDEO, replayVideo);
+            return root;
+        }
+    }
+
+    private static final Object WRITE_LOCK = new Object();
+    private static volatile @Nullable Snapshot snapshot;
+    private static @Nullable ScheduledExecutorService saveExecutor;
+    private static @Nullable ScheduledFuture<?> pendingSave;
+    private static boolean dirty;
+    private static boolean shuttingDown;
 
     private ClientVisualPreferences() {
     }
 
-    public static synchronized void load() {
-        if (loaded) return;
-        loaded = true;
-
-        AtomicJsonFiles.JsonLoad<JsonObject> result = AtomicJsonFiles.readJson(
-                file(), JsonObject.class, GSON);
-        if (!result.ok()) {
-            if (result.corrupt()) {
-                HabiTrainCore.LOGGER.warn("客户端视觉配置损坏，已回退为默认设置");
-            }
-            applyDefaults();
-            return;
-        }
-
-        JsonObject root = result.value();
-        lightweightInventory = readBoolean(root, "lightweightInventory", false);
-        decoratedShopEnabled = readBoolean(root, "decoratedShopEnabled", true);
-        idiotFaceOverlay = readBoolean(root, "idiotFaceOverlay", true);
-        idiotLargeJackpot = readBoolean(root, "idiotLargeJackpot", true);
-        idiotParticles = readInt(root, "idiotParticles", 2, value -> Math.clamp(value, 0, 2));
-        customTitlePanoramaEnabled = !root.has("customTitlePanoramaEnabled")
-                ? DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED
-                : root.get("customTitlePanoramaEnabled").isJsonPrimitive()
-                        && root.get("customTitlePanoramaEnabled").getAsBoolean();
-        kineticBootUiEnabled = readBoolean(root, "kineticBootUiEnabled", DEFAULT_KINETIC_BOOT_UI_ENABLED);
-        kineticUiSoundEnabled = readBoolean(root, "kineticUiSoundEnabled", DEFAULT_KINETIC_UI_SOUND_ENABLED);
-        kineticUiBgmVolume = readUnitFloat(root, "kineticUiBgmVolume", DEFAULT_KINETIC_UI_BGM_VOLUME);
-        kineticUiAutoEnter = readBoolean(root, "kineticUiAutoEnter", DEFAULT_KINETIC_UI_AUTO_ENTER);
-
-        JsonObject performance = root.has(SCENE_PERFORMANCE) && root.get(SCENE_PERFORMANCE).isJsonObject()
-                ? root.getAsJsonObject(SCENE_PERFORMANCE)
-                : new JsonObject();
-        requestTimeoutMs = readInt(performance, "requestTimeoutMs",
-                SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS,
-                SceneClientPerformanceRules::clampRequestTimeoutMs);
-        maxChunkRetries = readInt(performance, "maxChunkRetries",
-                SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES,
-                SceneClientPerformanceRules::clampMaxChunkRetries);
-        diskCacheQuotaMiB = readInt(performance, "diskCacheQuotaMiB",
-                SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB,
-                SceneClientPerformanceRules::clampDiskCacheQuotaMiB);
-        partialResumeEnabled = readBoolean(performance, "partialResumeEnabled",
-                SceneClientPerformanceRules.DEFAULT_PARTIAL_RESUME_ENABLED);
-        partialCacheQuotaMiB = readInt(performance, "partialCacheQuotaMiB",
-                SceneClientPerformanceRules.DEFAULT_PARTIAL_CACHE_QUOTA_MIB,
-                SceneClientPerformanceRules::clampPartialCacheQuotaMiB);
-        partialExpiryHours = readInt(performance, "partialExpiryHours",
-                SceneClientPerformanceRules.DEFAULT_PARTIAL_EXPIRY_HOURS,
-                SceneClientPerformanceRules::clampPartialExpiryHours);
-        transferWindowChunks = readInt(performance, "transferWindowChunks",
-                SceneClientPerformanceRules.DEFAULT_TRANSFER_WINDOW_CHUNKS,
-                SceneClientPerformanceRules::clampTransferWindowChunks);
-        meshBuildBudgetMsPerFrame = readInt(performance, "meshBuildBudgetMsPerFrame",
-                SceneClientPerformanceRules.DEFAULT_MESH_BUILD_BUDGET_MS_PER_FRAME,
-                SceneClientPerformanceRules::clampMeshBuildBudgetMsPerFrame);
-        memoryCacheQuotaMiB = readInt(performance, "memoryCacheQuotaMiB",
-                SceneClientPerformanceRules.DEFAULT_MEMORY_CACHE_QUOTA_MIB,
-                SceneClientPerformanceRules::clampMemoryCacheQuotaMiB);
-        meshCacheQuotaMiB = readInt(performance, "meshCacheQuotaMiB",
-                SceneClientPerformanceRules.DEFAULT_MESH_CACHE_QUOTA_MIB,
-                SceneClientPerformanceRules::clampMeshCacheQuotaMiB);
-        meshBatchMinSections = readInt(performance, "meshBatchMinSections",
-                SceneClientPerformanceRules.DEFAULT_MESH_BATCH_MIN_SECTIONS,
-                SceneClientPerformanceRules::clampMeshBatchMinSections);
-
-        JsonObject replayVideo = root.has(REPLAY_VIDEO) && root.get(REPLAY_VIDEO).isJsonObject()
-                ? root.getAsJsonObject(REPLAY_VIDEO)
-                : new JsonObject();
-        replayVideoResolution = normalizeReplayResolution(readString(replayVideo, "resolution", DEFAULT_REPLAY_RESOLUTION));
-        replayVideoCompress = readBoolean(replayVideo, "compress", DEFAULT_REPLAY_COMPRESS);
-        replayVideoQuality = normalizeReplayQuality(readString(replayVideo, "quality", DEFAULT_REPLAY_QUALITY));
-        replayVideoMusic = ReplayMusicPlan.Level.fromId(readString(replayVideo, "music", DEFAULT_REPLAY_MUSIC)).id;
-        replayVideoStyle = com.habitrain.core.scene.replay.ReplayExportContentOptions.VisualStyle
-                .fromId(readString(replayVideo, "style", "brass")).id;
-        replayVideoFfmpegPath = readString(replayVideo, "ffmpegPath", "").trim();
+    private static Snapshot ensureLoaded() {
+        Snapshot current = snapshot;
+        if (current != null) return current;
+        load();
+        Snapshot loaded = snapshot;
+        return loaded != null ? loaded : Snapshot.defaults();
     }
 
-    private static void applyDefaults() {
-        lightweightInventory = false;
-        decoratedShopEnabled = true;
-        idiotFaceOverlay = idiotLargeJackpot = true;
-        idiotParticles = 2;
-        customTitlePanoramaEnabled = DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED;
-        kineticBootUiEnabled = DEFAULT_KINETIC_BOOT_UI_ENABLED;
-        kineticUiSoundEnabled = DEFAULT_KINETIC_UI_SOUND_ENABLED;
-        kineticUiBgmVolume = DEFAULT_KINETIC_UI_BGM_VOLUME;
-        kineticUiAutoEnter = DEFAULT_KINETIC_UI_AUTO_ENTER;
-        replayVideoResolution = DEFAULT_REPLAY_RESOLUTION;
-        replayVideoCompress = DEFAULT_REPLAY_COMPRESS;
-        replayVideoQuality = DEFAULT_REPLAY_QUALITY;
-        replayVideoMusic = DEFAULT_REPLAY_MUSIC;
-        replayVideoStyle = "brass";
-        replayVideoFfmpegPath = "";
-        requestTimeoutMs = SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS;
-        maxChunkRetries = SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES;
-        diskCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB;
-        partialResumeEnabled = SceneClientPerformanceRules.DEFAULT_PARTIAL_RESUME_ENABLED;
-        partialCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_PARTIAL_CACHE_QUOTA_MIB;
-        partialExpiryHours = SceneClientPerformanceRules.DEFAULT_PARTIAL_EXPIRY_HOURS;
-        transferWindowChunks = SceneClientPerformanceRules.DEFAULT_TRANSFER_WINDOW_CHUNKS;
-        meshBuildBudgetMsPerFrame = SceneClientPerformanceRules.DEFAULT_MESH_BUILD_BUDGET_MS_PER_FRAME;
-        memoryCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_MEMORY_CACHE_QUOTA_MIB;
-        meshCacheQuotaMiB = SceneClientPerformanceRules.DEFAULT_MESH_CACHE_QUOTA_MIB;
-        meshBatchMinSections = SceneClientPerformanceRules.DEFAULT_MESH_BATCH_MIN_SECTIONS;
+    public static void load() {
+        if (snapshot != null) return;
+        synchronized (WRITE_LOCK) {
+            if (snapshot != null) return;
+            AtomicJsonFiles.JsonLoad<JsonObject> result = AtomicJsonFiles.readJson(
+                    file(), JsonObject.class, GSON);
+            if (!result.ok()) {
+                if (result.corrupt()) {
+                    HabiTrainCore.LOGGER.warn("客户端视觉配置损坏，已回退为默认设置");
+                }
+                snapshot = Snapshot.defaults();
+                return;
+            }
+            JsonObject root = result.value();
+            boolean lightweight = readBoolean(root, "lightweightInventory", false);
+            boolean decoratedShop = readBoolean(root, "decoratedShopEnabled", true);
+            boolean idiotFace = readBoolean(root, "idiotFaceOverlay", true);
+            boolean idiotJackpot = readBoolean(root, "idiotLargeJackpot", true);
+            int idiotPart = readInt(root, "idiotParticles", 2, value -> Math.clamp(value, 0, 2));
+            boolean customTitlePanorama = !root.has("customTitlePanoramaEnabled")
+                    ? DEFAULT_CUSTOM_TITLE_PANORAMA_ENABLED
+                    : root.get("customTitlePanoramaEnabled").isJsonPrimitive()
+                            && root.get("customTitlePanoramaEnabled").getAsBoolean();
+            boolean kineticBoot = readBoolean(root, "kineticBootUiEnabled", DEFAULT_KINETIC_BOOT_UI_ENABLED);
+            boolean kineticSound = readBoolean(root, "kineticUiSoundEnabled", DEFAULT_KINETIC_UI_SOUND_ENABLED);
+            float kineticBgm = readUnitFloat(root, "kineticUiBgmVolume", DEFAULT_KINETIC_UI_BGM_VOLUME);
+            boolean kineticAutoEnter = readBoolean(root, "kineticUiAutoEnter", DEFAULT_KINETIC_UI_AUTO_ENTER);
+
+            JsonObject performance = root.has(SCENE_PERFORMANCE) && root.get(SCENE_PERFORMANCE).isJsonObject()
+                    ? root.getAsJsonObject(SCENE_PERFORMANCE)
+                    : new JsonObject();
+            int reqTimeout = readInt(performance, "requestTimeoutMs",
+                    SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS,
+                    SceneClientPerformanceRules::clampRequestTimeoutMs);
+            int maxRetries = readInt(performance, "maxChunkRetries",
+                    SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES,
+                    SceneClientPerformanceRules::clampMaxChunkRetries);
+            int diskQuota = readInt(performance, "diskCacheQuotaMiB",
+                    SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB,
+                    SceneClientPerformanceRules::clampDiskCacheQuotaMiB);
+            boolean partialResume = readBoolean(performance, "partialResumeEnabled",
+                    SceneClientPerformanceRules.DEFAULT_PARTIAL_RESUME_ENABLED);
+            int partialQuota = readInt(performance, "partialCacheQuotaMiB",
+                    SceneClientPerformanceRules.DEFAULT_PARTIAL_CACHE_QUOTA_MIB,
+                    SceneClientPerformanceRules::clampPartialCacheQuotaMiB);
+            int partialExpiry = readInt(performance, "partialExpiryHours",
+                    SceneClientPerformanceRules.DEFAULT_PARTIAL_EXPIRY_HOURS,
+                    SceneClientPerformanceRules::clampPartialExpiryHours);
+            int transferWindow = readInt(performance, "transferWindowChunks",
+                    SceneClientPerformanceRules.DEFAULT_TRANSFER_WINDOW_CHUNKS,
+                    SceneClientPerformanceRules::clampTransferWindowChunks);
+            int buildBudget = readInt(performance, "meshBuildBudgetMsPerFrame",
+                    SceneClientPerformanceRules.DEFAULT_MESH_BUILD_BUDGET_MS_PER_FRAME,
+                    SceneClientPerformanceRules::clampMeshBuildBudgetMsPerFrame);
+            int memQuota = readInt(performance, "memoryCacheQuotaMiB",
+                    SceneClientPerformanceRules.DEFAULT_MEMORY_CACHE_QUOTA_MIB,
+                    SceneClientPerformanceRules::clampMemoryCacheQuotaMiB);
+            int meshQuota = readInt(performance, "meshCacheQuotaMiB",
+                    SceneClientPerformanceRules.DEFAULT_MESH_CACHE_QUOTA_MIB,
+                    SceneClientPerformanceRules::clampMeshCacheQuotaMiB);
+            int batchMin = readInt(performance, "meshBatchMinSections",
+                    SceneClientPerformanceRules.DEFAULT_MESH_BATCH_MIN_SECTIONS,
+                    SceneClientPerformanceRules::clampMeshBatchMinSections);
+
+            JsonObject replayVideo = root.has(REPLAY_VIDEO) && root.get(REPLAY_VIDEO).isJsonObject()
+                    ? root.getAsJsonObject(REPLAY_VIDEO)
+                    : new JsonObject();
+            String rvRes = normalizeReplayResolution(readString(replayVideo, "resolution", DEFAULT_REPLAY_RESOLUTION));
+            boolean rvCompress = readBoolean(replayVideo, "compress", DEFAULT_REPLAY_COMPRESS);
+            String rvQuality = normalizeReplayQuality(readString(replayVideo, "quality", DEFAULT_REPLAY_QUALITY));
+            String rvMusic = ReplayMusicPlan.Level.fromId(readString(replayVideo, "music", DEFAULT_REPLAY_MUSIC)).id;
+            String rvStyle = com.habitrain.core.scene.replay.ReplayExportContentOptions.VisualStyle
+                    .fromId(readString(replayVideo, "style", DEFAULT_REPLAY_STYLE)).id;
+            String rvFfmpeg = readString(replayVideo, "ffmpegPath", "").trim();
+
+            snapshot = new Snapshot(
+                    customTitlePanorama, kineticBoot, kineticSound, kineticBgm, kineticAutoEnter,
+                    lightweight, decoratedShop, idiotFace, idiotJackpot, idiotPart,
+                    rvRes, rvCompress, rvQuality, rvMusic, rvStyle, rvFfmpeg,
+                    reqTimeout, maxRetries, diskQuota, partialResume, partialQuota, partialExpiry,
+                    transferWindow, batchMin, buildBudget, memQuota, meshQuota
+            );
+        }
+    }
+
+    private static boolean update(UnaryOperator<Snapshot> updater) {
+        synchronized (WRITE_LOCK) {
+            Snapshot current = ensureLoaded();
+            Snapshot next = updater.apply(current);
+            if (next.equals(current)) {
+                return true;
+            }
+            snapshot = next;
+            dirty = true;
+            scheduleSaveLocked();
+            return true;
+        }
+    }
+
+    private static void scheduleSaveLocked() {
+        if (shuttingDown) {
+            flushNowLocked();
+            return;
+        }
+        if (saveExecutor == null || saveExecutor.isShutdown()) {
+            saveExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "habitrain-client-prefs-io");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+        if (pendingSave != null && !pendingSave.isDone()) {
+            pendingSave.cancel(false);
+        }
+        pendingSave = saveExecutor.schedule(ClientVisualPreferences::flushScheduled, SAVE_DEBOUNCE_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private static void flushScheduled() {
+        Snapshot toWrite;
+        synchronized (WRITE_LOCK) {
+            if (!dirty) return;
+            toWrite = snapshot;
+            dirty = false;
+            pendingSave = null;
+        }
+        if (toWrite != null) {
+            writeSnapshot(toWrite);
+        }
+    }
+
+    private static void flushNowLocked() {
+        if (!dirty || snapshot == null) return;
+        Snapshot toWrite = snapshot;
+        dirty = false;
+        if (pendingSave != null) {
+            pendingSave.cancel(false);
+            pendingSave = null;
+        }
+        writeSnapshot(toWrite);
+    }
+
+    private static boolean writeSnapshot(Snapshot s) {
+        // Non-authoritative local client preferences: skip fsync to avoid blocking UI/IO.
+        boolean saved = AtomicJsonFiles.writeJson(file(), s.toJson(), GSON, false, false);
+        if (!saved) {
+            HabiTrainCore.LOGGER.error("无法保存客户端视觉配置 {}", file());
+        }
+        return saved;
+    }
+
+    /** Flushes any pending debounced preferences and stops the background writer thread. */
+    public static void flushAndShutdown() {
+        ScheduledExecutorService exec;
+        Snapshot toWrite = null;
+        synchronized (WRITE_LOCK) {
+            shuttingDown = true;
+            if (pendingSave != null) {
+                pendingSave.cancel(false);
+                pendingSave = null;
+            }
+            if (dirty && snapshot != null) {
+                toWrite = snapshot;
+                dirty = false;
+            }
+            exec = saveExecutor;
+            saveExecutor = null;
+        }
+        if (exec != null) {
+            exec.shutdown();
+            try {
+                exec.awaitTermination(2, TimeUnit.SECONDS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (toWrite != null) {
+            writeSnapshot(toWrite);
+        }
     }
 
     private static String readString(JsonObject root, String key, String fallback) {
@@ -233,420 +638,255 @@ public final class ClientVisualPreferences {
         }
     }
 
-    public static synchronized boolean isCustomTitlePanoramaEnabled() {
-        load();
-        return customTitlePanoramaEnabled;
-    }
-
-    public static synchronized boolean isKineticBootUiEnabled() {
-        load();
-        return kineticBootUiEnabled;
-    }
-
-    public static synchronized boolean setKineticBootUiEnabled(boolean enabled) {
-        load();
-        boolean previous = kineticBootUiEnabled;
-        kineticBootUiEnabled = enabled;
-        if (save()) return true;
-        kineticBootUiEnabled = previous;
-        return false;
-    }
-
-    public static synchronized boolean isKineticUiSoundEnabled() {
-        load();
-        return kineticUiSoundEnabled;
-    }
-
-    public static synchronized boolean setKineticUiSoundEnabled(boolean enabled) {
-        load();
-        boolean previous = kineticUiSoundEnabled;
-        kineticUiSoundEnabled = enabled;
-        if (save()) return true;
-        kineticUiSoundEnabled = previous;
-        return false;
-    }
-
-    public static synchronized float getKineticUiBgmVolume() {
-        load();
-        return kineticUiBgmVolume;
-    }
-
-    /** Updates in-memory BGM volume immediately during slider drag without spamming disk writes. */
-    public static synchronized void previewKineticUiBgmVolume(float volume) {
-        load();
-        if (!Float.isFinite(volume)) return;
-        kineticUiBgmVolume = Math.max(0.0f, Math.min(1.0f, volume));
-    }
-
-    public static synchronized boolean setKineticUiBgmVolume(float volume) {
-        load();
-        float previous = kineticUiBgmVolume;
-        float clamped = Float.isFinite(volume) ? Math.max(0.0f, Math.min(1.0f, volume)) : DEFAULT_KINETIC_UI_BGM_VOLUME;
-        kineticUiBgmVolume = clamped;
-        if (save()) return true;
-        kineticUiBgmVolume = previous;
-        return false;
-    }
-
-    public static synchronized boolean isKineticUiAutoEnter() {
-        load();
-        return kineticUiAutoEnter;
-    }
-
-    public static synchronized boolean setKineticUiAutoEnter(boolean enabled) {
-        load();
-        boolean previous = kineticUiAutoEnter;
-        kineticUiAutoEnter = enabled;
-        if (save()) return true;
-        kineticUiAutoEnter = previous;
-        return false;
-    }
-
-    public static synchronized boolean isLightweightInventory() {
-        load();
-        return lightweightInventory;
-    }
-
-    public static synchronized boolean isDecoratedShopEnabled() {
-        load();
-        return decoratedShopEnabled;
-    }
-
-    /** Shop appearance is independent of the stamp album and its performance mode. */
-    public static synchronized boolean setDecoratedShopEnabled(boolean enabled) {
-        load();
-        boolean previous = decoratedShopEnabled;
-        decoratedShopEnabled = enabled;
-        if (save()) return true;
-        decoratedShopEnabled = previous;
-        return false;
-    }
-
-    /** Local only; preserve the previous selection if persistence fails. */
-    public static synchronized boolean setLightweightInventory(boolean enabled) {
-        load();
-        boolean previous = lightweightInventory;
-        lightweightInventory = enabled;
-        if (save()) return true;
-        lightweightInventory = previous;
-        return false;
-    }
-
-    /**
-     * Applies and persists the preference. A failed write restores the previous value so
-     * the Mod Menu control never claims a state that will disappear after restart.
-     */
-    public static synchronized boolean setCustomTitlePanoramaEnabled(boolean enabled) {
-        load();
-        boolean previous = customTitlePanoramaEnabled;
-        customTitlePanoramaEnabled = enabled;
-        if (save()) return true;
-        customTitlePanoramaEnabled = previous;
-        return false;
-    }
-
-    public static synchronized int getRequestTimeoutMs() {
-        load();
-        return requestTimeoutMs;
-    }
-
-    /** 单次分片请求超时（毫秒），超时后按退避重试。 */
-    public static synchronized boolean setRequestTimeoutMs(int millis) {
-        load();
-        int previous = requestTimeoutMs;
-        requestTimeoutMs = SceneClientPerformanceRules.clampRequestTimeoutMs(millis);
-        if (save()) return true;
-        requestTimeoutMs = previous;
-        return false;
-    }
-
-    public static synchronized int getMaxChunkRetries() {
-        load();
-        return maxChunkRetries;
-    }
-
-    /** 同一分片的最大重试次数；0 表示不重试。 */
-    public static synchronized boolean setMaxChunkRetries(int retries) {
-        load();
-        int previous = maxChunkRetries;
-        maxChunkRetries = SceneClientPerformanceRules.clampMaxChunkRetries(retries);
-        if (save()) return true;
-        maxChunkRetries = previous;
-        return false;
-    }
-
-    /** 已完成资产（.hscene）的磁盘缓存配额上限（MiB）。 */
-    public static synchronized int getDiskCacheQuotaMiB() {
-        load();
-        return diskCacheQuotaMiB;
-    }
-
-    public static synchronized boolean setDiskCacheQuotaMiB(int quotaMiB) {
-        load();
-        int previous = diskCacheQuotaMiB;
-        diskCacheQuotaMiB = SceneClientPerformanceRules.clampDiskCacheQuotaMiB(quotaMiB);
-        if (save()) return true;
-        diskCacheQuotaMiB = previous;
-        return false;
-    }
-
-    /** 是否保留未完成的分片、断线重连后只补缺失部分。 */
-    public static synchronized boolean isPartialResumeEnabled() {
-        load();
-        return partialResumeEnabled;
-    }
-
-    public static synchronized boolean setPartialResumeEnabled(boolean enabled) {
-        load();
-        boolean previous = partialResumeEnabled;
-        partialResumeEnabled = enabled;
-        if (save()) return true;
-        partialResumeEnabled = previous;
-        return false;
-    }
-
-    /** 未完成分片文件（.part）的总配额上限（MiB），与 .hscene 配额相互独立。 */
-    public static synchronized int getPartialCacheQuotaMiB() {
-        load();
-        return partialCacheQuotaMiB;
-    }
-
-    public static synchronized boolean setPartialCacheQuotaMiB(int quotaMiB) {
-        load();
-        int previous = partialCacheQuotaMiB;
-        partialCacheQuotaMiB = SceneClientPerformanceRules.clampPartialCacheQuotaMiB(quotaMiB);
-        if (save()) return true;
-        partialCacheQuotaMiB = previous;
-        return false;
-    }
-
-    /** 未完成分片的保留时长（小时），超期在下次启动时清理。 */
-    public static synchronized int getPartialExpiryHours() {
-        load();
-        return partialExpiryHours;
-    }
-
-    public static synchronized boolean setPartialExpiryHours(int hours) {
-        load();
-        int previous = partialExpiryHours;
-        partialExpiryHours = SceneClientPerformanceRules.clampPartialExpiryHours(hours);
-        if (save()) return true;
-        partialExpiryHours = previous;
-        return false;
-    }
-
-    /** 同时在途的分片请求数；1 等于此前的停等式传输。 */
-    public static synchronized int getTransferWindowChunks() {
-        load();
-        return transferWindowChunks;
-    }
-
-    public static synchronized boolean setTransferWindowChunks(int chunks) {
-        load();
-        int previous = transferWindowChunks;
-        transferWindowChunks = SceneClientPerformanceRules.clampTransferWindowChunks(chunks);
-        if (save()) return true;
-        transferWindowChunks = previous;
-        return false;
-    }
-
-    /** 每多少个 Section 才把网格分批；0 = 关闭分批（保持单份网格）。 */
-    public static synchronized int getMeshBatchMinSections() {
-        load();
-        return meshBatchMinSections;
-    }
-
-    /** 每帧用于推进场景网格构建的时间预算（毫秒），所有背景共享。 */
-    public static synchronized int getMeshBuildBudgetMsPerFrame() {
-        load();
-        return meshBuildBudgetMsPerFrame;
-    }
-
-    public static synchronized boolean setMeshBuildBudgetMsPerFrame(int millis) {
-        load();
-        int previous = meshBuildBudgetMsPerFrame;
-        meshBuildBudgetMsPerFrame = SceneClientPerformanceRules.clampMeshBuildBudgetMsPerFrame(millis);
-        if (save()) return true;
-        meshBuildBudgetMsPerFrame = previous;
-        return false;
-    }
-
-    /** 已解码场景资产驻留内存的配额（MiB）。 */
-    public static synchronized int getMemoryCacheQuotaMiB() {
-        load();
-        return memoryCacheQuotaMiB;
-    }
-
-    public static synchronized boolean setMemoryCacheQuotaMiB(int quotaMiB) {
-        load();
-        int previous = memoryCacheQuotaMiB;
-        memoryCacheQuotaMiB = SceneClientPerformanceRules.clampMemoryCacheQuotaMiB(quotaMiB);
-        if (save()) return true;
-        memoryCacheQuotaMiB = previous;
-        return false;
-    }
-
-    /** 场景网格顶点缓冲合计的估算配额（MiB）。 */
-    public static synchronized int getMeshCacheQuotaMiB() {
-        load();
-        return meshCacheQuotaMiB;
-    }
-
-    public static synchronized boolean setMeshCacheQuotaMiB(int quotaMiB) {
-        load();
-        int previous = meshCacheQuotaMiB;
-        meshCacheQuotaMiB = SceneClientPerformanceRules.clampMeshCacheQuotaMiB(quotaMiB);
-        if (save()) return true;
-        meshCacheQuotaMiB = previous;
-        return false;
-    }
-
-    private static boolean save() {
-        JsonObject root = new JsonObject();
-        root.addProperty("idiotFaceOverlay", idiotFaceOverlay);
-        root.addProperty("idiotLargeJackpot", idiotLargeJackpot);
-        root.addProperty("idiotParticles", idiotParticles);
-        root.addProperty("customTitlePanoramaEnabled", customTitlePanoramaEnabled);
-        root.addProperty("kineticBootUiEnabled", kineticBootUiEnabled);
-        root.addProperty("kineticUiSoundEnabled", kineticUiSoundEnabled);
-        root.addProperty("kineticUiBgmVolume", kineticUiBgmVolume);
-        root.addProperty("kineticUiAutoEnter", kineticUiAutoEnter);
-        root.addProperty("lightweightInventory", lightweightInventory);
-        root.addProperty("decoratedShopEnabled", decoratedShopEnabled);
-        JsonObject performance = new JsonObject();
-        performance.addProperty("requestTimeoutMs", requestTimeoutMs);
-        performance.addProperty("maxChunkRetries", maxChunkRetries);
-        performance.addProperty("diskCacheQuotaMiB", diskCacheQuotaMiB);
-        performance.addProperty("partialResumeEnabled", partialResumeEnabled);
-        performance.addProperty("partialCacheQuotaMiB", partialCacheQuotaMiB);
-        performance.addProperty("partialExpiryHours", partialExpiryHours);
-        performance.addProperty("transferWindowChunks", transferWindowChunks);
-        performance.addProperty("meshBuildBudgetMsPerFrame", meshBuildBudgetMsPerFrame);
-        performance.addProperty("meshBatchMinSections", meshBatchMinSections);
-        performance.addProperty("memoryCacheQuotaMiB", memoryCacheQuotaMiB);
-        performance.addProperty("meshCacheQuotaMiB", meshCacheQuotaMiB);
-        root.add(SCENE_PERFORMANCE, performance);
-        JsonObject replayVideo = new JsonObject();
-        replayVideo.addProperty("resolution", replayVideoResolution);
-        replayVideo.addProperty("compress", replayVideoCompress);
-        replayVideo.addProperty("quality", replayVideoQuality);
-        replayVideo.addProperty("music", replayVideoMusic);
-        replayVideo.addProperty("style", replayVideoStyle);
-        if (!replayVideoFfmpegPath.isBlank()) {
-            replayVideo.addProperty("ffmpegPath", replayVideoFfmpegPath);
-        }
-        root.add(REPLAY_VIDEO, replayVideo);
-        boolean saved = AtomicJsonFiles.writeJson(file(), root, GSON, true);
-        if (!saved) {
-            HabiTrainCore.LOGGER.error("无法保存客户端视觉配置 {}", file());
-        }
-        return saved;
-    }
-
     private static Path file() {
         return FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);
     }
 
-    public static synchronized boolean isIdiotFaceOverlay() { load(); return idiotFaceOverlay; }
-    public static synchronized boolean isIdiotLargeJackpot() { load(); return idiotLargeJackpot; }
-    public static synchronized int getIdiotParticles() { load(); return idiotParticles; }
-    public static synchronized boolean setIdiotFaceOverlay(boolean value) {
-        load(); boolean previous = idiotFaceOverlay; idiotFaceOverlay = value;
-        if (save()) return true; idiotFaceOverlay = previous; return false;
-    }
-    public static synchronized boolean setIdiotLargeJackpot(boolean value) {
-        load(); boolean previous = idiotLargeJackpot; idiotLargeJackpot = value;
-        if (save()) return true; idiotLargeJackpot = previous; return false;
-    }
-    public static synchronized boolean setIdiotParticles(int value) {
-        load(); int previous = idiotParticles; idiotParticles = Math.clamp(value, 0, 2);
-        if (save()) return true; idiotParticles = previous; return false;
+    public static boolean isCustomTitlePanoramaEnabled() {
+        return ensureLoaded().customTitlePanoramaEnabled();
     }
 
-    public static synchronized String getReplayVideoResolution() {
-        load();
-        return replayVideoResolution;
+    public static boolean setCustomTitlePanoramaEnabled(boolean enabled) {
+        return update(s -> s.withCustomTitlePanoramaEnabled(enabled));
     }
 
-    public static synchronized boolean setReplayVideoResolution(String resolutionId) {
-        load();
-        String previous = replayVideoResolution;
-        replayVideoResolution = normalizeReplayResolution(resolutionId);
-        if (save()) return true;
-        replayVideoResolution = previous;
-        return false;
+    public static boolean isKineticBootUiEnabled() {
+        return ensureLoaded().kineticBootUiEnabled();
     }
 
-    public static synchronized boolean isReplayVideoCompress() {
-        load();
-        return replayVideoCompress;
+    public static boolean setKineticBootUiEnabled(boolean enabled) {
+        return update(s -> s.withKineticBootUiEnabled(enabled));
     }
 
-    public static synchronized boolean setReplayVideoCompress(boolean compress) {
-        load();
-        boolean previous = replayVideoCompress;
-        replayVideoCompress = compress;
-        if (save()) return true;
-        replayVideoCompress = previous;
-        return false;
+    public static boolean isKineticUiSoundEnabled() {
+        return ensureLoaded().kineticUiSoundEnabled();
+    }
+
+    public static boolean setKineticUiSoundEnabled(boolean enabled) {
+        return update(s -> s.withKineticUiSoundEnabled(enabled));
+    }
+
+    public static float getKineticUiBgmVolume() {
+        return ensureLoaded().kineticUiBgmVolume();
+    }
+
+    /** Updates in-memory BGM volume immediately during slider drag without spamming disk writes. */
+    public static void previewKineticUiBgmVolume(float volume) {
+        if (!Float.isFinite(volume)) return;
+        float clamped = Math.max(0.0f, Math.min(1.0f, volume));
+        synchronized (WRITE_LOCK) {
+            Snapshot current = ensureLoaded();
+            if (current.kineticUiBgmVolume() != clamped) {
+                snapshot = current.withKineticUiBgmVolume(clamped);
+            }
+        }
+    }
+
+    public static boolean setKineticUiBgmVolume(float volume) {
+        float clamped = Float.isFinite(volume) ? Math.max(0.0f, Math.min(1.0f, volume)) : DEFAULT_KINETIC_UI_BGM_VOLUME;
+        return update(s -> s.withKineticUiBgmVolume(clamped));
+    }
+
+    public static boolean isKineticUiAutoEnter() {
+        return ensureLoaded().kineticUiAutoEnter();
+    }
+
+    public static boolean setKineticUiAutoEnter(boolean enabled) {
+        return update(s -> s.withKineticUiAutoEnter(enabled));
+    }
+
+    public static boolean isLightweightInventory() {
+        return ensureLoaded().lightweightInventory();
+    }
+
+    /** Local only. */
+    public static boolean setLightweightInventory(boolean enabled) {
+        return update(s -> s.withLightweightInventory(enabled));
+    }
+
+    public static boolean isDecoratedShopEnabled() {
+        return ensureLoaded().decoratedShopEnabled();
+    }
+
+    /** Shop appearance is independent of the stamp album and its performance mode. */
+    public static boolean setDecoratedShopEnabled(boolean enabled) {
+        return update(s -> s.withDecoratedShopEnabled(enabled));
+    }
+
+    public static int getRequestTimeoutMs() {
+        return ensureLoaded().requestTimeoutMs();
+    }
+
+    /** 单次分片请求超时（毫秒），超时后按退避重试。 */
+    public static boolean setRequestTimeoutMs(int millis) {
+        int clamped = SceneClientPerformanceRules.clampRequestTimeoutMs(millis);
+        return update(s -> s.withRequestTimeoutMs(clamped));
+    }
+
+    public static int getMaxChunkRetries() {
+        return ensureLoaded().maxChunkRetries();
+    }
+
+    /** 同一分片的最大重试次数；0 表示不重试。 */
+    public static boolean setMaxChunkRetries(int retries) {
+        int clamped = SceneClientPerformanceRules.clampMaxChunkRetries(retries);
+        return update(s -> s.withMaxChunkRetries(clamped));
+    }
+
+    /** 已完成资产（.hscene）的磁盘缓存配额上限（MiB）。 */
+    public static int getDiskCacheQuotaMiB() {
+        return ensureLoaded().diskCacheQuotaMiB();
+    }
+
+    public static boolean setDiskCacheQuotaMiB(int quotaMiB) {
+        int clamped = SceneClientPerformanceRules.clampDiskCacheQuotaMiB(quotaMiB);
+        return update(s -> s.withDiskCacheQuotaMiB(clamped));
+    }
+
+    /** 是否保留未完成的分片、断线重连后只补缺失部分。 */
+    public static boolean isPartialResumeEnabled() {
+        return ensureLoaded().partialResumeEnabled();
+    }
+
+    public static boolean setPartialResumeEnabled(boolean enabled) {
+        return update(s -> s.withPartialResumeEnabled(enabled));
+    }
+
+    /** 未完成分片文件（.part）的总配额上限（MiB），与 .hscene 配额相互独立。 */
+    public static int getPartialCacheQuotaMiB() {
+        return ensureLoaded().partialCacheQuotaMiB();
+    }
+
+    public static boolean setPartialCacheQuotaMiB(int quotaMiB) {
+        int clamped = SceneClientPerformanceRules.clampPartialCacheQuotaMiB(quotaMiB);
+        return update(s -> s.withPartialCacheQuotaMiB(clamped));
+    }
+
+    /** 未完成分片的保留时长（小时），超期在下次启动时清理。 */
+    public static int getPartialExpiryHours() {
+        return ensureLoaded().partialExpiryHours();
+    }
+
+    public static boolean setPartialExpiryHours(int hours) {
+        int clamped = SceneClientPerformanceRules.clampPartialExpiryHours(hours);
+        return update(s -> s.withPartialExpiryHours(clamped));
+    }
+
+    /** 同时在途的分片请求数；1 等于此前的停等式传输。 */
+    public static int getTransferWindowChunks() {
+        return ensureLoaded().transferWindowChunks();
+    }
+
+    public static boolean setTransferWindowChunks(int chunks) {
+        int clamped = SceneClientPerformanceRules.clampTransferWindowChunks(chunks);
+        return update(s -> s.withTransferWindowChunks(clamped));
+    }
+
+    /** 每多少个 Section 才把网格分批；0 = 关闭分批（保持单份网格）。 */
+    public static int getMeshBatchMinSections() {
+        return ensureLoaded().meshBatchMinSections();
+    }
+
+    /** 每帧用于推进场景网格构建的时间预算（毫秒），所有背景共享。 */
+    public static int getMeshBuildBudgetMsPerFrame() {
+        return ensureLoaded().meshBuildBudgetMsPerFrame();
+    }
+
+    public static boolean setMeshBuildBudgetMsPerFrame(int millis) {
+        int clamped = SceneClientPerformanceRules.clampMeshBuildBudgetMsPerFrame(millis);
+        return update(s -> s.withMeshBuildBudgetMsPerFrame(clamped));
+    }
+
+    /** 已解码场景资产驻留内存的配额（MiB）。 */
+    public static int getMemoryCacheQuotaMiB() {
+        return ensureLoaded().memoryCacheQuotaMiB();
+    }
+
+    public static boolean setMemoryCacheQuotaMiB(int quotaMiB) {
+        int clamped = SceneClientPerformanceRules.clampMemoryCacheQuotaMiB(quotaMiB);
+        return update(s -> s.withMemoryCacheQuotaMiB(clamped));
+    }
+
+    /** 场景网格顶点缓冲合计的估算配额（MiB）。 */
+    public static int getMeshCacheQuotaMiB() {
+        return ensureLoaded().meshCacheQuotaMiB();
+    }
+
+    public static boolean setMeshCacheQuotaMiB(int quotaMiB) {
+        int clamped = SceneClientPerformanceRules.clampMeshCacheQuotaMiB(quotaMiB);
+        return update(s -> s.withMeshCacheQuotaMiB(clamped));
+    }
+
+    public static boolean isIdiotFaceOverlay() { return ensureLoaded().idiotFaceOverlay(); }
+    public static boolean isIdiotLargeJackpot() { return ensureLoaded().idiotLargeJackpot(); }
+    public static int getIdiotParticles() { return ensureLoaded().idiotParticles(); }
+
+    public static boolean setIdiotFaceOverlay(boolean value) {
+        return update(s -> s.withIdiotFaceOverlay(value));
+    }
+
+    public static boolean setIdiotLargeJackpot(boolean value) {
+        return update(s -> s.withIdiotLargeJackpot(value));
+    }
+
+    public static boolean setIdiotParticles(int value) {
+        int clamped = Math.clamp(value, 0, 2);
+        return update(s -> s.withIdiotParticles(clamped));
+    }
+
+    public static String getReplayVideoResolution() {
+        return ensureLoaded().replayVideoResolution();
+    }
+
+    public static boolean setReplayVideoResolution(String resolutionId) {
+        String normalized = normalizeReplayResolution(resolutionId);
+        return update(s -> s.withReplayVideoResolution(normalized));
+    }
+
+    public static boolean isReplayVideoCompress() {
+        return ensureLoaded().replayVideoCompress();
+    }
+
+    public static boolean setReplayVideoCompress(boolean compress) {
+        return update(s -> s.withReplayVideoCompress(compress));
     }
 
     /** Replay video MP4 quality preset id: {@code light}, {@code balanced} or {@code original}. */
-    public static synchronized String getReplayVideoQuality() {
-        load();
-        return replayVideoQuality;
+    public static String getReplayVideoQuality() {
+        return ensureLoaded().replayVideoQuality();
     }
 
-    public static synchronized boolean setReplayVideoQuality(String qualityId) {
-        load();
-        String previous = replayVideoQuality;
-        replayVideoQuality = normalizeReplayQuality(qualityId);
-        if (save()) return true;
-        replayVideoQuality = previous;
-        return false;
+    public static boolean setReplayVideoQuality(String qualityId) {
+        String normalized = normalizeReplayQuality(qualityId);
+        return update(s -> s.withReplayVideoQuality(normalized));
     }
 
     /** Replay video soundtrack level id: {@code off}, {@code low}, {@code medium} or {@code high}. */
-    public static synchronized String getReplayVideoMusic() {
-        load();
-        return replayVideoMusic;
+    public static String getReplayVideoMusic() {
+        return ensureLoaded().replayVideoMusic();
     }
 
-    public static synchronized boolean setReplayVideoMusic(String levelId) {
-        load();
-        String previous = replayVideoMusic;
-        replayVideoMusic = ReplayMusicPlan.Level.fromId(levelId).id;
-        if (save()) return true;
-        replayVideoMusic = previous;
-        return false;
+    public static boolean setReplayVideoMusic(String levelId) {
+        String normalized = ReplayMusicPlan.Level.fromId(levelId).id;
+        return update(s -> s.withReplayVideoMusic(normalized));
     }
 
     /** Replay video packaging style id: {@code brass} (default) or {@code kinetic}. */
-    public static synchronized String getReplayVideoStyle() {
-        load();
-        return replayVideoStyle;
+    public static String getReplayVideoStyle() {
+        return ensureLoaded().replayVideoStyle();
     }
 
-    public static synchronized boolean setReplayVideoStyle(String styleId) {
-        load();
-        String previous = replayVideoStyle;
-        replayVideoStyle = com.habitrain.core.scene.replay.ReplayExportContentOptions.VisualStyle.fromId(styleId).id;
-        if (save()) return true;
-        replayVideoStyle = previous;
-        return false;
+    public static boolean setReplayVideoStyle(String styleId) {
+        String normalized = com.habitrain.core.scene.replay.ReplayExportContentOptions.VisualStyle.fromId(styleId).id;
+        return update(s -> s.withReplayVideoStyle(normalized));
     }
 
-    public static synchronized String getReplayVideoFfmpegPath() {
-        load();
-        return replayVideoFfmpegPath;
+    public static String getReplayVideoFfmpegPath() {
+        return ensureLoaded().replayVideoFfmpegPath();
     }
 
-    public static synchronized boolean setReplayVideoFfmpegPath(String path) {
-        load();
-        String previous = replayVideoFfmpegPath;
-        replayVideoFfmpegPath = path == null ? "" : path.trim();
-        if (save()) return true;
-        replayVideoFfmpegPath = previous;
-        return false;
+    public static boolean setReplayVideoFfmpegPath(String path) {
+        String normalized = path == null ? "" : path.trim();
+        return update(s -> s.withReplayVideoFfmpegPath(normalized));
     }
 }

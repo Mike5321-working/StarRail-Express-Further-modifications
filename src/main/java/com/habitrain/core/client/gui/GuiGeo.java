@@ -25,12 +25,34 @@ import org.joml.Matrix4f;
  * 绘制，保证画家顺序；批次期间不得穿插其它 GuiGraphics 绘制，结束时必须调用
  * {@link #end()}。几何不写深度、不参与深度测试，永远按调用顺序叠在之前的内容上。</p>
  */
-final class GuiGeo {
+public final class GuiGeo {
+    private static ByteBufferBuilder sharedBuilder;
     private final Matrix4f pose;
     private float[] positions = new float[128];
     private int[] colors = new int[64];
     private int vertexCount;
     private final boolean additive;
+
+    private static ByteBufferBuilder acquireSharedBuilder() {
+        if (sharedBuilder == null) {
+            sharedBuilder = new ByteBufferBuilder(16 * 1024);
+        }
+        return sharedBuilder;
+    }
+
+    public static void closeSharedBuffer() {
+        if (sharedBuilder != null) {
+            sharedBuilder.close();
+            sharedBuilder = null;
+        }
+    }
+
+    private static void restoreGuiState() {
+        RenderSystem.defaultBlendFunc();
+        RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
+        RenderSystem.enableCull();
+        RenderSystem.enableDepthTest();
+    }
 
     private GuiGeo(GuiGraphics g, boolean additive) {
         this(g.pose().last().pose(), additive);
@@ -77,7 +99,7 @@ final class GuiGeo {
         void draw(GuiGraphics g, float alpha, boolean additive) {
             if (vertices == null || alpha <= 0.01f) return;
             g.flush();
-            try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture()) {
+            try {
                 RenderSystem.enableBlend();
                 if (additive) {
                     RenderSystem.blendFunc(GlStateManager.SourceFactor.SRC_ALPHA, GlStateManager.DestFactor.ONE);
@@ -95,6 +117,8 @@ final class GuiGeo {
                 } finally {
                     VertexBuffer.unbind();
                 }
+            } finally {
+                restoreGuiState();
             }
         }
 
@@ -120,8 +144,9 @@ final class GuiGeo {
     }
 
     void end() {
-        try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture();
-             ByteBufferBuilder bytes = new ByteBufferBuilder(Math.max(256, vertexCount * 16))) {
+        if (vertexCount == 0) return;
+        ByteBufferBuilder bytes = acquireSharedBuilder();
+        try {
             MeshData mesh = build(bytes);
             if (mesh == null) return;
             RenderSystem.enableBlend();
@@ -139,7 +164,10 @@ final class GuiGeo {
                 mesh = null;
             } finally {
                 if (mesh != null) mesh.close();
+                restoreGuiState();
             }
+        } finally {
+            bytes.clear();
         }
     }
 

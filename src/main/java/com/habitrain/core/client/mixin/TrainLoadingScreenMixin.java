@@ -46,7 +46,6 @@ public abstract class TrainLoadingScreenMixin extends Screen {
 
     @Inject(method = "init", at = @At("HEAD"))
     private void habitrain$onInit(CallbackInfo ci) {
-        HabiLoadingScreenTextures.registerTextures(this.minecraft);
         HabiBootSession.getInstance().onLeaveTitleFlow();
         if (this.habitrain$worldTracker == null) {
             this.habitrain$worldTracker = new HabiRealProgressTracker(HabiRealProgressTracker.WORLD_STAGES);
@@ -110,7 +109,7 @@ public abstract class TrainLoadingScreenMixin extends Screen {
             )
     )
     private void habitrain$renderWorldLoadingBackground(FrameAnimationRenderer instance, GuiGraphics g, int screenWidth, int screenHeight, float delta, float overallAlpha) {
-        HabiLoadingScreenTextures.registerTextures(this.minecraft);
+        HabiLoadingScreenTextures.registerWorldLoadingTexture(this.minecraft);
         RenderSystem.enableBlend();
         RenderSystem.defaultBlendFunc();
         g.setColor(1.0F, 1.0F, 1.0F, overallAlpha);

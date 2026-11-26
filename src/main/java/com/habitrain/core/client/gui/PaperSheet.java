@@ -110,6 +110,9 @@ final class PaperSheet {
     private final float[] profT = new float[PROFILE + 1];
     private final float[] profZ = new float[PROFILE + 1];
     private final float[] profArc = new float[PROFILE + 1];
+    private boolean flatFastPath;
+    private float flatX0, flatY0, flatX1, flatY1;
+    private float flatU0, flatV0, flatU1, flatV1;
 
     /**
      * 按姿态计算网格。
@@ -129,6 +132,26 @@ final class PaperSheet {
         float centerX = halfW + (pose.cx() - halfW) * depth;
         float centerY = halfH + (pose.cy() - halfH) * depth;
         float dist = focal * depth;
+        boolean bent = !pose.flat();
+        if (!bent && pose.crumple() == 0.0f && lift == null
+                && pose.yaw() == 0.0f && pose.pitch() == 0.0f && pose.roll() == 0.0f) {
+            this.flatFastPath = true;
+            float scale = focal / Math.max(focal * 0.2f, dist);
+            float scx = halfW + (centerX - halfW) * scale;
+            float scy = halfH + (centerY - halfH) * scale;
+            float hw = w * 0.5f * scale;
+            float hh = h * 0.5f * scale;
+            this.flatX0 = scx - hw;
+            this.flatX1 = scx + hw;
+            this.flatY0 = scy - hh;
+            this.flatY1 = scy + hh;
+            this.flatU0 = PaperCanvas.u(x0);
+            this.flatU1 = PaperCanvas.u(x0 + w);
+            this.flatV0 = PaperCanvas.v(y0);
+            this.flatV1 = PaperCanvas.v(y0 + h);
+            return;
+        }
+        this.flatFastPath = false;
         float cosYaw = (float) Math.cos(pose.yaw());
         float sinYaw = (float) Math.sin(pose.yaw());
         float cosPitch = (float) Math.cos(pose.pitch());
@@ -138,7 +161,6 @@ final class PaperSheet {
         float ex = (float) Math.cos(pose.bendAngle());
         float ey = (float) Math.sin(pose.bendAngle());
         float reach = Math.abs(w * 0.5f * ex) + Math.abs(h * 0.5f * ey);
-        boolean bent = !pose.flat();
         if (bent) {
             this.buildProfile(pose);
         }
@@ -299,17 +321,33 @@ final class PaperSheet {
                 float hl = Mth.sqrt(hx * hx + hy * hy + hz * hz);
                 float nh = Math.max(0.0f, (nx * hx + ny * hy + nz * hz) / hl);
                 float nh0 = Math.max(0.0f, -hz / hl);
-                this.specular[k] = Math.max(0.0f, (float) (Math.pow(nh, SHININESS) - Math.pow(nh0, SHININESS)));
+                this.specular[k] = Math.max(0.0f, pow40(nh) - pow40(nh0));
             }
         }
     }
 
+    private static float pow40(float x) {
+        if (x <= 0.0f) return 0.0f;
+        float x2 = x * x;
+        float x4 = x2 * x2;
+        float x8 = x4 * x4;
+        float x16 = x8 * x8;
+        float x32 = x16 * x16;
+        return x32 * x8;
+    }
+
     /** 票面 (u, v) 处当前在屏幕上的位置（网格双线性插值）。 */
     float projectX(float u, float v) {
+        if (this.flatFastPath) {
+            return Mth.lerp(Mth.clamp(u, 0.0f, 1.0f), this.flatX0, this.flatX1);
+        }
         return sample(this.sx, u, v);
     }
 
     float projectY(float u, float v) {
+        if (this.flatFastPath) {
+            return Mth.lerp(Mth.clamp(v, 0.0f, 1.0f), this.flatY0, this.flatY1);
+        }
         return sample(this.sy, u, v);
     }
 
@@ -334,6 +372,18 @@ final class PaperSheet {
         float pcy = projectY(0.5f, 0.5f);
         int color = RailArt.a(0xFF000000, alpha * 0.22f);
         GuiGeo geo = GuiGeo.begin(g);
+        if (this.flatFastPath) {
+            for (int layer = 3; layer >= 1; layer--) {
+                float grow = 1.0f + spread * layer / 3.0f;
+                float x0 = pcx + (this.flatX0 - pcx) * grow + dx;
+                float y0 = pcy + (this.flatY0 - pcy) * grow + dy;
+                float x1 = pcx + (this.flatX1 - pcx) * grow + dx;
+                float y1 = pcy + (this.flatY1 - pcy) * grow + dy;
+                geo.quad(x0, y0, color, x0, y1, color, x1, y1, color, x1, y0, color);
+            }
+            geo.end();
+            return;
+        }
         for (int layer = 3; layer >= 1; layer--) {
             float grow = 1.0f + spread * layer / 3.0f;
             for (int j = 0; j < NY; j++) {
@@ -382,12 +432,20 @@ final class PaperSheet {
             BufferBuilder buffer = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX_COLOR);
             MeshData mesh = null;
             try {
-                for (int j = 0; j < NY; j++) {
-                    for (int i = 0; i < NX; i++) {
-                        this.emit(buffer, matrix, i, j, alpha, encoded);
-                        this.emit(buffer, matrix, i, j + 1, alpha, encoded);
-                        this.emit(buffer, matrix, i + 1, j + 1, alpha, encoded);
-                        this.emit(buffer, matrix, i + 1, j, alpha, encoded);
+                if (this.flatFastPath) {
+                    int color = encoded ? argb(0.5f, 0.0f, 0.0f, alpha) : argb(alpha, alpha, alpha, alpha);
+                    buffer.addVertex(matrix, this.flatX0, this.flatY0, 0.0f).setUv(this.flatU0, this.flatV0).setColor(color);
+                    buffer.addVertex(matrix, this.flatX0, this.flatY1, 0.0f).setUv(this.flatU0, this.flatV1).setColor(color);
+                    buffer.addVertex(matrix, this.flatX1, this.flatY1, 0.0f).setUv(this.flatU1, this.flatV1).setColor(color);
+                    buffer.addVertex(matrix, this.flatX1, this.flatY0, 0.0f).setUv(this.flatU1, this.flatV0).setColor(color);
+                } else {
+                    for (int j = 0; j < NY; j++) {
+                        for (int i = 0; i < NX; i++) {
+                            this.emit(buffer, matrix, i, j, alpha, encoded);
+                            this.emit(buffer, matrix, i, j + 1, alpha, encoded);
+                            this.emit(buffer, matrix, i + 1, j + 1, alpha, encoded);
+                            this.emit(buffer, matrix, i + 1, j, alpha, encoded);
+                        }
                     }
                 }
                 mesh = buffer.build();

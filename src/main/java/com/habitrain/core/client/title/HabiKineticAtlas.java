@@ -2,6 +2,7 @@ package com.habitrain.core.client.title;
 
 import com.habitrain.core.HabiTrainCore;
 import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.platform.TextureUtil;
 import com.mojang.blaze3d.vertex.BufferBuilder;
 import com.mojang.blaze3d.vertex.BufferUploader;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
@@ -9,7 +10,8 @@ import com.mojang.blaze3d.vertex.Tesselator;
 import com.mojang.blaze3d.vertex.VertexFormat;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
-import net.minecraft.client.renderer.texture.DynamicTexture;
+import net.minecraft.client.renderer.texture.AbstractTexture;
+import net.minecraft.server.packs.resources.ResourceManager;
 import org.joml.Matrix4f;
 
 import java.awt.BasicStroke;
@@ -25,6 +27,7 @@ import java.awt.geom.Ellipse2D;
 import java.awt.geom.Path2D;
 import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
+import java.awt.image.DataBufferInt;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Iterator;
@@ -54,9 +57,26 @@ public final class HabiKineticAtlas {
     private static final int MAX_TEXT_CACHE = 256;
     private static final String FONT_BASE = "assets/habitrain_core/font/replay/";
 
+    /** Static GPU-only texture: uploads with autoClose=true so NativeImage off-heap RAM is freed immediately. */
+    public static final class StaticGlTexture extends AbstractTexture {
+        StaticGlTexture(NativeImage image, boolean repeat) {
+            int texId = this.getId();
+            TextureUtil.prepareImage(texId, image.getWidth(), image.getHeight());
+            image.upload(0, 0, 0, 0, 0, image.getWidth(), image.getHeight(), true, !repeat, false, true);
+        }
+
+        @Override
+        public void load(ResourceManager manager) {}
+
+        @Override
+        public void close() {
+            this.releaseId();
+        }
+    }
+
     public record Slab(
-            DynamicTexture faceTex,
-            DynamicTexture maskTex,
+            StaticGlTexture faceTex,
+            StaticGlTexture maskTex,
             double w,
             double h,
             double ax,
@@ -73,20 +93,20 @@ public final class HabiKineticAtlas {
         public int maskTexId() { return maskTex != null ? maskTex.getId() : 0; }
     }
 
-    public record TextTex(DynamicTexture tex, double w, double h) {
+    public record TextTex(StaticGlTexture tex, double w, double h) {
         public int texId() { return tex != null ? tex.getId() : 0; }
     }
 
     private record GlyphCell(float u0, float v0, float u1, float v1, float adv, float drawW, float drawH) {}
 
     private static final class AsciiAtlas {
-        final DynamicTexture tex;
+        final StaticGlTexture tex;
         final float fontPx;
         final float ascent;
         final float descent;
         final GlyphCell[] cells = new GlyphCell[128];
 
-        AsciiAtlas(DynamicTexture tex, float fontPx, float ascent, float descent) {
+        AsciiAtlas(StaticGlTexture tex, float fontPx, float ascent, float descent) {
             this.tex = tex;
             this.fontPx = fontPx;
             this.ascent = ascent;
@@ -113,8 +133,8 @@ public final class HabiKineticAtlas {
     public final Slab[] zeroBands = new Slab[BANDS.length];
     public Slab zeroStem;
     public Slab zeroLeaf;
-    public DynamicTexture zeroOutlineDark;
-    public DynamicTexture zeroOutlinePaper;
+    public StaticGlTexture zeroOutlineDark;
+    public StaticGlTexture zeroOutlinePaper;
     public final List<Slab> titleGlyphs = new ArrayList<>();
     public double titleWidth;
     public double titleCapH;
@@ -144,10 +164,10 @@ public final class HabiKineticAtlas {
     public Slab plateRoute;
 
     // ── Post-processing textures ─────────────────────────────────────────────
-    public DynamicTexture noiseTex;
-    public DynamicTexture vigPaperTex;
-    public DynamicTexture vigDarkTex;
-    public DynamicTexture stationBgTex;
+    public StaticGlTexture noiseTex;
+    public StaticGlTexture vigPaperTex;
+    public StaticGlTexture vigDarkTex;
+    public StaticGlTexture stationBgTex;
 
     // ── Zero-allocation ASCII glyph atlases ──────────────────────────────────
     private AsciiAtlas monoAtlas;
@@ -155,7 +175,7 @@ public final class HabiKineticAtlas {
 
     // ── Bounded LRU CJK/mixed text texture cache ─────────────────────────────
     private final Map<String, TextTex> textCache = new LinkedHashMap<>(128, 0.75f, true);
-    private final List<DynamicTexture> ownedTextures = new ArrayList<>();
+    private final List<StaticGlTexture> ownedTextures = new ArrayList<>();
     private final Matrix4f identity = new Matrix4f();
 
     private HabiKineticAtlas() {}
@@ -172,7 +192,7 @@ public final class HabiKineticAtlas {
         bakeStation01Sprites();
         bakePostTextures();
         monoAtlas = bakeAsciiAtlas(fontMono, 40f);
-        displayAtlas = bakeAsciiAtlas(fontDisplay, 140f);
+        displayAtlas = bakeAsciiAtlas(fontDisplay, 96f);
         ready = true;
     }
 
@@ -580,17 +600,16 @@ public final class HabiKineticAtlas {
     }
 
     private void bakePostTextures() {
-        // 256x256 tileable film grain
+        // 256x256 tileable film grain (GL_REPEAT configured once at upload)
         BufferedImage nImg = new BufferedImage(256, 256, BufferedImage.TYPE_INT_ARGB);
+        int[] nPixels = ((DataBufferInt) nImg.getRaster().getDataBuffer()).getData();
         int seed = 77;
-        for (int y = 0; y < 256; y++) {
-            for (int x = 0; x < 256; x++) {
-                seed = nextMulberry(seed);
-                int v = (int) (toUnit(seed) * 255.0);
-                nImg.setRGB(x, y, (0xFF << 24) | (v << 16) | (v << 8) | v);
-            }
+        for (int i = 0; i < nPixels.length; i++) {
+            seed = nextMulberry(seed);
+            int v = (int) (toUnit(seed) * 255.0);
+            nPixels[i] = (0xFF << 24) | (v << 16) | (v << 8) | v;
         }
-        noiseTex = uploadImage(nImg);
+        noiseTex = uploadImage(nImg, true);
 
         // Radial vignettes
         vigPaperTex = bakeTexture(512, 288, 1f, g -> {
@@ -694,22 +713,21 @@ public final class HabiKineticAtlas {
         painter.accept(g);
         g.dispose();
 
-        DynamicTexture faceTex = uploadImage(faceImg);
-        DynamicTexture maskTex = null;
+        StaticGlTexture faceTex = uploadImage(faceImg, false);
+        StaticGlTexture maskTex = null;
         if (makeMask) {
             BufferedImage maskImg = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_ARGB);
-            for (int py = 0; py < ph; py++) {
-                for (int px = 0; px < pw; px++) {
-                    int a = (faceImg.getRGB(px, py) >>> 24) & 0xFF;
-                    maskImg.setRGB(px, py, (a << 24) | 0x00FFFFFF);
-                }
+            int[] src = ((DataBufferInt) faceImg.getRaster().getDataBuffer()).getData();
+            int[] dst = ((DataBufferInt) maskImg.getRaster().getDataBuffer()).getData();
+            for (int i = 0; i < src.length; i++) {
+                dst[i] = (src[i] & 0xFF000000) | 0x00FFFFFF;
             }
-            maskTex = uploadImage(maskImg);
+            maskTex = uploadImage(maskImg, false);
         }
         return new Slab(faceTex, maskTex, w, h, ax, ay, sideRgb, yc, y0, y1, adv, titleX, plate);
     }
 
-    private DynamicTexture bakeTexture(int w, int h, float scale, Consumer<Graphics2D> painter) {
+    private StaticGlTexture bakeTexture(int w, int h, float scale, Consumer<Graphics2D> painter) {
         int pw = Math.max(1, Math.round(w * scale));
         int ph = Math.max(1, Math.round(h * scale));
         BufferedImage img = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_ARGB);
@@ -718,39 +736,60 @@ public final class HabiKineticAtlas {
         g.scale(scale, scale);
         painter.accept(g);
         g.dispose();
-        return uploadImage(img);
+        return uploadImage(img, false);
     }
 
     // ── Zero-Allocation ASCII Glyph Atlas Rendering ──────────────────────────
 
     private AsciiAtlas bakeAsciiAtlas(Font baseFont, float fontPx) {
         Font derived = baseFont.deriveFont(baseFont == fontDisplay ? Font.PLAIN : Font.BOLD, fontPx);
-        int cols = 12, rows = 9;
-        int cellW = (int) Math.ceil(fontPx * 1.05f);
-        int cellH = (int) Math.ceil(fontPx * 1.45f);
-        int texW = cols * cellW;
-        int texH = rows * cellH;
+        BufferedImage probe = new BufferedImage(8, 8, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D pg = probe.createGraphics();
+        setupHints(pg);
+        pg.setFont(derived);
+        FontMetrics fm = pg.getFontMetrics();
+        float asc = fm.getAscent();
+        float desc = fm.getDescent();
+        float padX = 4f;
+        int cellH = Math.max(8, (int) Math.ceil(asc + desc + 10f));
+        float[] advs = new float[128];
+        int[] widths = new int[128];
+        int maxRowW = fontPx >= 64f ? 1024 : 512;
+        int curX = 0, curY = 0, usedW = 16;
+        int[] gx = new int[128];
+        int[] gy = new int[128];
+        for (int ch = 32; ch <= 126; ch++) {
+            float adv = fm.stringWidth(String.valueOf((char) ch));
+            int gw = Math.max(8, (int) Math.ceil(adv + padX * 2f + 2f));
+            advs[ch] = adv;
+            widths[ch] = gw;
+            if (curX + gw > maxRowW && curX > 0) {
+                curX = 0;
+                curY += cellH;
+            }
+            gx[ch] = curX;
+            gy[ch] = curY;
+            curX += gw;
+            if (curX > usedW) usedW = curX;
+        }
+        pg.dispose();
+
+        int texW = Math.max(16, usedW);
+        int texH = Math.max(16, curY + cellH);
         BufferedImage img = new BufferedImage(texW, texH, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g = img.createGraphics();
         setupHints(g);
         g.setFont(derived);
         g.setColor(Color.WHITE);
-        FontMetrics fm = g.getFontMetrics();
-        float asc = fm.getAscent();
-        float desc = fm.getDescent();
 
         AsciiAtlas atlas = new AsciiAtlas(null, fontPx, asc, desc);
+        float gh = asc + desc + 8f;
         for (int ch = 32; ch <= 126; ch++) {
-            int idx = ch - 32;
-            int cx = (idx % cols) * cellW;
-            int cy = (idx / cols) * cellH;
-            String s = String.valueOf((char) ch);
-            float adv = fm.stringWidth(s);
-            float padX = 4f;
-            float baseY = cy + asc + 4f;
-            g.drawString(s, cx + padX, baseY);
-            float gw = Math.min(cellW - 2f, Math.max(adv + padX * 2f, 8f));
-            float gh = Math.min(cellH - 2f, asc + desc + 8f);
+            int cx = gx[ch];
+            int cy = gy[ch];
+            float adv = advs[ch];
+            float gw = Math.max(adv + padX * 2f, 8f);
+            g.drawString(String.valueOf((char) ch), cx + padX, cy + asc + 4f);
             atlas.cells[ch] = new GlyphCell(
                     cx / (float) texW,
                     cy / (float) texH,
@@ -760,7 +799,7 @@ public final class HabiKineticAtlas {
             );
         }
         g.dispose();
-        DynamicTexture dt = uploadImage(img);
+        StaticGlTexture dt = uploadImage(img, false);
         AsciiAtlas finished = new AsciiAtlas(dt, fontPx, asc, desc);
         System.arraycopy(atlas.cells, 0, finished.cells, 0, 128);
         return finished;
@@ -933,7 +972,7 @@ public final class HabiKineticAtlas {
         }
         g.dispose();
 
-        DynamicTexture dt = uploadUnmanaged(img);
+        StaticGlTexture dt = uploadUnmanaged(img, false);
         TextTex tt = new TextTex(dt, logW, logH);
         textCache.put(key, tt);
         if (textCache.size() > MAX_TEXT_CACHE) {
@@ -984,30 +1023,34 @@ public final class HabiKineticAtlas {
 
     // ── Utilities ────────────────────────────────────────────────────────────
 
-    private DynamicTexture uploadImage(BufferedImage img) {
-        DynamicTexture dt = uploadUnmanaged(img);
+    private StaticGlTexture uploadImage(BufferedImage img, boolean repeat) {
+        StaticGlTexture dt = uploadUnmanaged(img, repeat);
         ownedTextures.add(dt);
         return dt;
     }
 
-    private static DynamicTexture uploadUnmanaged(BufferedImage img) {
+    private static StaticGlTexture uploadUnmanaged(BufferedImage img, boolean repeat) {
         int w = img.getWidth();
         int h = img.getHeight();
+        int[] src = ((DataBufferInt) img.getRaster().getDataBuffer()).getData();
         NativeImage nativeImg = new NativeImage(NativeImage.Format.RGBA, w, h, false);
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                int argb = img.getRGB(x, y);
-                int a = (argb >>> 24) & 0xFF;
-                int r = (argb >>> 16) & 0xFF;
-                int g = (argb >>> 8) & 0xFF;
-                int b = argb & 0xFF;
-                // NativeImage ABGR packed int
-                nativeImg.setPixelRGBA(x, y, (a << 24) | (b << 16) | (g << 8) | r);
+        try {
+            for (int y = 0; y < h; y++) {
+                int row = y * w;
+                for (int x = 0; x < w; x++) {
+                    int argb = src[row + x];
+                    int a = (argb >>> 24) & 0xFF;
+                    int r = (argb >>> 16) & 0xFF;
+                    int g = (argb >>> 8) & 0xFF;
+                    int b = argb & 0xFF;
+                    nativeImg.setPixelRGBA(x, y, (a << 24) | (b << 16) | (g << 8) | r);
+                }
             }
+            return new StaticGlTexture(nativeImg, repeat);
+        } catch (Throwable t) {
+            nativeImg.close();
+            throw t;
         }
-        DynamicTexture dt = new DynamicTexture(nativeImg);
-        dt.setFilter(true, false);
-        return dt;
     }
 
     private static void setupHints(Graphics2D g) {
@@ -1080,7 +1123,7 @@ public final class HabiKineticAtlas {
     }
 
     public void dispose() {
-        for (DynamicTexture dt : ownedTextures) {
+        for (StaticGlTexture dt : ownedTextures) {
             if (dt != null) dt.close();
         }
         ownedTextures.clear();
@@ -1088,6 +1131,15 @@ public final class HabiKineticAtlas {
             if (tt.tex() != null) tt.tex().close();
         }
         textCache.clear();
+        java.util.Arrays.fill(zeroBands, null);
+        java.util.Arrays.fill(stBands, null);
+        titleGlyphs.clear();
+        zeroStem = zeroLeaf = tagLead = tagCore = tagPrompt = tagAutoBoard = tagSyncBoard = tagDepart = null;
+        loadBadge = cursor = zeroCarLead = zeroCar = cardA = cardB = cardC = cardD = null;
+        stStem = stLeaf = stCarLead = stCar = plateStation = plateRoute = null;
+        zeroOutlineDark = zeroOutlinePaper = noiseTex = vigPaperTex = vigDarkTex = stationBgTex = null;
+        monoAtlas = null;
+        displayAtlas = null;
         ready = false;
     }
 }

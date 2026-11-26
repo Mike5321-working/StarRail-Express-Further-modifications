@@ -133,16 +133,18 @@ public final class HabiBootAudioEngine {
         return INSTANCE;
     }
 
-    // ── Loaded PCM stems (interleaved stereo float [-1, 1], 48 kHz) ──────────
-    private volatile float[] stemIntro;
-    private volatile float[] stemIdle;
-    private volatile float[] stemLoadLayer;
-    private volatile float[] stemExit;
-    private volatile float[] stemMenu;
+    // ── Loaded PCM stems (interleaved stereo 16-bit PCM short, 48 kHz) ────────
+    private static final float INV_SHORT_SCALE = 1.0f / 32768.0f;
+    private volatile short[] stemIntro;
+    private volatile short[] stemIdle;
+    private volatile short[] stemLoadLayer;
+    private volatile short[] stemExit;
+    private volatile short[] stemMenu;
     private volatile boolean stemsLoaded;
     private volatile boolean stemsFailed;
     private final AtomicBoolean loadStarted = new AtomicBoolean(false);
     private volatile CompletableFuture<Boolean> loadFuture;
+    private boolean releaseStemsOnStop;
 
     // ── Output backends (Minecraft OpenAL primary + early Java Sound bridge) ──
     private final Object stateLock = new Object();
@@ -223,6 +225,8 @@ public final class HabiBootAudioEngine {
     private final float[] liveBars = new float[SPECTRUM_BANDS];
     private final float[] goertzelCoeffs = new float[SPECTRUM_BANDS];
     private final float[] monoAnalysisRing = new float[MIX_BLOCK_FRAMES];
+    private final float[] hannWindow = new float[MIX_BLOCK_FRAMES];
+    private final float[] windowedMono = new float[MIX_BLOCK_FRAMES];
     private volatile double liveBass;
     private volatile double liveEnergy;
     private volatile boolean mixerProducingSound;
@@ -231,6 +235,9 @@ public final class HabiBootAudioEngine {
         for (int i = 0; i < SPECTRUM_BANDS; i++) {
             double omega = 2.0 * Math.PI * BAND_FREQS[i] / SAMPLE_RATE;
             goertzelCoeffs[i] = (float) (2.0 * Math.cos(omega));
+        }
+        for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
+            hannWindow[i] = 0.5f - 0.5f * (float) Math.cos((2.0 * Math.PI * i) / (MIX_BLOCK_FRAMES - 1));
         }
         Runtime.getRuntime().addShutdownHook(new Thread(this::shutdown, "habitrain-audio-shutdown"));
     }
@@ -242,15 +249,15 @@ public final class HabiBootAudioEngine {
             loadFuture = future;
             Thread loader = new Thread(() -> {
                 try {
-                    float[] intro = decodeWavResource(AUDIO_BASE + "intro.wav");
+                    short[] intro = decodeWavResourcePcm16(AUDIO_BASE + "intro.wav");
                     if (intro != null) stemIntro = intro;
-                    float[] idle = decodeWavResource(AUDIO_BASE + "idle.wav");
+                    short[] idle = decodeWavResourcePcm16(AUDIO_BASE + "idle.wav");
                     if (idle != null) stemIdle = idle;
-                    float[] loadLayer = decodeWavResource(AUDIO_BASE + "load_layer.wav");
+                    short[] loadLayer = decodeWavResourcePcm16(AUDIO_BASE + "load_layer.wav");
                     if (loadLayer != null) stemLoadLayer = loadLayer;
-                    float[] exit = decodeWavResource(AUDIO_BASE + "exit.wav");
+                    short[] exit = decodeWavResourcePcm16(AUDIO_BASE + "exit.wav");
                     if (exit != null) stemExit = exit;
-                    float[] menu = decodeWavResource(AUDIO_BASE + "menu.wav");
+                    short[] menu = decodeWavResourcePcm16(AUDIO_BASE + "menu.wav");
                     if (menu != null) stemMenu = menu;
                     if (intro == null || idle == null || loadLayer == null || exit == null || menu == null) {
                         stemsFailed = true;
@@ -259,7 +266,7 @@ public final class HabiBootAudioEngine {
                         return;
                     }
                     stemsLoaded = true;
-                    HabiTrainCore.LOGGER.info("[HabiBootAudio] Decoded all 5 boot_v3 WAV stems");
+                    HabiTrainCore.LOGGER.info("[HabiBootAudio] Decoded all 5 boot_v3 WAV stems (PCM16)");
                     Minecraft mcToAttach = null;
                     synchronized (stateLock) {
                         if (activeSession && isSoundEffectivelyEnabled()) {
@@ -659,6 +666,7 @@ public final class HabiBootAudioEngine {
         this.pendingStartLoading = false;
         this.pendingStartMenu = false;
         this.fadingOut = false;
+        this.releaseStemsOnStop = false;
         this.fadeOutGain = 1.0;
         this.departStartSample = -1L;
 
@@ -844,6 +852,7 @@ public final class HabiBootAudioEngine {
             mc = this.lastMinecraft;
             activeSession = true;
             fadingOut = false;
+            releaseStemsOnStop = false;
             fadeOutGain = 1.0;
             pendingMenuElapsed = menuElapsedSec;
             if (!isSoundEffectivelyEnabled()) {
@@ -903,6 +912,34 @@ public final class HabiBootAudioEngine {
         }
     }
 
+    /** Fades out and drops decoded boot PCM stems once playback finishes so gameplay heap stays lean. */
+    public void fadeOutAndReleaseStems() {
+        synchronized (stateLock) {
+            releaseStemsOnStop = true;
+            if (!activeSession && state == State.STOPPED) {
+                releaseStemsLocked();
+                return;
+            }
+            fadingOut = true;
+            pendingStartLoading = false;
+            pendingStartMenu = false;
+        }
+    }
+
+    private void releaseStemsLocked() {
+        clearMusicChannelsLocked();
+        stemIntro = null;
+        stemIdle = null;
+        stemLoadLayer = null;
+        stemExit = null;
+        stemMenu = null;
+        stemsLoaded = false;
+        stemsFailed = false;
+        loadFuture = null;
+        loadStarted.set(false);
+        releaseStemsOnStop = false;
+    }
+
     /** Immediately stops all music &amp; SFX. */
     public void stopImmediately() {
         Minecraft mc;
@@ -927,6 +964,9 @@ public final class HabiBootAudioEngine {
 
     public void shutdown() {
         stopImmediately();
+        synchronized (stateLock) {
+            releaseStemsLocked();
+        }
         earlyMixerRunning = false;
         earlyMixerRequested = false;
         Thread t;
@@ -1381,6 +1421,13 @@ public final class HabiBootAudioEngine {
     @Nullable
     ByteBuffer mixOpenAlChunk(@Nullable KineticBgmSoundInstance owner,
                               float[] bgmL, float[] bgmR, float[] sfxL, float[] sfxR, byte[] pcmBlock) {
+        return mixOpenAlChunk(owner, bgmL, bgmR, sfxL, sfxR, pcmBlock, null);
+    }
+
+    @Nullable
+    ByteBuffer mixOpenAlChunk(@Nullable KineticBgmSoundInstance owner,
+                              float[] bgmL, float[] bgmR, float[] sfxL, float[] sfxR, byte[] pcmBlock,
+                              @Nullable ByteBuffer reusableDirect) {
         synchronized (stateLock) {
             if (owner != null) {
                 if (owner != openAlBgmInstance || owner.isMarkedClosed()) {
@@ -1424,7 +1471,8 @@ public final class HabiBootAudioEngine {
             }
         }
 
-        ByteBuffer direct = BufferUtils.createByteBuffer(OPENAL_CHUNK_FRAMES * 4);
+        ByteBuffer direct = reusableDirect != null ? reusableDirect : BufferUtils.createByteBuffer(OPENAL_CHUNK_FRAMES * 4);
+        direct.clear();
         boolean chunkHasAudio = false;
         for (int b = 0; b < OPENAL_CHUNK_BLOCKS; b++) {
             boolean blockActive = mixBlock(bgmL, bgmR, sfxL, sfxR, pcmBlock, true);
@@ -1604,6 +1652,9 @@ public final class HabiBootAudioEngine {
                     activeSession = false;
                     clearMusicChannelsLocked();
                     state = State.STOPPED;
+                    if (releaseStemsOnStop) {
+                        releaseStemsLocked();
+                    }
                 }
             }
 
@@ -1670,17 +1721,18 @@ public final class HabiBootAudioEngine {
             pcmOut[p + 3] = (byte) ((sr >>> 8) & 0xFF);
         }
 
-        // Real 16-band Goertzel spectrum telemetry
+        // Real 16-band Goertzel spectrum telemetry (precomputed Hann window applied once per block)
         if (anyActive) {
             double rms = Math.sqrt(energySq / MIX_BLOCK_FRAMES);
+            for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
+                windowedMono[i] = monoAnalysisRing[i] * hannWindow[i];
+            }
             double bassSum = 0.0;
             for (int b = 0; b < SPECTRUM_BANDS; b++) {
                 float coeff = goertzelCoeffs[b];
                 float s0 = 0f, s1 = 0f, s2 = 0f;
                 for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
-                    // Hann window to eliminate spectral leakage
-                    float w = 0.5f - 0.5f * (float) Math.cos((2.0 * Math.PI * i) / (MIX_BLOCK_FRAMES - 1));
-                    s0 = monoAnalysisRing[i] * w + coeff * s1 - s2;
+                    s0 = windowedMono[i] + coeff * s1 - s2;
                     s2 = s1;
                     s1 = s0;
                 }
@@ -1824,7 +1876,7 @@ public final class HabiBootAudioEngine {
 
     // ── Lightweight pure-Java 16-bit PCM WAV decoder ─────────────────────────
 
-    static float[] decodeWavResource(String classpathPath) throws IOException {
+    static short[] decodeWavResourcePcm16(String classpathPath) throws IOException {
         InputStream raw = HabiBootAudioEngine.class.getClassLoader().getResourceAsStream(classpathPath);
         if (raw == null) {
             raw = Thread.currentThread().getContextClassLoader().getResourceAsStream(classpathPath);
@@ -1832,11 +1884,11 @@ public final class HabiBootAudioEngine {
         if (raw == null) return null;
         try (InputStream in = new BufferedInputStream(raw)) {
             byte[] all = in.readAllBytes();
-            return decodeWavBytes(all);
+            return decodeWavBytesPcm16(all);
         }
     }
 
-    static float[] decodeWavBytes(byte[] bytes) throws IOException {
+    static short[] decodeWavBytesPcm16(byte[] bytes) throws IOException {
         if (bytes == null || bytes.length < 44) {
             throw new IOException("WAV too short");
         }
@@ -1875,19 +1927,17 @@ public final class HabiBootAudioEngine {
         }
         int frameBytes = channels * 2;
         int srcFrames = dataSize / frameBytes;
-        float[] stereo = new float[srcFrames * 2];
+        short[] stereo = new short[srcFrames * 2];
         int p = dataOffset;
         if (channels == 2) {
             for (int i = 0; i < srcFrames; i++) {
-                short l = buf.getShort(p);
-                short r = buf.getShort(p + 2);
+                stereo[i * 2] = buf.getShort(p);
+                stereo[i * 2 + 1] = buf.getShort(p + 2);
                 p += 4;
-                stereo[i * 2] = l / 32768.0f;
-                stereo[i * 2 + 1] = r / 32768.0f;
             }
         } else {
             for (int i = 0; i < srcFrames; i++) {
-                float m = buf.getShort(p) / 32768.0f;
+                short m = buf.getShort(p);
                 p += 2;
                 stereo[i * 2] = m;
                 stereo[i * 2 + 1] = m;
@@ -1895,17 +1945,34 @@ public final class HabiBootAudioEngine {
         }
         if (sampleRate != SAMPLE_RATE && srcFrames > 1) {
             int dstFrames = (int) Math.round(srcFrames * (SAMPLE_RATE / (double) sampleRate));
-            float[] resampled = new float[dstFrames * 2];
+            short[] resampled = new short[dstFrames * 2];
             for (int i = 0; i < dstFrames; i++) {
                 double srcPos = i * (sampleRate / (double) SAMPLE_RATE);
                 int idx = Math.min(srcFrames - 2, (int) srcPos);
                 float frac = (float) (srcPos - idx);
-                resampled[i * 2] = stereo[idx * 2] * (1f - frac) + stereo[(idx + 1) * 2] * frac;
-                resampled[i * 2 + 1] = stereo[idx * 2 + 1] * (1f - frac) + stereo[(idx + 1) * 2 + 1] * frac;
+                float l = stereo[idx * 2] * (1f - frac) + stereo[(idx + 1) * 2] * frac;
+                float r = stereo[idx * 2 + 1] * (1f - frac) + stereo[(idx + 1) * 2 + 1] * frac;
+                resampled[i * 2] = (short) Math.max(-32768, Math.min(32767, Math.round(l)));
+                resampled[i * 2 + 1] = (short) Math.max(-32768, Math.min(32767, Math.round(r)));
             }
             return resampled;
         }
         return stereo;
+    }
+
+    static float[] decodeWavResource(String classpathPath) throws IOException {
+        short[] pcm16 = decodeWavResourcePcm16(classpathPath);
+        if (pcm16 == null) return null;
+        float[] out = new float[pcm16.length];
+        for (int i = 0; i < pcm16.length; i++) out[i] = pcm16[i] * INV_SHORT_SCALE;
+        return out;
+    }
+
+    static float[] decodeWavBytes(byte[] bytes) throws IOException {
+        short[] pcm16 = decodeWavBytesPcm16(bytes);
+        float[] out = new float[pcm16.length];
+        for (int i = 0; i < pcm16.length; i++) out[i] = pcm16[i] * INV_SHORT_SCALE;
+        return out;
     }
 
     private static float clamp01(float v) { return Math.max(0f, Math.min(1f, v)); }
@@ -1987,6 +2054,7 @@ public final class HabiBootAudioEngine {
         private final float[] sfxL = new float[MIX_BLOCK_FRAMES];
         private final float[] sfxR = new float[MIX_BLOCK_FRAMES];
         private final byte[] pcmBlock = new byte[MIX_BLOCK_FRAMES * 4];
+        private final ByteBuffer reusableDirect = BufferUtils.createByteBuffer(OPENAL_CHUNK_FRAMES * 4);
         private volatile boolean closed;
 
         LiveBgmAudioStream(HabiBootAudioEngine engine, KineticBgmSoundInstance owner) {
@@ -2002,7 +2070,7 @@ public final class HabiBootAudioEngine {
         @Override
         public @Nullable ByteBuffer read(int size) {
             if (closed || owner.isMarkedClosed()) return null;
-            return engine.mixOpenAlChunk(owner, bgmL, bgmR, sfxL, sfxR, pcmBlock);
+            return engine.mixOpenAlChunk(owner, bgmL, bgmR, sfxL, sfxR, pcmBlock, reusableDirect);
         }
 
         @Override
@@ -2088,7 +2156,7 @@ public final class HabiBootAudioEngine {
     record SfxSpec(double f0, double f1, double durSec, double amp, Wave wave, double pan, double delaySec) {}
 
     private static final class StemChannel {
-        final float[] pcm;
+        final short[] pcm;
         final int totalFrames;
         final boolean loop;
         boolean active;
@@ -2119,7 +2187,7 @@ public final class HabiBootAudioEngine {
 
         final StereoLowpass filter = new StereoLowpass(20_000.0, 0.707);
 
-        StemChannel(float[] pcm, boolean loop) {
+        StemChannel(short[] pcm, boolean loop) {
             this.pcm = pcm;
             this.totalFrames = pcm.length / 2;
             this.loop = loop;
@@ -2216,8 +2284,8 @@ public final class HabiBootAudioEngine {
                     }
                 }
                 int idx = (int) cursorFrame * 2;
-                float l = pcm[idx];
-                float r = pcm[idx + 1];
+                float l = pcm[idx] * INV_SHORT_SCALE;
+                float r = pcm[idx + 1] * INV_SHORT_SCALE;
                 if (useFilter) {
                     double[] f = filter.process(l, r);
                     l = (float) f[0];

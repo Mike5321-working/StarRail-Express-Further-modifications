@@ -40,7 +40,7 @@ public class PerPlayerTaskTicker {
         }
 
         var parallelBefore = player instanceof ServerPlayer sp
-                ? DlcTaskTracker.snapshotParallelTasks(sp)
+                ? DlcTaskTracker.borrowParallelTasksSnapshot(sp)
                 : java.util.Map.<io.wifi.starrailexpress.cca.SREPlayerTaskComponent.Task,
                         io.wifi.starrailexpress.cca.SREPlayerTaskComponent.TrainTask>of();
         try {
@@ -48,8 +48,12 @@ public class PerPlayerTaskTicker {
         } catch (Throwable t) {
             LOGGER.error("Task tick failed: {}", customTask.getFullId(), t);
         } finally {
-            if (customTask.getState() != TaskInstance.State.ACTIVE) {
-                handleMainTaskDone(mgr, customTask, player, parallelBefore);
+            try {
+                if (customTask.getState() != TaskInstance.State.ACTIVE) {
+                    handleMainTaskDone(mgr, customTask, player, parallelBefore);
+                }
+            } finally {
+                DlcTaskTracker.releaseParallelTasksSnapshot(parallelBefore);
             }
         }
     }

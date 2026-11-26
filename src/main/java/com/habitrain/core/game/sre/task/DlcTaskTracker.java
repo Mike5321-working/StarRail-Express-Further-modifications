@@ -219,13 +219,42 @@ public final class DlcTaskTracker {
      * 既不消失也占住刷新槽位（{@code generateTask()} 在 {@code tasks} 非空时返回 null，
      * 每次都白烧一次 nextTaskTimer），表现就是"做完了还有一个任务、而且不给刷新"。
      */
+    private static final java.util.HashMap<SREPlayerTaskComponent.Task, SREPlayerTaskComponent.TrainTask> PARALLEL_SCRATCH =
+            new java.util.HashMap<>(4);
+    private static boolean parallelScratchInUse;
+
     public static Map<SREPlayerTaskComponent.Task, SREPlayerTaskComponent.TrainTask> snapshotParallelTasks(ServerPlayer player) {
         try {
             var comp = SREPlayerTaskComponent.KEY.maybeGet(player).orElse(null);
-            if (comp == null || !comp.parallelTaskGenerated || comp.tasks == null) return Map.of();
+            if (comp == null || !comp.parallelTaskGenerated || comp.tasks == null || comp.tasks.isEmpty()) return Map.of();
             return new java.util.HashMap<>(comp.tasks);
         } catch (Throwable t) {
             return Map.of();
+        }
+    }
+
+    /** Reuses a scratch map on the server thread to avoid per-tick HashMap allocation during parallel tasks. */
+    public static Map<SREPlayerTaskComponent.Task, SREPlayerTaskComponent.TrainTask> borrowParallelTasksSnapshot(ServerPlayer player) {
+        try {
+            var comp = SREPlayerTaskComponent.KEY.maybeGet(player).orElse(null);
+            if (comp == null || !comp.parallelTaskGenerated || comp.tasks == null || comp.tasks.isEmpty()) return Map.of();
+            if (!parallelScratchInUse) {
+                parallelScratchInUse = true;
+                PARALLEL_SCRATCH.clear();
+                PARALLEL_SCRATCH.putAll(comp.tasks);
+                return PARALLEL_SCRATCH;
+            }
+            return new java.util.HashMap<>(comp.tasks);
+        } catch (Throwable t) {
+            return Map.of();
+        }
+    }
+
+    public static void releaseParallelTasksSnapshot(
+            Map<SREPlayerTaskComponent.Task, SREPlayerTaskComponent.TrainTask> snapshot) {
+        if (snapshot == PARALLEL_SCRATCH) {
+            PARALLEL_SCRATCH.clear();
+            parallelScratchInUse = false;
         }
     }
 

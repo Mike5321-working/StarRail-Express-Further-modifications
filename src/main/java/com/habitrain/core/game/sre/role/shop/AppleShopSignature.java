@@ -16,6 +16,22 @@ public record AppleShopSignature(ItemStack stack, int basePrice, String type, St
                 entry.currency().name(), entry.weight());
     }
 
+    /** Zero-allocation match against a live ShopEntry without copying its ItemStack. */
+    public boolean matches(ShopEntry entry) {
+        return matches(entry, entry.price());
+    }
+
+    public boolean matches(ShopEntry entry, int entryBasePrice) {
+        if (entry == null || basePrice != entryBasePrice || weight != entry.weight()) {
+            return false;
+        }
+        ItemStack entryStack = entry.stack();
+        return stack.getCount() == entryStack.getCount()
+                && type.equals(entry.type().name())
+                && currency.equals(entry.currency().name())
+                && ItemStack.isSameItemSameComponents(stack, entryStack);
+    }
+
     @Override
     public boolean equals(Object other) {
         return other instanceof AppleShopSignature that && basePrice == that.basePrice

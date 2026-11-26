@@ -401,7 +401,7 @@ public final class HabiBootSession {
 
     /** Called when leaving the title screen flow entirely (entering a world or switching to vanilla TitleScreen). */
     public void onLeaveTitleFlow() {
-        HabiBootAudioEngine.getInstance().fadeOutAndStop();
+        HabiBootAudioEngine.getInstance().fadeOutAndReleaseStems();
     }
 
     /** Resets transient reload references when entering a game world. */
@@ -411,7 +411,7 @@ public final class HabiBootSession {
         if (phase != Phase.STATION_01) {
             phase = Phase.IDLE;
         }
-        HabiBootAudioEngine.getInstance().fadeOutAndStop();
+        HabiBootAudioEngine.getInstance().fadeOutAndReleaseStems();
     }
 
     public @Nullable HabiRealProgressTracker.LoadSnapshot getLastSnapshot() {

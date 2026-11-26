@@ -59,6 +59,18 @@ final class ReplayVisualDownload {
     private void trimCache() {
         if (ready.size() > 3) ready.keySet().stream().filter(key -> !key.equals(VisualTape.WORLD)).findFirst().ifPresent(ready::remove);
     }
+    void clear() {
+        ready.clear();
+        loading = null;
+        buffer = null;
+        offset = 0;
+        if (decoding != null) {
+            decoding.cancel(true);
+            decoding = null;
+        }
+        failed = false;
+    }
+
     void accept(VisualPackets.Page page) {
         if (!page.subject().equals(loading) || page.offset() != offset || decoding != null) return;
         int total = page.total();
@@ -75,7 +87,7 @@ final class ReplayVisualDownload {
         retry = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(75); deadline = retry + TimeUnit.SECONDS.toNanos(30);
         if (offset == total) {
             byte[] packed = buffer; buffer = null;
-            decoding = CompletableFuture.supplyAsync(() -> { try { return VisualTape.decode(packed); } catch (IOException failure) { throw new UncheckedIOException(failure); } });
+            decoding = CompletableFuture.supplyAsync(() -> { try { return VisualTape.decode(packed); } catch (IOException failure) { throw new UncheckedIOException(failure); } }, net.minecraft.Util.ioPool());
         }
     }
 }

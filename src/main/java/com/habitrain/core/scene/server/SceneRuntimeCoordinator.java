@@ -385,15 +385,20 @@ public final class SceneRuntimeCoordinator implements SceneRuntimeBridge {
         if (level != null) clearLobbyForMatch(level);
     }
 
-    /** Poll settings once a second; match transitions are checked every tick. */
+    /** Poll settings once a second; match transitions are checked every tick while a lobby scene is active. */
     private void updateLobby(ServerLevel level, boolean force) {
+        String dimension = level.dimension().location().toString();
+        boolean hasLobbyState = lobbyConfigurations.containsKey(dimension)
+                || SceneMotionSettings.LOBBY_MAP_KEY.equals(getRuntimeState(level).getMapKey());
+        if (!force && !hasLobbyState && level.getGameTime() % 20 != 0) {
+            return;
+        }
         var context = contextResolver.resolve(level);
         if (context.matchActive() || contextResolver.isPreparingMatch(level)) {
-            clearLobbyForMatch(level);
+            if (hasLobbyState) clearLobbyForMatch(level);
             return;
         }
         if (level.players().isEmpty() || !force && level.getGameTime() % 20 != 0) return;
-        String dimension = level.dimension().location().toString();
         var desired = SceneLobbyPolicy.resolve(
                 ConfigManager.getInstance().getSceneMotionSettings(), dimension, false);
         if (desired.equals(lobbyConfigurations.get(dimension))) return;

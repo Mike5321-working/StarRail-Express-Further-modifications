@@ -3,14 +3,19 @@ package com.habitrain.core.role.capability;
 import com.habitrain.core.api.role.v2.RoleCatalogApi;
 import com.habitrain.core.api.role.v2.RoleKey;
 import com.habitrain.core.api.role.v2.capability.RoleCapabilityApi;
+import com.habitrain.core.api.role.v2.capability.RoleCapabilityKey;
+import com.habitrain.core.api.role.v2.capability.RoleCapabilityStatus;
+import com.habitrain.core.game.sre.replay.MatchVoiceRecorder;
 import io.wifi.starrailexpress.cca.SREGameWorldComponent;
 import io.wifi.starrailexpress.cca.SREAbilityPlayerComponent;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.level.ServerLevel;
 import org.agmas.noellesroles.content.item.RadioItem;
 import org.agmas.noellesroles.game.roles.neutral.commander.CommanderHandler;
 import org.agmas.noellesroles.role.ModRoles;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Set;
 import java.util.UUID;
 
@@ -25,10 +30,20 @@ public final class ServerVoicePermissions {
     public static void stop() { accepting = false; clear(); }
     public static void remove(UUID playerId) {
         var previous = current;
+        if (previous == VoicePermissionSnapshot.EMPTY || previous == VoicePermissionSnapshot.PASS_THROUGH) {
+            return;
+        }
+        if (!previous.players().containsKey(playerId) && !previous.privateChannels().contains(playerId)) {
+            return;
+        }
         var players = new HashMap<>(previous.players());
         players.remove(playerId);
-        var privateChannels = new HashSet<>(previous.privateChannels());
-        privateChannels.remove(playerId);
+        Set<UUID> privateChannels = previous.privateChannels();
+        if (privateChannels.contains(playerId)) {
+            var mutable = new HashSet<>(privateChannels);
+            mutable.remove(playerId);
+            privateChannels = mutable;
+        }
         current = new VoicePermissionSnapshot(players, previous.policies(), privateChannels);
     }
     public static void refresh(MinecraftServer server) {
@@ -44,23 +59,43 @@ public final class ServerVoicePermissions {
     private static void publish(MinecraftServer server) {
         var capability = RoleCapabilityApi.instance();
         if (!(capability instanceof RoleCapabilityServiceImpl service)) { clear(); return; }
-        var players = new HashMap<UUID, VoicePermissionSnapshot.Participant>();
-        var privateChannels = new HashSet<UUID>(RadioItem.RADIO_GROUP);
+        var policies = service.enabledVoicePolicies();
+        boolean recording = MatchVoiceRecorder.isRecording();
+        boolean voiceAvailable = service.status(RoleCapabilityKey.VOICE) == RoleCapabilityStatus.AVAILABLE;
+        if (policies.isEmpty() && !recording) {
+            current = voiceAvailable ? VoicePermissionSnapshot.PASS_THROUGH : VoicePermissionSnapshot.EMPTY;
+            return;
+        }
+        var serverPlayers = server.getPlayerList().getPlayers();
+        if (serverPlayers.isEmpty() && RadioItem.RADIO_GROUP.isEmpty()) {
+            current = policies.isEmpty() && voiceAvailable
+                    ? VoicePermissionSnapshot.PASS_THROUGH
+                    : VoicePermissionSnapshot.EMPTY;
+            return;
+        }
+        var players = new HashMap<UUID, VoicePermissionSnapshot.Participant>(Math.max(4, serverPlayers.size() * 2));
+        Set<UUID> privateChannels = RadioItem.RADIO_GROUP.isEmpty() ? null : new HashSet<>(RadioItem.RADIO_GROUP);
+        var dimStrings = new IdentityHashMap<ServerLevel, String>(4);
         var killerChannelOpen = false;
-        for (var player : server.getPlayerList().getPlayers()) {
+        var catalog = RoleCatalogApi.instance();
+        for (var player : serverPlayers) {
             try {
-                var game = SREGameWorldComponent.KEY.get(player.serverLevel());
+                ServerLevel level = player.serverLevel();
+                var game = SREGameWorldComponent.KEY.get(level);
                 var role = game.getRole(player);
                 if (game.isRole(player, ModRoles.COMMANDER) && SREAbilityPlayerComponent.KEY.get(player).status == 1) {
+                    if (privateChannels == null) privateChannels = new HashSet<>();
                     privateChannels.add(player.getUUID());
                     killerChannelOpen = true;
                 }
                 if (killerChannelOpen && role != null && CommanderHandler.canUseKillerChannel(role)) {
+                    if (privateChannels == null) privateChannels = new HashSet<>();
                     privateChannels.add(player.getUUID());
                 }
-                RoleKey key = role == null ? null : RoleCatalogApi.instance().canonicalize(role.identifier());
+                RoleKey key = role == null ? null : catalog.canonicalize(role.identifier());
+                String dimStr = dimStrings.computeIfAbsent(level, l -> l.dimension().location().toString());
                 players.put(player.getUUID(), new VoicePermissionSnapshot.Participant(key,
-                        service.groupOf(player.getUUID()), player.serverLevel().dimension().location().toString(),
+                        service.groupOf(player.getUUID()), dimStr,
                         player.getX(), player.getY(), player.getZ()));
             } catch (RuntimeException failure) {
                 com.habitrain.core.HabiTrainCore.LOGGER.warn("Cannot refresh voice permissions for {}", player.getUUID(), failure);
@@ -69,7 +104,8 @@ public final class ServerVoicePermissions {
         // A commander can activate the killer channel after the first pass.  Add eligible killer
         // roles in a second pass so the immutable snapshot is complete for the voice thread.
         if (killerChannelOpen) {
-            for (var player : server.getPlayerList().getPlayers()) {
+            if (privateChannels == null) privateChannels = new HashSet<>();
+            for (var player : serverPlayers) {
                 try {
                     var role = SREGameWorldComponent.KEY.get(player.serverLevel()).getRole(player);
                     if (role != null && CommanderHandler.canUseKillerChannel(role)) {
@@ -80,6 +116,6 @@ public final class ServerVoicePermissions {
                 }
             }
         }
-        current = new VoicePermissionSnapshot(players, service.enabledVoicePolicies(), privateChannels);
+        current = new VoicePermissionSnapshot(players, policies, privateChannels == null ? Set.of() : privateChannels);
     }
 }

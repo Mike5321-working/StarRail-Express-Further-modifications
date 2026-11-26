@@ -35,12 +35,18 @@ public class ClientLifecycleHandler {
     public ClientLifecycleHandler(ShaderMonitor shaderMonitor) {
 
         net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+            com.habitrain.core.client.config.ClientVisualPreferences.flushAndShutdown();
             com.habitrain.core.client.title.HabiBootAudioEngine.getInstance().shutdown();
             com.habitrain.core.client.title.HabiKineticAtlas.getInstance().dispose();
+            com.habitrain.core.client.gui.GuiGeo.closeSharedBuffer();
             MapVotePreviewCache.shutdown();
+            com.habitrain.core.client.gui.menu.MapVotePreviewFilePicker.shutdown();
             com.habitrain.core.client.render.CustomTitlePanoramaRenderer.release();
             com.habitrain.core.scene.client.SceneRenderRuntime.getInstance().reset();
             com.habitrain.core.scene.client.SceneBuildScheduler.getInstance().reset();
+            com.habitrain.core.scene.client.SceneAssetCache.getInstance().shutdown();
+            com.habitrain.core.scene.client.ReplayHistoryClient.shutdown();
+            com.habitrain.core.scene.client.replay.ReplayAudioPlaybackController.shutdown();
         });
 
         // INIT precedes play snapshots. JOIN may arrive after the first payloads.
@@ -61,6 +67,8 @@ public class ClientLifecycleHandler {
                 if (!ClientConnectionSession.isCurrent(handler)
                         || client.getConnection() != handler || !handler.getConnection().isConnected()) return;
                 com.habitrain.core.client.title.HabiBootSession.getInstance().onWorldJoined();
+                com.habitrain.core.client.title.HabiKineticAtlas.getInstance().dispose();
+                com.habitrain.core.client.loading.HabiLoadingScreenTextures.releaseTextures(client);
                 com.habitrain.core.client.render.CustomTitlePanoramaRenderer.release();
                 // INIT 已清理上一连接；JOIN 保留刚到达的服务端 snapshot、握手与场景状态。
                 // 结束转场覆盖层独立于 resetState()（后者在 OnGameFinishedClient 当帧被调用），
@@ -83,6 +91,9 @@ public class ClientLifecycleHandler {
                         false,
                         true);
                 com.habitrain.core.scene.client.SceneProjectionDiagnostics.reset();
+                com.habitrain.core.client.render.TaskOverlayDrawer.clearCache();
+                com.habitrain.core.client.gui.menu.page.SceneMotionPage.clearSessionState();
+                com.habitrain.core.scene.client.replay.ReplayAudioPlaybackController.clearPcmCache();
                 com.habitrain.core.client.gui.GameEndOverlayState.scheduleGrace(0L);
             };
             pendingDisconnectCleanup.set(cleanup);
@@ -122,6 +133,9 @@ public class ClientLifecycleHandler {
                 // 正式状态必须接管渲染，不能继续被设置页 preview 覆盖。
                 com.habitrain.core.scene.client.SceneRenderRuntime.getInstance().stopPreview();
                 com.habitrain.core.scene.client.SceneViewDistanceWarningController.getInstance().onRoundStarted();
+                com.habitrain.core.scene.client.ReplayHistoryClient.onGameStarted();
+                com.habitrain.core.scene.client.replay.ReplayAudioPlaybackController.onGameStarted();
+                com.habitrain.core.scene.client.replay.ReplayExportClient.onGameStartedCleanup();
                 GameRunningCache.invalidate();
                 VoteLaunchSession.onGameActive();
                 if (Minecraft.getInstance().screen

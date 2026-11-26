@@ -30,6 +30,7 @@ public final class AppleShopComponent implements RoleComponent, ServerTickingCom
     private int shopSize;
     private int purchaseIndex = -1;
     private ApplePriceState.Quote<AppleShopSignature> purchaseQuote;
+    private boolean frameOnlySync;
 
     public AppleShopComponent(Player player) { this.player = player; }
     @Override public Player getPlayer() { return player; }
@@ -125,9 +126,14 @@ public final class AppleShopComponent implements RoleComponent, ServerTickingCom
     }
 
     private boolean matchesShop(List<ShopEntry> entries) {
-        return entries.size() == shopSize && state.quotes().entrySet().stream().allMatch(e ->
-                e.getKey() >= 0 && e.getKey() < entries.size()
-                        && e.getValue().signature().equals(AppleShopSignature.of(entries.get(e.getKey()))));
+        if (entries.size() != shopSize) return false;
+        for (var e : state.quotes().entrySet()) {
+            int idx = e.getKey();
+            if (idx < 0 || idx >= entries.size() || !e.getValue().signature().matches(entries.get(idx))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     @Override public void clear() {
@@ -139,6 +145,16 @@ public final class AppleShopComponent implements RoleComponent, ServerTickingCom
 
     private void sync() {
         if (!player.level().isClientSide) KEY.sync(player);
+    }
+
+    private void syncFrameOnly() {
+        if (player.level().isClientSide) return;
+        frameOnlySync = true;
+        try {
+            KEY.sync(player);
+        } finally {
+            frameOnlySync = false;
+        }
     }
 
     @Override public void serverTick() {
@@ -153,15 +169,26 @@ public final class AppleShopComponent implements RoleComponent, ServerTickingCom
             sync();
             player.displayClientMessage(Component.translatable("message.habitrain_core.snake_fruit.settled"), true);
         } else if (state.advanceSyncedFrame(now)) {
-            sync();
+            syncFrameOnly();
         }
     }
 
     @Override public void writeToSyncNbt(CompoundTag tag, HolderLookup.Provider registries) {
+        if (frameOnlySync && !state.isEmpty() && !state.settled()) {
+            tag.putBoolean("frameOnly", true);
+            tag.putLong("revision", state.revision());
+            tag.putLong("seed", state.clientSeed());
+            tag.putInt("frame", state.syncedFrame());
+            return;
+        }
         AppleShopStateCodec.write(state, shopSize, tag, registries);
     }
 
     @Override public void readFromSyncNbt(CompoundTag tag, HolderLookup.Provider registries) {
+        if (tag.getBoolean("frameOnly")) {
+            state.applyClientFrame(tag.getLong("revision"), tag.getLong("seed"), tag.getInt("frame"));
+            return;
+        }
         shopSize = AppleShopStateCodec.read(state, tag, registries);
     }
 

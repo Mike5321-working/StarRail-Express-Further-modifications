@@ -18,6 +18,7 @@ import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.ints.IntSet;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientEntityEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
@@ -128,6 +129,7 @@ public final class DroneOperatorClient {
     private static final Map<Integer, Integer> DRONE_RECOIL_TICKS = new HashMap<>();
     private static final Map<Integer, Integer> PLAYER_UNBOX_TICKS = new HashMap<>();
     private static final Map<UUID, ReconDroneEntity> DRONES_BY_OWNER = new HashMap<>();
+    private static final Map<Integer, ReconDroneEntity> TRACKED_DRONES = new HashMap<>();
 
     private static @Nullable ClientLevel lastWorld;
     private static int clientTicks;
@@ -173,9 +175,19 @@ public final class DroneOperatorClient {
         ClientPlayNetworking.registerGlobalReceiver(DroneFxPayload.TYPE, (payload, ctx) ->
                 ctx.client().execute(() -> onReceiveFx(payload)));
 
+        ClientEntityEvents.ENTITY_LOAD.register((entity, clientLevel) -> {
+            if (entity instanceof ReconDroneEntity drone) {
+                TRACKED_DRONES.put(drone.getId(), drone);
+            }
+        });
+        ClientEntityEvents.ENTITY_UNLOAD.register((entity, clientLevel) -> {
+            if (entity instanceof ReconDroneEntity drone) {
+                TRACKED_DRONES.remove(drone.getId(), drone);
+            }
+        });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            if (client.isSameThread()) reset();
-            else client.execute(DroneOperatorClient::reset);
+            if (client.isSameThread()) reset(true);
+            else client.execute(() -> reset(true));
         });
         ClientTickEvents.END_CLIENT_TICK.register(DroneOperatorClient::tickClient);
         HudRenderCallback.EVENT.register((g, delta) ->
@@ -183,6 +195,10 @@ public final class DroneOperatorClient {
     }
 
     private static void reset() {
+        reset(false);
+    }
+
+    private static void reset(boolean clearTracked) {
         state = DroneStatePayload.EMPTY;
         LATCH.reset();
         PRESSED_SCANCODES.clear();
@@ -192,6 +208,7 @@ public final class DroneOperatorClient {
         DRONE_RECOIL_TICKS.clear();
         PLAYER_UNBOX_TICKS.clear();
         DRONES_BY_OWNER.clear();
+        if (clearTracked) TRACKED_DRONES.clear();
         wasFpvActive = false;
         wasUnboxing = false;
         smoothRollDeg = 0.0F;
@@ -443,9 +460,14 @@ public final class DroneOperatorClient {
     private static void tickAmbientWorldVisuals(Minecraft mc) {
         ClientLevel level = mc.level;
         DRONES_BY_OWNER.clear();
-        if (level == null) return;
-        for (Entity entity : level.entitiesForRendering()) {
-            if (!(entity instanceof ReconDroneEntity drone)) continue;
+        if (level == null || TRACKED_DRONES.isEmpty()) return;
+        Iterator<ReconDroneEntity> it = TRACKED_DRONES.values().iterator();
+        while (it.hasNext()) {
+            ReconDroneEntity drone = it.next();
+            if (drone == null || drone.isRemoved() || drone.level() != level) {
+                it.remove();
+                continue;
+            }
 
             DronePayloadCategory cat = drone.payloadCategory();
             Vec3 pos = drone.position();

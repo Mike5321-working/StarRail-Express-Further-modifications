@@ -80,10 +80,11 @@ public final class PrideComponent implements RoleComponent, ServerTickingCompone
 
     @Override
     public void clear() {
+        boolean dirty = breakImmuneUntilGameTime != 0 || weaponImmune;
         breakImmuneUntilGameTime = 0;
         weaponImmune = false;
         auraThrottle.reset();
-        if (player != null && player.level() != null && !player.level().isClientSide()) {
+        if (dirty && player != null && player.level() != null && !player.level().isClientSide()) {
             KEY.sync(player);
         }
     }

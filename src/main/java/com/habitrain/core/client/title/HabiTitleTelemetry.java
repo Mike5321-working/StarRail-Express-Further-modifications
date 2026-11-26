@@ -81,7 +81,7 @@ public final class HabiTitleTelemetry {
             } finally {
                 REFRESHING.set(false);
             }
-        });
+        }, net.minecraft.Util.ioPool());
     }
 
     public static int getLoadedModCount() {

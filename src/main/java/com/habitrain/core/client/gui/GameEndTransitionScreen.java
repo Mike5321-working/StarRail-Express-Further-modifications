@@ -140,6 +140,14 @@ public final class GameEndTransitionScreen extends Screen {
     private float ticketX;
     private float ticketY;
     private boolean ghostReady;
+    private boolean ghostSettled;
+    private int lastGhostFbW;
+    private int lastGhostFbH;
+    private float lastGhostTicketX;
+    private float lastGhostTicketY;
+    private float lastGhostWidth;
+    private float lastGhostHeight;
+    private UUID lastGhostPlayerId;
     private long lastFrameMillis;
 
     /** 已经响过的音效节点。 */
@@ -845,21 +853,37 @@ public final class GameEndTransitionScreen extends Screen {
      * 显形后人影平滑地向镜头靠近一点。画布就绪后 {@link #ghostReady} 为 true。
      */
     private void renderGhostCanvas(GuiGraphics g, TicketArt.Shape s, long mvpElapsed) {
-        this.ghostReady = false;
         if (this.mvpPlayers.isEmpty() || mvpElapsed < FIGURE_AT) {
+            this.ghostReady = false;
+            this.ghostSettled = false;
             return;
         }
         GameEndTransitionPayload.MvpPlayer entry = this.mvpPlayers.get(0);
         AbstractClientPlayer player = this.previewPlayer(entry.playerId(), entry.playerName());
         if (player == null) {
+            this.ghostReady = false;
+            this.ghostSettled = false;
             return;
         }
         GhostFrame frame = GhostFrame.of(s);
         float area = s.h() - s.inset() - s.band();
         float rise = TransitionFx.easeOutCubic((mvpElapsed - FIGURE_AT) / (float) FIGURE_RISE_MILLIS);
         float closer = TransitionFx.easeOutCubic((mvpElapsed - REVEALED_AT) / (float) REVEAL_EASE_MILLIS);
+        Window window = Minecraft.getInstance().getWindow();
+        int fbW = window.getWidth();
+        int fbH = window.getHeight();
+        boolean settled = rise >= 1.0f && closer >= 1.0f;
+        if (settled && this.ghostReady && this.ghostSettled
+                && this.ghostCanvas.textureId() != 0
+                && this.lastGhostFbW == fbW && this.lastGhostFbH == fbH
+                && this.lastGhostTicketX == this.ticketX && this.lastGhostTicketY == this.ticketY
+                && this.lastGhostWidth == s.w() && this.lastGhostHeight == s.h()
+                && java.util.Objects.equals(this.lastGhostPlayerId, entry.playerId())) {
+            return;
+        }
         float scale = frame.modelScale() * (1.0f + 0.07f * closer);
         float feetY = frame.feetY() + (1.0f - rise) * area * 0.3f + closer * area * 0.04f;
+        this.ghostReady = false;
         this.ghostCanvas.begin(g);
         try {
             g.pose().pushPose();
@@ -873,6 +897,14 @@ public final class GameEndTransitionScreen extends Screen {
             this.ghostCanvas.end(g);
         }
         this.ghostReady = true;
+        this.ghostSettled = settled;
+        this.lastGhostFbW = fbW;
+        this.lastGhostFbH = fbH;
+        this.lastGhostTicketX = this.ticketX;
+        this.lastGhostTicketY = this.ticketY;
+        this.lastGhostWidth = s.w();
+        this.lastGhostHeight = s.h();
+        this.lastGhostPlayerId = entry.playerId();
     }
 
     /**

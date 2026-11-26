@@ -155,6 +155,7 @@ public final class DroneOperatorService {
         long lastActionGameTime = -20L;
         final long[] lastCommandByAction = new long[DroneCommandPayload.Action.values().length];
         long lastResupplyBuyGameTime = -20L;
+        @Nullable DroneStatePayload lastSentPayload;
 
         State(ServerPlayer player) {
             this.player = player;
@@ -1170,12 +1171,25 @@ public final class DroneOperatorService {
     }
 
     private static void tickServer(MinecraftServer server) {
-        SCRAPPED_DRONES.removeIf(Entity::isRemoved);
-        tickRootedAndSilenceZones(server);
+        if (!SCRAPPED_DRONES.isEmpty()) {
+            SCRAPPED_DRONES.removeIf(Entity::isRemoved);
+        }
+        if (!NET_ROOTED_PLAYERS.isEmpty() || !SILENCE_ZONES.isEmpty() || !voiceMuted.isEmpty()) {
+            tickRootedAndSilenceZones(server);
+        }
 
+        boolean hasActiveOperators = !STATES.isEmpty();
+        int tickCount = server.getTickCount();
         // Commands, transfers from other mods and already oversized inventories can bypass vanilla add/click.
-        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-            HabiRoleItems.enforceDroneBatteryCap(player);
+        if (hasActiveOperators || tickCount % 20 == 0) {
+            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+                if ((hasActiveOperators && STATES.containsKey(player.getUUID())) || tickCount % 10 == 0) {
+                    HabiRoleItems.enforceDroneBatteryCap(player);
+                }
+            }
+        }
+        if (!hasActiveOperators) {
+            return;
         }
         boolean inMeeting = meetingActive();
         for (State state : List.copyOf(STATES.values())) {
@@ -1773,7 +1787,7 @@ public final class DroneOperatorService {
         boolean danger = (state.fpvActive || droneId != -1) && hasNearbyDangerToBody(player);
         int spares = HabiRoleItems.countDroneBatteries(player);
 
-        ServerPlayNetworking.send(player, new DroneStatePayload(
+        DroneStatePayload payload = new DroneStatePayload(
                 droneId,
                 state.frame.hasDroneFrame,
                 state.frame.everHadDrone,
@@ -1788,7 +1802,12 @@ public final class DroneOperatorService {
                 player.getX(),
                 player.getY() + 1.1D,
                 player.getZ()
-        ));
+        );
+        if (payload.equals(state.lastSentPayload)) {
+            return;
+        }
+        state.lastSentPayload = payload;
+        ServerPlayNetworking.send(player, payload);
     }
 
     public static void broadcastFx(ServerLevel level, int droneEntityId, byte fxType, Vec3 from, Vec3 to) {

@@ -114,6 +114,29 @@ public class TaskManager {
     /** 清空所有玩家的活跃任务（直接丢弃，不保留离线回收；若在对局结束时调用请用 {@link #endAllActiveTasks(MinecraftServer)}） */
     public void clearAllActiveTasks() { activeCustomTasks.clear(); dlcTaskCounts.clear(); }
 
+    private static final int MAX_PENDING_RECLAIM_PLAYERS = 256;
+    private static final int MAX_PENDING_RECLAIM_PER_PLAYER = 8;
+
+    private void enqueuePendingReclaim(UUID playerId, TaskInstance task) {
+        if (pendingReclaim.size() >= MAX_PENDING_RECLAIM_PLAYERS && !pendingReclaim.containsKey(playerId)) {
+            Iterator<UUID> it = pendingReclaim.keySet().iterator();
+            if (it.hasNext()) {
+                pendingReclaim.remove(it.next());
+            }
+        }
+        Queue<PendingReclaim> queue = pendingReclaim.computeIfAbsent(playerId, k -> new ConcurrentLinkedQueue<>());
+        String fullId = task.getFullId();
+        for (PendingReclaim existing : queue) {
+            if (existing.task().getFullId().equals(fullId)) {
+                return;
+            }
+        }
+        while (queue.size() >= MAX_PENDING_RECLAIM_PER_PLAYER) {
+            queue.poll();
+        }
+        queue.add(new PendingReclaim(task));
+    }
+
     /**
      * API-TV-13：对局结束时清理所有活跃任务。
      * 在线玩家直接执行取消与道具回收；已离线玩家的任务转入 {@link #pendingReclaim}，
@@ -134,8 +157,7 @@ public class TaskManager {
             } else {
                 task.cancel();
                 task.unbindOwner();
-                pendingReclaim.computeIfAbsent(id, k -> new ConcurrentLinkedQueue<>())
-                        .add(new PendingReclaim(task));
+                enqueuePendingReclaim(id, task);
             }
         }
         activeCustomTasks.clear();
@@ -184,8 +206,7 @@ public class TaskManager {
                 if (map.remove(id, task)) {
                     task.cancel();
                     task.unbindOwner();
-                    pendingReclaim.computeIfAbsent(id, k -> new ConcurrentLinkedQueue<>())
-                            .add(new PendingReclaim(task));
+                    enqueuePendingReclaim(id, task);
                 }
             }
         }

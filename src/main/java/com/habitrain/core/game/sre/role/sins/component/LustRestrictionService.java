@@ -46,6 +46,12 @@ public final class LustRestrictionService {
         // Observe source changes every tick, but write/sync only when the derived flag changes.
         // END_SERVER_TICK also covers role changes, disconnects and dimension/rest transfers.
         ServerTickEvents.END_SERVER_TICK.register(LustRestrictionService::reconcile);
+        net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            ServerPlayer player = handler.player;
+            if (player != null && !DEATH_MATCHES.containsKey(player.getUUID())) {
+                setHidden(player, false, 0);
+            }
+        });
     }
 
     private static boolean active(ServerLevel level) {
@@ -110,24 +116,37 @@ public final class LustRestrictionService {
     }
 
     private static void reconcile(MinecraftServer server) {
-        Map<ResourceKey<Level>, Integer> owners = new HashMap<>();
-        ROUNDS.keySet().removeIf(dimension -> server.getLevel(dimension) == null);
-        DEATH_MATCHES.values().removeIf(dimension -> server.getLevel(dimension) == null);
+        if (!ROUNDS.isEmpty()) {
+            ROUNDS.keySet().removeIf(dimension -> server.getLevel(dimension) == null);
+        }
+        if (!DEATH_MATCHES.isEmpty()) {
+            DEATH_MATCHES.values().removeIf(dimension -> server.getLevel(dimension) == null);
+        }
+        Map<ResourceKey<Level>, Integer> owners = null;
         for (ServerLevel level : server.getAllLevels()) {
             if (!active(level)) {
                 if (ROUNDS.containsKey(level.dimension())) resetRound(level);
                 continue;
             }
             // Covers joining an existing match and death paths that did not emit OnPlayerDeath.
-            onPenaltyHandled(level, level.players());
-            int count = (int) level.players().stream().filter(player -> isEffectiveLust(level, player)).count();
+            List<ServerPlayer> levelPlayers = level.players();
+            onPenaltyHandled(level, levelPlayers);
+            int count = 0;
+            for (ServerPlayer player : levelPlayers) {
+                if (isEffectiveLust(level, player)) count++;
+            }
+            if (owners == null) owners = new HashMap<>(4);
             owners.put(level.dimension(), count);
+        }
+        if (DEATH_MATCHES.isEmpty()) {
+            return;
         }
         // Offline deaths stay in the round table. Reconnected entities receive the same death's flag.
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             var match = DEATH_MATCHES.get(player.getUUID());
+            if (match == null) continue;
             var state = ROUNDS.get(match);
-            int count = owners.getOrDefault(match, 0);
+            int count = owners == null ? 0 : owners.getOrDefault(match, 0);
             setHidden(player, state != null && state.hidden(player.getUUID(), count > 0), count);
         }
     }

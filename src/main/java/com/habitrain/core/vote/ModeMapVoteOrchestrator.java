@@ -366,23 +366,27 @@ public final class ModeMapVoteOrchestrator {
         }
         Path baseDir = MapVoteProfileStore.baseDir(level);
         MinecraftServer server = level.getServer();
-        CompletableFuture.supplyAsync(() -> {
+        java.util.function.Supplier<Map<String, com.habitrain.core.network.MapVoteProfilePayload.MapProfile>> loader = () -> {
             MapVoteProfileStore.ensureProfiles(baseDir, profileIds, profileConfig);
             return MapVoteProfileStore.loadProfiles(baseDir, profileIds, profileConfig);
-        }).whenComplete((profiles, error) -> {
+        };
+        java.util.function.BiConsumer<Map<String, com.habitrain.core.network.MapVoteProfilePayload.MapProfile>, Throwable> onLoaded = (profiles, error) -> {
             if (server == null || server.isStopped()) return;
-            server.execute(() -> {
-                if (server.isStopped()) return;
-                if (SESSIONS.get(level.dimension()) != session || session.phase != Phase.MAP_VOTING) {
-                    return;
-                }
-                if (error != null) {
-                    LOGGER.warn("[ModeMapVote] async profile load failed", error);
-                    return;
-                }
-                OptionVoteManager.pushProfiles(level, profiles);
+            if (SESSIONS.get(level.dimension()) != session || session.phase != Phase.MAP_VOTING) {
+                return;
+            }
+            if (error != null) {
+                LOGGER.warn("[ModeMapVote] async profile load failed", error);
+                return;
+            }
+            OptionVoteManager.pushProfiles(level, profiles);
+        };
+        if (!com.habitrain.core.internal.ServerFileTasks.submit(server, loader, onLoaded)) {
+            CompletableFuture.supplyAsync(loader, net.minecraft.Util.ioPool()).whenComplete((profiles, error) -> {
+                if (server == null || server.isStopped()) return;
+                server.execute(() -> onLoaded.accept(profiles, error));
             });
-        });
+        }
 
         LOGGER.info("[ModeMapVote] map vote started mode={} options={} duration={}s",
                 winnerId, mapOptions.size(), duration);

@@ -35,11 +35,25 @@ float noise(vec2 p) {
                mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x), u.y);
 }
 
+const vec2 DIRS[12] = vec2[12](
+    vec2(1.0, 0.0),
+    vec2(0.8660254, 0.5),
+    vec2(0.5, 0.8660254),
+    vec2(0.0, 1.0),
+    vec2(-0.5, 0.8660254),
+    vec2(-0.8660254, 0.5),
+    vec2(-1.0, 0.0),
+    vec2(-0.8660254, -0.5),
+    vec2(-0.5, -0.8660254),
+    vec2(0.0, -1.0),
+    vec2(0.5, -0.8660254),
+    vec2(0.8660254, -0.5)
+);
+
 float coverage(vec2 uv) {
     float halo = 0.0;
     for (int i = 0; i < 12; i++) {
-        float ang = float(i) * 0.52359878;
-        vec2 dir = vec2(cos(ang), sin(ang)) * TexelSize;
+        vec2 dir = DIRS[i] * TexelSize;
         halo += texture(Sampler0, uv + dir * 3.5).a * 0.6;
         halo += texture(Sampler0, uv + dir * 9.0).a * 0.4;
     }
@@ -59,14 +73,26 @@ void main() {
     vec2 uv = texCoord0 + vec2(shift * size.x, 0.0);
     vec4 tex = texture(Sampler0, uv);
 
-    // 轮廓光：周围采样的覆盖率减去自身；撕裂时红青两色分开
-    float split = 0.006 * Glitch * size.x;
-    float haloR = coverage(uv + vec2(split, 0.0));
-    float haloB = coverage(uv - vec2(split, 0.0));
-    float halo = max(haloR, haloB);
-    vec3 rim = vec3(clamp(haloR - tex.a, 0.0, 1.0) * Rim.r,
-                    clamp(halo - tex.a, 0.0, 1.0) * Rim.g,
-                    clamp(haloB - tex.a, 0.0, 1.0) * Rim.b);
+    // 轮廓光：周围采样的覆盖率减去自身；撕裂时红青两色分开；不透明实心像素直接跳过 48 次采样
+    float halo;
+    vec3 rim;
+    if (tex.a >= 0.999) {
+        halo = 1.0;
+        rim = vec3(0.0);
+    } else {
+        float split = 0.006 * Glitch * size.x;
+        if (abs(split) < 1e-5) {
+            halo = coverage(uv);
+            rim = vec3(clamp(halo - tex.a, 0.0, 1.0)) * Rim.rgb;
+        } else {
+            float haloR = coverage(uv + vec2(split, 0.0));
+            float haloB = coverage(uv - vec2(split, 0.0));
+            halo = max(haloR, haloB);
+            rim = vec3(clamp(haloR - tex.a, 0.0, 1.0) * Rim.r,
+                       clamp(halo - tex.a, 0.0, 1.0) * Rim.g,
+                       clamp(haloB - tex.a, 0.0, 1.0) * Rim.b);
+        }
+    }
 
     // 浮现：烟雾状的溶解前沿自下而上推进
     float smoke = noise(local * vec2(9.0, 14.0) + vec2(0.0, -Time * 0.8)) * 0.65

@@ -14,29 +14,17 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /** Rejects newly applied ordinary debuffs before their first tick. */
 @Mixin(LivingEntity.class)
 public abstract class VirtueEffectImmunityMixin {
-    @Inject(method = "addEffect(Lnet/minecraft/world/effect/MobEffectInstance;)Z",
-            at = @At("HEAD"), cancellable = true)
-    private void habitrain$rejectEffect(MobEffectInstance effect,
-                                        CallbackInfoReturnable<Boolean> cir) {
-        reject(effect, cir);
-    }
-
     @Inject(method = "addEffect(Lnet/minecraft/world/effect/MobEffectInstance;Lnet/minecraft/world/entity/Entity;)Z",
             at = @At("HEAD"), cancellable = true)
     private void habitrain$rejectEffectFromEntity(MobEffectInstance effect, Entity source,
                                                   CallbackInfoReturnable<Boolean> cir) {
-        reject(effect, cir);
-    }
-
-    private void reject(MobEffectInstance effect, CallbackInfoReturnable<Boolean> cir) {
         if (!((Object) this instanceof ServerPlayer player) || effect == null) return;
-        if (GluttonyComponent.isGluttony(player)
-                && GluttonyComponent.isOrdinaryDebuff(effect.getEffect())) {
+        var holder = effect.getEffect();
+        if (GluttonyComponent.isOrdinaryDebuff(holder) && GluttonyComponent.isGluttony(player)) {
             cir.setReturnValue(false);
             return;
         }
-        if (ChastityVirtue.hasChastity(player)
-                && ChastityVirtue.isRegisteredPoison(effect.getEffect())) {
+        if (ChastityVirtue.isRegisteredPoison(holder) && ChastityVirtue.hasChastity(player)) {
             cir.setReturnValue(false);
         }
     }

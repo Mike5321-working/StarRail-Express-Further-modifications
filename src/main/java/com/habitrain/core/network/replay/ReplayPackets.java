@@ -184,12 +184,18 @@ public final class ReplayPackets {
         private volatile byte[] encodedTrailer;
 
         public LastMatchSummaryS2C(LastMatchReplay replay, byte[] tracks) {
+            this(replay, tracks, null);
+        }
+
+        public LastMatchSummaryS2C(LastMatchReplay replay, byte[] tracks, @Nullable byte[] preEncodedTrailer) {
             this.replay = replay;
             this.tracks = tracks;
+            this.encodedTrailer = preEncodedTrailer;
         }
 
         public LastMatchReplay replay() { return replay; }
         public byte[] tracks() { return tracks; }
+        public @Nullable byte[] peekEncodedTrailer() { return encodedTrailer; }
         @Override public Type<LastMatchSummaryS2C> type() { return TYPE; }
 
         // The same immutable replay is sent to every viewer. Only the first encode needs gzip.
@@ -497,10 +503,12 @@ public final class ReplayPackets {
         List<ReplaySkillEvent> skillEvents = List.of();
         ReplayGameSoundData gameSounds = ReplayGameSoundData.EMPTY;
 
+        byte[] compressedTrailer = null;
         if (b.isReadable()) {
             int magic = b.readInt();
             if (magic != SUMMARY_V2_MAGIC) throw new DecoderException("Invalid replay v2 trailer magic");
             byte[] compressed = b.readByteArray(MAX_SUMMARY);
+            compressedTrailer = compressed;
             V2Trailer v2 = decodeV2Trailer(compressed, events, duration);
             events = v2.events;
             blockDeltas = v2.blockDeltas;
@@ -511,7 +519,8 @@ public final class ReplayPackets {
 
         return new LastMatchSummaryS2C(new LastMatchReplay(id, anchor, duration, map, mode, status, win,
                 custom, title, subtitle, color, origin, manifest, people, events, spans,
-                mvp, killCount, limited, aircraft, killSounds, blockDeltas, entityTracks, skillEvents, gameSounds), tracks);
+                mvp, killCount, limited, aircraft, killSounds, blockDeltas, entityTracks, skillEvents, gameSounds),
+                tracks, compressedTrailer);
     }
 
     private record V2Trailer(List<Node> events, List<ReplayBlockDelta> blockDeltas,

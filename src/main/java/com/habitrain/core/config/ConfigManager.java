@@ -41,6 +41,9 @@ public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
     private volatile String revisionJson;
     private volatile String cachedAuthoritativeJson;
     private volatile boolean serverCacheDirty = true;
+    private volatile @Nullable java.nio.file.Path lastLoadedServerPath;
+    private volatile long lastLoadedServerMtime = Long.MIN_VALUE;
+    private volatile long lastLoadedServerSize = -1L;
     private final EnumSet<RuntimeModule> pendingRefresh = EnumSet.noneOf(RuntimeModule.class);
     private final EnumMap<RuntimeModule, Long> appliedRefreshRevisions = new EnumMap<>(RuntimeModule.class);
     private final Consumer<RuntimeModule> refreshModule;
@@ -179,11 +182,53 @@ public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
         com.habitrain.core.game.sre.mode.KnifeDurabilityToggleService.applyToServer(server);
     }
 
+    /** Skips redundant disk reload on SERVER_STARTED when config file stamp matches what onInitialize() just loaded. */
+    public void loadIfChanged() {
+        if (currentClientSession() == null && !store.isDirty() && isServerFileStampUnchanged()) {
+            return;
+        }
+        load();
+    }
+
+    private boolean isServerFileStampUnchanged() {
+        File f = store.getConfigFile();
+        if (f == null || lastLoadedServerPath == null) return false;
+        java.nio.file.Path p = f.toPath();
+        if (!lastLoadedServerPath.equals(p)) return false;
+        try {
+            if (!java.nio.file.Files.isRegularFile(p)) return false;
+            return java.nio.file.Files.getLastModifiedTime(p).toMillis() == lastLoadedServerMtime
+                    && java.nio.file.Files.size(p) == lastLoadedServerSize;
+        } catch (java.io.IOException ignored) {
+            return false;
+        }
+    }
+
+    private void recordServerFileStamp() {
+        File f = store.getConfigFile();
+        if (f != null) {
+            java.nio.file.Path p = f.toPath();
+            try {
+                if (java.nio.file.Files.isRegularFile(p)) {
+                    lastLoadedServerPath = p;
+                    lastLoadedServerMtime = java.nio.file.Files.getLastModifiedTime(p).toMillis();
+                    lastLoadedServerSize = java.nio.file.Files.size(p);
+                    return;
+                }
+            } catch (java.io.IOException ignored) {
+            }
+        }
+        lastLoadedServerPath = null;
+        lastLoadedServerMtime = Long.MIN_VALUE;
+        lastLoadedServerSize = -1L;
+    }
+
     public void load() {
         ClientConfigSession session = currentClientSession();
         ConfigRepository candidate = new ConfigRepository();
         if (session == null) {
             store.load(candidate); repository = candidate; localSnapshot = candidate.copy();
+            recordServerFileStamp();
             refreshServerRevisionCache(null);
             ClientConfigSession shared = sharedClientSession;
             if (shared != null && !shared.remote) {
@@ -225,6 +270,7 @@ public class ConfigManager implements ConfigQueryService, SceneConfigBridge {
         ConfigSaveResult result = store.commitResult(repository);
         if (result.status() == ConfigSaveResult.Status.SAVED) {
             localSnapshot = repository.copy();
+            recordServerFileStamp();
             refreshServerRevisionCache(null);
             if (!repository().isSuppressCallback()) {
                 Runnable cb = repository().getOnSaveCallback();

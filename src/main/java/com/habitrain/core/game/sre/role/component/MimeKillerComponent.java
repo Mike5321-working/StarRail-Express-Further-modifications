@@ -323,16 +323,23 @@ public final class MimeKillerComponent implements RoleComponent, ServerTickingCo
 
     @Override
     public void init() {
-        psychoDiscount = 0;
-        plotThinkBuys = 0;
-        rootedTicks.clear();
-        clearPsychoDynamicPrice();
-        sync();
+        clear();
     }
 
     @Override
     public void clear() {
-        init();
+        boolean hadDiscount = psychoDiscount != 0;
+        boolean dirty = hadDiscount || plotThinkBuys != 0 || !rootedTicks.isEmpty();
+        if (!dirty) {
+            return;
+        }
+        psychoDiscount = 0;
+        plotThinkBuys = 0;
+        rootedTicks.clear();
+        if (hadDiscount) {
+            clearPsychoDynamicPrice();
+        }
+        sync();
     }
 
     public void sync() {

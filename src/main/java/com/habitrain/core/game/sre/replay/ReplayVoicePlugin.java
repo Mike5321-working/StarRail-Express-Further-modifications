@@ -43,6 +43,10 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
     private static final ConcurrentHashMap<UUID, DecoderState> DECODERS = new ConcurrentHashMap<>();
     private static volatile @Nullable VoicechatServerApi serverApi;
     private static volatile boolean acceptingPackets;
+    private static volatile float cachedDefaultDist = 48.0f;
+    private static volatile float cachedWhisperDist = 16.0f;
+    private static volatile long lastDistRefreshNanos;
+    private static final long DIST_REFRESH_INTERVAL_NS = 5_000_000_000L;
 
     @Override
     public String getPluginId() {
@@ -112,10 +116,9 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
     private void onServerStarted(VoicechatServerStartedEvent event) {
         serverApi = event.getVoicechat();
         acceptingPackets = true;
+        lastDistRefreshNanos = 0L;
         if (serverApi != null) {
-            MatchVoiceRecorder.updateVoiceDistances(
-                    resolveMaxDistance(serverApi, false),
-                    resolveMaxDistance(serverApi, true));
+            refreshVoiceDistances(serverApi, true);
         }
     }
 
@@ -175,11 +178,8 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
             }
 
             Group group = sender.getGroup();
-            if (group != null) {
-                MatchVoiceRecorder.updateLiveGroup(speaker, group.getId(), group.getType() == Group.Type.OPEN);
-            } else {
-                MatchVoiceRecorder.updateLiveGroup(speaker, null, false);
-            }
+            UUID groupId = group == null ? null : group.getId();
+            boolean openGroup = group != null && group.getType() == Group.Type.OPEN;
 
             if (event.isCancelled()) return;
 
@@ -189,6 +189,9 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
             VoicechatServerApi activeApi = api;
             DecoderState decoder = DECODERS.computeIfAbsent(speaker,
                     ignored -> new DecoderState(activeApi.createDecoder()));
+            if (decoder.noteGroupChange(groupId, openGroup)) {
+                MatchVoiceRecorder.updateLiveGroup(speaker, groupId, openGroup);
+            }
             if (opus == null || opus.length == 0) {
                 decoder.resetState();
                 return;
@@ -218,16 +221,25 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
                 if (effectiveGroupId == null && group != null) effectiveGroupId = group.getId();
             }
 
-            float maxDist = resolveMaxDistance(api, packet.isWhispering());
-            MatchVoiceRecorder.updateVoiceDistances(
-                    resolveMaxDistance(api, false),
-                    resolveMaxDistance(api, true));
+            refreshVoiceDistances(api, false);
+            float maxDist = packet.isWhispering() ? cachedWhisperDist : cachedDefaultDist;
             MatchVoiceRecorder.recordPcm48k(round, speaker, maxDist, channelMode, effectiveGroupId, pcm48k);
         } catch (RuntimeException failure) {
             HabiTrainCore.LOGGER.debug("[ReplayVoice] microphone packet was not captured", failure);
         } catch (Error failure) {
             HabiTrainCore.LOGGER.error("[ReplayVoice] decoder failure while capturing microphone packet", failure);
         }
+    }
+
+    private static void refreshVoiceDistances(VoicechatServerApi api, boolean force) {
+        long now = System.nanoTime();
+        if (!force && now - lastDistRefreshNanos < DIST_REFRESH_INTERVAL_NS) return;
+        lastDistRefreshNanos = now;
+        float def = resolveMaxDistance(api, false);
+        float whisp = resolveMaxDistance(api, true);
+        cachedDefaultDist = def;
+        cachedWhisperDist = whisp;
+        MatchVoiceRecorder.updateVoiceDistances(def, whisp);
     }
 
     private static float resolveMaxDistance(VoicechatServerApi api, boolean whispering) {
@@ -246,9 +258,22 @@ public final class ReplayVoicePlugin implements VoicechatPlugin {
     private static final class DecoderState {
         private final OpusDecoder decoder;
         private boolean closed;
+        private boolean groupInitialized;
+        private @Nullable UUID lastGroupId;
+        private boolean lastOpenGroup;
 
         private DecoderState(OpusDecoder decoder) {
             this.decoder = decoder;
+        }
+
+        synchronized boolean noteGroupChange(@Nullable UUID groupId, boolean openGroup) {
+            if (groupInitialized && java.util.Objects.equals(lastGroupId, groupId) && lastOpenGroup == openGroup) {
+                return false;
+            }
+            groupInitialized = true;
+            lastGroupId = groupId;
+            lastOpenGroup = openGroup;
+            return true;
         }
 
         synchronized short[] decode(byte[] opus) {

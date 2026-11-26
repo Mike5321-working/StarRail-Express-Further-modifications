@@ -574,10 +574,10 @@ public final class EliminatedRestAreaService {
     }
 
     private static void syncPromptStates(MinecraftServer server) {
-        if (ELIMINATED_PLAYERS.isEmpty()) {
+        if (ELIMINATED_PLAYERS.isEmpty() || server.getTickCount() % 10 != 0) {
             return;
         }
-        for (UUID playerId : new HashSet<>(ELIMINATED_PLAYERS)) {
+        for (UUID playerId : ELIMINATED_PLAYERS) {
             ServerPlayer player = server.getPlayerList().getPlayer(playerId);
             if (player == null) {
                 PROMPT_STATES.remove(playerId);

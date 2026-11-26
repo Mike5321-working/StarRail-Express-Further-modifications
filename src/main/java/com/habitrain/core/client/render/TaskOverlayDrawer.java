@@ -95,12 +95,27 @@ public final class TaskOverlayDrawer {
         WorldRenderEvents.LAST.register(TaskOverlayDrawer::flushOverlayFrame);
     }
 
+    private static final int MAX_RENDER_TYPE_CACHE = 32;
+
+    /** Clears cached line-width RenderTypes on disconnect/reload. */
+    public static void clearCache() {
+        RENDER_TYPE_CACHE.clear();
+    }
+
     /**
-     * Memoized see-through line RenderType. Safe to share across SRE redirect + Habi drawer.
+     * Memoized see-through line RenderType (quantized to 0.5px steps and bounded to avoid leaks).
      */
     public static RenderType throughWallLines(float lineWidth) {
-        float w = lineWidth > 0f ? lineWidth : DEFAULT_LINE_WIDTH;
-        return RENDER_TYPE_CACHE.computeIfAbsent(w, TaskOverlayDrawer::createThroughWallType);
+        float raw = lineWidth > 0f ? lineWidth : DEFAULT_LINE_WIDTH;
+        float w = Math.round(Math.clamp(raw, 0.5f, 16.0f) * 2.0f) * 0.5f;
+        RenderType existing = RENDER_TYPE_CACHE.get(w);
+        if (existing != null) return existing;
+        if (RENDER_TYPE_CACHE.size() >= MAX_RENDER_TYPE_CACHE) {
+            RENDER_TYPE_CACHE.clear();
+        }
+        RenderType created = createThroughWallType(w);
+        RENDER_TYPE_CACHE.put(w, created);
+        return created;
     }
 
     private static RenderType createThroughWallType(float w) {
@@ -212,18 +227,17 @@ public final class TaskOverlayDrawer {
     }
 
     private static void flushOverlayFrame(WorldRenderContext context) {
-        try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture()) {
         List<QueuedOverlay> overlays = OVERLAY_QUEUE.drain();
         if (overlays.isEmpty() || context == null || context.camera() == null) {
             return;
         }
-
         Minecraft client = Minecraft.getInstance();
         Level world = context.world();
         PoseStack matrices = context.matrixStack();
         if (client == null || world == null || matrices == null) {
             return;
         }
+        try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture()) {
 
         Map<Float, List<QueuedOverlay>> batches = new LinkedHashMap<>();
         for (QueuedOverlay overlay : overlays) {

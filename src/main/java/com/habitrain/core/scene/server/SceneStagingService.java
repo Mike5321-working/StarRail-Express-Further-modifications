@@ -382,6 +382,7 @@ public final class SceneStagingService {
 
     public synchronized void tick(MinecraftServer server) {
         SceneSelectionSessionManager.getInstance().tick(server);
+        if (sessions.isEmpty()) return;
         long now = System.currentTimeMillis();
         for (SceneStagingSession session : new ArrayList<>(sessions.values())) {
             if (now >= session.expiresAt()) {

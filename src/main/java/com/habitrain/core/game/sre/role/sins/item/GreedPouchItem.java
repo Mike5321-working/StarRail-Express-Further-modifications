@@ -101,6 +101,7 @@ public final class GreedPouchItem {
         stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
     }
 
+    @SuppressWarnings("deprecation")
     public static @Nullable UUID getOwnerUuid(@Nullable ItemStack stack) {
         if (stack == null || stack.isEmpty()) return null;
         try {
@@ -113,7 +114,7 @@ public final class GreedPouchItem {
         }
         CustomData data = stack.get(DataComponents.CUSTOM_DATA);
         if (data != null) {
-            CompoundTag tag = data.copyTag();
+            CompoundTag tag = data.getUnsafe();
             if (tag.contains(TAG_GREED_OWNER)) {
                 return parseUuid(tag.getString(TAG_GREED_OWNER));
             }
@@ -180,12 +181,13 @@ public final class GreedPouchItem {
     }
 
     /** Read only the complete CUSTOM_DATA ledger, including entries hidden by bundle capacity. */
+    @SuppressWarnings("deprecation")
     public static List<ItemStack> getLedgerItems(ItemStack pouch, HolderLookup.Provider registries) {
         if (!isGreedPouch(pouch) || registries == null) return List.of();
         Map<String, ItemStack> byItemId = new LinkedHashMap<>();
         CustomData data = pouch.get(DataComponents.CUSTOM_DATA);
         if (data != null) {
-            ListTag list = data.copyTag().getList(TAG_GREED_CONTENTS, Tag.TAG_COMPOUND);
+            ListTag list = data.getUnsafe().getList(TAG_GREED_CONTENTS, Tag.TAG_COMPOUND);
             for (int i = 0; i < list.size(); i++) {
                 ItemStack parsed = ItemStack.parseOptional(registries, list.getCompound(i));
                 addByItemId(byItemId, parsed);

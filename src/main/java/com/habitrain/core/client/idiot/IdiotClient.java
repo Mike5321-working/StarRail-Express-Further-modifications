@@ -5,6 +5,7 @@ import com.habitrain.core.client.config.ClientVisualPreferences;
 import com.habitrain.core.game.sre.role.HabiRoles;
 import com.habitrain.core.game.sre.role.idiot.*;
 import com.habitrain.core.network.IdiotEffectPayload;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientEntityEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -28,6 +29,9 @@ import java.util.Locale;
 
 /** Local presentation only; disabling cosmetics cannot affect server-side gameplay. */
 public final class IdiotClient {
+    private static final net.minecraft.resources.ResourceLocation SPEED_MODIFIER_ID = HabiTrainCore.id("idiot_speed");
+    private static final java.util.Map<Integer, IdiotEggEntity> TRACKED_EGGS = new java.util.HashMap<>();
+    private static final java.util.Map<Integer, IdiotChickEntity> TRACKED_CHICKS = new java.util.HashMap<>();
     private static int boost, pity, face, jackpot, ticks;
     private static ClientLevel world;
     private static final Vector3f YOLK = new Vector3f(1, .78F, .15F);
@@ -46,16 +50,30 @@ public final class IdiotClient {
                 return player != null && chick.hasCustomName() && player.distanceToSqr(chick) < 36 && player.hasLineOfSight(chick);
             }
         });
+        ClientEntityEvents.ENTITY_LOAD.register((entity, clientLevel) -> {
+            if (entity instanceof IdiotEggEntity egg) TRACKED_EGGS.put(egg.getId(), egg);
+            else if (entity instanceof IdiotChickEntity chick) TRACKED_CHICKS.put(chick.getId(), chick);
+        });
+        ClientEntityEvents.ENTITY_UNLOAD.register((entity, clientLevel) -> {
+            if (entity instanceof IdiotEggEntity egg) TRACKED_EGGS.remove(egg.getId(), egg);
+            else if (entity instanceof IdiotChickEntity chick) TRACKED_CHICKS.remove(chick.getId(), chick);
+        });
         ClientPlayNetworking.registerGlobalReceiver(IdiotEffectPayload.TYPE, (payload, ctx) -> receive(payload));
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> reset());
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+            if (client.isSameThread()) reset(true);
+            else client.execute(() -> reset(true));
+        });
         ClientTickEvents.END_CLIENT_TICK.register(IdiotClient::tick);
         HudRenderCallback.EVENT.register((g, delta) -> hud(g));
     }
-    private static void reset() { boost = pity = face = jackpot = ticks = 0; world = null; }
+    private static void reset(boolean clearTracked) {
+        boost = pity = face = jackpot = ticks = 0; world = null;
+        if (clearTracked) { TRACKED_EGGS.clear(); TRACKED_CHICKS.clear(); }
+    }
     private static void receive(IdiotEffectPayload payload) {
         var mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null) return;
-        if (world != mc.level) { reset(); world = mc.level; }
+        if (world != mc.level) { reset(false); world = mc.level; }
         switch (payload.event()) {
             case IdiotEffectPayload.STATE -> { boost = payload.boostTicks(); pity = payload.pityRemaining(); }
             case IdiotEffectPayload.FACE -> {
@@ -74,8 +92,13 @@ public final class IdiotClient {
         }
     }
     private static void tick(Minecraft mc) {
-        if (mc.level == null || mc.player == null) { reset(); return; }
-        if (world != mc.level) { reset(); world = mc.level; }
+        if (mc.level == null || mc.player == null) { reset(true); return; }
+        if (world != mc.level) {
+            reset(false);
+            world = mc.level;
+            TRACKED_EGGS.values().removeIf(e -> e.level() != mc.level || e.isRemoved());
+            TRACKED_CHICKS.values().removeIf(e -> e.level() != mc.level || e.isRemoved());
+        }
         ticks++;
         if (boost > 0) boost--;
         if (face > 0) face--;
@@ -87,19 +110,29 @@ public final class IdiotClient {
         if (!mc.player.isAlive() || mc.player.isSpectator()) { boost = pity = face = jackpot = 0; return; }
         int density = ClientVisualPreferences.getIdiotParticles();
         if (density == 0 || ticks % (density == 1 ? 6 : 3) != 0) return;
-        for (var entity : mc.level.entitiesForRendering()) {
-            if (entity.distanceToSqr(mc.player) > 32 * 32) continue;
-            if (entity instanceof IdiotEggEntity) {
+        if (!TRACKED_EGGS.isEmpty()) {
+            var it = TRACKED_EGGS.values().iterator();
+            while (it.hasNext()) {
+                IdiotEggEntity entity = it.next();
+                if (entity == null || entity.isRemoved() || entity.level() != mc.level) { it.remove(); continue; }
+                if (entity.distanceToSqr(mc.player) > 32 * 32) continue;
                 particle(new DustParticleOptions(YOLK, .55F), entity.position(), new Vec3(0, .008, 0));
                 if (ticks % 6 == 0) feather(entity.position());
-            } else if (entity instanceof IdiotChickEntity && ticks % 12 == 0) {
+            }
+        }
+        if (!TRACKED_CHICKS.isEmpty() && ticks % 12 == 0) {
+            var it = TRACKED_CHICKS.values().iterator();
+            while (it.hasNext()) {
+                IdiotChickEntity entity = it.next();
+                if (entity == null || entity.isRemoved() || entity.level() != mc.level) { it.remove(); continue; }
+                if (entity.distanceToSqr(mc.player) > 32 * 32) continue;
                 feather(entity.position().add(0, .2, 0));
                 particle(new DustParticleOptions(new Vector3f(.55F, .8F, 1), .6F), entity.position().add(0, .3, 0), new Vec3(0, .03, 0));
             }
         }
         for (var player : mc.level.players()) {
             var speed = player.getAttribute(Attributes.MOVEMENT_SPEED);
-            boolean boosted = player == mc.player ? boost > 0 : speed != null && speed.getModifier(HabiTrainCore.id("idiot_speed")) != null;
+            boolean boosted = player == mc.player ? boost > 0 : speed != null && speed.getModifier(SPEED_MODIFIER_ID) != null;
             if (!boosted || player.distanceToSqr(mc.player) > 32 * 32) continue;
             boolean moving = player.getDeltaMovement().horizontalDistanceSqr() > .002;
             if (moving || ticks % 12 == 0) {

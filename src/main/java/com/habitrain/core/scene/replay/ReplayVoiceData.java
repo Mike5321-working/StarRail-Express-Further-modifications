@@ -30,7 +30,8 @@ public final class ReplayVoiceData {
     public static final int MAX_UTTERANCE_SAMPLES = SAMPLE_RATE * 30;
     public static final int MAX_POLICIES = 256;
     public static final int MAX_STATE_SPANS = 32_768;
-    public static final int MAX_VOICE_BYTES = 64 * 1024 * 1024;
+    public static final int MAX_VOICE_BYTES = 48 * 1024 * 1024;
+    private static final int MAX_READ_VOICE_BYTES = 64 * 1024 * 1024;
     public static final ReplayVoiceData EMPTY = new ReplayVoiceData(List.of());
 
     // SpeakerStateSpan stateFlags bitmask
@@ -414,7 +415,7 @@ public final class ReplayVoiceData {
 
     public static ReplayVoiceData fromBytes(byte[] raw) {
         if (raw == null || raw.length == 0) return EMPTY;
-        if (raw.length < 12 || raw.length > MAX_VOICE_BYTES) {
+        if (raw.length < 12 || raw.length > MAX_READ_VOICE_BYTES) {
             throw new IllegalArgumentException("Invalid voice archive size: " + raw.length);
         }
         ByteBuffer header = ByteBuffer.wrap(raw, 0, 12).order(ByteOrder.BIG_ENDIAN);

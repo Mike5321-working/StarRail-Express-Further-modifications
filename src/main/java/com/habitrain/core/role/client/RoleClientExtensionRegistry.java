@@ -48,6 +48,7 @@ public final class RoleClientExtensionRegistry implements RoleClientExtensionApi
     private final Map<ResourceLocation, String> screenProviders = new LinkedHashMap<>();
     private volatile boolean frozen;
     private volatile boolean loaded;
+    private volatile long revision;
     /** Providers whose client-extension registration committed (audit P1-4). */
     private final Set<String> loadedProviders = new LinkedHashSet<>();
     /**
@@ -299,11 +300,24 @@ public final class RoleClientExtensionRegistry implements RoleClientExtensionApi
      * provider set is fail-closed (same as empty). A {@code null} entry set is
      * only “all entries of an active provider” when the provider set is non-null.
      */
+    public long revision() {
+        return revision;
+    }
+
+    public boolean hasNameRenders() {
+        return !nameRenders.isEmpty();
+    }
+
+    public boolean hasInstincts() {
+        return !instincts.isEmpty();
+    }
+
     public synchronized void setActiveProviders(@Nullable Set<String> providers,
                                                 @Nullable Set<String> entryKeys) {
         this.activeProviders = providers == null ? null : Set.copyOf(providers);
         this.activeEntryKeys = entryKeys == null ? null : Set.copyOf(entryKeys);
         this.activeEntryIndex = entryKeys == null ? null : buildActiveEntryIndex(entryKeys);
+        this.revision++;
     }
 
     /**
@@ -442,6 +456,7 @@ public final class RoleClientExtensionRegistry implements RoleClientExtensionApi
             throw new IllegalArgumentException("Duplicate instinct rule: " + rule.id());
         }
         instinctProviders.put(rule.id(), provider);
+        revision++;
     }
 
     synchronized void commitSkin(@Nullable String provider, RoleSkinSpec spec) {
@@ -464,6 +479,7 @@ public final class RoleClientExtensionRegistry implements RoleClientExtensionApi
             throw new IllegalArgumentException("Duplicate name-render rule: " + rule.id());
         }
         nameRenderProviders.put(rule.id(), provider);
+        revision++;
     }
 
     synchronized void commitHudWidget(@Nullable String provider, ResourceLocation id,
@@ -631,6 +647,7 @@ public final class RoleClientExtensionRegistry implements RoleClientExtensionApi
         activeEntryIndex = null;
         frozen = false;
         loaded = false;
+        revision++;
     }
 
     private record ManagedHudWidget(@Nullable String provider, @Nullable String entryKey,

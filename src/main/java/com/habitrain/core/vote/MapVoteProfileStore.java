@@ -74,8 +74,15 @@ public final class MapVoteProfileStore {
     private record CachedPreview(long lastModifiedMillis, long size, byte[] bytes) {}
     private record CachedIndex(long lastModifiedMillis, long size, String rawJson) {}
 
-    /** X-CUT-02 & API-TV-21：按文件路径+修改时间+文件大小缓存已读取的 PNG 字节与 maps.json，消除主线程重复磁盘 IO */
-    private static final ConcurrentHashMap<Path, CachedPreview> PREVIEW_CACHE = new ConcurrentHashMap<>();
+    /** X-CUT-02 & API-TV-21：按文件路径+修改时间+文件大小缓存已读取的 PNG 字节与 maps.json，限制 LRU 上限避免无界增长 */
+    private static final int MAX_PREVIEW_CACHE_ENTRIES = 64;
+    private static final Map<Path, CachedPreview> PREVIEW_CACHE = java.util.Collections.synchronizedMap(
+            new LinkedHashMap<Path, CachedPreview>(MAX_PREVIEW_CACHE_ENTRIES + 1, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Path, CachedPreview> eldest) {
+                    return size() > MAX_PREVIEW_CACHE_ENTRIES;
+                }
+            });
     private static final ConcurrentHashMap<Path, CachedIndex> INDEX_CACHE = new ConcurrentHashMap<>();
     private static volatile byte[] cachedPlaceholder;
     private static final long PROFILE_CACHE_TTL_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
@@ -238,9 +245,28 @@ public final class MapVoteProfileStore {
         if (!target.startsWith(previewDir)) {
             return UploadResult.error("预览图路径无效");
         }
-        synchronized (IO_LOCK) {
-            try {
-                writePreviewAtomically(target, pngBytes);
+        Path temp = null;
+        try {
+            Path normalizedTarget = target.toAbsolutePath().normalize();
+            Path parent = normalizedTarget.getParent();
+            Files.createDirectories(parent);
+            // Stage PNG bytes outside IO_LOCK so concurrent profile reads are not stalled by disk writes.
+            temp = Files.createTempFile(parent, normalizedTarget.getFileName().toString() + ".", ".uploading");
+            Files.write(temp, pngBytes, StandardOpenOption.CREATE,
+                    StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            synchronized (IO_LOCK) {
+                try {
+                    Files.move(temp, normalizedTarget, StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException ignored) {
+                    Files.move(temp, normalizedTarget, StandardCopyOption.REPLACE_EXISTING);
+                }
+                temp = null;
+                cachedProfiles = null;
+                PREVIEW_CACHE.put(normalizedTarget, new CachedPreview(
+                        Files.getLastModifiedTime(normalizedTarget).toMillis(),
+                        pngBytes.length,
+                        pngBytes));
                 // Config override already points to this deterministic path. Keep maps.json
                 // aligned as a fallback, but an index-write problem must not invalidate an
                 // otherwise successful atomic image replacement.
@@ -252,9 +278,13 @@ public final class MapVoteProfileStore {
                 }
                 deletePreviousPreviewIfUnshared(base, mapId, previousPreviewPath, target, context.otherPreviews());
                 return UploadResult.ok();
-            } catch (Exception e) {
-                LOGGER.error("[MapVoteProfileStore] failed to store uploaded preview for '{}'", mapId, e);
-                return UploadResult.error("服务器写入图片失败");
+            }
+        } catch (Exception e) {
+            LOGGER.error("[MapVoteProfileStore] failed to store uploaded preview for '{}'", mapId, e);
+            return UploadResult.error("服务器写入图片失败");
+        } finally {
+            if (temp != null) {
+                try { Files.deleteIfExists(temp); } catch (IOException ignored) {}
             }
         }
     }

@@ -22,12 +22,18 @@ final class ShaderReportTracker {
         return true;
     }
     List<UUID> expire(long now) {
-        List<UUID> expired = new ArrayList<>();
-        pending.entrySet().removeIf(entry -> {
-            if (now - entry.getValue().started() < TIMEOUT) return false;
-            expired.add(entry.getKey()); return true;
-        });
-        return expired;
+        if (pending.isEmpty()) return List.of();
+        List<UUID> expired = null;
+        var it = pending.entrySet().iterator();
+        while (it.hasNext()) {
+            var entry = it.next();
+            if (now - entry.getValue().started() >= TIMEOUT) {
+                if (expired == null) expired = new ArrayList<>();
+                expired.add(entry.getKey());
+                it.remove();
+            }
+        }
+        return expired == null ? List.of() : expired;
     }
     void clear(UUID id) { reports.remove(id); pending.remove(id); }
     void clear() { reports.clear(); pending.clear(); }

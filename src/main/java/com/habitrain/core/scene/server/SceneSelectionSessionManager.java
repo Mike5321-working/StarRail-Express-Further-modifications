@@ -222,21 +222,24 @@ public final class SceneSelectionSessionManager {
     }
 
     public List<SelectionSession> cleanupExpired(long timeoutMs) {
-        List<SelectionSession> removed = new ArrayList<>();
+        if (sessions.isEmpty()) return List.of();
+        List<SelectionSession> removed = null;
         for (Map.Entry<UUID, SelectionSession> entry : new ArrayList<>(sessions.entrySet())) {
             SelectionSession session = entry.getValue();
             if (isExpired(session, timeoutMs) && sessions.remove(entry.getKey(), session)) {
                 rotateEditorSession(entry.getKey());
                 pendingClearSyncPlayers.add(entry.getKey());
+                if (removed == null) removed = new ArrayList<>();
                 removed.add(session);
             }
         }
-        return removed;
+        return removed == null ? List.of() : removed;
     }
 
     public void tick(MinecraftServer server) {
         if (server == null) return;
-        cleanupExpired(DEFAULT_EXPIRY_MS);
+        if (!sessions.isEmpty()) cleanupExpired(DEFAULT_EXPIRY_MS);
+        if (pendingClearSyncPlayers.isEmpty()) return;
         for (UUID playerId : new ArrayList<>(pendingClearSyncPlayers)) {
             ServerPlayer player = server.getPlayerList().getPlayer(playerId);
             if (player != null && !player.hasDisconnected()) {

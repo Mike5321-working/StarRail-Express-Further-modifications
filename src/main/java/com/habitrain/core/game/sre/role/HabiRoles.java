@@ -111,8 +111,11 @@ public final class HabiRoles {
             return true;
         }
         try {
-            return RoleCatalogApi.instance().canonicalize(have)
-                    .equals(RoleCatalogApi.instance().canonicalize(want));
+            RoleCatalogApi catalog = RoleCatalogApi.instance();
+            if (catalog instanceof com.habitrain.core.role.catalog.RoleCatalogImpl impl) {
+                return impl.sameCanonicalId(have, want);
+            }
+            return catalog.canonicalize(have).equals(catalog.canonicalize(want));
         } catch (Throwable ignored) {
             return false;
         }

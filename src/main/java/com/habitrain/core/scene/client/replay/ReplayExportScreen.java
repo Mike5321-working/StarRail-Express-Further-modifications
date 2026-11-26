@@ -941,16 +941,24 @@ final class ReplayExportScreen extends Screen {
         }
     }
 
+    private boolean cachedFfmpegReady;
+    private boolean cachedFfmpegProbing;
+
+    private void refreshFfmpegState() {
+        cachedFfmpegReady = minecraft != null && ReplayFfmpegManager.isReady(minecraft.gameDirectory.toPath());
+        cachedFfmpegProbing = ReplayFfmpegManager.isProbing();
+    }
+
     private boolean ffmpegReady() {
-        return minecraft != null && ReplayFfmpegManager.isReady(minecraft.gameDirectory.toPath());
+        return cachedFfmpegReady;
     }
 
     private boolean probingFfmpeg() {
-        return !exporting() && compress && !ffmpegReady() && ReplayFfmpegManager.isProbing();
+        return !exporting() && compress && !cachedFfmpegReady && cachedFfmpegProbing;
     }
 
     private boolean needsFfmpegAction() {
-        return !exporting() && compress && !ffmpegReady() && !ReplayFfmpegManager.isProbing();
+        return !exporting() && compress && !cachedFfmpegReady && !cachedFfmpegProbing;
     }
 
     private void toggleExport() {
@@ -1010,6 +1018,7 @@ final class ReplayExportScreen extends Screen {
     }
 
     private void refresh() {
+        refreshFfmpegState();
         view = history != null ? ReplayHistoryClient.watch(history) : ClientReplayBoard.viewForBoard(pos);
         video = ReplayExportClient.forScreen(video);
         syncParticipants(view == null ? null : view.replay());

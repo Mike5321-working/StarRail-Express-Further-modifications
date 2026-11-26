@@ -72,6 +72,11 @@ public final class LustComponent implements RoleComponent, ServerTickingComponen
 
     @Override public void init() { clear(); }
     @Override public void clear() {
+        boolean dirty = initialized || initialPlayerCount != 0 || selected != null
+                || selectionReadyAt != 0 || revivalToken != null || selectedDiedAt != 0
+                || deathPosition != null || deathUnsafePosition || nauseaAt != 0
+                || !roster.isEmpty() || !highlights.isEmpty();
+        if (!dirty) return;
         initialized = false;
         initialPlayerCount = 0;
         selected = null;
@@ -352,16 +357,23 @@ public final class LustComponent implements RoleComponent, ServerTickingComponen
                             : new CharmEntry(id, target.getGameProfile().getName(),
                                     target.level() == level && isAliveParticipant(target), true);
                 }).sorted(Comparator.comparing(CharmEntry::name)).toList();
+        Set<UUID> aliveCharmedIds = new HashSet<>(marked.size() * 2);
+        for (CharmEntry entry : marked) {
+            if (entry.alive()) aliveCharmedIds.add(entry.id());
+        }
+        Set<ServerPlayer> ownerSet = owners.isEmpty() ? Set.of() : new HashSet<>(owners);
         for (ServerPlayer viewer : players) {
             LustComponent state = KEY.get(viewer);
             Set<UUID> next = new HashSet<>();
+            boolean viewerIsOwner = ownerSet.contains(viewer);
             if (isAliveParticipant(viewer)) {
+                boolean viewerIsCharmed = charmedIds.contains(viewer.getUUID());
                 for (ServerPlayer owner : owners) {
                     UUID chosen = KEY.get(owner).selected;
                     if (owner == viewer) {
-                        marked.stream().filter(CharmEntry::alive).map(CharmEntry::id).forEach(next::add);
-                    } else if (isCharmed(viewer)) {
-                        if (chosen != null && marked.stream().anyMatch(e -> e.alive() && chosen.equals(e.id()))) {
+                        next.addAll(aliveCharmedIds);
+                    } else if (viewerIsCharmed) {
+                        if (chosen != null && aliveCharmedIds.contains(chosen)) {
                             next.add(chosen);
                         }
                         if (viewer.getUUID().equals(chosen)) next.add(owner.getUUID());
@@ -369,7 +381,7 @@ public final class LustComponent implements RoleComponent, ServerTickingComponen
                 }
             }
             next.remove(viewer.getUUID());
-            List<CharmEntry> nextRoster = owners.contains(viewer) ? marked : List.of();
+            List<CharmEntry> nextRoster = viewerIsOwner ? marked : List.of();
             if (!state.highlights.equals(next) || !state.roster.equals(nextRoster)) {
                 state.highlights.clear();
                 state.highlights.addAll(next);

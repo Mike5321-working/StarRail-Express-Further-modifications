@@ -121,7 +121,7 @@ public final class ClientReplayBoard {
             var level = Minecraft.getInstance().level;
             if (level != null) LOCAL.finish(level);
         });
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(() -> {
             clearView();
             available = new Available(EMPTY, false);
             LOCAL.clear();
@@ -132,7 +132,7 @@ public final class ClientReplayBoard {
             EXITING_BOARDS.clear();
             observedLevel = null;
             wasInMatch = false;
-        });
+        }));
     }
 
     public static void acceptSessionSync(BoardSessionSyncS2C payload) {

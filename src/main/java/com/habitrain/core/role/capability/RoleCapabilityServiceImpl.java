@@ -43,6 +43,15 @@ public final class RoleCapabilityServiceImpl implements RoleCapabilityApi {
     private final Map<RoleCapabilityKey, RoleCapabilityStatus> adapters = new ConcurrentHashMap<>();
     private final Map<UUID, UUID> groups = new ConcurrentHashMap<>();
     private volatile boolean frozen;
+    private volatile int policyMutationVersion;
+    private volatile @Nullable com.habitrain.core.api.role.v2.RoleSnapshot cachedVoiceSnapshot;
+    private volatile long cachedVoiceConfigRevision = Long.MIN_VALUE;
+    private volatile int cachedVoiceMutationVersion = -1;
+    private volatile List<RoleVoicePolicy> cachedEnabledVoices = List.of();
+    private volatile @Nullable com.habitrain.core.api.role.v2.RoleSnapshot cachedChatSnapshot;
+    private volatile long cachedChatConfigRevision = Long.MIN_VALUE;
+    private volatile int cachedChatMutationVersion = -1;
+    private volatile List<RoleChatPolicy> cachedEnabledChats = List.of();
 
     static {
         // 审核 R-04：隔离组过去永不清理，陈旧组会被 withStoredGroups 注入后续每一轮与
@@ -100,6 +109,7 @@ public final class RoleCapabilityServiceImpl implements RoleCapabilityApi {
         if (voices.putIfAbsent(policy.id(), new ManagedDeclaration<>(providerId, entryId, policy.role(), policy)) != null) {
             throw new IllegalArgumentException("Duplicate voice policy: " + policy.id());
         }
+        policyMutationVersion++;
         LOGGER.info("Registered voice policy {} for {} (provider {}, entry {})",
                 policy.id(), policy.role(), providerId, entryId);
         return policy;
@@ -118,6 +128,7 @@ public final class RoleCapabilityServiceImpl implements RoleCapabilityApi {
         if (chats.putIfAbsent(policy.id(), new ManagedDeclaration<>(providerId, entryId, policy.role(), policy)) != null) {
             throw new IllegalArgumentException("Duplicate chat policy: " + policy.id());
         }
+        policyMutationVersion++;
         LOGGER.info("Registered chat policy {} for {} (provider {}, entry {})",
                 policy.id(), policy.role(), providerId, entryId);
         return policy;
@@ -176,30 +187,82 @@ public final class RoleCapabilityServiceImpl implements RoleCapabilityApi {
         return CapabilityPolicyEvaluator.chat(enabledChatPolicies(), withStoredGroups(ctx));
     }
 
-    /** Voice policies whose provider/entry gate is ENABLED (audit P1-2). */
-    synchronized List<RoleVoicePolicy> enabledVoicePolicies() {
-        List<RoleVoicePolicy> enabled = new ArrayList<>();
-        for (ManagedDeclaration<RoleVoicePolicy> decl : voices.values()) {
-            if (gateEnabled(decl.providerId(), decl.entryId())) {
-                enabled.add(decl.declaration());
-            }
-        }
-        return enabled;
-    }
-
-    /** Chat policies whose provider/entry gate is ENABLED (audit P1-2). */
-    private synchronized List<RoleChatPolicy> enabledChatPolicies() {
-        List<RoleChatPolicy> enabled = new ArrayList<>();
-        for (ManagedDeclaration<RoleChatPolicy> decl : chats.values()) {
-            if (gateEnabled(decl.providerId(), decl.entryId())) {
-                enabled.add(decl.declaration());
-            }
-        }
-        return enabled;
-    }
-
-    private static boolean gateEnabled(String providerId, String entryId) {
+    /** Voice policies whose provider/entry gate is ENABLED (audit P1-2), cached per snapshot/config revision. */
+    List<RoleVoicePolicy> enabledVoicePolicies() {
         var snapshot = com.habitrain.core.role.snapshot.RoleSnapshotManager.INSTANCE.current();
+        long configRev = snapshot != null ? 0L : RoleExtensionConfigService.INSTANCE.revision();
+        int mutVer = policyMutationVersion;
+        if (cachedVoiceMutationVersion == mutVer
+                && cachedVoiceSnapshot == snapshot
+                && cachedVoiceConfigRevision == configRev) {
+            return cachedEnabledVoices;
+        }
+        synchronized (this) {
+            mutVer = policyMutationVersion;
+            if (cachedVoiceMutationVersion == mutVer
+                    && cachedVoiceSnapshot == snapshot
+                    && cachedVoiceConfigRevision == configRev) {
+                return cachedEnabledVoices;
+            }
+            List<RoleVoicePolicy> enabled;
+            if (voices.isEmpty()) {
+                enabled = List.of();
+            } else {
+                List<RoleVoicePolicy> list = new ArrayList<>(voices.size());
+                for (ManagedDeclaration<RoleVoicePolicy> decl : voices.values()) {
+                    if (gateEnabled(snapshot, decl.providerId(), decl.entryId())) {
+                        list.add(decl.declaration());
+                    }
+                }
+                enabled = list.isEmpty() ? List.of() : List.copyOf(list);
+            }
+            cachedVoiceSnapshot = snapshot;
+            cachedVoiceConfigRevision = configRev;
+            cachedVoiceMutationVersion = mutVer;
+            cachedEnabledVoices = enabled;
+            return enabled;
+        }
+    }
+
+    /** Chat policies whose provider/entry gate is ENABLED (audit P1-2), cached per snapshot/config revision. */
+    private List<RoleChatPolicy> enabledChatPolicies() {
+        var snapshot = com.habitrain.core.role.snapshot.RoleSnapshotManager.INSTANCE.current();
+        long configRev = snapshot != null ? 0L : RoleExtensionConfigService.INSTANCE.revision();
+        int mutVer = policyMutationVersion;
+        if (cachedChatMutationVersion == mutVer
+                && cachedChatSnapshot == snapshot
+                && cachedChatConfigRevision == configRev) {
+            return cachedEnabledChats;
+        }
+        synchronized (this) {
+            mutVer = policyMutationVersion;
+            if (cachedChatMutationVersion == mutVer
+                    && cachedChatSnapshot == snapshot
+                    && cachedChatConfigRevision == configRev) {
+                return cachedEnabledChats;
+            }
+            List<RoleChatPolicy> enabled;
+            if (chats.isEmpty()) {
+                enabled = List.of();
+            } else {
+                List<RoleChatPolicy> list = new ArrayList<>(chats.size());
+                for (ManagedDeclaration<RoleChatPolicy> decl : chats.values()) {
+                    if (gateEnabled(snapshot, decl.providerId(), decl.entryId())) {
+                        list.add(decl.declaration());
+                    }
+                }
+                enabled = list.isEmpty() ? List.of() : List.copyOf(list);
+            }
+            cachedChatSnapshot = snapshot;
+            cachedChatConfigRevision = configRev;
+            cachedChatMutationVersion = mutVer;
+            cachedEnabledChats = enabled;
+            return enabled;
+        }
+    }
+
+    private static boolean gateEnabled(@Nullable com.habitrain.core.api.role.v2.RoleSnapshot snapshot,
+                                       String providerId, String entryId) {
         if (snapshot != null) return snapshot.isBehaviorEntryEnabled(providerId, entryId);
         return RoleExtensionConfigService.INSTANCE.gateFor(providerId, entryId)
                 == RoleExtensionConfigService.EntryGate.ENABLED;
@@ -281,6 +344,7 @@ public final class RoleCapabilityServiceImpl implements RoleCapabilityApi {
         chats.clear();
         chats.putAll(snapshot.chats());
         frozen = snapshot.frozen();
+        policyMutationVersion++;
     }
 
     public synchronized void clear() {
@@ -289,6 +353,7 @@ public final class RoleCapabilityServiceImpl implements RoleCapabilityApi {
         adapters.clear();
         groups.clear();
         frozen = false;
+        policyMutationVersion++;
     }
 
     public List<String> describe() {

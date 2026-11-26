@@ -21,12 +21,13 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.item.ItemStack;
+import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fStack;
 import org.lwjgl.opengl.GL11;
 
-import java.util.HashSet;
-import java.util.Set;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -42,7 +43,7 @@ final class ReplayVideoCanvas {
     static final ResourceLocation MV_DISPLAY = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_mv_display");
     static final ResourceLocation MV_TEXT = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_mv_text");
     static final ResourceLocation MV_MONO = ResourceLocation.fromNamespaceAndPath("habitrain_core", "replay_mv_mono");
-    private static final Set<ResourceLocation> PREPARED = new HashSet<>();
+    private static final Map<ResourceLocation, Boolean> PREPARED = new HashMap<>();
     private static final boolean MODERN_UI = FabricLoader.getInstance().isModLoaded("modernui");
 
     enum Tex {
@@ -466,13 +467,17 @@ final class ReplayVideoCanvas {
 
     private void prepareTexture(ResourceLocation id, boolean repeat, boolean additive) {
         var texture = mc.getTextureManager().getTexture(id);
-        if (PREPARED.add(id)) {
+        Boolean prevRepeat = PREPARED.get(id);
+        if (prevRepeat == null) {
             texture.setFilter(true, false);
         }
         RenderSystem.bindTexture(texture.getId());
-        int wrap = repeat ? GL11.GL_REPEAT : 0x812F; // GL_CLAMP_TO_EDGE
-        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, wrap);
-        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, wrap);
+        if (prevRepeat == null || prevRepeat.booleanValue() != repeat) {
+            int wrap = repeat ? GL11.GL_REPEAT : 0x812F; // GL_CLAMP_TO_EDGE
+            GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, wrap);
+            GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, wrap);
+            PREPARED.put(id, repeat);
+        }
         RenderSystem.disableDepthTest();
         RenderSystem.enableBlend();
         if (additive) RenderSystem.blendFunc(GlStateManager.SourceFactor.SRC_ALPHA, GlStateManager.DestFactor.ONE);
@@ -483,6 +488,17 @@ final class ReplayVideoCanvas {
 
     /** Resource reloads replace textures; forget cached sampler setup. */
     static void invalidate() { PREPARED.clear(); }
+
+    /** Releases all GPU textures loaded for replay video motion graphics. */
+    static void releaseTextures(@Nullable Minecraft client) {
+        if (PREPARED.isEmpty()) return;
+        if (client != null && client.getTextureManager() != null) {
+            for (ResourceLocation id : PREPARED.keySet()) {
+                client.getTextureManager().release(id);
+            }
+        }
+        PREPARED.clear();
+    }
 
     // ------------------------------------------------------------------ colour helpers
 

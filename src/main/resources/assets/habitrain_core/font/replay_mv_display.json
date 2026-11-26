@@ -1,7 +1,7 @@
 {
   "providers": [
-    {"type": "ttf", "file": "habitrain_core:replay/bebas.ttf", "size": 11.0, "oversample": 8.0, "shift": [0.0, 1.0]},
-    {"type": "ttf", "file": "habitrain_core:replay/noto_sans_sc_bold.ttf", "size": 9.0, "oversample": 8.0, "shift": [0.0, 0.0]},
+    {"type": "reference", "id": "habitrain_core:replay_bebas"},
+    {"type": "reference", "id": "habitrain_core:replay_cjk"},
     {"type": "reference", "id": "minecraft:default"}
   ]
 }

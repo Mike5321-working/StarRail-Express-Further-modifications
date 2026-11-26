@@ -144,6 +144,12 @@ public final class GreedComponent implements RoleComponent, ServerTickingCompone
 
     @Override
     public void clear() {
+        boolean dirty = targetCount != 0 || !collectedTypeIds.isEmpty() || !storedItems.isEmpty()
+                || pouchGiven || collectionComplete || lastPouchResyncTick != -1
+                || estateDistributed || incomeRemainder != 0;
+        if (!dirty) {
+            return;
+        }
         targetCount = 0;
         collectedTypeIds.clear();
         storedItems.clear();
@@ -321,7 +327,7 @@ public final class GreedComponent implements RoleComponent, ServerTickingCompone
 
         if (!isGreed) return;
 
-        if ((!pouchGiven || findOwnPouch(sp).isEmpty()) && targetCount > 0) {
+        if (!pouchGiven && targetCount > 0) {
             givePouch(sp);
         }
         if (targetCount <= 0 && pouchGiven) {
@@ -331,11 +337,17 @@ public final class GreedComponent implements RoleComponent, ServerTickingCompone
 
         // Vanilla bundle UI inserts only update BUNDLE_CONTENTS and offers no
         // insertion event, so the win counter must be polled from the physical
-        // pouch — but not every tick: the NBT parse (CustomData.copyTag + 逐条
-        // parse + 多次集合分配) runs every 5 ticks instead (review L7).
+        // pouch — but not every tick: scan inventory and reconcile every 5 ticks.
         if (lastPouchResyncTick < 0 || level.getGameTime() - lastPouchResyncTick >= 5) {
             lastPouchResyncTick = level.getGameTime();
-            resyncFromPhysicalPouch(sp);
+            ItemStack pouch = findOwnPouch(sp);
+            if (pouch.isEmpty() && targetCount > 0) {
+                givePouch(sp);
+                pouch = findOwnPouch(sp);
+            }
+            if (!pouch.isEmpty()) {
+                resyncFromPhysicalPouch(sp, pouch);
+            }
         }
 
         // Periodic progress HUD every 5s
@@ -361,6 +373,11 @@ public final class GreedComponent implements RoleComponent, ServerTickingCompone
         if (self == null || collectionComplete) return;
         ItemStack pouch = findOwnPouch(self);
         if (pouch.isEmpty()) return;
+        resyncFromPhysicalPouch(self, pouch);
+    }
+
+    private void resyncFromPhysicalPouch(ServerPlayer self, ItemStack pouch) {
+        if (self == null || collectionComplete || pouch == null || pouch.isEmpty()) return;
 
         List<ItemStack> ledger = GreedPouchItem.getLedgerItems(pouch, self.registryAccess());
         List<ItemStack> actualVisible = GreedPouchItem.getBundleItems(pouch);

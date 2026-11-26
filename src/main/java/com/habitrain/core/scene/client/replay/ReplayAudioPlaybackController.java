@@ -139,11 +139,20 @@ public final class ReplayAudioPlaybackController {
         }
     }
 
-    static void clearPcmCache() {
+    public static void clearPcmCache() {
         synchronized (PCM_CACHE) {
             PCM_CACHE.clear();
             pcmCacheBytes = 0L;
         }
+    }
+
+    public static void onGameStarted() {
+        clearPcmCache();
+    }
+
+    public static void shutdown() {
+        reset();
+        PCM_WORKERS.shutdownNow();
     }
 
     private record ActiveVoice(Object key, @Nullable UUID speakerId, float gain, boolean isSelf,

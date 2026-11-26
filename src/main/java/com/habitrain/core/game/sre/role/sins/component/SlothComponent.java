@@ -109,7 +109,7 @@ public final class SlothComponent implements RoleComponent, ServerTickingCompone
             return false;
         }
         forceNextSleepTask = false;
-        sync();
+        syncOwnerOnly();
         return true;
     }
 
@@ -127,11 +127,25 @@ public final class SlothComponent implements RoleComponent, ServerTickingCompone
     }
 
     public static void resetRound(ServerLevel level) {
-        INDUCED_THIS_ROUND.remove(level);
+        Set<UUID> induced = INDUCED_THIS_ROUND.remove(level);
+        if (induced != null) {
+            SLEEPING_PLAYERS.removeAll(induced);
+        }
         for (ServerPlayer participant : level.players()) {
             SLEEPING_PLAYERS.remove(participant.getUUID());
             KEY.get(participant).clear();
         }
+    }
+
+    public static void onPlayerDisconnect(UUID playerId) {
+        if (playerId != null) {
+            SLEEPING_PLAYERS.remove(playerId);
+        }
+    }
+
+    public static void clearRuntimeState() {
+        INDUCED_THIS_ROUND.clear();
+        SLEEPING_PLAYERS.clear();
     }
 
     public boolean isInducedSleeping() {
@@ -168,7 +182,7 @@ public final class SlothComponent implements RoleComponent, ServerTickingCompone
                 }
                 component.forceNextSleepTask = true;
                 component.enforceForcedSleepTask(target);
-                component.sync();
+                component.syncOwnerOnly();
                 target.displayClientMessage(
                         Component.translatable("message.habitrain_core.sin_sloth.task_forced"), true);
                 affected++;
@@ -228,9 +242,9 @@ public final class SlothComponent implements RoleComponent, ServerTickingCompone
         }
         try {
             SlothComponent component = KEY.get(serverPlayer);
-            component.consumeForcedSleepTask();
+            component.forceNextSleepTask = false;
             component.completedSleepTasks++;
-            component.sync();
+            component.syncOwnerOnly();
             if (component.completedSleepTasks == REQUIRED_SLEEP_TASKS) {
                 serverPlayer.displayClientMessage(
                         Component.translatable("message.habitrain_core.sin_sloth.target_unlocked"), true);
@@ -446,21 +460,31 @@ public final class SlothComponent implements RoleComponent, ServerTickingCompone
     @Override
     public void clear() {
         boolean wasSleeping = inducedSleeping;
-        inducedSleeping = false;
         SLEEPING_PLAYERS.remove(player.getUUID());
+        boolean dirty = wasSleeping || forceNextSleepTask || completedSleepTasks != 0
+                || inducedThisRound || inducedBySloth != null || slothWinTriggered
+                || sleepX != 0.0D || sleepY != 0.0D || sleepZ != 0.0D
+                || sleepYaw != 0.0F || sleepPitch != 0.0F || !BlockPos.ZERO.equals(sleepPos);
+        if (!dirty) {
+            return;
+        }
+        inducedSleeping = false;
         if (wasSleeping && player.isSleeping()) {
             player.stopSleeping();
         }
         forceNextSleepTask = false;
         completedSleepTasks = 0;
         inducedThisRound = false;
-        inducedSleeping = false;
         inducedBySloth = null;
         slothWinTriggered = false;
         sleepX = sleepY = sleepZ = 0.0D;
         sleepYaw = sleepPitch = 0.0F;
         sleepPos = BlockPos.ZERO;
-        sync();
+        if (wasSleeping) {
+            sync();
+        } else {
+            syncOwnerOnly();
+        }
     }
 
     @Override
@@ -536,18 +560,17 @@ public final class SlothComponent implements RoleComponent, ServerTickingCompone
     }
 
     private void checkSlothBedWin(ServerPlayer self, ServerLevel level) {
-        if (slothWinTriggered || self.isSpectator() || inducedSleeping) {
+        if (slothWinTriggered || self.isSpectator() || inducedSleeping || !isLyingInRealBed(self, level)) {
             return;
         }
         int sleepers = countInducedSleepers(level, self.getUUID());
-        boolean lyingInRealBed = isLyingInRealBed(self, level);
-        if (!SlothWinPolicy.shouldDeclare(sleepers, GreedComponent.resolveStartPlayers(level), lyingInRealBed,
+        if (!SlothWinPolicy.shouldDeclare(sleepers, GreedComponent.resolveStartPlayers(level), true,
                 GameUtils.isPlayerAliveAndSurvival(self), slothWinTriggered)) {
             return;
         }
 
         slothWinTriggered = true;
-        sync();
+        syncOwnerOnly();
         self.displayClientMessage(
                 Component.translatable("message.habitrain_core.sin_sloth.win_ready"), true);
         SinVictoryHooks.triggerSlothWin(level, self);
@@ -574,6 +597,15 @@ public final class SlothComponent implements RoleComponent, ServerTickingCompone
     private void sync() {
         try {
             KEY.sync(player);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void syncOwnerOnly() {
+        try {
+            if (player instanceof ServerPlayer sp) {
+                KEY.syncWith(sp, (org.ladysnake.cca.api.v3.component.ComponentProvider) (Object) player);
+            }
         } catch (Throwable ignored) {
         }
     }

@@ -61,10 +61,22 @@ public final class SceneMeshSet implements AutoCloseable {
     private final List<Batch> batches = new ArrayList<>();
     private final Map<Layer, SortedBuffer> layerSorts = new EnumMap<>(Layer.class);
     private final Map<SceneMaterialKey, SortedBuffer> customSorts = new LinkedHashMap<>();
+    private static final float SORT_THRESHOLD_SQ = 0.25f;
+    private static long currentRenderFrameSeq = 0L;
+
+    static void beginRenderFrame(long seq) {
+        currentRenderFrameSeq = seq;
+    }
+
+    static void endRenderFrame() {
+        currentRenderFrameSeq = 0L;
+    }
+
     private ByteBufferBuilder sortScratch;
     private static final class SortedBuffer {
         final SceneTransparencySort state;
         float x = Float.NaN, y, z;
+        long lastSortedFrame = Long.MIN_VALUE;
         SortedBuffer(SceneTransparencySort state) { this.state = state; }
     }
     public void setSortState(Layer layer, SceneMaterialKey material, SceneTransparencySort sort) {
@@ -74,8 +86,9 @@ public final class SceneMeshSet implements AutoCloseable {
     }
     private void sort(VertexBuffer buffer, SortedBuffer sort) {
         if (sort == null) return;
+        if (currentRenderFrameSeq != 0L && sort.lastSortedFrame == currentRenderFrameSeq) return;
         var camera = SceneShaders.localCamera();
-        if (Float.isFinite(sort.x) && camera.distanceSquared(sort.x, sort.y, sort.z) < 1.0e-6f) return;
+        if (Float.isFinite(sort.x) && camera.distanceSquared(sort.x, sort.y, sort.z) < SORT_THRESHOLD_SQ) return;
         if (sortScratch == null) sortScratch = new ByteBufferBuilder(4096);
         try (var indices = sort.state.buildSortedIndexBuffer(sortScratch,
                 VertexSorting.byDistance(camera.x, camera.y, camera.z))) {
@@ -84,6 +97,7 @@ public final class SceneMeshSet implements AutoCloseable {
             sortScratch.clear();
         }
         sort.x = camera.x; sort.y = camera.y; sort.z = camera.z;
+        sort.lastSortedFrame = currentRenderFrameSeq;
     }
     private volatile boolean closed = false;
     private long estimatedBytes;
@@ -172,12 +186,17 @@ public final class SceneMeshSet implements AutoCloseable {
      * and will call {@code VertexBuffer.unbind()} + {@code renderType.clearRenderState()} after the batch loop.
      */
     public void drawBoundLayer(Layer layer, Matrix4f modelViewMatrix, Matrix4f projectionMatrix, ShaderInstance baseShader) {
+        drawBoundLayer(layer, modelViewMatrix, projectionMatrix, baseShader, 0.0f, 0.0f, 0.0f);
+    }
+
+    public void drawBoundLayer(Layer layer, Matrix4f modelViewMatrix, Matrix4f projectionMatrix, ShaderInstance baseShader,
+                               float chunkOffsetX, float chunkOffsetY, float chunkOffsetZ) {
         if (closed) return;
         VertexBuffer buffer = buffers.get(layer);
         if (buffer == null) return;
         buffer.bind();
         sort(buffer, layerSorts.get(layer));
-        drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, 0.0f, 0.0f, 0.0f,
+        drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, chunkOffsetX, chunkOffsetY, chunkOffsetZ,
                 alphaCutoffFor(layer), baseShader);
     }
 
@@ -192,12 +211,18 @@ public final class SceneMeshSet implements AutoCloseable {
 
     public void drawBoundCustomMaterial(SceneMaterialKey key, Matrix4f modelViewMatrix,
                                         Matrix4f projectionMatrix, ShaderInstance baseShader) {
+        drawBoundCustomMaterial(key, modelViewMatrix, projectionMatrix, baseShader, 0.0f, 0.0f, 0.0f);
+    }
+
+    public void drawBoundCustomMaterial(SceneMaterialKey key, Matrix4f modelViewMatrix,
+                                        Matrix4f projectionMatrix, ShaderInstance baseShader,
+                                        float chunkOffsetX, float chunkOffsetY, float chunkOffsetZ) {
         if (closed) return;
         VertexBuffer buffer = customBuffers.get(key);
         if (buffer == null) return;
         buffer.bind();
         sort(buffer, customSorts.get(key));
-        drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, 0.0f, 0.0f, 0.0f,
+        drawBufferWithChunkOffset(buffer, modelViewMatrix, projectionMatrix, chunkOffsetX, chunkOffsetY, chunkOffsetZ,
                 alphaCutoffFor(key), baseShader);
     }
 

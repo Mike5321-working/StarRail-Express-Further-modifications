@@ -301,10 +301,11 @@ public final class HabiRoleItems {
         stack.set(DataComponents.CUSTOM_DATA, CustomData.of(tag));
     }
 
+    @SuppressWarnings("deprecation")
     public static boolean hasFlag(ItemStack stack, String key) {
         if (stack == null || stack.isEmpty()) return false;
         CustomData data = stack.get(DataComponents.CUSTOM_DATA);
-        if (data == null || !data.contains(key)) return false;
-        return data.copyTag().getBoolean(key);
+        if (data == null) return false;
+        return data.getUnsafe().getBoolean(key);
     }
 }

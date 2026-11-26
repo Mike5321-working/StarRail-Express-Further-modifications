@@ -43,11 +43,31 @@ public final class VisualFrames {
             for (int index = 0; index < count; index++) {
                 int kind = in.readUnsignedByte(); float x = coordinate(in), y = coordinate(in), xx = coordinate(in), yy = coordinate(in);
                 int color = in.readInt(); String text = in.readUTF();
-                if (kind > 4 || text.length() > 512 || ((kind == 3 || kind == 4) && (!text.matches("[a-z0-9_.-]+:[a-z0-9_/.-]+") || text.contains("..")))) throw new IOException("Invalid HUD command");
+                if (kind > 4 || text.length() > 512 || ((kind == 3 || kind == 4) && !isValidResourceId(text))) throw new IOException("Invalid HUD command");
                 float[] uv = kind == 3 ? new float[]{coordinate(in), coordinate(in), coordinate(in), coordinate(in)} : null;
                 draws.add(new Draw(kind, x, y, xx, yy, color, text, uv));
             }
             return new Hud(width, height, draws);
+        }
+        private static boolean isValidResourceId(String text) {
+            int len = text.length();
+            if (len < 3) return false;
+            int colon = -1;
+            char prev = 0;
+            for (int i = 0; i < len; i++) {
+                char c = text.charAt(i);
+                if (c == '.' && prev == '.') return false;
+                prev = c;
+                if (c == ':') {
+                    if (colon >= 0 || i == 0 || i == len - 1) return false;
+                    colon = i;
+                    continue;
+                }
+                boolean valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                        || c == '_' || c == '.' || c == '-' || (colon >= 0 && c == '/');
+                if (!valid) return false;
+            }
+            return colon > 0;
         }
         private static float coordinate(DataInputStream in) throws IOException {
             float value = in.readFloat(); if (!(Math.abs(value) <= 65536)) throw new IOException("Invalid HUD coordinate"); return value;

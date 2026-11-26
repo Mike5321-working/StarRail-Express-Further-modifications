@@ -18,13 +18,16 @@ import com.habitrain.core.api.scene.model.SceneRuntimeState;
 import com.habitrain.core.api.scene.model.SceneShakeSettings;
 import com.habitrain.core.api.scene.model.SceneSoundSettings;
 import com.habitrain.core.scene.network.SceneAssetReadyC2S;
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.math.Axis;
 import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.RenderType;
+import net.minecraft.client.renderer.ShaderInstance;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
@@ -35,6 +38,7 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Map;
@@ -101,7 +105,13 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
     private long previewStartNanos = 0L;
     private volatile int lastConfiguredOrbitInstances = 0;
     private volatile int lastVisibleOrbitInstances = 0;
+    private long renderFrameSeq = 0L;
+    private final Vector3f scratchBatchCenter = new Vector3f();
+    private final Vector3f scratchFrustumPoint = new Vector3f();
+    private final List<VisibleBatch> visibleBatchScratch = new ArrayList<>();
+    private final Set<SceneMaterialKey> customOpaqueKeyScratch = new LinkedHashSet<>();
 
+    private record VisibleBatch(SceneMeshSet mesh, float offsetX, float offsetY, float offsetZ) {}
     private record AnchoredProfileCache(long revision, SceneProfile profile) {}
 
     private SceneRenderRuntime() {}
@@ -402,6 +412,7 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
                     if (previous != null && previous != mesh) previous.close();
                     additionalMeshUseSeq.put(hash, ++meshUseCounter);
                     enforceMeshBudget();
+                    SceneAssetCache.getInstance().trimMemoryCacheIfOverQuota();
                     LOGGER.info("已启用附加动态背景 GPU 网格: hash={}", shortHash(hash));
                     reportAdditionalPrefetchWaiters(hash, true);
                 }
@@ -532,6 +543,7 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
                         mesh.close();
                     }
                     enforceMeshBudget();
+                    SceneAssetCache.getInstance().trimMemoryCacheIfOverQuota();
                     reportAdditionalPrefetchWaiters(hash, success);
                 }
             }).exceptionally(ex -> {
@@ -584,6 +596,20 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
             if (instance != null) addIfPresent(hashes, instance.assetHash());
         }
         hashes.addAll(additionalMeshesByHash.keySet());
+        hashes.addAll(additionalLoadingHashes);
+        hashes.addAll(additionalPrefetchWaiters.keySet());
+        hashes.addAll(primaryPrefetchWaiters.assetHashes());
+        return hashes;
+    }
+
+    /**
+     * 仅包含此刻仍需要 CPU 侧解码资产（{@code AssetData}）进行烘焙的 hash 集合。
+     * 已烘焙并上传到 GPU VBO 的场景网格无需长期钉死解码后的 CPU 资产副本，
+     * 超过内存配额时可安全淘汰（磁盘 {@code .hscene} 仍受 {@link #activeAssetHashes()} 保护）。
+     */
+    public Set<String> activeCpuBuildAssetHashes() {
+        Set<String> hashes = new HashSet<>();
+        addIfPresent(hashes, preparingAssetHash);
         hashes.addAll(additionalLoadingHashes);
         hashes.addAll(additionalPrefetchWaiters.keySet());
         hashes.addAll(primaryPrefetchWaiters.assetHashes());
@@ -809,6 +835,7 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
                 meshSet.close();
             }
         }
+        SceneAssetCache.getInstance().trimMemoryCacheIfOverQuota();
         result.complete(success);
     }
 
@@ -938,7 +965,6 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
     }
 
     public synchronized void render(WorldRenderContext context) {
-        try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture()) {
         if (context == null || context.camera() == null) return;
         // Capture the projection even when no scene is currently active. This lets the
         // administrator diagnostics page report the matrix the world renderer actually used.
@@ -983,50 +1009,55 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
             return;
         }
 
-        int frameTotalBatches = 0;
-        int frameDrawnBatches = 0;
-        long frameCulledBatchBytes = 0L;
-        boolean anyBatched = false;
+        try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture()) {
+            SceneMeshSet.beginRenderFrame(++renderFrameSeq);
+            try {
+                int frameTotalBatches = 0;
+                int frameDrawnBatches = 0;
+                long frameCulledBatchBytes = 0L;
+                boolean anyBatched = false;
 
-        // 第一阶段：先绘制全部场景实例/副本的不透明与裁切层，防止后绘制副本的不透明面遮挡先绘制副本的半透明面
-        for (RenderSubmission sub : submissions) {
-            if (sub.mesh().isBatched()) {
-                anyBatched = true;
-            }
-            try (var modelScope = SceneShaders.model(sub.modelMatrix())) {
-            BatchStats stats = drawMeshInstanceOpaque(
-                    sub.mesh(), sub.modelMatrix(), sub.modelView(), projectionMatrix,
-                    camPos, frustum, sub.chunkOffsetX(), sub.chunkOffsetY(), sub.chunkOffsetZ());
-            frameTotalBatches += stats.total();
-            frameDrawnBatches += stats.drawn();
-            frameCulledBatchBytes += stats.culledBytes();
-            }
-        }
-        if (anyBatched) {
-            lastTotalBatches = frameTotalBatches;
-            lastDrawnBatches = frameDrawnBatches;
-            lastCulledBatchBytes = frameCulledBatchBytes;
-        }
+                // 第一阶段：先绘制全部场景实例/副本的不透明与裁切层，防止后绘制副本的不透明面遮挡先绘制副本的半透明面
+                for (RenderSubmission sub : submissions) {
+                    if (sub.mesh().isBatched()) {
+                        anyBatched = true;
+                    }
+                    try (var modelScope = SceneShaders.model(sub.modelMatrix())) {
+                        BatchStats stats = drawMeshInstanceOpaque(
+                                sub.mesh(), sub.modelMatrix(), sub.modelView(), projectionMatrix,
+                                camPos, frustum, sub.chunkOffsetX(), sub.chunkOffsetY(), sub.chunkOffsetZ());
+                        frameTotalBatches += stats.total();
+                        frameDrawnBatches += stats.drawn();
+                        frameCulledBatchBytes += stats.culledBytes();
+                    }
+                }
+                if (anyBatched) {
+                    lastTotalBatches = frameTotalBatches;
+                    lastDrawnBatches = frameDrawnBatches;
+                    lastCulledBatchBytes = frameCulledBatchBytes;
+                }
 
-        // 第二阶段：收集启用了半透明渲染的全部实例/副本，按包围球中心离相机从远到近排序后统一绘制半透明层
-        List<RenderSubmission> translucentSubmissions = new ArrayList<>(submissions.size());
-        for (RenderSubmission sub : submissions) {
-            if (sub.renderTranslucent()) {
-                translucentSubmissions.add(sub);
+                // 第二阶段：收集启用了半透明渲染的全部实例/副本，按包围球中心离相机从远到近排序后统一绘制半透明层
+                List<RenderSubmission> translucentSubmissions = new ArrayList<>(submissions.size());
+                for (RenderSubmission sub : submissions) {
+                    if (sub.renderTranslucent()) {
+                        translucentSubmissions.add(sub);
+                    }
+                }
+                if (translucentSubmissions.size() > 1) {
+                    translucentSubmissions.sort(Comparator.comparingDouble((RenderSubmission sub) ->
+                            sub.bounds().distanceSquaredTo(camPos.x, camPos.y, camPos.z)).reversed());
+                }
+                for (RenderSubmission sub : translucentSubmissions) {
+                    try (var modelScope = SceneShaders.model(sub.modelMatrix())) {
+                        drawMeshInstanceTranslucent(
+                                sub.mesh(), sub.modelView(), projectionMatrix, true,
+                                sub.chunkOffsetX(), sub.chunkOffsetY(), sub.chunkOffsetZ());
+                    }
+                }
+            } finally {
+                SceneMeshSet.endRenderFrame();
             }
-        }
-        if (translucentSubmissions.size() > 1) {
-            translucentSubmissions.sort(Comparator.comparingDouble((RenderSubmission sub) ->
-                    sub.bounds().distanceSquaredTo(camPos.x, camPos.y, camPos.z)).reversed());
-        }
-        for (RenderSubmission sub : translucentSubmissions) {
-            try (var modelScope = SceneShaders.model(sub.modelMatrix())) {
-            drawMeshInstanceTranslucent(
-                    sub.mesh(), sub.modelView(), projectionMatrix, true,
-                    sub.chunkOffsetX(), sub.chunkOffsetY(), sub.chunkOffsetZ());
-            }
-        }
-    
         }
     }
 
@@ -1272,31 +1303,62 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
             int total = 0;
             int drawn = 0;
             long culledBytes = 0L;
-            for (SceneMeshSet.Batch batch : mesh.batches()) {
-                total++;
-                if (!isBatchInFrustum(batch, modelMatrix, camPos, frustum)) {
-                    culledBytes += batch.mesh().estimatedBytes();
-                    continue;
-                }
-                drawn++;
-                float bCenterX = (float) batch.centerX();
-                float bCenterY = (float) batch.centerY();
-                float bCenterZ = (float) batch.centerZ();
-                Vector3f batchCenterWorld = new Vector3f(bCenterX, bCenterY, bCenterZ);
-                modelMatrix.transformPosition(batchCenterWorld);
-                float batchOffsetX = batchCenterWorld.x - bCenterX;
-                float batchOffsetY = batchCenterWorld.y - bCenterY;
-                float batchOffsetZ = batchCenterWorld.z - bCenterZ;
+            boolean hasSolid = false;
+            boolean hasCutoutMipped = false;
+            boolean hasCutout = false;
+            visibleBatchScratch.clear();
+            customOpaqueKeyScratch.clear();
+            try {
+                for (SceneMeshSet.Batch batch : mesh.batches()) {
+                    total++;
+                    if (!isBatchInFrustum(batch, modelMatrix, camPos, frustum)) {
+                        culledBytes += batch.mesh().estimatedBytes();
+                        continue;
+                    }
+                    drawn++;
+                    float bCenterX = (float) batch.centerX();
+                    float bCenterY = (float) batch.centerY();
+                    float bCenterZ = (float) batch.centerZ();
+                    scratchBatchCenter.set(bCenterX, bCenterY, bCenterZ);
+                    modelMatrix.transformPosition(scratchBatchCenter);
+                    float batchOffsetX = scratchBatchCenter.x - bCenterX;
+                    float batchOffsetY = scratchBatchCenter.y - bCenterY;
+                    float batchOffsetZ = scratchBatchCenter.z - bCenterZ;
 
-                SceneMeshSet batchMesh = batch.mesh();
-                batchMesh.renderLayer(SceneMeshSet.Layer.SOLID, modelView, projMat, RenderType.solid(),
-                        batchOffsetX, batchOffsetY, batchOffsetZ);
-                batchMesh.renderLayer(SceneMeshSet.Layer.CUTOUT_MIPPED, modelView, projMat, RenderType.cutoutMipped(),
-                        batchOffsetX, batchOffsetY, batchOffsetZ);
-                batchMesh.renderLayer(SceneMeshSet.Layer.CUTOUT, modelView, projMat, RenderType.cutout(),
-                        batchOffsetX, batchOffsetY, batchOffsetZ);
-                batchMesh.renderCustomOpaqueBatches(modelView, projMat,
-                        batchOffsetX, batchOffsetY, batchOffsetZ);
+                    SceneMeshSet batchMesh = batch.mesh();
+                    visibleBatchScratch.add(new VisibleBatch(batchMesh, batchOffsetX, batchOffsetY, batchOffsetZ));
+                    if (!hasSolid && batchMesh.hasLayer(SceneMeshSet.Layer.SOLID)) hasSolid = true;
+                    if (!hasCutoutMipped && batchMesh.hasLayer(SceneMeshSet.Layer.CUTOUT_MIPPED)) hasCutoutMipped = true;
+                    if (!hasCutout && batchMesh.hasLayer(SceneMeshSet.Layer.CUTOUT)) hasCutout = true;
+                    batchMesh.collectCustomOpaqueKeys(customOpaqueKeyScratch);
+                }
+                if (hasSolid) {
+                    drawBatchedOpaqueLayer(visibleBatchScratch, SceneMeshSet.Layer.SOLID, RenderType.solid(), modelView, projMat);
+                }
+                if (hasCutoutMipped) {
+                    drawBatchedOpaqueLayer(visibleBatchScratch, SceneMeshSet.Layer.CUTOUT_MIPPED, RenderType.cutoutMipped(), modelView, projMat);
+                }
+                if (hasCutout) {
+                    drawBatchedOpaqueLayer(visibleBatchScratch, SceneMeshSet.Layer.CUTOUT, RenderType.cutout(), modelView, projMat);
+                }
+                for (SceneMaterialKey key : customOpaqueKeyScratch) {
+                    RenderType rt = key.toRenderType();
+                    rt.setupRenderState();
+                    try {
+                        ShaderInstance baseShader = RenderSystem.getShader();
+                        for (int i = 0; i < visibleBatchScratch.size(); i++) {
+                            VisibleBatch vb = visibleBatchScratch.get(i);
+                            vb.mesh().drawBoundCustomMaterial(key, modelView, projMat, baseShader,
+                                    vb.offsetX(), vb.offsetY(), vb.offsetZ());
+                        }
+                    } finally {
+                        VertexBuffer.unbind();
+                        rt.clearRenderState();
+                    }
+                }
+            } finally {
+                visibleBatchScratch.clear();
+                customOpaqueKeyScratch.clear();
             }
             return new BatchStats(total, drawn, culledBytes);
         }
@@ -1309,6 +1371,22 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
         mesh.renderCustomOpaqueBatches(modelView, projMat,
                 chunkOffsetX, chunkOffsetY, chunkOffsetZ);
         return new BatchStats(0, 0, 0L);
+    }
+
+    private static void drawBatchedOpaqueLayer(List<VisibleBatch> batches, SceneMeshSet.Layer layer,
+                                               RenderType renderType, Matrix4f modelView, Matrix4f projMat) {
+        renderType.setupRenderState();
+        try {
+            ShaderInstance baseShader = RenderSystem.getShader();
+            for (int i = 0; i < batches.size(); i++) {
+                VisibleBatch vb = batches.get(i);
+                vb.mesh().drawBoundLayer(layer, modelView, projMat, baseShader,
+                        vb.offsetX(), vb.offsetY(), vb.offsetZ());
+            }
+        } finally {
+            VertexBuffer.unbind();
+            renderType.clearRenderState();
+        }
     }
 
     private void drawMeshInstanceTranslucent(SceneMeshSet mesh, Matrix4f modelView,
@@ -1328,8 +1406,8 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
      * 得到 frustum 期望的世界坐标。8 个角点全部参与：场景可以带枢轴旋转，只取两个对角点会
      * 在旋转后得到错误的包围盒。</p>
      */
-    private static boolean isBatchInFrustum(SceneMeshSet.Batch batch, Matrix4f modelMatrix,
-                                            Vec3 camPos, Frustum frustum) {
+    private boolean isBatchInFrustum(SceneMeshSet.Batch batch, Matrix4f modelMatrix,
+                                     Vec3 camPos, Frustum frustum) {
         if (frustum == null) return true;
         double minX = Double.POSITIVE_INFINITY;
         double minY = Double.POSITIVE_INFINITY;
@@ -1338,14 +1416,14 @@ public final class SceneRenderRuntime implements com.habitrain.core.api.spi.Scen
         double maxY = Double.NEGATIVE_INFINITY;
         double maxZ = Double.NEGATIVE_INFINITY;
         for (int corner = 0; corner < 8; corner++) {
-            Vector3f point = new Vector3f(
+            scratchFrustumPoint.set(
                     (corner & 1) == 0 ? (float) batch.minX() : (float) batch.maxX(),
                     (corner & 2) == 0 ? (float) batch.minY() : (float) batch.maxY(),
                     (corner & 4) == 0 ? (float) batch.minZ() : (float) batch.maxZ());
-            modelMatrix.transformPosition(point);
-            double x = point.x + camPos.x;
-            double y = point.y + camPos.y;
-            double z = point.z + camPos.z;
+            modelMatrix.transformPosition(scratchFrustumPoint);
+            double x = scratchFrustumPoint.x + camPos.x;
+            double y = scratchFrustumPoint.y + camPos.y;
+            double z = scratchFrustumPoint.z + camPos.z;
             minX = Math.min(minX, x);
             minY = Math.min(minY, y);
             minZ = Math.min(minZ, z);

@@ -218,9 +218,20 @@ public final class ReplayExportClient {
         }
     }
 
+    public static void onGameStartedCleanup() {
+        if (video != null && !video.running() && !video.encoderBusy()) {
+            video.releaseRenderResources();
+            releasePinnedRound();
+            video = null;
+            voiceSource = null;
+            finishedAt = 0;
+        }
+    }
+
     static void onGameStarted(Minecraft client) {
         if (foreground()) { markMatch(client, true); return; }
         if (video != null && video.running() && isExportScreen(client.screen)) client.setScreen(null);
+        else onGameStartedCleanup();
     }
 
     static void reset() {
@@ -296,8 +307,14 @@ public final class ReplayExportClient {
         if (video == null || client.level == null || client.player == null || client.getOverlay() != null) return;
         if (!foreground()) advance(client);
         long now = System.nanoTime();
-        if (isExportScreen(client.screen) || (client.options.hideGui && client.screen == null)
-                || (finishedAt != 0 && now - finishedAt >= TimeUnit.SECONDS.toNanos(6))) return;
+        if (isExportScreen(client.screen) || (client.options.hideGui && client.screen == null)) return;
+        if (finishedAt != 0 && now - finishedAt >= TimeUnit.SECONDS.toNanos(6)) {
+            if (!video.running() && !video.encoderBusy() && !video.failed()) {
+                video = null;
+                finishedAt = 0;
+            }
+            return;
+        }
 
         GuiGraphics g = new GuiGraphics(client, client.renderBuffers().bufferSource());
         int width = Math.min(180, g.guiWidth() - 16);

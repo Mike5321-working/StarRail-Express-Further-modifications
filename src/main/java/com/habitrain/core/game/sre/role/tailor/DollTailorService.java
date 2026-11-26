@@ -50,6 +50,7 @@ public final class DollTailorService {
                     .build("habitrain_core:tailor_doll"));
     private static final TicketType<UUID> DOLL_TICKET = TicketType.create("habitrain_tailor", Comparator.comparing(UUID::toString));
     private static final Map<UUID, State> STATES = new HashMap<>();
+    private static final Map<UUID, List<DollProtectionPayload.Link>> LAST_SENT_LINKS = new HashMap<>();
     private static final class State {
         final ServerPlayer player;
         final Map<UUID, Integer> patterns = new HashMap<>();
@@ -58,6 +59,7 @@ public final class DollTailorService {
         Vec3 anchor;
         float yaw;
         long lastRequest = -100;
+        DollTailorStatePayload lastSentState;
         State(ServerPlayer player) { this.player = player; }
     }
     private DollTailorService() {}
@@ -67,11 +69,23 @@ public final class DollTailorService {
         DollTailorActionPayload.register(); DollTailorStatePayload.register(); DollProtectionPayload.register();
         ServerPlayNetworking.registerGlobalReceiver(DollTailorActionPayload.TYPE, (payload, ctx) -> handleAction(ctx.player(), payload));
         ServerTickEvents.END_SERVER_TICK.register(DollTailorService::tick);
-        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> sendLinks(handler.player, false));
-        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> releasePlayer(handler.player));
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            if (!STATES.isEmpty()) sendLinks(handler.player, false);
+        });
+        net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register(
+                (player, origin, destination) -> {
+                    if (!STATES.isEmpty() || LAST_SENT_LINKS.containsKey(player.getUUID())) {
+                        sendLinks(player, false);
+                    }
+                });
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
+            LAST_SENT_LINKS.remove(handler.player.getUUID());
+            releasePlayer(handler.player);
+        });
         ServerLifecycleEvents.SERVER_STOPPING.register(server -> {
             for (State state : List.copyOf(STATES.values())) clear(state.player);
             STATES.clear();
+            LAST_SENT_LINKS.clear();
         });
         AttackEntityCallback.EVENT.register((player, level, hand, entity, hit) ->
                 isCasting(player) ? InteractionResult.FAIL : InteractionResult.PASS);
@@ -160,6 +174,7 @@ public final class DollTailorService {
     }
 
     private static void tick(MinecraftServer server) {
+        if (STATES.isEmpty()) return;
         for (State state : List.copyOf(STATES.values())) {
             ServerPlayer self = state.player;
             if (server.getPlayerList().getPlayer(self.getUUID()) != self || !eligible(self)) { clear(self); continue; }
@@ -209,10 +224,6 @@ public final class DollTailorService {
             if (self.tickCount % 5 == 0) sendState(state);
             if (self.tickCount % 20 == 0) sendLinks(self, false);
         }
-        // Refresh dimension changes and late joins even when the viewer is not a tailor.
-        for (ServerPlayer viewer : server.getPlayerList().getPlayers()) {
-            if (viewer.tickCount % 40 == 0) sendLinks(viewer, false);
-        }
     }
 
     public static void interrupt(ServerPlayer self) {
@@ -259,18 +270,47 @@ public final class DollTailorService {
     }
     private static void sendState(State state) {
         if (state.player.hasDisconnected()) return;
-        List<DollTailorStatePayload.Entry> entries = state.player.server.getPlayerList().getPlayers().stream()
-                .filter(p -> p != state.player && ServerAimTargeting.isAliveParticipant(p))
-                .limit(256).map(p -> new DollTailorStatePayload.Entry(p.getUUID(), p.getGameProfile().getName(),
-                        state.patterns.getOrDefault(p.getUUID(), 0))).toList();
+        List<DollTailorStatePayload.Entry> entries = new ArrayList<>();
+        for (ServerPlayer p : state.player.server.getPlayerList().getPlayers()) {
+            if (p != state.player && ServerAimTargeting.isAliveParticipant(p)) {
+                entries.add(new DollTailorStatePayload.Entry(p.getUUID(), p.getGameProfile().getName(),
+                        state.patterns.getOrDefault(p.getUUID(), 0)));
+                if (entries.size() >= 256) break;
+            }
+        }
         int ticks = state.doll != null && !state.doll.complete() ? state.doll.stitches() + 1 : 0;
-        ServerPlayNetworking.send(state.player, new DollTailorStatePayload(state.selected, ticks, entries));
+        DollTailorStatePayload payload = new DollTailorStatePayload(state.selected, ticks, List.copyOf(entries));
+        if (payload.equals(state.lastSentState)) return;
+        state.lastSentState = payload;
+        ServerPlayNetworking.send(state.player, payload);
     }
     private static void broadcastLinks(ServerLevel level) { for (ServerPlayer viewer : level.players()) sendLinks(viewer, false); }
     private static void sendLinks(ServerPlayer viewer, boolean snapped) {
-        List<DollProtectionPayload.Link> links = STATES.values().stream().map(s -> s.doll)
-                .filter(d -> d != null && !d.isRemoved() && d.complete() && d.level() == viewer.level()).limit(256)
-                .map(d -> new DollProtectionPayload.Link(d.ownerId(), d.targetId(), d.getUUID(), d.position())).toList();
+        if (viewer == null || viewer.hasDisconnected()) return;
+        List<DollProtectionPayload.Link> links = List.of();
+        if (!STATES.isEmpty()) {
+            List<DollProtectionPayload.Link> active = null;
+            for (State s : STATES.values()) {
+                TailorDollEntity d = s.doll;
+                if (d != null && !d.isRemoved() && d.complete() && d.level() == viewer.level()) {
+                    if (active == null) active = new ArrayList<>(4);
+                    active.add(new DollProtectionPayload.Link(d.ownerId(), d.targetId(), d.getUUID(), d.position()));
+                    if (active.size() >= 256) break;
+                }
+            }
+            if (active != null) links = List.copyOf(active);
+        }
+        UUID id = viewer.getUUID();
+        List<DollProtectionPayload.Link> previous = LAST_SENT_LINKS.get(id);
+        if (!snapped) {
+            if (links.isEmpty() && (previous == null || previous.isEmpty())) {
+                LAST_SENT_LINKS.remove(id);
+                return;
+            }
+            if (links.equals(previous)) return;
+        }
+        if (links.isEmpty()) LAST_SENT_LINKS.remove(id);
+        else LAST_SENT_LINKS.put(id, links);
         ServerPlayNetworking.send(viewer, new DollProtectionPayload(links, snapped));
     }
 

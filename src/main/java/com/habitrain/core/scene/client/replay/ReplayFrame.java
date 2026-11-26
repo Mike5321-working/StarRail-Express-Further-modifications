@@ -215,9 +215,28 @@ final class ReplayFrame {
         return java.util.Objects.requireNonNull(mapScope);
     }
 
+    private enum ClipRegion { INSIDE, STRADDLE, OUTSIDE }
+
     private record Viewport(Matrix4f inverseBoard, float hw, float hd) {
         ReplayClippedConsumer wrap(VertexConsumer source) {
             return new ReplayClippedConsumer(source, inverseBoard, hw, hd);
+        }
+
+        ClipRegion classifyLocalBox(Matrix4f transform, float horizRadius, float yMin, float yMax, Matrix4f scratch) {
+            inverseBoard.mul(transform, scratch);
+            float midY = 0.5f * (yMin + yMax);
+            float halfY = 0.5f * Math.abs(yMax - yMin);
+            float cx = scratch.m10() * midY + scratch.m30();
+            float cz = scratch.m12() * midY + scratch.m32();
+            float ex = Math.abs(scratch.m00()) * horizRadius
+                    + Math.abs(scratch.m10()) * halfY
+                    + Math.abs(scratch.m20()) * horizRadius;
+            float ez = Math.abs(scratch.m02()) * horizRadius
+                    + Math.abs(scratch.m12()) * halfY
+                    + Math.abs(scratch.m22()) * horizRadius;
+            if (Math.abs(cx) - ex > hw || Math.abs(cz) - ez > hd) return ClipRegion.OUTSIDE;
+            if (Math.abs(cx) + ex <= hw && Math.abs(cz) + ez <= hd) return ClipRegion.INSIDE;
+            return ClipRegion.STRADDLE;
         }
     }
 
@@ -320,6 +339,22 @@ final class ReplayFrame {
     /** Defers a model draw; the consumer receives a pose stack positioned at {@code m}. */
     void model(Matrix4f m, Consumer<PoseStack> draw) {
         ViewportBuffers deferred = mapScope == null ? null : mapScope.deferred;
+        models.add(new DeferredModel(deferred, new Matrix4f(m), draw));
+    }
+
+    /**
+     * Defers a bounded model draw with fast viewport classification: models strictly outside the tray
+     * are culled immediately, and models strictly inside bypass {@link ReplayClippedConsumer} so
+     * Sodium's direct {@code VertexBufferWriter} fast path remains active.
+     */
+    void model(Matrix4f m, float horizRadius, float yMin, float yMax, Consumer<PoseStack> draw) {
+        if (mapScope == null) {
+            models.add(new DeferredModel(null, new Matrix4f(m), draw));
+            return;
+        }
+        ClipRegion region = mapScope.viewport.classifyLocalBox(m, horizRadius, yMin, yMax, textMatrixScratch);
+        if (region == ClipRegion.OUTSIDE) return;
+        ViewportBuffers deferred = region == ClipRegion.INSIDE ? null : mapScope.deferred;
         models.add(new DeferredModel(deferred, new Matrix4f(m), draw));
     }
 

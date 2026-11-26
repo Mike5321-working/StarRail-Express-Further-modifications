@@ -1319,33 +1319,37 @@ public final class SceneMeshBuilder {
             try {
                 while (uploadCursor < pendingUploads.size()) {
                     Upload upload = pendingUploads.get(uploadCursor++);
-                    MeshData data = upload.builder().build();
-                    if (data != null) {
-                        boolean translucent = upload.material() != null
-                                ? upload.material().isTranslucent()
-                                : upload.layer() == SceneMeshSet.Layer.TRANSLUCENT;
-                        boolean batched = batchCount > 1 && !translucent;
-                        try (data) {
-                            int stride = data.drawState().format().getVertexSize();
-                            SceneTransparencySort sort = null;
-                            if (translucent && upload.byteBuilder() != null) {
-                                float sortX = asset.sourceBounds != null ? asset.sourceBounds.sizeX() * 0.5f : 0.0f;
-                                float sortY = asset.sourceBounds != null ? asset.sourceBounds.sizeY() * 0.5f : 0.0f;
-                                float sortZ = asset.sourceBounds != null ? asset.sourceBounds.sizeZ() * 0.5f : 0.0f;
-                                sort = SceneTransparencySort.capture(data, upload.byteBuilder(),
-                                        com.mojang.blaze3d.vertex.VertexSorting.byDistance(sortX, sortY, sortZ));
+                    try {
+                        MeshData data = upload.builder().build();
+                        if (data != null) {
+                            boolean translucent = upload.material() != null
+                                    ? upload.material().isTranslucent()
+                                    : upload.layer() == SceneMeshSet.Layer.TRANSLUCENT;
+                            boolean batched = batchCount > 1 && !translucent;
+                            try (data) {
+                                int stride = data.drawState().format().getVertexSize();
+                                SceneTransparencySort sort = null;
+                                if (translucent && upload.byteBuilder() != null) {
+                                    float sortX = asset.sourceBounds != null ? asset.sourceBounds.sizeX() * 0.5f : 0.0f;
+                                    float sortY = asset.sourceBounds != null ? asset.sourceBounds.sizeY() * 0.5f : 0.0f;
+                                    float sortZ = asset.sourceBounds != null ? asset.sourceBounds.sizeZ() * 0.5f : 0.0f;
+                                    sort = SceneTransparencySort.capture(data, upload.byteBuilder(),
+                                            com.mojang.blaze3d.vertex.VertexSorting.byDistance(sortX, sortY, sortZ));
+                                }
+                                if (batched || replayMesh) {
+                                    var bounds = batched ? batchBounds.computeIfAbsent(upload.batch(), ignored -> new SceneVertexBounds())
+                                            : replayUnbatchedBounds;
+                                    bounds.include(data.vertexBuffer(), data.drawState().vertexCount(), stride);
+                                    if (replayMesh) uploadTarget.includeReplayCeiling(bounds.maxY());
+                                }
+                                long bytes = (long) data.drawState().vertexCount() * stride;
+                                if (sort != null) bytes += sort.indexBytes();
+                                else if (data.indexBuffer() != null) bytes += data.indexBuffer().remaining();
+                                storeUpload(upload, uploadBuffer(data), bytes, sort);
                             }
-                            if (batched || replayMesh) {
-                                var bounds = batched ? batchBounds.computeIfAbsent(upload.batch(), ignored -> new SceneVertexBounds())
-                                        : replayUnbatchedBounds;
-                                bounds.include(data.vertexBuffer(), data.drawState().vertexCount(), stride);
-                                if (replayMesh) uploadTarget.includeReplayCeiling(bounds.maxY());
-                            }
-                            long bytes = (long) data.drawState().vertexCount() * stride;
-                            if (sort != null) bytes += sort.indexBytes();
-                            else if (data.indexBuffer() != null) bytes += data.indexBuffer().remaining();
-                            storeUpload(upload, uploadBuffer(data), bytes, sort);
                         }
+                    } finally {
+                        releaseUploadedCpuBuilder(upload);
                     }
                     if (System.nanoTime() >= deadlineNanos) return false;
                 }
@@ -1379,6 +1383,24 @@ public final class SceneMeshBuilder {
             } catch (Throwable uploadFailure) {
                 buffer.close();
                 throw uploadFailure;
+            }
+        }
+
+        private void releaseUploadedCpuBuilder(Upload upload) {
+            int batch = upload.batch();
+            if (upload.material() != null) {
+                BufferBuilder[] bArr = customBuilders.get(upload.material());
+                if (bArr != null && batch >= 0 && batch < bArr.length) bArr[batch] = null;
+                ByteBufferBuilder[] bbArr = customByteBuilders.get(upload.material());
+                if (bbArr != null && batch >= 0 && batch < bbArr.length) bbArr[batch] = null;
+            } else if (upload.layer() != null) {
+                BufferBuilder[] bArr = builders.get(upload.layer());
+                if (bArr != null && batch >= 0 && batch < bArr.length) bArr[batch] = null;
+                ByteBufferBuilder[] bbArr = byteBuilders.get(upload.layer());
+                if (bbArr != null && batch >= 0 && batch < bbArr.length) bbArr[batch] = null;
+            }
+            if (upload.byteBuilder() != null) {
+                upload.byteBuilder().close();
             }
         }
 

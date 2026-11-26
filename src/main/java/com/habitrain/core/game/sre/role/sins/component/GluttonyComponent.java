@@ -184,7 +184,7 @@ public final class GluttonyComponent implements RoleComponent, ServerTickingComp
 
         BuffEntry entry = buffs.get(id);
         if (entry == null) {
-            entry = new BuffEntry(0, BUFF_ADD_TICKS);
+            entry = new BuffEntry(0, BUFF_ADD_TICKS, picked);
             buffs.put(id, entry);
             apply(self, picked, entry);
             self.displayClientMessage(
@@ -239,6 +239,9 @@ public final class GluttonyComponent implements RoleComponent, ServerTickingComp
 
     @Override
     public void clear() {
+        if (buffs.isEmpty()) {
+            return;
+        }
         buffs.clear();
         if (player != null && player.level() != null && !player.level().isClientSide()) {
             KEY.sync(player);
@@ -271,12 +274,16 @@ public final class GluttonyComponent implements RoleComponent, ServerTickingComp
                 // removing by effect id would also delete external/hidden effects.
                 continue;
             }
-            Holder<MobEffect> holder = resolveEffect(e.getKey());
+            Holder<MobEffect> holder = entry.cachedHolder;
+            if (holder == null) {
+                holder = resolveEffect(e.getKey());
+                entry.cachedHolder = holder;
+            }
             if (holder == null) continue;
             MobEffectInstance active = self.getEffect(holder);
             if (active == null
                     || active.getAmplifier() < entry.amplifier
-                    || active.getDuration() < entry.remainingTicks) {
+                    || active.getDuration() < entry.remainingTicks - 2) {
                 apply(self, holder, entry);
             }
         }
@@ -387,7 +394,7 @@ public final class GluttonyComponent implements RoleComponent, ServerTickingComp
                 remain = BUFF_ADD_TICKS;
             }
             if (remain > 0) {
-                buffs.put(id, new BuffEntry(amp, remain));
+                buffs.put(id, new BuffEntry(amp, remain, holder));
             }
         }
     }
@@ -405,10 +412,16 @@ public final class GluttonyComponent implements RoleComponent, ServerTickingComp
     public static final class BuffEntry {
         public int amplifier;
         public int remainingTicks;
+        transient @Nullable Holder<MobEffect> cachedHolder;
 
         public BuffEntry(int amplifier, int remainingTicks) {
+            this(amplifier, remainingTicks, null);
+        }
+
+        public BuffEntry(int amplifier, int remainingTicks, @Nullable Holder<MobEffect> cachedHolder) {
             this.amplifier = amplifier;
             this.remainingTicks = remainingTicks;
+            this.cachedHolder = cachedHolder;
         }
     }
 

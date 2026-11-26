@@ -28,6 +28,7 @@ import static com.habitrain.core.network.replay.ReplayArchivePackets.*;
 public final class ReplayHistoryClient {
     private static final long RETRY_NS = 3_000_000_000L, WATCH_NS = 2_000_000_000L;
     private static final long SETTINGS_COOLDOWN_NS = 300_000_000L;
+    private static final long MAX_ROUNDS_BYTES = 128L * 1024L * 1024L;
     private static final Map<UUID, Round> rounds = new LinkedHashMap<>(8, .75f, true);
     private static Settings settings;
     private static VoiceRecordingSettings voiceSettings;
@@ -38,8 +39,24 @@ public final class ReplayHistoryClient {
     private static Set<UUID> boardPins = Set.of();
     private static final Map<UUID, Integer> pinCounts = new HashMap<>();
     private static long nextStats, nextLimit, nextRecording;
-    private static final java.util.concurrent.Executor CACHE_IO = java.util.concurrent.Executors.newSingleThreadExecutor(
-            task -> Thread.ofPlatform().daemon().name("habitrain-replay-client-cache").unstarted(task));
+    private static final java.util.concurrent.ThreadPoolExecutor CACHE_IO = createCacheIoExecutor();
+
+    private static java.util.concurrent.ThreadPoolExecutor createCacheIoExecutor() {
+        var exec = new java.util.concurrent.ThreadPoolExecutor(1, 1, 30, java.util.concurrent.TimeUnit.SECONDS,
+                new java.util.concurrent.LinkedBlockingQueue<>(),
+                task -> Thread.ofPlatform().daemon().name("habitrain-replay-client-cache").unstarted(task));
+        exec.allowCoreThreadTimeOut(true);
+        return exec;
+    }
+
+    public static void shutdown() {
+        CACHE_IO.shutdownNow();
+    }
+
+    /** Drops non-pinned history rounds on match start so lobby replay data does not linger in heap mid-match. */
+    public static void onGameStarted() {
+        rounds.entrySet().removeIf(entry -> entry.getValue().pins <= 0);
+    }
 
     public enum Phase {
         LOADING, MAP, READY, MISSING, FAILED;
@@ -64,7 +81,23 @@ public final class ReplayHistoryClient {
         ReplayTimeline timeline;
         ClientReplayBoard.MapData map;
         ReplayVoiceData voice = ReplayVoiceData.EMPTY;
+        long estimatedVoiceBytes;
         Round(UUID id) { this.id = id; }
+
+        long estimatedBytes() {
+            long total = estimatedVoiceBytes;
+            if (cached != null) total += cached.length;
+            if (voiceBuffer != null) total += voiceBuffer.length;
+            if (map != null) {
+                var assembled = map.assembled;
+                if (assembled != null) {
+                    total += com.habitrain.core.api.scene.asset.SceneAssetCodec.estimateRetainedBytes(assembled);
+                } else {
+                    total += (long) map.parts.size() * 64L * 1024L;
+                }
+            }
+            return total;
+        }
     }
     private ReplayHistoryClient() {}
 
@@ -113,7 +146,7 @@ public final class ReplayHistoryClient {
         ClientPlayNetworking.registerGlobalReceiver(Settings.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> settings = r));
         ClientPlayNetworking.registerGlobalReceiver(VoiceRecordingSettings.TYPE, (r, ctx) -> ClientConnectionSession.executeIfConnected(ctx, () -> voiceSettings = r));
         ClientTickEvents.END_CLIENT_TICK.register(ReplayHistoryClient::tick);
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(() -> {
             rounds.clear();
             lastReady.clear();
             boardPins = Set.of();
@@ -123,7 +156,7 @@ public final class ReplayHistoryClient {
             sharing = null;
             nextSend = 0;
             nextStats = nextLimit = nextRecording = 0;
-        });
+        }));
     }
 
     public static boolean supported() { return ClientPlayNetworking.canSend(Request.TYPE); }
@@ -223,6 +256,25 @@ public final class ReplayHistoryClient {
         return r == null ? Phase.LOADING : r.phase;
     }
 
+    private static void evictIfOverBudget(@Nullable UUID keepId) {
+        long total = 0L;
+        for (Round round : rounds.values()) total += round.estimatedBytes();
+        while (rounds.size() > 6 || total > MAX_ROUNDS_BYTES) {
+            UUID victim = null;
+            long victimBytes = 0L;
+            for (Round candidate : rounds.values()) {
+                if (candidate.pins == 0 && !candidate.id.equals(keepId)) {
+                    victim = candidate.id;
+                    victimBytes = candidate.estimatedBytes();
+                    break;
+                }
+            }
+            if (victim == null) break;
+            rounds.remove(victim);
+            total -= victimBytes;
+        }
+    }
+
     public static ClientReplayBoard.View watch(UUID id) {
         Round r = rounds.get(id);
         if (r == null && supported()) {
@@ -235,6 +287,7 @@ public final class ReplayHistoryClient {
             r = new Round(id);
             r.pins = pinCounts.getOrDefault(id, 0);
             rounds.put(id, r);
+            evictIfOverBudget(id);
             load(r);
         }
         if (r == null) return new ClientReplayBoard.View(null, null, null, 0, 0, false);
@@ -320,10 +373,13 @@ public final class ReplayHistoryClient {
         r.voiceHave = null;
         try {
             r.voice = ReplayVoiceData.fromBytes(assembled);
+            r.estimatedVoiceBytes = assembled.length;
             if (r.voice.truncated()) ClientReplayBoard.notifyVoiceTruncated();
             r.voiceReady = true;
+            evictIfOverBudget(r.id);
         } catch (RuntimeException malformed) {
             r.voice = ReplayVoiceData.EMPTY;
+            r.estimatedVoiceBytes = 0L;
             stopVoiceRequests(r);
         }
     }
@@ -380,6 +436,7 @@ public final class ReplayHistoryClient {
         r.map = ClientReplayBoard.loadMap(r.replay.manifest());
         r.cached = null;
         r.phase = Phase.MAP;
+        evictIfOverBudget(r.id);
     }
 
     private static void tick(Minecraft mc) {

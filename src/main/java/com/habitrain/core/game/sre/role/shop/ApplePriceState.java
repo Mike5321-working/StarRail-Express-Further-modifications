@@ -54,6 +54,14 @@ public final class ApplePriceState<K> {
         return true;
     }
 
+    /** Client-side delta update for a new scramble frame without re-parsing shop ItemStacks. */
+    public boolean applyClientFrame(long revision, long frameSeed, int frame) {
+        if (settled || isEmpty() || this.revision != revision) return false;
+        this.seed = frameSeed;
+        this.syncedFrame = frame;
+        return true;
+    }
+
     public int syncedFrame() {
         return syncedFrame;
     }

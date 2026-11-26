@@ -97,10 +97,10 @@ final class PaperCanvas {
      */
     static void blit(GuiGraphics g, int texture, ShaderInstance shader, float x0, float y0, float x1, float y1,
                      float u0, float v0, float u1, float v1, float alpha) {
-        try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture()) {
         if (texture == 0 || alpha <= 0.002f) {
             return;
         }
+        try (var stateGuard = com.habitrain.core.client.render.ClientRenderState.capture()) {
         g.flush();
         if (shader != null) {
             RenderSystem.setShader(() -> shader);

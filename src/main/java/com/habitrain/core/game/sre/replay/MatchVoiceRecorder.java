@@ -62,7 +62,7 @@ public final class MatchVoiceRecorder {
     private static final int LEGACY_PAD_SAMPLES_24K = (40 * ReplayVoiceData.SAMPLE_RATE) / 1000;
     private static final int LEGACY_FADE_SAMPLES_24K = (30 * ReplayVoiceData.SAMPLE_RATE) / 1000;
 
-    /** Reserve ~1.5 MiB inside the 32 MiB cap for metadata, headers, and optional legacy clips. */
+    /** Reserve ~1.5 MiB inside the 48 MiB cap for metadata, headers, and optional legacy clips. */
     private static final int MAX_UTTERANCE_ADPCM_BUDGET = ReplayVoiceData.MAX_VOICE_BYTES - (3 * 512 * 1024);
 
     private static volatile @Nullable ActiveRound active;
@@ -206,6 +206,28 @@ public final class MatchVoiceRecorder {
         active = round;
     }
 
+    /** O(1) server-thread detach so ADPCM flush, highlight mixing and serialization run off-thread. */
+    static @Nullable DetachedRound detachRound(UUID roundId) {
+        ActiveRound round = active;
+        if (round == null || !round.roundId.equals(roundId)) return null;
+        active = null;
+        round.stopCapture();
+        return new DetachedRound(round);
+    }
+
+    static final class DetachedRound {
+        private final ActiveRound round;
+
+        DetachedRound(ActiveRound round) {
+            this.round = round;
+        }
+
+        byte[] finishToBytes(List<LastMatchReplay.Node> sortedEvents) {
+            ReplayVoiceData voice = round.extractVoiceData(sortedEvents);
+            return voice.isEmpty() && !voice.truncated() ? new byte[0] : voice.toBytes();
+        }
+    }
+
     public static byte[] finishRound(UUID roundId, List<LastMatchReplay.Node> sortedEvents) {
         ReplayVoiceData voice = finish(roundId, sortedEvents);
         return voice.isEmpty() && !voice.truncated() ? new byte[0] : voice.toBytes();
@@ -272,10 +294,10 @@ public final class MatchVoiceRecorder {
         final ArrayDeque<RawFrame> preRoll = new ArrayDeque<>(6);
         int preRollSamples;
 
-        boolean activeSpeech;
+        volatile boolean activeSpeech;
         long startMs;
         long lastFrameEndMs;
-        long lastActiveEndMs;
+        volatile long lastActiveEndMs;
         float maxDist;
         ChannelMode mode = ChannelMode.NORMAL_OPEN;
         @Nullable UUID groupId;
@@ -286,8 +308,8 @@ public final class MatchVoiceRecorder {
             this.speakerId = speakerId;
         }
 
-        void push(long matchMs, float frameMaxDist, ChannelMode frameMode, @Nullable UUID frameGroup,
-                  short[] pcm24k, List<VoiceUtterance> output, int[] budgetRemaining) {
+        synchronized void push(long matchMs, float frameMaxDist, ChannelMode frameMode, @Nullable UUID frameGroup,
+                  short[] pcm24k, List<VoiceUtterance> output, int[] budgetRemaining, Object outputLock) {
             long frameDurMs = Math.max(1L, Math.round(pcm24k.length * 1000.0 / ReplayVoiceData.SAMPLE_RATE));
             long frameEndMs = matchMs + frameDurMs;
             boolean voiced = hasVoiceActivity(pcm24k);
@@ -297,7 +319,7 @@ public final class MatchVoiceRecorder {
                     || !Objects.equals(frameGroup, groupId)
                     || Math.abs(frameMaxDist - maxDist) > 1.0f
                     || matchMs - lastFrameEndMs > VAD_HANGOVER_MS)) {
-                flush(output, budgetRemaining);
+                flush(output, budgetRemaining, outputLock);
             }
 
             if (!activeSpeech) {
@@ -346,19 +368,23 @@ public final class MatchVoiceRecorder {
                 lastActiveEndMs = frameEndMs;
             }
             if (totalSamples >= MAX_UTTERANCE_SPLIT_SAMPLES_24K) {
-                flush(output, budgetRemaining);
+                flush(output, budgetRemaining, outputLock);
             } else if (!voiced && frameEndMs - lastActiveEndMs >= VAD_HANGOVER_MS) {
-                flush(output, budgetRemaining);
+                flush(output, budgetRemaining, outputLock);
             }
         }
 
-        void flushIfIdle(long nowMs, List<VoiceUtterance> output, int[] budgetRemaining) {
+        boolean needsIdleFlush(long nowMs) {
+            return activeSpeech && nowMs - lastActiveEndMs >= VAD_HANGOVER_MS;
+        }
+
+        synchronized void flushIfIdle(long nowMs, List<VoiceUtterance> output, int[] budgetRemaining, Object outputLock) {
             if (activeSpeech && nowMs - lastActiveEndMs >= VAD_HANGOVER_MS) {
-                flush(output, budgetRemaining);
+                flush(output, budgetRemaining, outputLock);
             }
         }
 
-        void flush(List<VoiceUtterance> output, int[] budgetRemaining) {
+        synchronized void flush(List<VoiceUtterance> output, int[] budgetRemaining, Object outputLock) {
             if (!activeSpeech || totalSamples == 0) {
                 activeSpeech = false;
                 chunks.clear();
@@ -398,16 +424,20 @@ public final class MatchVoiceRecorder {
                 trimmed[len - 1 - i] = (short) Math.round(trimmed[len - 1 - i] * env);
             }
 
+            // Perform ADPCM encoding and RMS computation outside the global utterance list lock.
             byte[] adpcm = ReplayVoiceData.encodeAdpcm(trimmed);
-            if (adpcm.length + 48 > budgetRemaining[0] || output.size() >= ReplayVoiceData.MAX_UTTERANCES) {
-                budgetRemaining[1]++;
-                return;
-            }
-            budgetRemaining[0] -= (adpcm.length + 48);
             long adjustedStartMs = Math.max(0L, startMs + Math.round(trimStart * 1000.0 / ReplayVoiceData.SAMPLE_RATE));
             float rms = ReplayVoiceData.computeNormalizedRms(trimmed);
-            output.add(new VoiceUtterance(speakerId, adjustedStartMs, trimmed.length, maxDist,
-                    mode, groupId, adpcm, rms));
+            VoiceUtterance utterance = new VoiceUtterance(speakerId, adjustedStartMs, trimmed.length, maxDist,
+                    mode, groupId, adpcm, rms);
+            synchronized (outputLock) {
+                if (adpcm.length + 48 > budgetRemaining[0] || output.size() >= ReplayVoiceData.MAX_UTTERANCES) {
+                    budgetRemaining[1]++;
+                    return;
+                }
+                budgetRemaining[0] -= (adpcm.length + 48);
+                output.add(utterance);
+            }
         }
     }
 
@@ -429,22 +459,68 @@ public final class MatchVoiceRecorder {
         }
     }
 
+    private static final class PlayerPosTrack {
+        private final ArrayList<PosSample> samples = new ArrayList<>();
+        private volatile boolean lastPresent = true;
+
+        synchronized void record(PosSample next) {
+            if (!samples.isEmpty()) {
+                PosSample prev = samples.getLast();
+                if (prev.tick() == next.tick()) {
+                    samples.set(samples.size() - 1, next);
+                    lastPresent = next.present();
+                    return;
+                }
+                if (prev.alive() == next.alive() && prev.present() == next.present()
+                        && next.tick() - prev.tick() < 5 && prev.distanceTo(next.x(), next.y(), next.z()) < 0.2) {
+                    return;
+                }
+            }
+            samples.add(next);
+            lastPresent = next.present();
+        }
+
+        synchronized void markAbsent(int tick) {
+            if (samples.isEmpty() || !samples.getLast().present()) return;
+            PosSample last = samples.getLast();
+            record(new PosSample(tick, last.x(), last.y(), last.z(), false, false));
+        }
+
+        boolean isAbsentAt(int tick) {
+            if (lastPresent) return false;
+            synchronized (this) {
+                PosSample at = ActiveRound.lookupPos(samples, tick);
+                return at != null && !at.present();
+            }
+        }
+
+        synchronized @Nullable PosSample lookup(int tick) {
+            return ActiveRound.lookupPos(samples, tick);
+        }
+
+        synchronized boolean isEmpty() {
+            return samples.isEmpty();
+        }
+    }
+
     private static final class ActiveRound {
         final UUID roundId;
         final @Nullable ServerLevel level;
         final String dimension;
         final SceneBounds bounds;
 
-        final Map<UUID, SpeakerVadState> vadBySpeaker = new HashMap<>();
-        final Map<UUID, Long> lastLiveEndMs = new HashMap<>();
+        final ConcurrentHashMap<UUID, SpeakerVadState> vadBySpeaker = new ConcurrentHashMap<>();
+        final ConcurrentHashMap<UUID, Long> lastLiveEndMs = new ConcurrentHashMap<>();
+        final Object utteranceLock = new Object();
         final List<VoiceUtterance> utterances = new ArrayList<>();
         final int[] utteranceBudget = new int[]{MAX_UTTERANCE_ADPCM_BUDGET, 0};
 
-        final Map<UUID, List<PosSample>> posByPlayer = new HashMap<>();
+        final ConcurrentHashMap<UUID, PlayerPosTrack> posByPlayer = new ConcurrentHashMap<>();
         final Map<UUID, OpenSpan> openSpans = new HashMap<>();
         final List<SpeakerStateSpan> closedSpans = new ArrayList<>();
         final List<SpeakerStateSpan> extraTestSpans = new ArrayList<>();
         final Map<String, RecordedVoicePolicy> recordedPolicies = new LinkedHashMap<>();
+        @Nullable List<RoleVoicePolicy> lastPolicySnapshot;
 
         final ConcurrentHashMap<UUID, LiveGroup> liveGroups = new ConcurrentHashMap<>();
         volatile Map<UUID, ChannelHint> channelHints = Map.of();
@@ -453,7 +529,7 @@ public final class MatchVoiceRecorder {
         volatile boolean postEventTail;
         volatile float defaultVoiceDist = 48.0f;
         volatile float whisperVoiceDist = 16.0f;
-        long lastRecordedTickMs;
+        volatile long lastRecordedTickMs;
 
         ActiveRound(UUID roundId, @Nullable ServerLevel level, SceneBounds bounds) {
             this.roundId = roundId;
@@ -483,18 +559,22 @@ public final class MatchVoiceRecorder {
             boolean closing = game.getGameStatus() != SREGameWorldComponent.GameStatus.ACTIVE;
             if (closing && postEventTail) {
                 clock = new CaptureClock(matchTick, System.nanoTime(), clock.speakers());
-                if (matchTick % 10 == 0) flushIdleVad(matchMs);
+                if (matchTick % 10 == 0) scheduleIdleVadFlush(matchMs);
                 return;
             }
 
             var permSnap = ServerVoicePermissions.current();
-            for (RoleVoicePolicy pol : permSnap.policies()) {
-                if (pol == null || pol.role() == null) continue;
-                RecordedVoicePolicy rec = new RecordedVoicePolicy(
-                        pol.role().location().toString(),
-                        pol.muteSend(), pol.muteReceive(), pol.isolateGroup(), pol.hearWorld(),
-                        (float) pol.maxDistance());
-                recordedPolicies.putIfAbsent(policyKey(rec), rec);
+            var snapPolicies = permSnap.policies();
+            if (snapPolicies != lastPolicySnapshot) {
+                lastPolicySnapshot = snapPolicies;
+                for (RoleVoicePolicy pol : snapPolicies) {
+                    if (pol == null || pol.role() == null) continue;
+                    RecordedVoicePolicy rec = new RecordedVoicePolicy(
+                            pol.role().location().toString(),
+                            pol.muteSend(), pol.muteReceive(), pol.isolateGroup(), pol.hearWorld(),
+                            (float) pol.maxDistance());
+                    recordedPolicies.putIfAbsent(policyKey(rec), rec);
+                }
             }
 
             boolean killerChannelOpen = false;
@@ -557,7 +637,7 @@ public final class MatchVoiceRecorder {
             }
             channelHints = hints.isEmpty() ? Map.of() : Map.copyOf(hints);
             clock = new CaptureClock(matchTick, System.nanoTime(), Set.copyOf(present));
-            if (matchTick % 20 == 0) flushIdleVad(matchMs);
+            if (matchTick % 20 == 0) scheduleIdleVadFlush(matchMs);
         }
 
         private void updateStateSpan(UUID id, long matchMs, int stateFlags, @Nullable UUID groupId, String roleId) {
@@ -584,10 +664,8 @@ public final class MatchVoiceRecorder {
         }
 
         void markAbsent(UUID speaker, int tick) {
-            List<PosSample> positions = posByPlayer.get(speaker);
-            if (positions == null || positions.isEmpty() || !positions.getLast().present()) return;
-            PosSample last = positions.getLast();
-            recordPlayerPos(speaker, new PosSample(tick, last.x(), last.y(), last.z(), false, false));
+            PlayerPosTrack track = posByPlayer.get(speaker);
+            if (track != null) track.markAbsent(tick);
         }
 
         void recordPlayerPos(UUID id, int tick, double x, double y, double z, boolean alive) {
@@ -595,19 +673,7 @@ public final class MatchVoiceRecorder {
         }
 
         private void recordPlayerPos(UUID id, PosSample next) {
-            List<PosSample> list = posByPlayer.computeIfAbsent(id, ignored -> new ArrayList<>());
-            if (!list.isEmpty()) {
-                PosSample prev = list.getLast();
-                if (prev.tick() == next.tick()) {
-                    list.set(list.size() - 1, next);
-                    return;
-                }
-                if (prev.alive() == next.alive() && prev.present() == next.present()
-                        && next.tick() - prev.tick() < 5 && prev.distanceTo(next.x(), next.y(), next.z()) < 0.2) {
-                    return;
-                }
-            }
-            list.add(next);
+            posByPlayer.computeIfAbsent(id, ignored -> new PlayerPosTrack()).record(next);
         }
 
         void appendLivePcm48k(UUID speaker, float maxDist, ChannelMode mode, @Nullable UUID groupId, short[] pcm48k) {
@@ -627,40 +693,56 @@ public final class MatchVoiceRecorder {
             short[] pcm24k = ReplayVoiceData.downsample48kTo24k(pcm48k);
             if (pcm24k.length == 0) return;
 
-            synchronized (this) {
-                if (!capturing || (live && !clock.speakers().contains(speaker))) return;
-                // Exclude packets arriving after a recorded departure
-                List<PosSample> posList = posByPlayer.get(speaker);
-                if (posList != null && !posList.isEmpty()) {
-                    PosSample at = lookupPos(posList, (int) (matchMs / 50L));
-                    if (at != null && !at.present()) return;
-                }
-                long frameMs = matchMs;
-                if (live) frameMs = Math.max(frameMs, lastLiveEndMs.getOrDefault(speaker, Long.MIN_VALUE));
-                SpeakerVadState vad = vadBySpeaker.computeIfAbsent(speaker, SpeakerVadState::new);
-                vad.push(frameMs, maxDist, mode, groupId, pcm24k, utterances, utteranceBudget);
-                lastRecordedTickMs = Math.max(lastRecordedTickMs, frameMs + Math.round(pcm24k.length * 1000.0 / ReplayVoiceData.SAMPLE_RATE));
-                if (live) {
-                    lastLiveEndMs.put(speaker, frameMs + pcm24k.length * 1000L / ReplayVoiceData.SAMPLE_RATE);
-                }
+            if (!capturing || (live && !clock.speakers().contains(speaker))) return;
+            // Exclude packets arriving after a recorded departure (thread-safe per-player lock).
+            PlayerPosTrack posTrack = posByPlayer.get(speaker);
+            if (posTrack != null && posTrack.isAbsentAt((int) (matchMs / 50L))) return;
+
+            SpeakerVadState vad = vadBySpeaker.computeIfAbsent(speaker, SpeakerVadState::new);
+            long frameMs = matchMs;
+            if (live) {
+                long prevEnd = lastLiveEndMs.getOrDefault(speaker, Long.MIN_VALUE);
+                if (prevEnd > frameMs) frameMs = prevEnd;
+            }
+            vad.push(frameMs, maxDist, mode, groupId, pcm24k, utterances, utteranceBudget, utteranceLock);
+            long endMs = frameMs + Math.round(pcm24k.length * 1000.0 / ReplayVoiceData.SAMPLE_RATE);
+            if (endMs > lastRecordedTickMs) lastRecordedTickMs = endMs;
+            if (live) {
+                lastLiveEndMs.put(speaker, frameMs + pcm24k.length * 1000L / ReplayVoiceData.SAMPLE_RATE);
             }
         }
 
-        synchronized void flushIdleVad(long nowMs) {
+        void scheduleIdleVadFlush(long nowMs) {
+            boolean anyIdle = false;
             for (SpeakerVadState vad : vadBySpeaker.values()) {
-                vad.flushIfIdle(nowMs, utterances, utteranceBudget);
+                if (vad.needsIdleFlush(nowMs)) {
+                    anyIdle = true;
+                    break;
+                }
+            }
+            if (!anyIdle) return;
+            if (!ReplayBoardService.submitBackgroundVoiceWork(() -> flushIdleVad(nowMs))) {
+                flushIdleVad(nowMs);
+            }
+        }
+
+        void flushIdleVad(long nowMs) {
+            for (SpeakerVadState vad : vadBySpeaker.values()) {
+                if (vad.needsIdleFlush(nowMs)) {
+                    vad.flushIfIdle(nowMs, utterances, utteranceBudget, utteranceLock);
+                }
             }
         }
 
         ReplayVoiceData extractVoiceData(List<LastMatchReplay.Node> sortedEvents) {
+            for (SpeakerVadState vad : vadBySpeaker.values()) {
+                vad.flush(utterances, utteranceBudget, utteranceLock);
+            }
             List<VoiceUtterance> finalizedUtterances;
             List<SpeakerStateSpan> allSpans;
             List<RecordedVoicePolicy> policies;
             int droppedUtterances;
             synchronized (this) {
-                for (SpeakerVadState vad : vadBySpeaker.values()) {
-                    vad.flush(utterances, utteranceBudget);
-                }
                 long endMs = Math.max(lastRecordedTickMs, clock.tick() * 50L + POST_EVENT_MS);
                 allSpans = new ArrayList<>(closedSpans.size() + openSpans.size() + extraTestSpans.size());
                 allSpans.addAll(closedSpans);
@@ -671,11 +753,13 @@ public final class MatchVoiceRecorder {
                     allSpans.add(new SpeakerStateSpan(entry.getKey(), s.startMs, Math.max(s.startMs, endMs),
                             s.stateFlags, s.groupId, s.roleId));
                 }
-                finalizedUtterances = new ArrayList<>(utterances);
+                synchronized (utteranceLock) {
+                    finalizedUtterances = new ArrayList<>(utterances);
+                    droppedUtterances = utteranceBudget[1];
+                }
                 finalizedUtterances.sort(Comparator.comparingLong(VoiceUtterance::startMs)
                         .thenComparing(VoiceUtterance::speakerId));
                 policies = List.copyOf(recordedPolicies.values());
-                droppedUtterances = utteranceBudget[1];
             }
 
             VoiceTimelineMeta meta = new VoiceTimelineMeta(policies, allSpans, defaultVoiceDist, whisperVoiceDist);
@@ -728,7 +812,7 @@ public final class MatchVoiceRecorder {
                 if (u.startMs() > windowEndMs) break;
                 if (u.endMs() <= windowStartMs) continue;
                 if (u.channelMode() != ChannelMode.NORMAL_OPEN && u.channelMode() != ChannelMode.WHISPER) continue;
-                List<PosSample> positions = posByPlayer.get(u.speakerId());
+                PlayerPosTrack positions = posByPlayer.get(u.speakerId());
                 if (positions == null || positions.isEmpty()) continue;
 
                 short[] pcm = u.decode24k();
@@ -743,12 +827,12 @@ public final class MatchVoiceRecorder {
                     if (chunkEndMs <= windowStartMs || chunkMs >= windowEndMs) continue;
 
                     int frameTick = Math.max(0, (int) (chunkMs / 50L));
-                    PosSample pos = lookupPos(positions, frameTick);
+                    PosSample pos = positions.lookup(frameTick);
                     if (pos == null || !pos.present()) continue;
 
                     boolean aliveEligible = pos.alive();
                     if (!aliveEligible && chunkMs <= eventMs + DEATH_GRACE_MS) {
-                        PosSample pre = lookupPos(positions, Math.max(0, node.tick() - 1));
+                        PosSample pre = positions.lookup(Math.max(0, node.tick() - 1));
                         aliveEligible = pre != null && pre.alive()
                                 && (u.speakerId().equals(node.target()) || u.speakerId().equals(node.actor())
                                 || chunkMs <= eventMs + 50L);

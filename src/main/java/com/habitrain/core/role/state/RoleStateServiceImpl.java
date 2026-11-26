@@ -57,6 +57,7 @@ public final class RoleStateServiceImpl implements RoleStateApi {
     private final Map<StorageKey, ManagedDeclaration<RoleStateSpec<?>>> specs = new LinkedHashMap<>();
     private final Map<StateSlotKey, Object> transientValues = new ConcurrentHashMap<>();
     private final Set<StateSlotKey> migrationRequired = new CopyOnWriteArraySet<>();
+    private final Set<StateSlotKey> validatedPersistentSlots = ConcurrentHashMap.newKeySet();
     private final RoleStateSyncService syncService = new RoleStateSyncService();
     private volatile RoleStateStore store = new MemoryRoleStateStore();
     private volatile boolean frozen;
@@ -89,6 +90,7 @@ public final class RoleStateServiceImpl implements RoleStateApi {
         transientValues.keySet().removeIf(key -> playerId.equals(key.playerId()));
         transientValues.putAll(checkpoint.memory());
         store.removeWhere(key -> playerId.equals(key.playerId()));
+        validatedPersistentSlots.removeIf(key -> playerId.equals(key.playerId()));
         checkpoint.persistent().forEach((key, value) -> {
             if (!store.write(key, value)) throw new IllegalStateException("Failed to restore role state " + key);
         });
@@ -110,6 +112,7 @@ public final class RoleStateServiceImpl implements RoleStateApi {
     /** Binds the persistence backend (production = CCA store; tests inject memory/fakes). */
     public void setStore(RoleStateStore store) {
         this.store = store == null ? new MemoryRoleStateStore() : store;
+        this.validatedPersistentSlots.clear();
     }
 
     /** The sync service used after writes; tests configure its recipients/sender. */
@@ -322,6 +325,7 @@ public final class RoleStateServiceImpl implements RoleStateApi {
                 LOGGER.error("role state persist failed for {} (offline player or unloaded world)", slot);
                 return;
             }
+            validatedPersistentSlots.add(slot);
         }
         migrationRequired.remove(slot);
         notifySync(spec, slot, encoded);
@@ -394,6 +398,7 @@ public final class RoleStateServiceImpl implements RoleStateApi {
         transientValues.clear();
         clearRoundState(null);
         migrationRequired.clear();
+        validatedPersistentSlots.clear();
     }
 
     /**
@@ -437,6 +442,10 @@ public final class RoleStateServiceImpl implements RoleStateApi {
             try {
                 StoredState st = store.read(slot);
                 if (st == null) continue;
+                if (st.dataVersion() == spec.dataVersion() && validatedPersistentSlots.contains(slot)) {
+                    prepared.add(new PreparedState(spec, slot, st.encoded()));
+                    continue;
+                }
                 ReadResult<?> result = readCurrent(spec, slot, st);
                 if (result.available()) prepared.add(new PreparedState(spec, slot, result.state().encoded()));
             } catch (Throwable failure) {
@@ -464,6 +473,7 @@ public final class RoleStateServiceImpl implements RoleStateApi {
 
     /** Restores a persistent snapshot (restart simulation / diagnostics). */
     public void importPersistent(Map<StateSlotKey, StoredState> data) {
+        validatedPersistentSlots.clear();
         store.importAll(data);
     }
 
@@ -635,14 +645,12 @@ public final class RoleStateServiceImpl implements RoleStateApi {
         if (slot == null) {
             return null;
         }
-        for (ManagedDeclaration<RoleStateSpec<?>> decl : specs.values()) {
-            RoleStateSpec<?> s = decl.declaration();
-            if (s.id().equals(slot.id()) && s.role().equals(slot.role())
-                    && s.scope() == slot.scope()) {
-                return s;
-            }
+        ManagedDeclaration<RoleStateSpec<?>> decl = specs.get(new StorageKey(slot.id(), slot.role()));
+        if (decl == null) {
+            return null;
         }
-        return null;
+        RoleStateSpec<?> s = decl.declaration();
+        return s.scope() == slot.scope() ? s : null;
     }
 
     /** Whether the spec's owning provider/entry passes the v2 config gate (audit P1-2). */
@@ -683,12 +691,15 @@ public final class RoleStateServiceImpl implements RoleStateApi {
                     throw new IllegalStateException("migration persistence failed (offline player or unloaded world)");
                 }
                 migrationRequired.remove(slot);
+                validatedPersistentSlots.add(slot);
                 return new ReadResult<>(true, migrated, current, true);
             }
             migrationRequired.remove(slot);
+            validatedPersistentSlots.add(slot);
             return new ReadResult<>(true, value, stored, false);
         } catch (Throwable t) {
             migrationRequired.add(slot);
+            validatedPersistentSlots.remove(slot);
             LOGGER.warn("role state {} failed to decode v{} (opaque bytes preserved)", slot, stored.dataVersion(), t);
             return ReadResult.unavailable();
         }

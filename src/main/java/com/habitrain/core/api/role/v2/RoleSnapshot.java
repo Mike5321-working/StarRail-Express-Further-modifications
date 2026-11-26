@@ -26,6 +26,7 @@ public final class RoleSnapshot {
     private final RoleSnapshotId id;
     private final Map<ResourceLocation, EffectiveRole> roles;
     private final Map<ResourceLocation, ResourceLocation> aliases;
+    private final Map<ResourceLocation, ResourceLocation> flattenedAliases;
     private final Set<ResourceLocation> replacedTargets;
     private final Set<BehaviorEntry> enabledBehaviorEntries;
     private final boolean allowGlobalHooks;
@@ -58,11 +59,40 @@ public final class RoleSnapshot {
                 new LinkedHashMap<>(Objects.requireNonNull(roles, "roles")));
         this.aliases = Collections.unmodifiableMap(
                 new LinkedHashMap<>(Objects.requireNonNull(aliases, "aliases")));
+        this.flattenedAliases = flattenAliases(this.aliases);
         this.replacedTargets = Collections.unmodifiableSet(
                 new LinkedHashSet<>(Objects.requireNonNull(replacedTargets, "replacedTargets")));
         this.enabledBehaviorEntries = Collections.unmodifiableSet(
                 new LinkedHashSet<>(Objects.requireNonNullElse(enabledBehaviorEntries, Set.of())));
         this.allowGlobalHooks = allowGlobalHooks;
+    }
+
+    private static Map<ResourceLocation, ResourceLocation> flattenAliases(
+            Map<ResourceLocation, ResourceLocation> rawAliases) {
+        if (rawAliases.isEmpty()) {
+            return Map.of();
+        }
+        Map<ResourceLocation, ResourceLocation> flat = new java.util.HashMap<>(rawAliases.size() * 2);
+        Set<ResourceLocation> seen = new java.util.HashSet<>();
+        for (ResourceLocation start : rawAliases.keySet()) {
+            if (start == null) {
+                continue;
+            }
+            seen.clear();
+            ResourceLocation cur = start;
+            boolean cycle = false;
+            while (cur != null && rawAliases.containsKey(cur)) {
+                if (!seen.add(cur)) {
+                    cycle = true;
+                    break;
+                }
+                cur = rawAliases.get(cur);
+            }
+            if (!cycle && cur != null && !cur.equals(start)) {
+                flat.put(start, cur);
+            }
+        }
+        return flat.isEmpty() ? Map.of() : Collections.unmodifiableMap(flat);
     }
 
     public RoleSnapshotId id() {
@@ -100,9 +130,22 @@ public final class RoleSnapshot {
         if (keyOrAlias == null || keyOrAlias.location() == null) {
             return Optional.empty();
         }
-        RoleKey canonical = canonicalize(keyOrAlias.location());
-        EffectiveRole er = roles.get(canonical.location());
+        ResourceLocation canonicalId = canonicalizeId(keyOrAlias.location());
+        EffectiveRole er = roles.get(canonicalId);
         return er == null ? Optional.empty() : Optional.of(er);
+    }
+
+    /**
+     * Zero-allocation canonical identifier lookup using the pre-flattened alias table.
+     *
+     * @throws NullPointerException {@code id} 为 {@code null}
+     */
+    public ResourceLocation canonicalizeId(ResourceLocation id) {
+        Objects.requireNonNull(id, "id");
+        if (flattenedAliases.isEmpty()) {
+            return id;
+        }
+        return flattenedAliases.getOrDefault(id, id);
     }
 
     /**
@@ -114,16 +157,7 @@ public final class RoleSnapshot {
      * @throws NullPointerException {@code id} 为 {@code null}
      */
     public RoleKey canonicalize(ResourceLocation id) {
-        Objects.requireNonNull(id, "id");
-        ResourceLocation cur = id;
-        java.util.Set<ResourceLocation> seen = new java.util.HashSet<>();
-        while (cur != null && aliases.containsKey(cur)) {
-            if (!seen.add(cur)) {
-                return RoleKey.of(id);
-            }
-            cur = aliases.get(cur);
-        }
-        return RoleKey.of(cur == null ? id : cur);
+        return RoleKey.of(canonicalizeId(id));
     }
 
     /**

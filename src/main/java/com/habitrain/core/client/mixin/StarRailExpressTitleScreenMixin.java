@@ -74,6 +74,11 @@ public class StarRailExpressTitleScreenMixin {
 
     @Unique private static Field habitrain$textField;
     @Unique private static Field habitrain$onPressField;
+    @Unique private static Field habitrain$xField;
+    @Unique private static Field habitrain$yField;
+    @Unique private static Field habitrain$indexField;
+    @Unique private List<HabiStationSceneRenderer.MenuItemData> habitrain$cachedMenuItems;
+    @Unique private int habitrain$cachedMenuSize = -1;
 
     // ==================== 遗留回退路径 ====================
 
@@ -109,6 +114,8 @@ public class StarRailExpressTitleScreenMixin {
     @Inject(method = "init", at = @At("TAIL"))
     private void habitrain$onInit(CallbackInfo ci) {
         habitrain$customizeCommunityEntries();
+        habitrain$cachedMenuItems = null;
+        habitrain$cachedMenuSize = -1;
         if (HabiKineticUiController.isKineticTitleEnabled()) {
             waitingForContinue.set(false);
             StarRailExpressTitleScreen.voiceFadeInDuration = 0;
@@ -296,8 +303,16 @@ public class StarRailExpressTitleScreenMixin {
 
     @Unique
     private List<HabiStationSceneRenderer.MenuItemData> habitrain$extractMenuItems() {
-        List<HabiStationSceneRenderer.MenuItemData> out = new ArrayList<>(menuEntries.size());
-        if (menuEntries.isEmpty()) return out;
+        int size = menuEntries == null ? 0 : menuEntries.size();
+        if (habitrain$cachedMenuItems != null && habitrain$cachedMenuSize == size) {
+            return habitrain$cachedMenuItems;
+        }
+        List<HabiStationSceneRenderer.MenuItemData> out = new ArrayList<>(size);
+        if (size == 0) {
+            habitrain$cachedMenuItems = out;
+            habitrain$cachedMenuSize = 0;
+            return out;
+        }
         try {
             habitrain$ensureEntryFields(menuEntries.get(0).getClass());
             for (Object entry : menuEntries) {
@@ -307,6 +322,8 @@ public class StarRailExpressTitleScreenMixin {
                     out.add(new HabiStationSceneRenderer.MenuItemData(text, onPress));
                 }
             }
+            habitrain$cachedMenuItems = out;
+            habitrain$cachedMenuSize = size;
         } catch (Exception e) {
             HabiTrainCore.LOGGER.error("[主页菜单] 读取 MenuEntry 列表失败", e);
         }
@@ -330,6 +347,25 @@ public class StarRailExpressTitleScreenMixin {
     }
 
     @Unique
+    private static void habitrain$ensurePosFields(Class<?> entryClass) throws NoSuchFieldException {
+        if (habitrain$xField == null) {
+            Field xf = entryClass.getDeclaredField("x");
+            xf.setAccessible(true);
+            habitrain$xField = xf;
+        }
+        if (habitrain$yField == null) {
+            Field yf = entryClass.getDeclaredField("y");
+            yf.setAccessible(true);
+            habitrain$yField = yf;
+        }
+        if (habitrain$indexField == null) {
+            Field idx = entryClass.getDeclaredField("index");
+            idx.setAccessible(true);
+            habitrain$indexField = idx;
+        }
+    }
+
+    @Unique
     private static Constructor<?> habitrain$findMenuEntryCtor() {
         for (Class<?> nested : StarRailExpressTitleScreen.class.getDeclaredClasses()) {
             if (nested.getSimpleName().equals("MenuEntry")) {
@@ -348,19 +384,12 @@ public class StarRailExpressTitleScreenMixin {
     @Unique
     private static void habitrain$setEntryPos(Object entry, int index, int baseX, int baseY) {
         try {
-            Class<?> c = entry.getClass();
-            habitrain$setInt(c, entry, "x", baseX);
-            habitrain$setInt(c, entry, "y", baseY + index * HABITRAIN$MENU_SPACING);
-            habitrain$setInt(c, entry, "index", index);
+            habitrain$ensurePosFields(entry.getClass());
+            habitrain$xField.setInt(entry, baseX);
+            habitrain$yField.setInt(entry, baseY + index * HABITRAIN$MENU_SPACING);
+            habitrain$indexField.setInt(entry, index);
         } catch (Exception e) {
             HabiTrainCore.LOGGER.error("[主页菜单] 设置条目坐标失败 index={}", index, e);
         }
-    }
-
-    @Unique
-    private static void habitrain$setInt(Class<?> clz, Object obj, String name, int val) throws Exception {
-        Field f = clz.getDeclaredField(name);
-        f.setAccessible(true);
-        f.setInt(obj, val);
     }
 }

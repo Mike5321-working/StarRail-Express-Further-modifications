@@ -50,8 +50,10 @@ public final class MapFileMonitor {
     private static volatile boolean initialized = false;
     private static volatile boolean scanInFlight = false;
     private static final AtomicInteger EPOCH = new AtomicInteger(0);
+    private static volatile @Nullable CachedIntro cachedFullIntro;
 
     private record FileStamp(long lastModified, long size) {}
+    private record CachedIntro(int epoch, long configRevision, MapIntroSyncPayload payload) {}
 
     private MapFileMonitor() {}
 
@@ -108,8 +110,14 @@ public final class MapFileMonitor {
         Set<String> dirtyMapIds = dirtyMapIds(PREVIOUS_STAMPS, currentStamps);
         PREVIOUS_STAMPS.clear();
         PREVIOUS_STAMPS.putAll(currentStamps);
+        cachedFullIntro = null;
         HabiTrainCore.LOGGER.info("[MapFileMonitor] 检测到地图相关文件已被修改，正在自动同步至客户端...");
         syncMapDataToAll(server, dirtyMapIds);
+    }
+
+    /** 使全量地图介绍缓存失效（配置或地图文件变化时调用）。 */
+    public static void invalidateIntroCache() {
+        cachedFullIntro = null;
     }
 
     /**
@@ -120,6 +128,7 @@ public final class MapFileMonitor {
         PREVIOUS_STAMPS.clear();
         initialized = false;
         scanInFlight = false;
+        cachedFullIntro = null;
         MapVoteProfileStore.clearCache();
     }
 
@@ -160,10 +169,11 @@ public final class MapFileMonitor {
                     }
                 }
 
+                cachedFullIntro = null;
                 MapIntroSyncPayload introPayload = buildMapIntroPayload(server, dirtyMapIds);
 
-                var profiles = MapVoteProfileStore.loadProfiles(overworld, configMaps.keySet(), configMaps);
-                List<MapVoteProfilePayload> profilePayloads = MapVoteProfilePayload.fragment(profiles);
+                List<MapVoteProfilePayload> profilePayloads = MapVoteProfileStore.loadProfileFragments(
+                        overworld, configMaps, ConfigManager.getInstance().revision());
 
                 for (ServerPlayer player : server.getPlayerList().getPlayers()) {
                     if (player != null) {
@@ -178,8 +188,8 @@ public final class MapFileMonitor {
                     }
                 }
 
-                HabiTrainCore.LOGGER.info("[MapFileMonitor] 地图数据自动同步完成：{} 张地图，{} 份档案",
-                        introPayload.maps().size(), profiles.size());
+                HabiTrainCore.LOGGER.info("[MapFileMonitor] 地图数据自动同步完成：{} 张地图，{} 个档案分片",
+                        introPayload.maps().size(), profilePayloads.size());
             }
         } catch (Throwable t) {
             HabiTrainCore.LOGGER.warn("[MapFileMonitor] syncMapDataToAll failed", t);
@@ -187,7 +197,15 @@ public final class MapFileMonitor {
     }
 
     public static MapIntroSyncPayload buildMapIntroPayload(MinecraftServer server) {
-        return buildMapIntroPayload(server, null);
+        int epoch = EPOCH.get();
+        long rev = ConfigManager.getInstance().revision();
+        CachedIntro cached = cachedFullIntro;
+        if (cached != null && cached.epoch() == epoch && cached.configRevision() == rev) {
+            return cached.payload();
+        }
+        MapIntroSyncPayload built = buildMapIntroPayload(server, null);
+        cachedFullIntro = new CachedIntro(epoch, rev, built);
+        return built;
     }
 
     public static MapIntroSyncPayload buildMapIntroPayload(MinecraftServer server,

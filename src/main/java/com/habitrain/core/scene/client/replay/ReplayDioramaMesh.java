@@ -47,6 +47,7 @@ final class ReplayDioramaMesh {
     private static final long PARTIAL_REBUILD_NS = 2_500_000_000L;
     private static final long FAILURE_RETRY_NS = 15_000_000_000L;
     private static final long IDLE_RELEASE_NS = 45_000_000_000L;
+    private static final long MAX_SLOTS_BYTES = 128L * 1024L * 1024L;
 
     record Key(String fingerprint, int present) {
         boolean sameMap(Key other) { return other != null && fingerprint.equals(other.fingerprint); }
@@ -75,7 +76,7 @@ final class ReplayDioramaMesh {
     static @Nullable SceneMeshSet resolveSolid(@Nullable SceneAssetCodec.AssetData asset, int present, int total) {
         if (asset == null || asset.sections.isEmpty()) return null;
         Slot slot = slots.computeIfAbsent(asset.fingerprint, key -> new Slot(false));
-        while (slots.size() > 5) slots.pollFirstEntry().getValue().reset();
+        enforceSlotBudget(asset.fingerprint);
         slot.update(asset, present, total);
         return slot.matches(asset) ? slot.current() : null;
     }
@@ -85,6 +86,49 @@ final class ReplayDioramaMesh {
     static void retry(String fingerprint) {
         Slot slot = slots.get(fingerprint);
         if (slot != null) slot.failedKey = null;
+    }
+
+    private static long totalSlotBytes() {
+        long total = 0L;
+        for (Slot slot : slots.values()) {
+            total += slot.estimatedBytes();
+        }
+        return total;
+    }
+
+    private static void enforceSlotBudget(@Nullable String keepFingerprint) {
+        while (slots.size() > 5 || totalSlotBytes() > MAX_SLOTS_BYTES) {
+            String victimKey = null;
+            for (var entry : slots.entrySet()) {
+                if (Objects.equals(entry.getKey(), keepFingerprint) || entry.getValue() == selected) {
+                    continue;
+                }
+                victimKey = entry.getKey();
+                break;
+            }
+            if (victimKey == null) break;
+            Slot removed = slots.remove(victimKey);
+            if (removed != null) removed.reset();
+        }
+    }
+
+    /** Immediately evicts and closes an export-only diorama slot (even if it was last selected by the exporter). */
+    static void evictSlot(@Nullable String fingerprint) {
+        if (fingerprint == null || fingerprint.isEmpty()) return;
+        Slot removed = slots.remove(fingerprint);
+        if (removed != null) {
+            if (removed == selected) selected = null;
+            removed.reset();
+        }
+    }
+
+    /** Evicts a cached slot only when it is not currently selected by an active board. */
+    static void evictIfUnselected(@Nullable String fingerprint) {
+        if (fingerprint == null || fingerprint.isEmpty()) return;
+        Slot slot = slots.get(fingerprint);
+        if (slot == null || slot == selected) return;
+        slots.remove(fingerprint);
+        slot.reset();
     }
 
     /**
@@ -101,7 +145,10 @@ final class ReplayDioramaMesh {
         }
         String cacheKey = baseAsset.fingerprint + "#" + baseAsset.sections.size() + "#" + deltaSignature(deltas);
         DynamicWorld cached = dynamicCache.get(cacheKey);
-        if (cached != null) return cached;
+        if (cached != null) {
+            cached.touch();
+            return cached;
+        }
         DynamicWorld created = DynamicWorld.create(baseAsset, origin, deltas, cacheKey);
         dynamicCache.put(cacheKey, created);
         while (dynamicCache.size() > 6) dynamicCache.pollFirstEntry().getValue().close();
@@ -129,7 +176,7 @@ final class ReplayDioramaMesh {
     private static void update(@Nullable SceneAssetCodec.AssetData asset, int present, int total, boolean autoRetry) {
         if (asset == null || asset.sections.isEmpty()) { selected = null; return; }
         selected = slots.computeIfAbsent(asset.fingerprint, key -> new Slot());
-        while (slots.size() > 5) slots.pollFirstEntry().getValue().reset();
+        enforceSlotBudget(asset.fingerprint);
         if (autoRetry && selected.retryAfter != 0 && System.nanoTime() - selected.retryAfter >= 0) selected.failedKey = null;
         selected.update(asset, present, total);
     }
@@ -137,6 +184,14 @@ final class ReplayDioramaMesh {
     static void tickIdle() {
         long now = System.nanoTime();
         evictIdle(slots, now, true);
+        var dynIt = dynamicCache.values().iterator();
+        while (dynIt.hasNext()) {
+            var dw = dynIt.next();
+            if (now - dw.lastUse > IDLE_RELEASE_NS) {
+                dw.close();
+                dynIt.remove();
+            }
+        }
     }
 
     private static void evictIdle(Map<String, Slot> map, long now, boolean clearSelected) {
@@ -185,6 +240,9 @@ final class ReplayDioramaMesh {
         private int bakedMeshRevision = -1;
         private @Nullable SceneMeshSet bakedMesh;
         private List<ResolvedBlock> bakedFallbacks = List.of();
+        private long lastUse = System.nanoTime();
+
+        void touch() { lastUse = System.nanoTime(); }
 
         void close() {
             SceneMeshSet old = bakedMesh;
@@ -360,6 +418,7 @@ final class ReplayDioramaMesh {
                                  float minX, float minZ, float maxX, float maxZ, int scanAxis, float scanLimit,
                                  double matchTick) {
             if (sortedDeltas.isEmpty() || mc == null) return;
+            touch();
             ensureBakedMesh(mc, matchTick);
             if (bakedMesh != null && !bakedMesh.isEmpty() && !bakedMesh.isClosed()) {
                 ReplayTerrainRenderer.draw(bakedMesh, modelView, projection, fans,
@@ -371,6 +430,7 @@ final class ReplayDioramaMesh {
         void renderDynamicFallbacks(Minecraft mc, Matrix4f modelToCamera, MultiBufferSource buffers,
                                     double matchTick, @Nullable ReplayFanCutaway fanCutaway, int packedLight) {
             if (sortedDeltas.isEmpty() || mc == null) return;
+            touch();
             ensureBakedMesh(mc, matchTick);
             if (bakedFallbacks.isEmpty()) return;
             BlockRenderDispatcher dispatcher = mc.getBlockRenderer();
@@ -444,6 +504,7 @@ final class ReplayDioramaMesh {
                     int roofCutLayer, @Nullable ReplayFanCutaway fanCutaway, int packedLight,
                     @Nullable ReplayPovTerrain terrain) {
             if (sortedDeltas.isEmpty() || mc == null) return;
+            touch();
             Map<Long, ResolvedBlock> active = resolveAt(matchTick);
             if (active.isEmpty()) return;
             BlockRenderDispatcher dispatcher = mc.getBlockRenderer();
@@ -594,6 +655,11 @@ final class ReplayDioramaMesh {
 
         boolean hasFailed(Key key) { return key.equals(failedKey); }
 
+        long estimatedBytes() {
+            SceneMeshSet m = mesh;
+            return (m == null || m.isClosed()) ? 0L : m.estimatedBytes();
+        }
+
         void installBuilt(Key key, @Nullable SceneMeshSet built, @Nullable Throwable failure) {
             if (failure != null || built == null || built.isClosed() || built.isEmpty()) {
                 if (built != null) built.close();
@@ -617,6 +683,7 @@ final class ReplayDioramaMesh {
             failedKey = null;
             retryAfter = 0;
             if (previous != null && previous != built) previous.close();
+            enforceSlotBudget(key.fingerprint());
         }
 
         private void cancelPending() {

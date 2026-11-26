@@ -7,6 +7,7 @@ import com.habitrain.core.game.sre.role.tailor.TailorDollEntity;
 import com.habitrain.core.network.*;
 import com.mojang.authlib.GameProfile;
 import io.wifi.starrailexpress.client.SREClient;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientEntityEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
@@ -36,6 +37,7 @@ public final class DollTailorClient {
     private static final Map<UUID, Integer> completedAt = new HashMap<>();
     private static final Map<UUID, RemotePlayer> proxies = new HashMap<>();
     private static final Map<UUID, OptionalInt> cachedHighlights = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final Map<UUID, TailorDollEntity> trackedDolls = new HashMap<>();
     private static ClientLevel world;
     private static int ticks;
     private static int snapTicks;
@@ -49,24 +51,46 @@ public final class DollTailorClient {
             if (ctx.client().screen instanceof DollTailorRosterView view) view.habitrain$tailorRoster(payload.entries());
         }));
         ClientPlayNetworking.registerGlobalReceiver(DollProtectionPayload.TYPE, (payload, ctx) -> ctx.client().execute(() -> {
-            if (!links.equals(payload.links())) SREClient.cachedHighLightMap.clear();
+            if (!links.equals(payload.links())) {
+                SREClient.cachedHighLightMap.clear();
+                cachedHighlights.clear();
+            }
             links = payload.links();
             if (payload.snapped()) snapTicks = 12;
         }));
+        ClientEntityEvents.ENTITY_LOAD.register((entity, clientLevel) -> {
+            if (entity instanceof TailorDollEntity doll) {
+                trackedDolls.put(doll.getUUID(), doll);
+            }
+        });
+        ClientEntityEvents.ENTITY_UNLOAD.register((entity, clientLevel) -> {
+            if (entity instanceof TailorDollEntity doll) {
+                UUID id = doll.getUUID();
+                trackedDolls.remove(id, doll);
+                completedAt.remove(id);
+                proxies.remove(id);
+                cachedHighlights.remove(id);
+            }
+        });
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-            if (client.isSameThread()) reset();
-            else client.execute(DollTailorClient::reset);
+            if (client.isSameThread()) reset(true);
+            else client.execute(() -> reset(true));
         });
         ClientTickEvents.END_CLIENT_TICK.register(DollTailorClient::tick);
         HudRenderCallback.EVENT.register((g, delta) -> hud(g));
     }
-    private static void reset() {
+    private static void reset(boolean clearTracked) {
         state = new DollTailorStatePayload(null, 0, List.of()); links = List.of();
-        completedAt.clear(); proxies.clear(); cachedHighlights.clear(); snapTicks = 0; resolving = false; world = null;
+        completedAt.clear(); proxies.clear(); cachedHighlights.clear();
+        if (clearTracked) trackedDolls.clear();
+        snapTicks = 0; resolving = false; world = null;
     }
     public static DollTailorStatePayload state() { return state; }
     public static int observed(UUID id) {
-        return state.entries().stream().filter(e -> e.id().equals(id)).mapToInt(DollTailorStatePayload.Entry::observedTicks).findFirst().orElse(0);
+        for (var entry : state.entries()) {
+            if (entry.id().equals(id)) return entry.observedTicks();
+        }
+        return 0;
     }
     public static boolean casting() {
         var self = Minecraft.getInstance().player;
@@ -75,9 +99,13 @@ public final class DollTailorClient {
     }
     public static boolean sewing(Player player) {
         if (player == Minecraft.getInstance().player && casting()) return true;
-        if (world == null) return false;
-        for (Entity entity : world.entitiesForRendering())
-            if (entity instanceof TailorDollEntity doll && !doll.complete() && player.getUUID().equals(doll.ownerId())) return true;
+        if (world == null || trackedDolls.isEmpty()) return false;
+        UUID playerId = player.getUUID();
+        for (TailorDollEntity doll : trackedDolls.values()) {
+            if (!doll.isRemoved() && doll.level() == world && !doll.complete() && playerId.equals(doll.ownerId())) {
+                return true;
+            }
+        }
         return false;
     }
     public static boolean killerViewer() {
@@ -99,12 +127,19 @@ public final class DollTailorClient {
         return false;
     }
     public static OptionalInt highlight(TailorDollEntity doll) {
-        if (doll == null) return OptionalInt.empty();
+        if (doll == null || !doll.complete()) return OptionalInt.empty();
+        if (!killerViewer()) return OptionalInt.empty();
+        OptionalInt cached = cachedHighlights.get(doll.getUUID());
+        if (cached != null) return cached;
         if (!com.mojang.blaze3d.systems.RenderSystem.isOnRenderThread()) {
-            return cachedHighlights.getOrDefault(doll.getUUID(), OptionalInt.empty());
+            return OptionalInt.empty();
         }
-        if (!doll.complete() || !killerViewer() || world == null || doll.targetId() == null) {
-            cachedHighlights.remove(doll.getUUID());
+        return refreshHighlight(doll);
+    }
+
+    private static OptionalInt refreshHighlight(TailorDollEntity doll) {
+        if (doll == null || !doll.complete() || !killerViewer() || world == null || doll.targetId() == null) {
+            if (doll != null) cachedHighlights.remove(doll.getUUID());
             return OptionalInt.empty();
         }
         Player target = world.getPlayerByUUID(doll.targetId());
@@ -136,10 +171,11 @@ public final class DollTailorClient {
         return age >= 0 && age < 10 ? (float) Math.sin(age * Math.PI / 10) * .12F : 0;
     }
     private static void tick(Minecraft mc) {
-        if (mc.level == null || mc.player == null) { if (world != null) reset(); return; }
+        if (mc.level == null || mc.player == null) { if (world != null) reset(true); return; }
         if (world != mc.level) {
-            if (world != null) reset();
+            if (world != null) reset(false);
             world = mc.level;
+            trackedDolls.values().removeIf(d -> d.level() != mc.level || d.isRemoved());
         }
         ticks++; if (snapTicks > 0) snapTicks--;
         if (casting()) {
@@ -148,34 +184,46 @@ public final class DollTailorClient {
             mc.player.setDeltaMovement(Vec3.ZERO);
             mc.options.keyAttack.setDown(false); mc.options.keyUse.setDown(false); mc.options.keyJump.setDown(false);
         }
-        Set<UUID> visible = new HashSet<>();
-        for (Entity entity : mc.level.entitiesForRendering()) {
-            if (!(entity instanceof TailorDollEntity doll)) continue;
-            visible.add(doll.getUUID());
-            if (doll.complete()) {
-                if (!completedAt.containsKey(doll.getUUID())) completedAt.put(doll.getUUID(), ticks - 20);
-                if (killerViewer()) highlight(doll);
-                else cachedHighlights.remove(doll.getUUID());
-                if (ticks % 35 == 0) particle(ParticleTypes.SNOWFLAKE, doll.position().add(0, 1.1, 0), new Vec3(.005, -.015, 0));
-            } else {
-                completedAt.put(doll.getUUID(), ticks);
-                double angle = ticks * .42;
-                float p = doll.stitches() / (float) DollTailorRules.SEWING_TICKS;
-                for (int i = 0; i < 3; i++) {
-                    double a = angle + i * Math.PI * 2 / 3;
-                    Vec3 pos = doll.position().add(Math.cos(a) * .48, .1 + (ticks * .045 + i * .6) % 1.85, Math.sin(a) * .48);
-                    particle(new DustParticleOptions(THREADS[i], .45F), pos, new Vec3(0, .012, 0));
-                    if (ticks % 3 == 0) particle(ParticleTypes.ENCHANT, pos, doll.position().add(0, 1, 0).subtract(pos).scale(.1));
+        if (!trackedDolls.isEmpty()) {
+            boolean viewerIsKiller = killerViewer();
+            var it = trackedDolls.entrySet().iterator();
+            while (it.hasNext()) {
+                var entry = it.next();
+                TailorDollEntity doll = entry.getValue();
+                if (doll == null || doll.isRemoved() || doll.level() != mc.level) {
+                    UUID id = entry.getKey();
+                    it.remove();
+                    completedAt.remove(id);
+                    proxies.remove(id);
+                    cachedHighlights.remove(id);
+                    continue;
                 }
-                if (ticks % 4 == 0) particle(new BlockParticleOption(ParticleTypes.BLOCK, Blocks.WHITE_WOOL.defaultBlockState()),
-                        doll.position().add((mc.level.random.nextDouble() - .5) * .7, .15 + p * 1.6, 0), new Vec3(0, .015, 0));
-                if (doll.stitches() >= 180 && doll.stitches() < 183) particle(ParticleTypes.SWEEP_ATTACK, doll.position().add(0, 1.1, 0), Vec3.ZERO);
-                if (ticks % 6 == 0) sound(doll.position(), SoundEvents.WOOL_HIT, .16F, 1.6F);
-                if (ticks % 13 == 0) sound(doll.position(), SoundEvents.SHEEP_SHEAR, .12F, 1.7F);
-                if (ticks % 20 == 0) sound(doll.position(), SoundEvents.WARDEN_HEARTBEAT, .12F, 1.5F);
+                if (doll.complete()) {
+                    if (!completedAt.containsKey(doll.getUUID())) completedAt.put(doll.getUUID(), ticks - 20);
+                    if (viewerIsKiller) refreshHighlight(doll);
+                    else cachedHighlights.remove(doll.getUUID());
+                    if (ticks % 35 == 0) particle(ParticleTypes.SNOWFLAKE, doll.position().add(0, 1.1, 0), new Vec3(.005, -.015, 0));
+                } else {
+                    completedAt.put(doll.getUUID(), ticks);
+                    double angle = ticks * .42;
+                    float p = doll.stitches() / (float) DollTailorRules.SEWING_TICKS;
+                    for (int i = 0; i < 3; i++) {
+                        double a = angle + i * Math.PI * 2 / 3;
+                        Vec3 pos = doll.position().add(Math.cos(a) * .48, .1 + (ticks * .045 + i * .6) % 1.85, Math.sin(a) * .48);
+                        particle(new DustParticleOptions(THREADS[i], .45F), pos, new Vec3(0, .012, 0));
+                        if (ticks % 3 == 0) particle(ParticleTypes.ENCHANT, pos, doll.position().add(0, 1, 0).subtract(pos).scale(.1));
+                    }
+                    if (ticks % 4 == 0) particle(new BlockParticleOption(ParticleTypes.BLOCK, Blocks.WHITE_WOOL.defaultBlockState()),
+                            doll.position().add((mc.level.random.nextDouble() - .5) * .7, .15 + p * 1.6, 0), new Vec3(0, .015, 0));
+                    if (doll.stitches() >= 180 && doll.stitches() < 183) particle(ParticleTypes.SWEEP_ATTACK, doll.position().add(0, 1.1, 0), Vec3.ZERO);
+                    if (ticks % 6 == 0) sound(doll.position(), SoundEvents.WOOL_HIT, .16F, 1.6F);
+                    if (ticks % 13 == 0) sound(doll.position(), SoundEvents.SHEEP_SHEAR, .12F, 1.7F);
+                    if (ticks % 20 == 0) sound(doll.position(), SoundEvents.WARDEN_HEARTBEAT, .12F, 1.5F);
+                }
             }
+        } else if (!completedAt.isEmpty() || !proxies.isEmpty() || !cachedHighlights.isEmpty()) {
+            completedAt.clear(); proxies.clear(); cachedHighlights.clear();
         }
-        completedAt.keySet().retainAll(visible); proxies.keySet().retainAll(visible); cachedHighlights.keySet().retainAll(visible);
         if (ticks % 4 == 0) {
             for (var link : links) {
                 if (!mc.player.getUUID().equals(link.owner()) && !mc.player.getUUID().equals(link.target())) continue;
@@ -217,8 +265,11 @@ public final class DollTailorClient {
             threadRing(g, cx, cy, 24, p);
             g.drawCenteredString(mc.font, Component.translatable("hud.habitrain_core.doll_tailor.sewing",
                     String.format(java.util.Locale.ROOT, "%.1f", Math.max(0, 200 - state.sewingTicks()) / 20F)), cx, cy + 34, 0xEEE6D6);
-        } else if (HabiRoles.isHabiRole(mc.player, HabiRoles.DOLL_TAILOR_ID) && state.selected() != null) {
-            var entry = state.entries().stream().filter(e -> e.id().equals(state.selected())).findFirst().orElse(null);
+        } else if (state.selected() != null && HabiRoles.isHabiRole(mc.player, HabiRoles.DOLL_TAILOR_ID)) {
+            DollTailorStatePayload.Entry entry = null;
+            for (var e : state.entries()) {
+                if (e.id().equals(state.selected())) { entry = e; break; }
+            }
             if (entry != null) {
                 float p = entry.observedTicks() / (float) DollTailorRules.OBSERVATION_TICKS;
                 threadRing(g, cx + 30, cy, 10, p);
@@ -227,12 +278,20 @@ public final class DollTailorClient {
                 g.drawString(mc.font, mc.font.substrByWidth(label, Math.max(0, w - cx - 50)).getString(), cx + 46, cy - 4, 0xDABF89, true);
             }
         }
-        if (links.stream().anyMatch(link -> link.target().equals(mc.player.getUUID()))) {
-            int x = w - 105, y = h - 62, alpha = 180 + (int) (40 * Math.sin(ticks * .07));
-            int color = alpha << 24 | 0xDABF89;
-            g.fill(x, y + 2, x + 7, y + 9, color); g.fill(x + 1, y - 3, x + 6, y + 2, color);
-            g.fill(x - 2, y + 3, x + 9, y + 5, color); g.fill(x, y + 9, x + 2, y + 13, color); g.fill(x + 5, y + 9, x + 7, y + 13, color);
-            g.drawString(mc.font, Component.translatable("hud.habitrain_core.doll_tailor.protected"), x + 13, y + 2, color, true);
+        var activeLinks = links;
+        if (!activeLinks.isEmpty()) {
+            boolean isProtected = false;
+            UUID selfId = mc.player.getUUID();
+            for (var link : activeLinks) {
+                if (link.target().equals(selfId)) { isProtected = true; break; }
+            }
+            if (isProtected) {
+                int x = w - 105, y = h - 62, alpha = 180 + (int) (40 * Math.sin(ticks * .07));
+                int color = alpha << 24 | 0xDABF89;
+                g.fill(x, y + 2, x + 7, y + 9, color); g.fill(x + 1, y - 3, x + 6, y + 2, color);
+                g.fill(x - 2, y + 3, x + 9, y + 5, color); g.fill(x, y + 9, x + 2, y + 13, color); g.fill(x + 5, y + 9, x + 7, y + 13, color);
+                g.drawString(mc.font, Component.translatable("hud.habitrain_core.doll_tailor.protected"), x + 13, y + 2, color, true);
+            }
         }
     }
     private static void threadRing(GuiGraphics g, int cx, int cy, int radius, float progress) {

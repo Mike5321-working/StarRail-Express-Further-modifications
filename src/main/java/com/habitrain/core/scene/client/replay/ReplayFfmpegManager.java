@@ -51,6 +51,7 @@ final class ReplayFfmpegManager {
     private static final long READ_STALL_TIMEOUT_NS = TimeUnit.SECONDS.toNanos(25);
     private static final long PROBE_TIMEOUT_SECONDS = 20L;
     private static final long RECHECK_INTERVAL_NS = TimeUnit.SECONDS.toNanos(2);
+    private static final long PEEK_TTL_NS = TimeUnit.MILLISECONDS.toNanos(750);
 
     record PlatformAsset(String id, String fileName, long expectedBytes, String sha256, boolean windows) {
         String executableName() {
@@ -88,8 +89,10 @@ final class ReplayFfmpegManager {
     }
 
     private record ProbeCache(String fingerprint, @Nullable Path executable, long checkedAtNs) {}
+    private record PeekCache(@Nullable Path gameDir, String customPath, @Nullable Path executable, long checkedAtNs) {}
 
     private static final Object LOCK = new Object();
+    private static volatile @Nullable PeekCache cachedPeek;
     private static volatile State state = State.IDLE;
     private static volatile double progress;
     private static volatile int mirrorIndex;
@@ -203,19 +206,32 @@ final class ReplayFfmpegManager {
      */
     static @Nullable Path peekAvailable(Path gameDir) {
         String custom = readCustomPathSafely();
+        long now = System.nanoTime();
+        PeekCache peek = cachedPeek;
+        if (peek != null && java.util.Objects.equals(peek.gameDir(), gameDir)
+                && peek.customPath().equals(custom)
+                && now - peek.checkedAtNs() < PEEK_TTL_NS) {
+            return peek.executable();
+        }
         String fingerprint = candidateFingerprint(gameDir, custom);
         ProbeCache cache = cachedProbe;
         if (cache != null && cache.fingerprint().equals(fingerprint)) {
             if (cache.executable() != null) {
-                if (Files.isRegularFile(cache.executable())) return cache.executable();
+                if (Files.isRegularFile(cache.executable())) {
+                    cachedPeek = new PeekCache(gameDir, custom, cache.executable(), now);
+                    return cache.executable();
+                }
                 cachedProbe = null;
-            } else if (System.nanoTime() - cache.checkedAtNs() < RECHECK_INTERVAL_NS) {
+            } else if (now - cache.checkedAtNs() < RECHECK_INTERVAL_NS) {
+                cachedPeek = new PeekCache(gameDir, custom, null, now);
                 return null;
             }
         }
         triggerAsyncProbe(gameDir, custom, fingerprint);
-        return cache != null && cache.executable() != null && Files.isRegularFile(cache.executable())
+        Path result = cache != null && cache.executable() != null && Files.isRegularFile(cache.executable())
                 ? cache.executable() : null;
+        cachedPeek = new PeekCache(gameDir, custom, result, now);
+        return result;
     }
 
     static boolean isReady(Path gameDir) {
@@ -237,11 +253,13 @@ final class ReplayFfmpegManager {
         }
         Path resolved = findValidExecutable(gameDir, customPath);
         cachedProbe = new ProbeCache(fingerprint, resolved, System.nanoTime());
+        cachedPeek = null;
         return resolved;
     }
 
     static void invalidateCache() {
         cachedProbe = null;
+        cachedPeek = null;
     }
 
     private static void triggerAsyncProbe(Path gameDir, String customPath, String fingerprint) {
@@ -253,6 +271,7 @@ final class ReplayFfmpegManager {
             try {
                 Path found = findValidExecutable(gameDir, customPath);
                 cachedProbe = new ProbeCache(fingerprint, found, System.nanoTime());
+                cachedPeek = null;
                 if (found != null && (state == State.FAILED || state == State.CANCELLED
                         || state == State.IMPORT_INVALID || state == State.UNSUPPORTED_PLATFORM)) {
                     state = State.READY;
@@ -788,6 +807,7 @@ final class ReplayFfmpegManager {
             activeWorker = null;
             probing = false;
             cachedProbe = null;
+            cachedPeek = null;
             progress = 0.0;
             mirrorIndex = 0;
             mirrorCount = 0;

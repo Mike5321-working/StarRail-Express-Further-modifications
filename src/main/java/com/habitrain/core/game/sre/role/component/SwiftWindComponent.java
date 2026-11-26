@@ -100,10 +100,27 @@ public final class SwiftWindComponent implements RoleComponent {
         knife.set(DataComponents.MAX_STACK_SIZE, 64);
     }
 
+    private static volatile Item cachedThrowingKnifeItem;
+    private static final java.util.Map<Player, java.lang.ref.WeakReference<net.minecraft.world.entity.Entity>> TRACKED_INFLIGHT_KNIFE =
+            java.util.Collections.synchronizedMap(new java.util.WeakHashMap<>());
+
+    private static @org.jetbrains.annotations.Nullable Item throwingKnifeItem() {
+        Item item = cachedThrowingKnifeItem;
+        if (item == null || item == net.minecraft.world.item.Items.AIR) {
+            Item resolved = net.minecraft.core.registries.BuiltInRegistries.ITEM.get(HabiRoleItems.THROWING_KNIFE_ID);
+            if (resolved != null && resolved != net.minecraft.world.item.Items.AIR) {
+                cachedThrowingKnifeItem = resolved;
+                item = resolved;
+            } else {
+                return null;
+            }
+        }
+        return item;
+    }
+
     public static boolean hasPsychoKnife(Player player) {
-        ItemStack knife = HabiRoleItems.lookupItem(HabiRoleItems.THROWING_KNIFE_ID, 1);
-        if (knife.isEmpty()) return false;
-        Item item = knife.getItem();
+        Item item = throwingKnifeItem();
+        if (item == null) return false;
         for (int slot = 0; slot < player.getInventory().getContainerSize(); slot++) {
             if (player.getInventory().getItem(slot).is(item)) return true;
         }
@@ -113,19 +130,29 @@ public final class SwiftWindComponent implements RoleComponent {
             }
         } catch (Throwable ignored) {}
         try {
-            if (player.level() != null && !player.level().getEntitiesOfClass(
-                    org.agmas.noellesroles.content.entity.ThrowingKnifeEntity.class,
-                    player.getBoundingBox().inflate(64.0D),
-                    entity -> entity.isAlive() && player.equals(entity.getOwner())).isEmpty()) {
+            var trackedRef = TRACKED_INFLIGHT_KNIFE.get(player);
+            net.minecraft.world.entity.Entity tracked = trackedRef == null ? null : trackedRef.get();
+            if (tracked != null && tracked.isAlive() && !tracked.isRemoved() && tracked.level() == player.level()) {
                 return true;
             }
+            if (player.level() != null) {
+                var knives = player.level().getEntitiesOfClass(
+                        org.agmas.noellesroles.content.entity.ThrowingKnifeEntity.class,
+                        player.getBoundingBox().inflate(64.0D),
+                        entity -> entity.isAlive() && player.equals(entity.getOwner()));
+                if (!knives.isEmpty()) {
+                    TRACKED_INFLIGHT_KNIFE.put(player, new java.lang.ref.WeakReference<>(knives.getFirst()));
+                    return true;
+                }
+            }
+            TRACKED_INFLIGHT_KNIFE.remove(player);
         } catch (Throwable ignored) {}
         return false;
     }
 
     public static void refreshPsychoKnifeCooldown(Player player) {
-        ItemStack knife = HabiRoleItems.lookupItem(HabiRoleItems.THROWING_KNIFE_ID, 1);
-        if (!knife.isEmpty()) player.getCooldowns().removeCooldown(knife.getItem());
+        Item item = throwingKnifeItem();
+        if (item != null) player.getCooldowns().removeCooldown(item);
     }
 
     public static boolean isPsychoActive(Player player) {
@@ -270,14 +297,17 @@ public final class SwiftWindComponent implements RoleComponent {
 
     @Override
     public void init() {
-        killCount = 0;
-        knifeKills = 0;
-        sync();
+        clear();
     }
 
     @Override
     public void clear() {
-        init();
+        if (killCount == 0 && knifeKills == 0) {
+            return;
+        }
+        killCount = 0;
+        knifeKills = 0;
+        sync();
     }
 
     public void sync() {

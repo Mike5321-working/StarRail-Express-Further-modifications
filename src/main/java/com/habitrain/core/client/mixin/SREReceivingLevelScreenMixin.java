@@ -48,7 +48,6 @@ public abstract class SREReceivingLevelScreenMixin extends Screen {
 
     @Inject(method = "init", at = @At("HEAD"))
     private void habitrain$onInit(CallbackInfo ci) {
-        HabiLoadingScreenTextures.registerTextures(this.minecraft);
         HabiBootSession.getInstance().onLeaveTitleFlow();
         if (this.habitrain$recvTracker == null) {
             this.habitrain$recvTracker = new HabiRealProgressTracker(HabiRealProgressTracker.WORLD_STAGES);
@@ -130,7 +129,7 @@ public abstract class SREReceivingLevelScreenMixin extends Screen {
             )
     )
     private void habitrain$renderWorldLoadingBackground(FrameAnimationRenderer instance, GuiGraphics g, int screenWidth, int screenHeight, float delta, float overallAlpha) {
-        HabiLoadingScreenTextures.registerTextures(this.minecraft);
+        HabiLoadingScreenTextures.registerWorldLoadingTexture(this.minecraft);
         RenderSystem.enableBlend();
         RenderSystem.defaultBlendFunc();
         g.setColor(1.0F, 1.0F, 1.0F, overallAlpha);

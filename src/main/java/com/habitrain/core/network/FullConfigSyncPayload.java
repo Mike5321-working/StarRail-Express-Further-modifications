@@ -82,9 +82,17 @@ public class FullConfigSyncPayload implements CustomPacketPayload {
     }
 
     public static void broadcastToAll(MinecraftServer server) {
+        broadcastToAllExcept(server, null);
+    }
+
+    public static void broadcastToAllExcept(MinecraftServer server,
+                                            @org.jetbrains.annotations.Nullable ServerPlayer excluded) {
         String json = ConfigManager.getInstance().authoritativeSyncJson();
         FullConfigSyncPayload payload = new FullConfigSyncPayload(json);
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (excluded != null && player == excluded) {
+                continue;
+            }
             ServerPlayNetworking.send(player, payload);
         }
     }

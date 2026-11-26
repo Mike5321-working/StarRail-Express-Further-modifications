@@ -64,6 +64,17 @@ public final class IdiotService {
             if (!published) reset(level.getServer());
         });
         ServerTickEvents.END_SERVER_TICK.register(IdiotService::tick);
+        ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> {
+            ServerPlayer player = handler.player;
+            if (player != null && !active(player)) {
+                modifier(player, SLOW, 0);
+                modifier(player, SPEED, 0);
+                MatchPhase phase = MatchStateApi.phase(player.level());
+                if (phase != MatchPhase.INITIATING && phase != MatchPhase.STARTING) {
+                    removeEggs(player);
+                }
+            }
+        });
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> clearPlayer(handler.player));
         ServerLifecycleEvents.SERVER_STOPPING.register(IdiotService::reset);
     }
@@ -81,9 +92,12 @@ public final class IdiotService {
     public static boolean isEgg(ItemStack stack) {
         return stack != null && !stack.isEmpty() && stack.getItem() instanceof IdiotEggItem;
     }
+    @SuppressWarnings("deprecation")
     public static boolean boundTo(ItemStack stack, Player player) {
         if (!isEgg(stack)) return false;
-        CompoundTag tag = stack.getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY).copyTag();
+        CustomData data = stack.get(DataComponents.CUSTOM_DATA);
+        if (data == null) return false;
+        CompoundTag tag = data.getUnsafe();
         return tag.hasUUID("idiotOwner") && tag.getUUID("idiotOwner").equals(player.getUUID())
                 && tag.hasUUID("idiotRound") && tag.getUUID("idiotRound").equals(round);
     }
@@ -194,17 +208,28 @@ public final class IdiotService {
     }
 
     private static void tick(MinecraftServer server) {
-        prune();
+        if (!EGGS.isEmpty() || !CHICKS.isEmpty()) prune();
         long tick = server.getTickCount();
-        PROTECTION.values().removeIf(until -> until <= tick);
+        if (!PROTECTION.isEmpty()) PROTECTION.values().removeIf(until -> until <= tick);
+        boolean anyActiveMatch = false;
+        for (var level : server.getAllLevels()) {
+            if (MatchStateApi.phase(level) == MatchPhase.ACTIVE) {
+                anyActiveMatch = true;
+                break;
+            }
+        }
+        if (!anyActiveMatch && STATES.isEmpty() && SLOWED.isEmpty() && EGGS.isEmpty() && CHICKS.isEmpty()) {
+            return;
+        }
         for (ServerPlayer player : server.getPlayerList().getPlayers()) {
             UUID id = player.getUUID();
-            if (SLOWED.containsKey(id)) {
-                if (SLOWED.get(id) <= tick || !participant(player)) {
+            Long slowedUntil = SLOWED.get(id);
+            if (slowedUntil != null) {
+                if (slowedUntil <= tick || !participant(player)) {
                     modifier(player, SLOW, 0); SLOWED.remove(id);
                 } else modifier(player, SLOW, player.hasEffect(MobEffects.MOVEMENT_SLOWDOWN) ? 0 : -.15);
-            } else modifier(player, SLOW, 0); // also removes stale saved modifiers after restart
-            if (active(player)) {
+            }
+            if (anyActiveMatch && active(player)) {
                 State state = STATES.computeIfAbsent(id, ignored -> new State());
                 if (tick % 5 == 0 || !state.equipped) { ensureEgg(player); state.equipped = true; }
                 updateSpeed(player, state);
@@ -212,9 +237,14 @@ public final class IdiotService {
             } else {
                 State state = STATES.get(id);
                 if (state != null && state.equipped) clearPlayer(player);
-                modifier(player, SPEED, 0);
-                if (tick % 5 == 0 && MatchStateApi.phase(player.level()) != MatchPhase.INITIATING
-                        && MatchStateApi.phase(player.level()) != MatchPhase.STARTING) removeEggs(player);
+                else if (state != null && state.boostUntil > 0) {
+                    state.boostUntil = 0;
+                    modifier(player, SPEED, 0);
+                }
+                if (anyActiveMatch && tick % 5 == 0) {
+                    MatchPhase phase = MatchStateApi.phase(player.level());
+                    if (phase != MatchPhase.INITIATING && phase != MatchPhase.STARTING) removeEggs(player);
+                }
             }
         }
     }
@@ -228,11 +258,16 @@ public final class IdiotService {
         var attribute = player.getAttribute(Attributes.MOVEMENT_SPEED);
         if (attribute == null) return;
         var previous = attribute.getModifier(id);
+        if (amount == 0) {
+            if (previous != null) attribute.removeModifier(id);
+            return;
+        }
         if (previous != null && Math.abs(previous.amount() - amount) < .000001) return;
-        attribute.removeModifier(id);
-        if (amount != 0) attribute.addTransientModifier(new AttributeModifier(id, amount, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL));
+        if (previous != null) attribute.removeModifier(id);
+        attribute.addTransientModifier(new AttributeModifier(id, amount, AttributeModifier.Operation.ADD_MULTIPLIED_TOTAL));
     }
 
+    @SuppressWarnings("deprecation")
     private static void ensureEgg(ServerPlayer player) {
         boolean found = false, changed = false;
         List<ItemStack> stacks = new ArrayList<>();
@@ -240,8 +275,9 @@ public final class IdiotService {
         stacks.add(player.containerMenu.getCarried());
         for (ItemStack stack : stacks) {
             if (!isEgg(stack)) continue;
-            CompoundTag tag = stack.getOrDefault(DataComponents.CUSTOM_DATA, CustomData.EMPTY).copyTag();
-            if (!found && (boundTo(stack, player) || !tag.contains("idiotOwner"))) {
+            CustomData data = stack.get(DataComponents.CUSTOM_DATA);
+            boolean hasOwner = data != null && data.getUnsafe().contains("idiotOwner");
+            if (!found && (boundTo(stack, player) || !hasOwner)) {
                 if (!boundTo(stack, player) || stack.getCount() != 1) { bind(stack, player); changed = true; }
                 found = true;
             } else { stack.setCount(0); changed = true; }

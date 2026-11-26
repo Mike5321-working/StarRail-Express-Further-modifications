@@ -128,10 +128,13 @@ public final class SceneAssetStore implements SceneAssetBridge {
     }
 
     /**
-     * 原子保存新生成的资产文件并更新索引。
+     * 原子保存新生成的资产文件并更新索引。哈希校验与大文件写盘在锁外执行，避免阻塞主线程 tick。
      */
-    public synchronized boolean saveAsset(String mapKey, byte[] compressedBytes, SceneAssetDescriptor descriptor) {
-        File storage = this.storageDir;
+    public boolean saveAsset(String mapKey, byte[] compressedBytes, SceneAssetDescriptor descriptor) {
+        File storage;
+        synchronized (this) {
+            storage = this.storageDir;
+        }
         if (storage == null || compressedBytes == null || descriptor == null || !descriptor.isValid()
                 || compressedBytes.length != descriptor.compressedSize()) {
             return false;
@@ -142,18 +145,19 @@ public final class SceneAssetStore implements SceneAssetBridge {
             return false;
         }
 
-        // 先校验哈希再落盘，防止不合法字节写入磁盘
+        // 先在锁外校验哈希并落盘，防止不合法字节写入磁盘及持锁阻塞主线程
         String verifyHash = SceneAssetCodec.calculateSha256(compressedBytes);
         if (!verifyHash.equalsIgnoreCase(sha256)) {
             LOGGER.error("资产写盘校验失败: 期望={}, 实际={}", sha256, verifyHash);
             return false;
         }
 
+        File tempFile = null;
         try {
             if (!storage.exists()) storage.mkdirs();
 
             File targetFile = new File(storage, sha256 + ".hscene");
-            File tempFile = new File(storage, sha256 + ".tmp." + System.nanoTime());
+            tempFile = new File(storage, sha256 + ".tmp." + Thread.currentThread().threadId() + "." + System.nanoTime());
 
             try (FileOutputStream fos = new FileOutputStream(tempFile)) {
                 fos.write(compressedBytes);
@@ -167,25 +171,39 @@ public final class SceneAssetStore implements SceneAssetBridge {
             } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
                 Files.move(tempFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
+            tempFile = null;
 
-            SceneAssetDescriptor previous = mapIndex.put(normalizedMapKey, descriptor);
-            if (!saveIndex()) {
-                if (previous == null) mapIndex.remove(normalizedMapKey);
-                else mapIndex.put(normalizedMapKey, previous);
-                return false;
+            String unreferencedOldHash = null;
+            synchronized (this) {
+                if (this.storageDir != storage) {
+                    return false;
+                }
+                SceneAssetDescriptor previous = mapIndex.put(normalizedMapKey, descriptor);
+                if (!saveIndex()) {
+                    if (previous == null) mapIndex.remove(normalizedMapKey);
+                    else mapIndex.put(normalizedMapKey, previous);
+                    return false;
+                }
+                // 直接覆盖发布时废弃旧增量补丁，并回收不再被任何资产键引用的旧 .hscene 文件
+                SceneDeltaStore.getInstance().discard(normalizedMapKey);
+                if (previous != null && !previous.sha256().equalsIgnoreCase(sha256)) {
+                    unreferencedOldHash = previous.sha256();
+                }
+                indexRevision++;
             }
-            // 直接覆盖发布时废弃旧增量补丁，并回收不再被任何资产键引用的旧 .hscene 文件
-            SceneDeltaStore.getInstance().discard(normalizedMapKey);
-            if (previous != null && !previous.sha256().equalsIgnoreCase(sha256)) {
-                deleteUnreferencedAssetFile(previous.sha256());
+            if (unreferencedOldHash != null) {
+                deleteUnreferencedAssetFile(unreferencedOldHash);
             }
-            indexRevision++;
             LOGGER.info("成功发布移动场景资产: mapKey={}, sha256={}, 大小={} bytes",
                     normalizedMapKey, descriptor.shortHash(), compressedBytes.length);
             return true;
         } catch (Exception e) {
             LOGGER.error("保存场景资产失败: mapKey=" + normalizedMapKey, e);
             return false;
+        } finally {
+            if (tempFile != null) {
+                try { Files.deleteIfExists(tempFile.toPath()); } catch (IOException ignored) {}
+            }
         }
     }
 
@@ -447,11 +465,20 @@ public final class SceneAssetStore implements SceneAssetBridge {
         return !retiredAssets.isEmpty();
     }
 
-    synchronized void collectRetiredAssets(Set<String> activeHashes) {
-        for (String hash : retiredAssets.keySet()) {
-            if (activeHashes.contains(hash)) continue;
-            retiredAssets.remove(hash);
-            deleteUnreferencedAssetFile(hash);
+    void collectRetiredAssets(Set<String> activeHashes) {
+        List<String> toDelete = null;
+        synchronized (this) {
+            for (String hash : retiredAssets.keySet()) {
+                if (activeHashes.contains(hash)) continue;
+                retiredAssets.remove(hash);
+                if (toDelete == null) toDelete = new ArrayList<>();
+                toDelete.add(hash);
+            }
+        }
+        if (toDelete != null) {
+            for (String hash : toDelete) {
+                deleteUnreferencedAssetFile(hash);
+            }
         }
     }
 

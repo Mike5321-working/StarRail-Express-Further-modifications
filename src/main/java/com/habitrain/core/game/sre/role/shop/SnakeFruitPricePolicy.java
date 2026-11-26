@@ -18,21 +18,55 @@ public final class SnakeFruitPricePolicy {
         return (int) Long.remainderUnsigned(value ^ (value >>> 31), MAX_PRICE + 1L);
     }
 
-    /** Derives a one-time per-frame token from the server's private salt via SHA-256 so future frames cannot be predicted. */
-    public static long frameSeed(long masterSeed, long secretSalt, int frame) {
-        if (secretSalt == 0L) return masterSeed;
+    private static final ThreadLocal<java.security.MessageDigest> SHA256_TL = ThreadLocal.withInitial(() -> {
         try {
-            java.security.MessageDigest sha256 = java.security.MessageDigest.getInstance("SHA-256");
-            byte[] input = new byte[20];
-            java.nio.ByteBuffer.wrap(input)
-                    .putLong(masterSeed)
-                    .putLong(secretSalt)
-                    .putInt(frame);
-            byte[] digest = sha256.digest(input);
-            return java.nio.ByteBuffer.wrap(digest, 0, 8).getLong();
+            return java.security.MessageDigest.getInstance("SHA-256");
         } catch (java.security.NoSuchAlgorithmException e) {
             throw new AssertionError("SHA-256 unavailable", e);
         }
+    });
+    private static final ThreadLocal<byte[]> FRAME_INPUT_TL = ThreadLocal.withInitial(() -> new byte[20]);
+
+    /** Derives a one-time per-frame token from the server's private salt via SHA-256 so future frames cannot be predicted. */
+    public static long frameSeed(long masterSeed, long secretSalt, int frame) {
+        if (secretSalt == 0L) return masterSeed;
+        java.security.MessageDigest sha256 = SHA256_TL.get();
+        sha256.reset();
+        byte[] input = FRAME_INPUT_TL.get();
+        putLongBE(input, 0, masterSeed);
+        putLongBE(input, 8, secretSalt);
+        putIntBE(input, 16, frame);
+        byte[] digest = sha256.digest(input);
+        return getLongBE(digest, 0);
+    }
+
+    private static void putLongBE(byte[] buf, int off, long v) {
+        buf[off] = (byte) (v >>> 56);
+        buf[off + 1] = (byte) (v >>> 48);
+        buf[off + 2] = (byte) (v >>> 40);
+        buf[off + 3] = (byte) (v >>> 32);
+        buf[off + 4] = (byte) (v >>> 24);
+        buf[off + 5] = (byte) (v >>> 16);
+        buf[off + 6] = (byte) (v >>> 8);
+        buf[off + 7] = (byte) v;
+    }
+
+    private static void putIntBE(byte[] buf, int off, int v) {
+        buf[off] = (byte) (v >>> 24);
+        buf[off + 1] = (byte) (v >>> 16);
+        buf[off + 2] = (byte) (v >>> 8);
+        buf[off + 3] = (byte) v;
+    }
+
+    private static long getLongBE(byte[] buf, int off) {
+        return ((long) buf[off] << 56)
+                | ((buf[off + 1] & 0xFFL) << 48)
+                | ((buf[off + 2] & 0xFFL) << 40)
+                | ((buf[off + 3] & 0xFFL) << 32)
+                | ((buf[off + 4] & 0xFFL) << 24)
+                | ((buf[off + 5] & 0xFFL) << 16)
+                | ((buf[off + 6] & 0xFFL) << 8)
+                | (buf[off + 7] & 0xFFL);
     }
 
     public enum Faction { GOOD, KILLER, NEUTRAL }

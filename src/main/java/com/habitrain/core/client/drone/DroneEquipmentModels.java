@@ -249,9 +249,14 @@ public final class DroneEquipmentModels {
             int packedLight
     ) {
         if (stack == null || stack.isEmpty()) return false;
-        boolean isTerminal = HabiRoleItems.isDroneTerminal(stack);
-        boolean isBattery = !isTerminal && HabiRoleItems.isDroneBattery(stack);
-        boolean isResupply = !isTerminal && !isBattery && HabiRoleItems.hasFlag(stack, HabiRoleItems.TAG_DRONE_RESUPPLY);
+        boolean isCompass = stack.is(net.minecraft.world.item.Items.RECOVERY_COMPASS);
+        boolean isShard = !isCompass && stack.is(net.minecraft.world.item.Items.ECHO_SHARD);
+        if (!isCompass && !isShard) {
+            return false;
+        }
+        boolean isTerminal = isCompass && HabiRoleItems.hasFlag(stack, HabiRoleItems.TAG_DRONE_TERMINAL);
+        boolean isBattery = isShard && HabiRoleItems.hasFlag(stack, HabiRoleItems.TAG_DRONE_BATTERY);
+        boolean isResupply = isCompass && !isTerminal && HabiRoleItems.hasFlag(stack, HabiRoleItems.TAG_DRONE_RESUPPLY);
         if (!isTerminal && !isBattery && !isResupply) {
             return false;
         }

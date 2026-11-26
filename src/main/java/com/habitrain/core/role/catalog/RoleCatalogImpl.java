@@ -220,34 +220,74 @@ public final class RoleCatalogImpl implements RoleCatalogApi {
         };
     }
 
-    @Override
-    public RoleKey canonicalize(ResourceLocation id) {
+    /** Zero-allocation canonical id resolution for hot-path identity checks. */
+    public ResourceLocation canonicalizeId(ResourceLocation id) {
         Objects.requireNonNull(id, "id");
         RoleSnapshot frozen = RoleSnapshotManager.INSTANCE.current();
         if (frozen != null) {
-            return frozen.canonicalize(id);
+            return frozen.canonicalizeId(id);
         }
-        ResourceLocation cur = id;
+        ResourceLocation next = resolveNextCanonicalId(id);
+        if (next == null) {
+            return id;
+        }
+        ResourceLocation second = resolveNextCanonicalId(next);
+        if (second == null) {
+            return next;
+        }
         Set<ResourceLocation> seen = new java.util.HashSet<>();
+        seen.add(id);
+        seen.add(next);
+        ResourceLocation cur = second;
         while (seen.add(cur)) {
-            ResourceLocation alias = RoleExtensionRegistry.INSTANCE.resolveAlias(cur);
-            if (alias != null && !alias.equals(cur)) {
-                cur = alias;
-                continue;
+            ResourceLocation step = resolveNextCanonicalId(cur);
+            if (step == null) {
+                break;
             }
-            RoleReplacement repl = RoleExtensionRegistry.INSTANCE.replacementFor(cur);
-            if (repl != null && RoleExtensionRegistry.INSTANCE.isReplacementActive(cur)) {
-                if (repl.identity() == ReplacementIdentity.NEW_ID_WITH_ALIAS) {
-                    ResourceLocation next = repl.replacement().key().location();
-                    if (!next.equals(cur)) {
-                        cur = next;
-                        continue;
-                    }
+            cur = step;
+        }
+        return cur;
+    }
+
+    /** Fast-path canonical identity comparison avoiding RoleKey/HashSet allocations. */
+    public boolean sameCanonicalId(ResourceLocation have, ResourceLocation want) {
+        if (have.equals(want)) {
+            return true;
+        }
+        RoleSnapshot frozen = RoleSnapshotManager.INSTANCE.current();
+        if (frozen != null) {
+            if (frozen.aliases().isEmpty()) {
+                return false;
+            }
+            return frozen.canonicalizeId(have).equals(frozen.canonicalizeId(want));
+        }
+        if (RoleExtensionRegistry.INSTANCE.getAliases().isEmpty()
+                && RoleExtensionRegistry.INSTANCE.getReplacements().isEmpty()) {
+            return false;
+        }
+        return canonicalizeId(have).equals(canonicalizeId(want));
+    }
+
+    private static @org.jetbrains.annotations.Nullable ResourceLocation resolveNextCanonicalId(ResourceLocation cur) {
+        ResourceLocation alias = RoleExtensionRegistry.INSTANCE.resolveAlias(cur);
+        if (alias != null && !alias.equals(cur)) {
+            return alias;
+        }
+        RoleReplacement repl = RoleExtensionRegistry.INSTANCE.replacementFor(cur);
+        if (repl != null && RoleExtensionRegistry.INSTANCE.isReplacementActive(cur)) {
+            if (repl.identity() == ReplacementIdentity.NEW_ID_WITH_ALIAS) {
+                ResourceLocation next = repl.replacement().key().location();
+                if (!next.equals(cur)) {
+                    return next;
                 }
             }
-            break;
         }
-        return RoleKey.of(cur);
+        return null;
+    }
+
+    @Override
+    public RoleKey canonicalize(ResourceLocation id) {
+        return RoleKey.of(canonicalizeId(id));
     }
 
     @Override

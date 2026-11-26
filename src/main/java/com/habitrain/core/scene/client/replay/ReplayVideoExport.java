@@ -84,6 +84,8 @@ final class ReplayVideoExport {
     private final @Nullable Path ffmpegExecutable;
     private final boolean fullBody;
     private final UUID roundId;
+    private final boolean useBgra;
+    private final int bytesPerPixel;
     private final int frameBytes;
     final ReplayExportBackend backend;
     final ReplayVisualDownload visuals;
@@ -242,7 +244,9 @@ final class ReplayVideoExport {
         this.music = this.options.musicLevel();
         this.focusPlayer = this.options.focusPlayer();
         this.ffmpegExecutable = compress ? Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable") : null;
-        this.frameBytes = resolution.frameBytes();
+        this.useBgra = compress;
+        this.bytesPerPixel = useBgra ? 4 : 3;
+        this.frameBytes = Math.multiplyExact(Math.multiplyExact(resolution.width, resolution.height), bytesPerPixel);
         if (snapshot.asset() != null) ReplayDioramaMesh.retry(snapshot.asset().fingerprint);
     }
 
@@ -392,7 +396,9 @@ final class ReplayVideoExport {
                     cameraStage = new ReplayVideoCamera.Stage(ReplayBoardRenderer.trayHalfSize(model), model.mapW, model.mapD, model.mapH,
                             mesh == null ? (float)model.mapH : (float) Math.max(model.mapH, mesh.replayCeiling() * model.scale),
                             ReplayActorSizing.baseSize(model.scale));
-                    var audio = ReplayVideoAudioRenderer.prepareStreaming(client, directory(client), film, voice, film.frames(FPS));
+                    Path replayDir = directory(client);
+                    sweepStaleTempFilesAsync(replayDir);
+                    var audio = ReplayVideoAudioRenderer.prepareStreaming(client, replayDir, film, voice, film.frames(FPS));
                     audioTask = new java.util.concurrent.FutureTask<>(audio::get);
                     Thread.ofPlatform().daemon().name("habitrain-replay-audio-mix").start(audioTask);
                     return;
@@ -413,7 +419,7 @@ final class ReplayVideoExport {
                 String focusSlug = focusData == null ? null : sanitizeFileSlug(focusData.name());
                 String modeSlug = sanitizeFileSlug(film.mode().id);
                 String combinedSlug = focusSlug == null ? modeSlug : (modeSlug == null ? focusSlug : modeSlug + "-" + focusSlug);
-                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress, quality,
+                encoder = new Encoder(directory(client), view.replay().roundId(), resolution, compress, useBgra, quality,
                         ffmpegExecutable, film.frames(FPS), mixedPcm, combinedSlug);
                 stagedAudioPcm = null; // Ownership transferred to Encoder
                 encoder.thread.start();
@@ -550,10 +556,11 @@ final class ReplayVideoExport {
 
     private void drainPbo(int pboId, VideoFrame output) throws IOException {
         int prevPackBuffer = GL11.glGetInteger(GL21.GL_PIXEL_PACK_BUFFER_BINDING);
+        boolean verifyGl = captured == 0;
         try {
-            clearGlErrors();
+            if (verifyGl) clearGlErrors();
             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pboId);
-            checkGl("bind pending pixel pack buffer");
+            if (verifyGl) checkGl("bind pending pixel pack buffer");
             ByteBuffer mapped = GL30.glMapBufferRange(GL21.GL_PIXEL_PACK_BUFFER, 0L, frameBytes, GL30.GL_MAP_READ_BIT);
             if (mapped == null) throw new IOException("Could not map pending pixel pack buffer");
             boolean valid;
@@ -563,7 +570,7 @@ final class ReplayVideoExport {
                 valid = GL15.glUnmapBuffer(GL21.GL_PIXEL_PACK_BUFFER);
             }
             if (!valid) throw new IOException("Pending pixel pack buffer was corrupted");
-            checkGl("read pending pixel pack buffer");
+            if (verifyGl) checkGl("read pending pixel pack buffer");
         } finally {
             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, prevPackBuffer);
         }
@@ -591,23 +598,26 @@ final class ReplayVideoExport {
         int rowLength = GL11.glGetInteger(GL11.GL_PACK_ROW_LENGTH);
         int skipRows = GL11.glGetInteger(GL11.GL_PACK_SKIP_ROWS);
         int skipPixels = GL11.glGetInteger(GL11.GL_PACK_SKIP_PIXELS);
+        boolean verifyGl = pboId == 0 || submitted == 0;
+        int pixelFormat = useBgra ? GL12.GL_BGRA : GL12.GL_BGR;
+        int packAlign = useBgra ? 4 : 1;
         try {
-            clearGlErrors();
+            if (verifyGl) clearGlErrors();
             GlStateManager._glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, target.frameBufferId);
             GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, pboId);
-            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1);
+            GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, packAlign);
             GL11.glPixelStorei(GL11.GL_PACK_ROW_LENGTH, 0);
             GL11.glPixelStorei(GL11.GL_PACK_SKIP_ROWS, 0);
             GL11.glPixelStorei(GL11.GL_PACK_SKIP_PIXELS, 0);
-            checkGl("prepare replay readback");
+            if (verifyGl) checkGl("prepare replay readback");
             if (pboId != 0) {
-                GL11.glReadPixels(0, 0, resolution.width, resolution.height, GL12.GL_BGR, GL11.GL_UNSIGNED_BYTE, 0L);
+                GL11.glReadPixels(0, 0, resolution.width, resolution.height, pixelFormat, GL11.GL_UNSIGNED_BYTE, 0L);
             } else {
                 if (pixels == null) pixels = MemoryUtil.memAlloc(frameBytes);
                 pixels.clear();
-                GL11.glReadPixels(0, 0, resolution.width, resolution.height, GL12.GL_BGR, GL11.GL_UNSIGNED_BYTE, pixels);
+                GL11.glReadPixels(0, 0, resolution.width, resolution.height, pixelFormat, GL11.GL_UNSIGNED_BYTE, pixels);
             }
-            checkGl("read replay pixels");
+            if (verifyGl) checkGl("read replay pixels");
             if (output != null) pixels.get(0, output.data);
         } catch (IOException | RuntimeException failure) {
             if (pboId != 0) throw new PboReadException(failure);
@@ -833,12 +843,32 @@ final class ReplayVideoExport {
     }
 
     void releaseRenderResources() {
-        if (audioTask != null) { audioTask.cancel(true); audioTask = null; }
+        if (audioTask != null) {
+            var task = audioTask;
+            audioTask = null;
+            boolean alreadyDone = task.isDone() && !task.isCancelled();
+            task.cancel(true);
+            if (alreadyDone) {
+                try {
+                    Path finishedPcm = task.get();
+                    if (finishedPcm != null) deleteTempFileAsync(finishedPcm);
+                } catch (Exception ignored) {}
+            }
+        }
         if (stagedAudioPcm != null) {
-            try { Files.deleteIfExists(stagedAudioPcm); } catch (IOException ignored) {}
+            Path staged = stagedAudioPcm;
             stagedAudioPcm = null;
+            deleteTempFileAsync(staged);
+        }
+        var rawAsset = snapshot != null ? snapshot.asset() : null;
+        if (reviewAsset != null && reviewAsset != rawAsset) {
+            ReplayDioramaMesh.evictSlot(reviewAsset.fingerprint);
+        }
+        if (staticExportAsset != null && staticExportAsset != rawAsset) {
+            ReplayDioramaMesh.evictIfUnselected(staticExportAsset.fingerprint);
         }
         snapshot = null;
+        if (visuals != null) visuals.clear();
         if (foregroundWorld != null) { foregroundWorld.detach(Minecraft.getInstance()); foregroundWorld = null; }
         dynamicWorld = null;
         staticExportAsset = null;
@@ -857,6 +887,40 @@ final class ReplayVideoExport {
         pendingPbo = -1;
         deletePbos();
         if (pixels != null) { MemoryUtil.memFree(pixels); pixels = null; }
+        if (RenderSystem.isOnRenderThread()) {
+            ReplayVideoCanvas.releaseTextures(Minecraft.getInstance());
+            ReplayPovSceneRenderer.releaseBuffers();
+        }
+    }
+
+    private static void deleteTempFileAsync(Path path) {
+        try {
+            if (Files.deleteIfExists(path)) return;
+        } catch (IOException ignored) {
+            net.minecraft.Util.ioPool().execute(() -> {
+                try { deleteFileWithRetry(path); } catch (IOException ignoredAgain) {}
+            });
+        }
+    }
+
+    private static void sweepStaleTempFilesAsync(Path directory) {
+        net.minecraft.Util.ioPool().execute(() -> {
+            if (!Files.isDirectory(directory)) return;
+            long cutoffMs = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(2);
+            try (var stream = Files.newDirectoryStream(directory)) {
+                for (Path file : stream) {
+                    String name = file.getFileName() != null ? file.getFileName().toString() : "";
+                    boolean isStaleTemp = (name.startsWith(".replay-stream-audio-") && name.endsWith(".pcm"))
+                            || (name.startsWith(".replay-") && name.endsWith(".part"));
+                    if (!isStaleTemp) continue;
+                    try {
+                        if (Files.isRegularFile(file) && Files.getLastModifiedTime(file).toMillis() < cutoffMs) {
+                            Files.deleteIfExists(file);
+                        }
+                    } catch (IOException ignored) {}
+                }
+            } catch (IOException ignored) {}
+        });
     }
 
     private static void destroyTarget(@Nullable TextureTarget fbo) {
@@ -974,34 +1038,39 @@ final class ReplayVideoExport {
 
     /** Lateral RGB split for impact frames, on bottom-up BGR rows. */
     static void aberrate(byte[] bgr, byte[] row, int width, int height, float strength) {
+        aberrate(bgr, row, width, height, 3, strength);
+    }
+
+    /** Lateral RGB split for impact frames, on bottom-up BGR (3 Bpp) or BGRA (4 Bpp) rows. */
+    static void aberrate(byte[] pixels, byte[] row, int width, int height, int bpp, float strength) {
         int shift = Math.round(strength * 7f * width / ReplayVideoCanvas.DESIGN_WIDTH);
-        if (shift <= 0 || width <= 0 || height <= 0) return;
-        int stride = width * 3;
+        if (shift <= 0 || width <= 0 || height <= 0 || bpp < 3) return;
+        int stride = width * bpp;
         int clampedShift = Math.min(shift, width - 1);
-        int byteShift = clampedShift * 3;
+        int byteShift = clampedShift * bpp;
         int rightStart = width - clampedShift;
         int leftLimit = Math.min(clampedShift, rightStart);
-        int lastRedOffset = stride - 1;
+        int lastRedOffset = stride - bpp + 2;
         for (int y = 0; y < height; y++) {
             int base = y * stride;
-            System.arraycopy(bgr, base, row, 0, stride);
+            System.arraycopy(pixels, base, row, 0, stride);
             byte firstBlue = row[0];
             byte lastRed = row[lastRedOffset];
             int dst = base;
-            for (int x = 0; x < leftLimit; x++, dst += 3) {
-                bgr[dst] = firstBlue;
-                bgr[dst + 2] = row[(x + clampedShift) * 3 + 2];
+            for (int x = 0; x < leftLimit; x++, dst += bpp) {
+                pixels[dst] = firstBlue;
+                pixels[dst + 2] = row[(x + clampedShift) * bpp + 2];
             }
             int midSrcBlue = 0;
             int midSrcRed = byteShift * 2 + 2;
-            for (int x = leftLimit; x < rightStart; x++, dst += 3, midSrcBlue += 3, midSrcRed += 3) {
-                bgr[dst] = row[midSrcBlue];
-                bgr[dst + 2] = row[midSrcRed];
+            for (int x = leftLimit; x < rightStart; x++, dst += bpp, midSrcBlue += bpp, midSrcRed += bpp) {
+                pixels[dst] = row[midSrcBlue];
+                pixels[dst + 2] = row[midSrcRed];
             }
-            for (int x = rightStart; x < width; x++, dst += 3) {
-                int blueIdx = x >= shift ? (x - shift) * 3 : 0;
-                bgr[dst] = row[blueIdx];
-                bgr[dst + 2] = lastRed;
+            for (int x = rightStart; x < width; x++, dst += bpp) {
+                int blueIdx = x >= shift ? (x - shift) * bpp : 0;
+                pixels[dst] = row[blueIdx];
+                pixels[dst + 2] = lastRed;
             }
         }
     }
@@ -1017,6 +1086,7 @@ final class ReplayVideoExport {
         final int frames;
         final ReplayExportResolution resolution;
         final boolean compress;
+        final boolean useBgra;
         final ReplayExportQuality quality;
         final @Nullable Path ffmpegExecutable;
         @Nullable Path preMixedAudioPcm;
@@ -1031,12 +1101,13 @@ final class ReplayVideoExport {
         private volatile @Nullable ReplayVideoWriter activeWriter;
         private boolean committing;
 
-        Encoder(Path directory, UUID round, ReplayExportResolution resolution, boolean compress,
+        Encoder(Path directory, UUID round, ReplayExportResolution resolution, boolean compress, boolean useBgra,
                 ReplayExportQuality quality, @Nullable Path ffmpegExecutable, int frames,
                 @Nullable Path preMixedAudioPcm, @Nullable String focusSlug) {
             this.directory = directory;
             this.resolution = resolution;
             this.compress = compress;
+            this.useBgra = useBgra;
             this.quality = quality == null ? ReplayExportQuality.DEFAULT : quality;
             this.ffmpegExecutable = ffmpegExecutable;
             this.frames = frames;
@@ -1049,7 +1120,8 @@ final class ReplayVideoExport {
             String focusPart = focusSlug == null || focusSlug.isBlank() ? "" : "-" + focusSlug;
             output = directory.resolve("replay-" + date + "-" + round.toString().substring(0, 8)
                     + focusPart + "-" + resolution.id + "-" + UUID.randomUUID().toString().substring(0, 8) + ext);
-            int frameBytes = resolution.frameBytes();
+            int bpp = useBgra ? 4 : 3;
+            int frameBytes = Math.multiplyExact(Math.multiplyExact(resolution.width, resolution.height), bpp);
             for (int i = 0; i < poolSize; i++) pool.add(new VideoFrame(frameBytes));
             thread.setDaemon(true);
         }
@@ -1076,14 +1148,15 @@ final class ReplayVideoExport {
             byte[] audioChunk = compress ? null : new byte[audioFrameBytes];
             InputStream aviAudioStream = null;
             try {
-                byte[] row = new byte[width * 3];
+                int bpp = useBgra ? 4 : 3;
+                byte[] row = new byte[width * bpp];
                 Files.createDirectories(directory);
                 temp = Files.createTempFile(directory, ".replay-", ".part");
                 if (!compress && preMixedAudioPcm != null && Files.isRegularFile(preMixedAudioPcm)) {
                     aviAudioStream = new BufferedInputStream(Files.newInputStream(preMixedAudioPcm), 65536);
                 }
                 try (ReplayVideoWriter writer = compress
-                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, preMixedAudioPcm, quality, false)
+                        ? new ReplayMp4Writer(ffmpegExecutable, temp, width, height, FPS, preMixedAudioPcm, quality, false, useBgra)
                         : new ReplayAviWriter(temp, width, height, FPS, true)) {
                     activeWriter = writer;
                     if (cancelled) {
@@ -1094,7 +1167,7 @@ final class ReplayVideoExport {
                         while (written < frames && !cancelled) {
                             VideoFrame frame = pending.poll(250, TimeUnit.MILLISECONDS);
                             if (frame == null) continue;
-                            if (frame.aberration > 0.02f) aberrate(frame.data, row, width, height, frame.aberration);
+                            if (frame.aberration > 0.02f) aberrate(frame.data, row, width, height, bpp, frame.aberration);
                             writer.add(frame.data);
                             if (!compress && audioChunk != null) {
                                 int filled = 0;

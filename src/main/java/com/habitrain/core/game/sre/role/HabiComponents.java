@@ -96,8 +96,7 @@ public final class HabiComponents implements EntityComponentInitializer, WorldCo
     }
 
     public static void clearAll(Player player) {
-        clearRoundComponents(player, true);
-        if (player != null) LustComponent.KEY.get(player).clear();
+        clearRoundComponents(player, true, true);
     }
 
     /**
@@ -107,13 +106,13 @@ public final class HabiComponents implements EntityComponentInitializer, WorldCo
     public static void clearLeftoverRoundStateOnJoin(Player player) {
         if (player == null) return;
         boolean keepFlowerGirl = isActiveFlowerGirl(player);
-        clearRoundComponents(player, !keepFlowerGirl);
+        clearRoundComponents(player, !keepFlowerGirl, false);
         if (isActiveRound(player)) {
             initCurrentRoundRole(player, keepFlowerGirl);
         }
     }
 
-    private static void clearRoundComponents(Player player, boolean includeFlowerGirl) {
+    private static void clearRoundComponents(Player player, boolean includeFlowerGirl, boolean forceClearLust) {
         if (player == null) return;
         try { com.habitrain.core.game.sre.role.shop.AppleShopComponent.KEY.get(player).clear(); } catch (Throwable ignored) {}
         try { CrimeScapegoatComponent.KEY.get(player).clear(); } catch (Throwable ignored) {}
@@ -128,7 +127,7 @@ public final class HabiComponents implements EntityComponentInitializer, WorldCo
         try { GreedComponent.KEY.get(player).clear(); } catch (Throwable ignored) {}
         try { GluttonyComponent.KEY.get(player).clear(); } catch (Throwable ignored) {}
         // Keep selection cooldown / revival deadline through same-round reconnects only if still Lust.
-        if (!isActiveRound(player) || !HabiRoles.isHabiRole(player, SevenSins.LUST)) {
+        if (forceClearLust || !isActiveRound(player) || !HabiRoles.isHabiRole(player, SevenSins.LUST)) {
             try { LustComponent.KEY.get(player).clear(); } catch (Throwable ignored) {}
         }
         try { SlothComponent.KEY.get(player).clear(); } catch (Throwable ignored) {}

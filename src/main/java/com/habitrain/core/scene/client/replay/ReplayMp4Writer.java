@@ -69,6 +69,13 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
     ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
                     @Nullable Path preMixedAudioPcmFile, ReplayExportQuality quality,
                     boolean deleteAudioOnClose) throws IOException {
+        this(ffmpegExecutable, path, width, height, fps, preMixedAudioPcmFile, quality, deleteAudioOnClose, false);
+    }
+
+    /** Streaming constructor supporting both 3-byte {@code bgr24} and GPU-native 4-byte {@code bgra} frames. */
+    ReplayMp4Writer(Path ffmpegExecutable, Path path, int width, int height, int fps,
+                    @Nullable Path preMixedAudioPcmFile, ReplayExportQuality quality,
+                    boolean deleteAudioOnClose, boolean bgra) throws IOException {
         Objects.requireNonNull(ffmpegExecutable, "ffmpegExecutable");
         Objects.requireNonNull(path, "path");
         ReplayExportQuality effectiveQuality = quality == null ? ReplayExportQuality.DEFAULT : quality;
@@ -78,7 +85,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         if (fps <= 0) {
             throw new IllegalArgumentException("FPS must be positive: " + fps);
         }
-        this.expectedBytes = Math.multiplyExact(Math.multiplyExact(width, height), 3);
+        this.expectedBytes = Math.multiplyExact(Math.multiplyExact(width, height), bgra ? 4 : 3);
         this.width = width;
 
         Path parent = path.toAbsolutePath().normalize().getParent();
@@ -88,7 +95,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
                 && Files.size(preMixedAudioPcmFile) >= AUDIO_CHANNELS * 2L ? preMixedAudioPcmFile : null;
         Process started = null;
         try {
-            List<String> cmd = buildCommand(ffmpegExecutable, path, width, height, fps, audioTemp, effectiveQuality);
+            List<String> cmd = buildCommand(ffmpegExecutable, path, width, height, fps, audioTemp, effectiveQuality, bgra);
             started = new ProcessBuilder(cmd)
                     .redirectErrorStream(true)
                     .start();
@@ -121,6 +128,11 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
 
     static List<String> buildCommand(Path ffmpegExecutable, Path outputPath, int width, int height, int fps,
                                      @Nullable Path audioPcmFile, ReplayExportQuality quality) {
+        return buildCommand(ffmpegExecutable, outputPath, width, height, fps, audioPcmFile, quality, false);
+    }
+
+    static List<String> buildCommand(Path ffmpegExecutable, Path outputPath, int width, int height, int fps,
+                                     @Nullable Path audioPcmFile, ReplayExportQuality quality, boolean bgra) {
         ReplayExportQuality q = quality == null ? ReplayExportQuality.DEFAULT : quality;
         List<String> cmd = new ArrayList<>(44);
         cmd.add(ffmpegExecutable.toAbsolutePath().toString());
@@ -131,7 +143,7 @@ final class ReplayMp4Writer implements ReplayVideoWriter {
         cmd.add("-f");
         cmd.add("rawvideo");
         cmd.add("-pix_fmt");
-        cmd.add("bgr24");
+        cmd.add(bgra ? "bgra" : "bgr24");
         cmd.add("-s");
         cmd.add(width + "x" + height);
         cmd.add("-r");

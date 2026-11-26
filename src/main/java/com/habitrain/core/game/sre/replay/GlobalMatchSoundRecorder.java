@@ -36,44 +36,52 @@ public final class GlobalMatchSoundRecorder {
     private static final int MAX_RAW_CUES = ReplayGameSoundData.MAX_CUES;
     private static final int FOOTSTEP_RESERVE_THRESHOLD = 24_000;
 
-    private static final ThreadLocal<Integer> SUPPRESS_DIRECT_DEPTH = ThreadLocal.withInitial(() -> 0);
+    private static final ThreadLocal<int[]> SUPPRESS_DIRECT_DEPTH = ThreadLocal.withInitial(() -> new int[1]);
     private static volatile @Nullable ActiveSession active;
 
     private GlobalMatchSoundRecorder() {}
 
+    public static boolean isRecording() {
+        return active != null;
+    }
+
     public static void enterLevelOrNotifySound() {
-        SUPPRESS_DIRECT_DEPTH.set(SUPPRESS_DIRECT_DEPTH.get() + 1);
+        if (active == null) return;
+        SUPPRESS_DIRECT_DEPTH.get()[0]++;
     }
 
     public static void exitLevelOrNotifySound() {
-        int next = SUPPRESS_DIRECT_DEPTH.get() - 1;
-        SUPPRESS_DIRECT_DEPTH.set(Math.max(0, next));
+        if (active == null) return;
+        int[] box = SUPPRESS_DIRECT_DEPTH.get();
+        if (box[0] > 0) box[0]--;
     }
 
     public static boolean isSuppressingDirectPackets() {
-        return SUPPRESS_DIRECT_DEPTH.get() > 0;
+        if (active == null) return false;
+        return SUPPRESS_DIRECT_DEPTH.get()[0] > 0;
     }
 
     public static void begin(UUID roundId, ServerLevel level, SceneBounds bounds, long activeStartGameTime) {
-        SUPPRESS_DIRECT_DEPTH.set(0);
+        SUPPRESS_DIRECT_DEPTH.get()[0] = 0;
         active = new ActiveSession(roundId, level, bounds, activeStartGameTime);
     }
 
     /** Test-only initializer without a live ServerLevel. */
     static void beginTest(UUID roundId, SceneBounds bounds) {
-        SUPPRESS_DIRECT_DEPTH.set(0);
+        SUPPRESS_DIRECT_DEPTH.get()[0] = 0;
         active = new ActiveSession(roundId, null, bounds, 0L);
     }
 
     public static void reset() {
-        SUPPRESS_DIRECT_DEPTH.set(0);
+        if (active != null) SUPPRESS_DIRECT_DEPTH.get()[0] = 0;
         active = null;
     }
 
     public static void flushTick(ServerLevel level, int matchTick) {
-        SUPPRESS_DIRECT_DEPTH.set(0);
         ActiveSession s = active;
-        if (s != null && s.level == level) {
+        if (s == null) return;
+        SUPPRESS_DIRECT_DEPTH.get()[0] = 0;
+        if (s.level == level) {
             s.flushPendingBatches(matchTick);
         }
     }

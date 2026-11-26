@@ -150,6 +150,8 @@ public final class ReplayBoardRenderer {
         nextRenderAttempt = 0;
         lastHonorsDraw = 0;
         releaseBuffers();
+        ReplayPovSceneRenderer.releaseBuffers();
+        ReplayVideoCanvas.releaseTextures(Minecraft.getInstance());
         animOriginLevel = null;
         ReplayDioramaMesh.reset();
         ReplayHeadSkins.clear();

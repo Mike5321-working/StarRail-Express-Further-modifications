@@ -115,7 +115,7 @@ public final class MvpScoreTracker {
     }
 
     private static void tick(MinecraftServer server) {
-        if (server == null || ROUNDS.isEmpty()) {
+        if (server == null || ROUNDS.isEmpty() || server.getTickCount() % 20 != 0) {
             return;
         }
         for (Map.Entry<ResourceKey<Level>, RoundState> round : ROUNDS.entrySet()) {
@@ -136,7 +136,7 @@ public final class MvpScoreTracker {
                 try {
                     if (player == null || player.serverLevel() != level
                             || (!GameUtils.isPlayerAliveAndSurvival((Player)player) && !(player.isCreative() && player.isAlive()))) continue;
-                    ++entry.getValue().survivalTicks;
+                    entry.getValue().survivalTicks += 20;
                 }
                 catch (Throwable throwable) {}
             }

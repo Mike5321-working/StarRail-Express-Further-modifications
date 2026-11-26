@@ -144,9 +144,10 @@ final class ReplayActorPainter {
             ReplayFullPlayerRenderer.PoseSpec spec = ReplayFullPlayerRenderer.poseFrom(model, actor, pose, f.replayTick);
             float charScale = size * 0.92f;
             Matrix4f m = new Matrix4f(d).translate(x, y + lift, z);
-            f.model(m, stack -> ReplayFullPlayerRenderer.renderCharacter(
-                    stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
-                    tint, LightTexture.FULL_BRIGHT, 1.18f, true));
+            f.model(m, charScale * 1.15f, -0.15f * charScale, 2.25f * charScale,
+                    stack -> ReplayFullPlayerRenderer.renderCharacter(
+                            stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
+                            tint, LightTexture.FULL_BRIGHT, 1.18f, true));
         } else {
             double moving = Math.min(1, pose.speed() / 0.12);
             float bob = (float) (Math.abs(Math.sin(f.anim * 9.0 + actor.index * 1.7)) * size * 0.15 * moving);
@@ -225,9 +226,10 @@ final class ReplayActorPainter {
                 float charScale = size * 0.72f;
                 int tint = ReplayPalette.alpha(ReplayPalette.lerp(0xFFFFFFFF, 0xFFFF7070, 1.0 - k * 0.5), alpha * (1.0 - 0.35 * k));
                 Matrix4f m = new Matrix4f(d).translate(x, y, z);
-                f.model(m, stack -> ReplayFullPlayerRenderer.renderCharacter(
-                        stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
-                        tint, LightTexture.FULL_BRIGHT, 1.10f, true));
+                f.model(m, charScale * 2.1f, -0.2f * charScale, 2.1f * charScale,
+                        stack -> ReplayFullPlayerRenderer.renderCharacter(
+                                stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
+                                tint, LightTexture.FULL_BRIGHT, 1.10f, true));
             } else {
                 float drop = (float) (k * size * 0.58);
                 float fallen = (float) (size * (1 - 0.35 * k));
@@ -247,9 +249,10 @@ final class ReplayActorPainter {
             float charScale = size * 0.68f;
             int corpseTint = ReplayPalette.alpha(ReplayPalette.scale(0xFFD6DCE8, brightness), 0.78 * alpha);
             Matrix4f m = new Matrix4f(d).translate(x, y, z);
-            f.model(m, stack -> ReplayFullPlayerRenderer.renderCharacter(
-                    stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
-                    corpseTint, LightTexture.FULL_BRIGHT, 1.06f, true));
+            f.model(m, charScale * 2.1f, -0.2f * charScale, 2.1f * charScale,
+                    stack -> ReplayFullPlayerRenderer.renderCharacter(
+                            stack, f.modelBuffers(), spec, charScale, yawOffset, f.anim,
+                            corpseTint, LightTexture.FULL_BRIGHT, 1.06f, true));
         } else {
             // Legacy tombstone fallback
             VertexConsumer fill = f.fill();
@@ -277,7 +280,7 @@ final class ReplayActorPainter {
         ResourceLocation skin = ReplayHeadSkins.skin(actor.p.id(), actor.p.name()).texture();
         Matrix4f m = new Matrix4f(frame).translate(x, y, z).rotateY((float) Math.toRadians(yawDeg)).scale(size);
         int color = ReplayPalette.alpha(tint, alpha);
-        f.model(m, stack -> drawHead(f, stack, skin, color));
+        f.model(m, 0.65f, -0.65f, 0.65f, stack -> drawHead(f, stack, skin, color));
     }
 
     static void drawHead(ReplayFrame f, PoseStack stack, ResourceLocation skin, int color) {

@@ -21,14 +21,24 @@ import java.util.Locale;
 import java.util.Iterator;
 
 /** Native PNG chooser plus bounded client-side resizing for network upload. */
-final class MapVotePreviewFilePicker {
+public final class MapVotePreviewFilePicker {
     // Native dialogs cannot be interrupted safely. Bound both concurrent dialogs and queued work.
-    private static final java.util.concurrent.ThreadPoolExecutor WORKER = new java.util.concurrent.ThreadPoolExecutor(
-            1, 1, 30, java.util.concurrent.TimeUnit.SECONDS, new java.util.concurrent.ArrayBlockingQueue<>(1), task -> {
-                Thread thread = new Thread(task, "habitrain-map-preview-picker");
-                thread.setDaemon(true);
-                return thread;
-            }, new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+    private static final java.util.concurrent.ThreadPoolExecutor WORKER = createWorker();
+
+    private static java.util.concurrent.ThreadPoolExecutor createWorker() {
+        var exec = new java.util.concurrent.ThreadPoolExecutor(
+                1, 1, 30, java.util.concurrent.TimeUnit.SECONDS, new java.util.concurrent.ArrayBlockingQueue<>(1), task -> {
+                    Thread thread = new Thread(task, "habitrain-map-preview-picker");
+                    thread.setDaemon(true);
+                    return thread;
+                }, new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+        exec.allowCoreThreadTimeOut(true);
+        return exec;
+    }
+
+    public static void shutdown() {
+        WORKER.shutdownNow();
+    }
 
     static boolean submit(Runnable task) {
         try { WORKER.execute(task); return true; }

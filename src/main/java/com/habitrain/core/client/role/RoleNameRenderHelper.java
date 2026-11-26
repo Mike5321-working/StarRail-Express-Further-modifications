@@ -24,40 +24,61 @@ public final class RoleNameRenderHelper {
 
     private RoleNameRenderHelper() {}
 
-    /** The first NAMEPLATE rule declared for the target player's role, if any. */
-    private static java.lang.ref.WeakReference<Player> cachedPlayerRef = new java.lang.ref.WeakReference<>(null);
-    private static @Nullable RoleKey cachedRoleKey;
-    private static boolean hasCachedRule;
-    private static @Nullable RoleNameRenderRule cachedRule;
+    private static final java.util.Map<RoleKey, java.util.Optional<RoleNameRenderRule>> RULE_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static volatile long cachedRegistryRevision = -1L;
+    private static volatile @Nullable Object cachedSnapshotRef;
+    private static volatile @Nullable Object cachedPayloadRef;
 
     public static void clearCache() {
-        cachedPlayerRef = new java.lang.ref.WeakReference<>(null);
-        cachedRoleKey = null;
-        hasCachedRule = false;
-        cachedRule = null;
+        RULE_CACHE.clear();
+        cachedRegistryRevision = -1L;
+        cachedSnapshotRef = null;
+        cachedPayloadRef = null;
     }
 
     public static @Nullable RoleNameRenderRule findNameplateRule(Player player) {
         if (player == null || player.level() == null || !player.level().isClientSide) {
-            clearCache();
             return null;
         }
-        RoleKey currentRole = RoleClientExtensionHooks.currentRole(player);
-        if (hasCachedRule && cachedPlayerRef.get() == player && java.util.Objects.equals(cachedRoleKey, currentRole)) {
-            return cachedRule;
+        RoleClientExtensionApi api = RoleClientExtensionApi.instance();
+        long rev = -1L;
+        if (api instanceof com.habitrain.core.role.client.RoleClientExtensionRegistry reg) {
+            if (!reg.hasNameRenders()) {
+                return null;
+            }
+            rev = reg.revision();
         }
-        cachedPlayerRef = new java.lang.ref.WeakReference<>(player);
-        cachedRoleKey = currentRole;
-        cachedRule = computeNameplateRule(currentRole);
-        hasCachedRule = true;
-        return cachedRule;
+        RoleKey currentRole = RoleClientExtensionHooks.currentRole(player);
+        if (currentRole == null) {
+            return null;
+        }
+        Object snap = com.habitrain.core.role.snapshot.RoleSnapshotManager.INSTANCE.current();
+        Object payload = null;
+        try {
+            payload = RoleSnapshotState.INSTANCE.get();
+        } catch (Throwable ignored) {
+        }
+        if (rev != cachedRegistryRevision || snap != cachedSnapshotRef || payload != cachedPayloadRef) {
+            RULE_CACHE.clear();
+            cachedRegistryRevision = rev;
+            cachedSnapshotRef = snap;
+            cachedPayloadRef = payload;
+        }
+        java.util.Optional<RoleNameRenderRule> cached = RULE_CACHE.get(currentRole);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+        RoleNameRenderRule computed = computeNameplateRule(api, currentRole);
+        RULE_CACHE.put(currentRole, java.util.Optional.ofNullable(computed));
+        return computed;
     }
 
-    private static @Nullable RoleNameRenderRule computeNameplateRule(@Nullable RoleKey role) {
+    private static @Nullable RoleNameRenderRule computeNameplateRule(RoleClientExtensionApi api, @Nullable RoleKey role) {
         if (role == null) {
             return null;
         }
-        for (RoleNameRenderRule rule : RoleClientExtensionApi.instance().nameRendersFor(role)) {
+        for (RoleNameRenderRule rule : api.nameRendersFor(role)) {
             if (rule.phase() == RoleRenderPhase.NAMEPLATE) {
                 return rule;
             }

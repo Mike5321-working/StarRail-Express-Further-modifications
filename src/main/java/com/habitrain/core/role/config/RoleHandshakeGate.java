@@ -78,6 +78,12 @@ public final class RoleHandshakeGate {
         }
     }
 
+    /** Clears all stored handshake reports and cached server manifest on server stop. */
+    public void clearAll() {
+        reports.clear();
+        cachedManifest = null;
+    }
+
     /** The last reported client manifest for a player, or {@code null}. */
     public @Nullable ClientManifest reportOf(UUID playerId) {
         return playerId == null ? null : reports.get(playerId);

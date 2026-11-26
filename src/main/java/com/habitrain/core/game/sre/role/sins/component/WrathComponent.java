@@ -283,9 +283,13 @@ public final class WrathComponent implements RoleComponent, ServerTickingCompone
         if (self == null) return;
         var attribute = self.getAttribute(Attributes.KNOCKBACK_RESISTANCE);
         if (attribute == null) return;
-        attribute.removeModifier(BERSERK_KNOCKBACK_IMMUNITY);
+        boolean has = attribute.hasModifier(BERSERK_KNOCKBACK_IMMUNITY.id());
         if (enabled) {
-            attribute.addTransientModifier(BERSERK_KNOCKBACK_IMMUNITY);
+            if (!has) {
+                attribute.addTransientModifier(BERSERK_KNOCKBACK_IMMUNITY);
+            }
+        } else if (has) {
+            attribute.removeModifier(BERSERK_KNOCKBACK_IMMUNITY);
         }
     }
 
@@ -300,6 +304,8 @@ public final class WrathComponent implements RoleComponent, ServerTickingCompone
 
     @Override
     public void clear() {
+        boolean dirty = !countedTeammateDeaths.isEmpty() || rage != 0 || teammateDeaths != 0
+                || berserkThreshold != 1 || berserkTriggers != 0 || berserkActive;
         countedTeammateDeaths.clear();
         rage = 0;
         teammateDeaths = 0;
@@ -308,7 +314,9 @@ public final class WrathComponent implements RoleComponent, ServerTickingCompone
         berserkActive = false;
         if (player instanceof ServerPlayer self) {
             updateKnockbackImmunity(self, false);
-            sync(self);
+            if (dirty) {
+                sync(self);
+            }
         }
     }
 

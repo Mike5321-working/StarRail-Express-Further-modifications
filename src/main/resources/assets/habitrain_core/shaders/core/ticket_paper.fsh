@@ -73,7 +73,10 @@ void main() {
     float aspect = max(TicketSize.x, 1.0) / max(TicketSize.y, 1.0);
     vec2 q = vec2(local.x * aspect, local.y);
     float paper = tex.a;
-    vec3 col = paper > 0.001 ? tex.rgb / paper : vec3(0.0);
+    if (paper < 0.001) {
+        discard;
+    }
+    vec3 col = tex.rgb / paper;
 
     if (Age > 0.0) {
         // 斑驳地渐次泛黄：不同区域先后变旧

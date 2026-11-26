@@ -313,21 +313,20 @@ public final class FlowerGirlComponent implements RoleComponent, ServerTickingCo
 
     @Override
     public void init() {
+        clear();
+    }
+
+    @Override
+    public void clear() {
         shieldFloors.clear();
         stillTicks.clear();
         lastPos.clear();
         rewarded.clear();
         rewardedGlowUntil.clear();
-        sync();
-    }
-
-    @Override
-    public void clear() {
-        init();
     }
 
     public void sync() {
-        KEY.sync(player);
+        // Server-only component (writeToSyncNbt is empty); avoid sending empty CCA sync packets.
     }
 
     @Override

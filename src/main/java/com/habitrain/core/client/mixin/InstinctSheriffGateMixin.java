@@ -51,23 +51,60 @@ public class InstinctSheriffGateMixin {
         }
     }
 
+    @Unique private static volatile ResourceLocation habitrain$cachedRoleId;
+    @Unique private static volatile long habitrain$cachedClientRev = -1L;
+    @Unique private static volatile java.util.List<ManagedRoleEntry<?>> habitrain$cachedEntries;
+    @Unique private static volatile Object habitrain$cachedSnapshot;
+    @Unique private static volatile Object habitrain$cachedPayload;
+    @Unique private static volatile boolean habitrain$cachedGrant;
+
     @Unique
     private static boolean habitrain$hasExplicitInstinctGrant(SRERole role) {
         ResourceLocation id = role.identifier();
         if (id == null) {
             return false;
         }
-        RoleKey key = RoleKey.of(id);
-        if (!RoleClientExtensionApi.instance().instinctsFor(key).isEmpty()) {
-            return true;
+        RoleClientExtensionApi clientApi = RoleClientExtensionApi.instance();
+        long clientRev = clientApi instanceof com.habitrain.core.role.client.RoleClientExtensionRegistry reg
+                ? reg.revision() : -2L;
+        java.util.List<ManagedRoleEntry<?>> entries = RoleExtensionRegistry.INSTANCE.getCompiledEntries();
+        Object snap = com.habitrain.core.role.snapshot.RoleSnapshotManager.INSTANCE.current();
+        Object payload = null;
+        try {
+            payload = com.habitrain.core.client.role.RoleSnapshotState.INSTANCE.get();
+        } catch (Throwable ignored) {
         }
-        for (ManagedRoleEntry<?> entry : RoleExtensionRegistry.INSTANCE.getCompiledEntries()) {
-            if (entry.target() != null && entry.target().equals(key) && entry.declaration() instanceof RolePatch patch) {
-                if (patch.canUseInstinct() != null && Boolean.TRUE.equals(patch.canUseInstinct().value())) {
-                    return true;
+        if (clientRev >= 0L
+                && clientRev == habitrain$cachedClientRev
+                && entries == habitrain$cachedEntries
+                && snap == habitrain$cachedSnapshot
+                && payload == habitrain$cachedPayload
+                && id.equals(habitrain$cachedRoleId)) {
+            return habitrain$cachedGrant;
+        }
+        RoleKey key = RoleKey.of(id);
+        boolean grant = false;
+        if (!(clientApi instanceof com.habitrain.core.role.client.RoleClientExtensionRegistry reg) || reg.hasInstincts()) {
+            grant = !clientApi.instinctsFor(key).isEmpty();
+        }
+        if (!grant) {
+            for (ManagedRoleEntry<?> entry : entries) {
+                if (entry.target() != null && entry.target().equals(key) && entry.declaration() instanceof RolePatch patch) {
+                    if (patch.canUseInstinct() != null && Boolean.TRUE.equals(patch.canUseInstinct().value())) {
+                        grant = true;
+                        break;
+                    }
                 }
             }
         }
-        return false;
+        if (clientRev >= 0L) {
+            habitrain$cachedRoleId = id;
+            habitrain$cachedClientRev = clientRev;
+            habitrain$cachedEntries = entries;
+            habitrain$cachedSnapshot = snap;
+            habitrain$cachedPayload = payload;
+            habitrain$cachedGrant = grant;
+        }
+        return grant;
     }
 }

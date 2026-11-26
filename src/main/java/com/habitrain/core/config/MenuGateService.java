@@ -41,6 +41,9 @@ public final class MenuGateService {
     /** 已成功从盘加载或成功写入过；坏档时据此保留内存中的上一份好配置。 */
     private static volatile boolean appliedFromDisk = false;
     private static volatile @Nullable Path fileOverride;
+    private static @Nullable Path lastLoadedPath;
+    private static long lastLoadedMtime = Long.MIN_VALUE;
+    private static long lastLoadedSize = -1L;
 
     private MenuGateService() {}
 
@@ -66,6 +69,9 @@ public final class MenuGateService {
             ALLOWED.clear();
             enabled = true;
             appliedFromDisk = false;
+            lastLoadedPath = null;
+            lastLoadedMtime = Long.MIN_VALUE;
+            lastLoadedSize = -1L;
         }
     }
 
@@ -77,6 +83,42 @@ public final class MenuGateService {
         return FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);
     }
 
+    /** Skips redundant re-parsing on SERVER_STARTED when the file stamp matches the last load/save. */
+    public static void loadIfChanged() {
+        synchronized (LOCK) {
+            if (appliedFromDisk && isFileStampUnchanged(file())) {
+                return;
+            }
+        }
+        load();
+    }
+
+    private static boolean isFileStampUnchanged(Path path) {
+        if (lastLoadedPath == null || !lastLoadedPath.equals(path)) return false;
+        try {
+            if (!java.nio.file.Files.isRegularFile(path)) return false;
+            return java.nio.file.Files.getLastModifiedTime(path).toMillis() == lastLoadedMtime
+                    && java.nio.file.Files.size(path) == lastLoadedSize;
+        } catch (java.io.IOException ignored) {
+            return false;
+        }
+    }
+
+    private static void recordFileStamp(Path path) {
+        try {
+            if (java.nio.file.Files.isRegularFile(path)) {
+                lastLoadedPath = path;
+                lastLoadedMtime = java.nio.file.Files.getLastModifiedTime(path).toMillis();
+                lastLoadedSize = java.nio.file.Files.size(path);
+                return;
+            }
+        } catch (java.io.IOException ignored) {
+        }
+        lastLoadedPath = null;
+        lastLoadedMtime = Long.MIN_VALUE;
+        lastLoadedSize = -1L;
+    }
+
     public static void load() {
         synchronized (LOCK) {
             Path path = file();
@@ -86,6 +128,8 @@ public final class MenuGateService {
                 appliedFromDisk = true;
                 if (loaded.usedBackup()) {
                     save();
+                } else {
+                    recordFileStamp(path);
                 }
                 LOGGER.info("已加载 Mod 菜单门控: enabled={}, 允许 {} 人", enabled, ALLOWED.size());
                 return;
@@ -110,13 +154,15 @@ public final class MenuGateService {
 
     public static boolean save() {
         synchronized (LOCK) {
+            Path path = file();
             JsonObject root = toJson();
-            boolean ok = AtomicJsonFiles.writeJson(file(), root, GSON, true);
+            boolean ok = AtomicJsonFiles.writeJson(path, root, GSON, true);
             if (!ok) {
                 LOGGER.error("保存 Mod 菜单门控失败");
                 return false;
             }
             appliedFromDisk = true;
+            recordFileStamp(path);
             return true;
         }
     }

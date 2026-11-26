@@ -40,6 +40,7 @@ public final class ReplayArchiveService {
     private static final Logger LOG = LoggerFactory.getLogger(ReplayArchiveService.class);
     private static final int CAPACITY = 16;
     private static final long WRITE_BUDGET_BYTES = 128L * 1024 * 1024;
+    private static final long MAX_VOICE_LANE_BYTES = 96L * 1024 * 1024;
     private static final long RATE = 768 * 1024L, GLOBAL = 4L * 1024 * 1024;
     private static volatile State state;
 
@@ -243,18 +244,42 @@ public final class ReplayArchiveService {
             @Nullable T next;
             final ArrayList<T> batch = new ArrayList<>();
             long readyAtNanos;
+            long reservedBytes;
 
             Slot(long epoch) {
                 this.epoch = epoch;
             }
+
+            void clearPayload() {
+                if (packets instanceof ReleasableIterator releasable) {
+                    releasable.release();
+                }
+                packets = null;
+                next = null;
+                batch.clear();
+            }
         }
 
         private final int capacity;
+        private final long maxTotalBytes;
         private final Map<UUID, Slot<T>> slots = new LinkedHashMap<>();
         private long nextEpoch;
+        private long totalBytes;
 
         TransferLane(int capacity) {
+            this(capacity, Long.MAX_VALUE);
+        }
+
+        TransferLane(int capacity, long maxTotalBytes) {
             this.capacity = Math.max(1, capacity);
+            this.maxTotalBytes = maxTotalBytes <= 0L ? Long.MAX_VALUE : maxTotalBytes;
+        }
+
+        private void releaseSlot(Slot<T> slot) {
+            if (slot == null) return;
+            totalBytes = Math.max(0L, totalBytes - slot.reservedBytes);
+            slot.reservedBytes = 0L;
+            slot.clearPayload();
         }
 
         /**
@@ -264,22 +289,38 @@ public final class ReplayArchiveService {
         long begin(UUID player) {
             if (!slots.containsKey(player) && slots.size() >= capacity) return -1L;
             long epoch = ++nextEpoch;
-            slots.put(player, new Slot<>(epoch));
+            Slot<T> prev = slots.put(player, new Slot<>(epoch));
+            releaseSlot(prev);
             return epoch;
         }
 
         /**
          * Installs fetched packets only if {@code epoch} is still current and still awaiting I/O.
-         * Returns {@code false} (dropping stale async results) if superseded or cancelled.
+         * Returns {@code false} (dropping stale async results) if superseded, cancelled, or over byte budget.
          */
         boolean installIfCurrent(UUID player, long epoch, Iterator<T> packets) {
+            return installIfCurrent(player, epoch, packets, 0L);
+        }
+
+        boolean installIfCurrent(UUID player, long epoch, Iterator<T> packets, long bytes) {
             Slot<T> slot = slots.get(player);
-            if (slot == null || slot.epoch != epoch || slot.packets != null) return false;
+            if (slot == null || slot.epoch != epoch || slot.packets != null) {
+                if (packets instanceof ReleasableIterator releasable) releasable.release();
+                return false;
+            }
             if (packets == null || !packets.hasNext()) {
-                slots.remove(player);
+                releaseSlot(slots.remove(player));
                 return true;
             }
+            long clampedBytes = Math.max(0L, bytes);
+            if (clampedBytes > 0L && totalBytes > maxTotalBytes - clampedBytes) {
+                releaseSlot(slots.remove(player));
+                if (packets instanceof ReleasableIterator releasable) releasable.release();
+                return false;
+            }
             slot.packets = packets;
+            slot.reservedBytes = clampedBytes;
+            totalBytes += clampedBytes;
             return true;
         }
 
@@ -291,7 +332,7 @@ public final class ReplayArchiveService {
         boolean cancelIfCurrent(UUID player, long epoch) {
             Slot<T> slot = slots.get(player);
             if (slot == null || slot.epoch != epoch) return false;
-            slots.remove(player);
+            releaseSlot(slots.remove(player));
             return true;
         }
 
@@ -309,7 +350,7 @@ public final class ReplayArchiveService {
         }
 
         void remove(UUID player) {
-            slots.remove(player);
+            releaseSlot(slots.remove(player));
         }
 
         /**
@@ -330,11 +371,11 @@ public final class ReplayArchiveService {
             } else if (slot.packets.hasNext()) {
                 out = slot.packets.next();
             } else {
-                slots.remove(player);
+                releaseSlot(slots.remove(player));
                 return null;
             }
             if (slot.batch.isEmpty() && slot.next == null && !slot.packets.hasNext()) {
-                slots.remove(player);
+                releaseSlot(slots.remove(player));
             }
             return out;
         }
@@ -352,6 +393,7 @@ public final class ReplayArchiveService {
                 UUID id = entry.getKey();
                 Slot<T> slot = entry.getValue();
                 if (!alive.test(id)) {
+                    releaseSlot(slot);
                     iterator.remove();
                     continue;
                 }
@@ -359,6 +401,7 @@ public final class ReplayArchiveService {
                 if (defer.test(id)) continue;
                 if (slot.batch.isEmpty()) {
                     if (slot.next == null && !slot.packets.hasNext()) {
+                        releaseSlot(slot);
                         iterator.remove();
                         continue;
                     }
@@ -384,9 +427,106 @@ public final class ReplayArchiveService {
                 for (T packet : slot.batch) sender.accept(id, packet);
                 slot.batch.clear();
                 if (slot.next == null && !slot.packets.hasNext()) {
+                    releaseSlot(slot);
                     iterator.remove();
                 }
             }
+        }
+    }
+
+    private interface ReleasableIterator {
+        void release();
+    }
+
+    /** Lazy chunk slicer for archive voice payloads — avoids pre-allocating thousands of packet objects and copies. */
+    private static final class VoiceChunkIterator implements Iterator<CustomPacketPayload>, ReleasableIterator {
+        private final UUID round;
+        private byte @Nullable [] voice;
+        private int offset;
+
+        VoiceChunkIterator(UUID round, byte[] voice) {
+            this.round = round;
+            this.voice = voice;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return voice != null && offset < voice.length;
+        }
+
+        @Override
+        public CustomPacketPayload next() {
+            byte[] data = voice;
+            if (data == null || offset >= data.length) throw new NoSuchElementException();
+            int start = offset;
+            int end = Math.min(data.length, start + ReplayPackets.FRAGMENT_BYTES);
+            offset = end;
+            byte[] slice = Arrays.copyOfRange(data, start, end);
+            if (offset >= data.length) voice = null;
+            return new Voice(new ReplayPackets.ReplayVoiceChunkS2C(round, start, data.length, slice));
+        }
+
+        @Override
+        public void release() {
+            voice = null;
+        }
+    }
+
+    /** Lazy chunk slicer for archive section patches — drops each section byte[] as soon as it finishes streaming. */
+    private static final class SectionChunkIterator implements Iterator<CustomPacketPayload>, ReleasableIterator {
+        private final UUID round;
+        private final Iterator<Map.Entry<Integer, byte[]>> sections;
+        private int currentIndex;
+        private byte @Nullable [] currentData;
+        private int offset;
+
+        SectionChunkIterator(UUID round, Map<Integer, byte[]> patches) {
+            this.round = round;
+            this.sections = patches.entrySet().iterator();
+            advance();
+        }
+
+        private void advance() {
+            currentData = null;
+            offset = 0;
+            while (sections.hasNext()) {
+                var next = sections.next();
+                byte[] data = next.getValue();
+                if (data != null && data.length > 0) {
+                    currentIndex = next.getKey();
+                    currentData = data;
+                    return;
+                }
+            }
+        }
+
+        @Override
+        public boolean hasNext() {
+            return currentData != null;
+        }
+
+        @Override
+        public CustomPacketPayload next() {
+            byte[] data = currentData;
+            if (data == null) throw new NoSuchElementException();
+            int idx = currentIndex;
+            int start = offset;
+            int end = Math.min(data.length, start + ReplayPackets.FRAGMENT_BYTES);
+            offset = end;
+            byte[] slice = Arrays.copyOfRange(data, start, end);
+            if (offset >= data.length) advance();
+            return new Section(new ReplayPackets.ReplaySectionPatchS2C(round, idx, start, data.length, slice));
+        }
+
+        @Override
+        public void release() {
+            currentData = null;
+        }
+    }
+
+    private record FetchedStream(Iterator<CustomPacketPayload> packets, long estimatedBytes) {
+        static FetchedStream ofSingle(CustomPacketPayload payload) {
+            return new FetchedStream(List.of(payload).iterator(), 0L);
         }
     }
 
@@ -404,7 +544,7 @@ public final class ReplayArchiveService {
         final ReplayArchiveQueue io;
         final Path root;
         final TransferLane<CustomPacketPayload> summaryLane = new TransferLane<>(CAPACITY);
-        final TransferLane<CustomPacketPayload> voiceLane = new TransferLane<>(CAPACITY / 2);
+        final TransferLane<CustomPacketPayload> voiceLane = new TransferLane<>(CAPACITY / 2, MAX_VOICE_LANE_BYTES);
         final RequestThrottle throttle = new RequestThrottle();
         final Map<SettlementSummaryBoard.Marker, Preparing> preparing = new HashMap<>();
         final Map<BlockPos, UUID> activeSharedBoards = new ConcurrentHashMap<>();
@@ -590,20 +730,25 @@ public final class ReplayArchiveService {
             boolean isAdmin = admin(p);
 
             submit(() -> {
-                List<CustomPacketPayload> packets;
+                FetchedStream stream;
                 try {
-                    packets = fetch(r, id, isAdmin);
+                    stream = fetchStream(r, id, isAdmin);
                 } catch (Exception failed) {
                     LOG.debug("Replay request failed for {}", r.round(), failed);
-                    packets = List.of(new Reply(r.round(), ERROR));
+                    stream = FetchedStream.ofSingle(new Reply(r.round(), ERROR));
                 }
-                List<CustomPacketPayload> fetched = packets;
+                FetchedStream fetched = stream;
                 server.execute(() -> {
                     if (!online(p)) {
                         lane.cancelIfCurrent(id, epoch);
+                        if (fetched.packets() instanceof ReleasableIterator releasable) releasable.release();
                         return;
                     }
-                    lane.installIfCurrent(id, epoch, fetched.iterator());
+                    boolean wasCurrent = lane.isCurrent(id, epoch);
+                    if (!lane.installIfCurrent(id, epoch, fetched.packets(), fetched.estimatedBytes())
+                            && wasCurrent && isVoice) {
+                        ServerPlayNetworking.send(p, new Reply(r.round(), TABLE_BUSY));
+                    }
                 });
             }, () -> server.execute(() -> {
                 if (lane.cancelIfCurrent(id, epoch) && online(p)) {
@@ -652,6 +797,41 @@ public final class ReplayArchiveService {
                 sharing.remove(id);
                 if (online(p)) ServerPlayNetworking.send(p, new Reply(r.round(), SHARE_ERROR));
             }));
+        }
+
+        FetchedStream fetchStream(Request r, UUID requesterId, boolean isAdmin) throws Exception {
+            UUID round = r.round();
+            if (archive == null) return FetchedStream.ofSingle(new Reply(round, ERROR));
+            if (r.action() == VOICE) {
+                ReplayPackets.LastMatchSummaryS2C summary = null;
+                if (!isAdmin) {
+                    byte[] rawSum = archive.summary(round);
+                    if (rawSum == null) return FetchedStream.ofSingle(new Reply(round, MISSING));
+                    summary = ReplayArchiveData.decode(rawSum);
+                    rememberDuration(round, summary.replay().durationTicks());
+                    if (!canExportVoice(summary.replay(), requesterId, false)) {
+                        return FetchedStream.ofSingle(new Reply(round, ERROR));
+                    }
+                }
+                byte[] voice = archive.voice(round);
+                if (voice == null) return FetchedStream.ofSingle(new Reply(round, MISSING));
+                if (summary != null) voice = ReplayVoiceDelivery.forRecipient(summary, voice, requesterId, false);
+                if (voice.length == 0) {
+                    return FetchedStream.ofSingle(new Voice(new ReplayPackets.ReplayVoiceChunkS2C(round, 0, 0, new byte[0])));
+                }
+                return new FetchedStream(new VoiceChunkIterator(round, voice), voice.length);
+            }
+            if (r.action() == SECTIONS) {
+                var patches = archive.sections(round, r.missing());
+                if (patches == null) return FetchedStream.ofSingle(new Reply(round, MISSING));
+                long total = 0L;
+                for (byte[] data : patches.values()) {
+                    if (data != null) total += data.length;
+                }
+                return new FetchedStream(new SectionChunkIterator(round, patches), total);
+            }
+            List<CustomPacketPayload> single = fetch(r, requesterId, isAdmin);
+            return new FetchedStream(single.iterator(), 0L);
         }
 
         List<CustomPacketPayload> fetch(Request r, UUID requesterId, boolean isAdmin) throws Exception {

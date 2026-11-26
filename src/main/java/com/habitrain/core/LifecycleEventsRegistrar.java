@@ -71,10 +71,10 @@ public final class LifecycleEventsRegistrar {
             com.habitrain.core.scene.server.SceneTransferService.getInstance().start();
             com.habitrain.core.scene.server.SceneCaptureService.getInstance().start();
         com.habitrain.core.scene.server.SceneStagingService.getInstance().start();
-            ConfigManager.getInstance().load();
-            // CORE-08：单机集成服切换存档或开服前手动改盘时，重新加载门控与角色扩展 v2 配置
-            MenuGateService.load();
-            RoleExtensionConfigService.INSTANCE.load();
+            ConfigManager.getInstance().loadIfChanged();
+            // CORE-08：单机集成服切换存档或开服前手动改盘时，重新加载门控与角色扩展 v2 配置（文件未变更时跳过重复解析）
+            MenuGateService.loadIfChanged();
+            RoleExtensionConfigService.INSTANCE.loadIfChanged();
             ConfigManager.getInstance().setServer(server);
             ConfigManager.getInstance().applyMinigameEnforcement(server);
             // 角色状态 v2：绑定实时 server 引用供 CCA store 与状态同步解析
@@ -222,14 +222,8 @@ public final class LifecycleEventsRegistrar {
                 }
             }
         });
-        cleanup.run("role handshake gate", () -> {
-            if (server != null) {
-                for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-                    com.habitrain.core.role.config.RoleHandshakeGate.INSTANCE.clear(p.getUUID());
-                }
-            }
-            com.habitrain.core.role.config.RoleHandshakeGate.INSTANCE.publishServerManifest(null);
-        });
+        cleanup.run("sloth sleeping", com.habitrain.core.game.sre.role.sins.component.SlothComponent::clearRuntimeState);
+        cleanup.run("role handshake gate", com.habitrain.core.role.config.RoleHandshakeGate.INSTANCE::clearAll);
         cleanup.run("role server reference", com.habitrain.core.role.state.RuntimeRoleServer.INSTANCE::unbind);
         cleanup.run("task owners", () -> com.habitrain.core.task.TaskManager.getInstance().clearAll());
         cleanup.run("role views", () -> { LAST_VIEW.clear(); PENDING_ROLE_STATE.clear(); });
@@ -328,8 +322,9 @@ public final class LifecycleEventsRegistrar {
                 ServerLevel overworld = server.overworld();
                 if (overworld != null) {
                     var configMaps = ConfigManager.getInstance().getModeMapVoteSettings().maps;
-                    var profiles = com.habitrain.core.vote.MapVoteProfileStore.loadProfiles(overworld, configMaps.keySet(), configMaps);
-                    for (var fragment : com.habitrain.core.network.MapVoteProfilePayload.fragment(profiles)) {
+                    var fragments = com.habitrain.core.vote.MapVoteProfileStore.loadProfileFragments(
+                            overworld, configMaps, ConfigManager.getInstance().revision());
+                    for (var fragment : fragments) {
                         net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(player, fragment);
                     }
                 }
@@ -443,9 +438,9 @@ public final class LifecycleEventsRegistrar {
         // 玩家断线：通知激活的 GameMode 处理。
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> {
             ServerPlayer player = handler.getPlayer();
-            com.habitrain.core.config.ShaderRuleRevalidation.onPlayerJoin(player);
             if (player == null) return;
             LifecycleCleanup cleanup = new LifecycleCleanup("player disconnect " + player.getUUID());
+            cleanup.run("sloth sleeping", () -> com.habitrain.core.game.sre.role.sins.component.SlothComponent.onPlayerDisconnect(player.getUUID()));
             cleanup.run("mode callback", () -> GameModeRegistry.resolveActiveForPlayer(player)
                     .ifPresent(mode -> mode.onPlayerLeave(player)));
             cleanup.run("voice pending", () -> SREGameModeBase.removePendingVoiceJoin(player.getUUID()));

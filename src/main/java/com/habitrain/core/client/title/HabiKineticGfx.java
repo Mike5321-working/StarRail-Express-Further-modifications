@@ -397,12 +397,7 @@ public final class HabiKineticGfx {
     // ── Textured Quads & 2.5D Perspective Extruded Slabs ─────────────────────
 
     public void bindTexture(int glTexId, boolean repeat, BlendMode mode) {
-        RenderSystem.bindTexture(glTexId);
-        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
-        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
-        int wrap = repeat ? GL11.GL_REPEAT : 0x812F; // GL_CLAMP_TO_EDGE
-        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, wrap);
-        GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, wrap);
+        // Filter (GL_LINEAR) and wrap mode (CLAMP_TO_EDGE / REPEAT for noiseTex) are configured once at upload.
         RenderSystem.enableBlend();
         applyBlend(mode);
         RenderSystem.setShader(GameRenderer::getPositionTexColorShader);

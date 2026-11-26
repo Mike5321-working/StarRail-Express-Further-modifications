@@ -57,6 +57,9 @@ public final class RoleExtensionConfigService {
      * 各 setter 触发的 save）都会自增，供角色目录的 TEMP 编译缓存做失效判据。
      */
     private volatile long revision;
+    private @Nullable Path lastLoadedPath;
+    private long lastLoadedMtime = Long.MIN_VALUE;
+    private long lastLoadedSize = -1L;
 
     /** 配置修订号；每次门控可能变化时自增（只增不减）。 */
     public long revision() {
@@ -186,6 +189,41 @@ public final class RoleExtensionConfigService {
     // Persistence
     // ------------------------------------------------------------------
 
+    /** Skips redundant re-parsing on SERVER_STARTED when file path + mtime + size are unchanged since last load/save. */
+    public synchronized void loadIfChanged() {
+        File target = file();
+        if (target != null && isFileStampUnchanged(target.toPath())) {
+            return;
+        }
+        load();
+    }
+
+    private boolean isFileStampUnchanged(Path path) {
+        if (lastLoadedPath == null || !lastLoadedPath.equals(path)) return false;
+        try {
+            if (!Files.isRegularFile(path)) return false;
+            return Files.getLastModifiedTime(path).toMillis() == lastLoadedMtime
+                    && Files.size(path) == lastLoadedSize;
+        } catch (IOException ignored) {
+            return false;
+        }
+    }
+
+    private void recordFileStamp(Path path) {
+        try {
+            if (Files.isRegularFile(path)) {
+                lastLoadedPath = path;
+                lastLoadedMtime = Files.getLastModifiedTime(path).toMillis();
+                lastLoadedSize = Files.size(path);
+                return;
+            }
+        } catch (IOException ignored) {
+        }
+        lastLoadedPath = null;
+        lastLoadedMtime = Long.MIN_VALUE;
+        lastLoadedSize = -1L;
+    }
+
     public synchronized void load() {
         // 审核 R-22：load 会（可能）整体替换门控 section，修订号必须推进。
         revision++;
@@ -194,6 +232,7 @@ public final class RoleExtensionConfigService {
             // No usable config dir (bare unit-test JVM / hostile environment):
             // keep the in-memory defaults, do not throw, do not attempt a save.
             this.section = RoleExtensionConfigSection.createDefault();
+            lastLoadedPath = null;
             LOGGER.warn("角色扩展配置目录不可用; 保持内存默认值 (lastSaveError={})", lastSaveError);
             return;
         }
@@ -207,12 +246,14 @@ public final class RoleExtensionConfigService {
                     ? root.getAsJsonObject("roleExtensionsV2") : root;
             RoleExtensionConfigSection parsed = parse(sectionJson);
             this.section = parsed;
+            recordFileStamp(target.toPath());
             LOGGER.info("已加载角色扩展配置: enabled={}, providers={}, entries={}, winners={}",
                     parsed.isEnabled(), parsed.providers().size(), parsed.entries().size(),
                     parsed.conflictWinners().size());
         } catch (Exception e) {
             LOGGER.error("加载角色扩展配置失败，使用默认值", e);
             this.section = RoleExtensionConfigSection.createDefault();
+            lastLoadedPath = null;
             if (renameCorrupt(target)) {
                 // Original corrupt file preserved under a .corrupt.* name; write defaults atomically.
                 save();
@@ -289,6 +330,7 @@ public final class RoleExtensionConfigService {
                     Files.move(tmp, targetPath, StandardCopyOption.REPLACE_EXISTING);
                 }
                 lastSaveError = null;
+                recordFileStamp(targetPath);
             } finally {
                 Files.deleteIfExists(tmp);
             }
@@ -465,6 +507,9 @@ public final class RoleExtensionConfigService {
         this.fileOverride = null;
         this.fileResolverForTests = null;
         this.lastSaveError = null;
+        this.lastLoadedPath = null;
+        this.lastLoadedMtime = Long.MIN_VALUE;
+        this.lastLoadedSize = -1L;
     }
 
     /** Convenience for {@link LinkedHashMap} building in commands. */

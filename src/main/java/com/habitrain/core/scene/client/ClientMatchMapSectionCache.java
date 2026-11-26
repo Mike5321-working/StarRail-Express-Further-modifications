@@ -23,6 +23,10 @@ final class ClientMatchMapSectionCache {
     void observe(ClientLevel level) { begin(level, false); }
 
     private void begin(ClientLevel level, boolean explicitStart) {
+        if (explicitStart) {
+            // Release prior match section snapshot as soon as a new match begins.
+            previous = null;
+        }
         var areas = AreasWorldComponent.KEY.get(level);
         if (areas.mapName == null || areas.mapName.isBlank()) return;
         SceneBounds clip = ReplaySectionGeometry.playBounds(areas.getPlayArea(), level.getMinBuildHeight(), level.getMaxBuildHeight());
@@ -31,7 +35,7 @@ final class ClientMatchMapSectionCache {
                 && (!active.finished || !explicitStart)) return;
         if (active != null) {
             active.level = null;
-            previous = active;
+            previous = explicitStart ? null : active;
         }
         active = new Scan(level, areas.mapName, clip);
     }

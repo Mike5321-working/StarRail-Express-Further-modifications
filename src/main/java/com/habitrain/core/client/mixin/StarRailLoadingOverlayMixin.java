@@ -57,13 +57,15 @@ public class StarRailLoadingOverlayMixin {
 
     @Inject(method = "registerTextures", at = @At("TAIL"))
     private static void habitrain$registerLoadingTextures(Minecraft minecraft, CallbackInfo ci) {
-        HabiLoadingScreenTextures.registerTextures(minecraft);
+        if (!HabiKineticUiController.isKineticLoadingEnabled()) {
+            HabiLoadingScreenTextures.registerGameLoadingTexture(minecraft);
+        }
     }
 
     @Inject(method = "render", at = @At("HEAD"), cancellable = true)
     private void habitrain$renderKineticOrPrepareLegacy(GuiGraphics g, int mouseX, int mouseY, float partialTick, CallbackInfo ci) {
-        HabiLoadingScreenTextures.registerTextures(this.minecraft);
         if (!HabiKineticUiController.isKineticLoadingEnabled()) {
+            HabiLoadingScreenTextures.registerGameLoadingTexture(this.minecraft);
             return;
         }
 

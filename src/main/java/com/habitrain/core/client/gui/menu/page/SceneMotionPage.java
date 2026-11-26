@@ -49,6 +49,11 @@ public class SceneMotionPage implements ConfigPage {
     private static final Map<String, String> LAST_SELECTED_BACKGROUND_PER_MAP = new java.util.concurrent.ConcurrentHashMap<>();
     private static volatile String lastSelectedMapKey = null;
 
+    public static void clearSessionState() {
+        LAST_SELECTED_BACKGROUND_PER_MAP.clear();
+        lastSelectedMapKey = null;
+    }
+
     private final ConfigMenuScreen root;
     private final Font font;
     private final boolean editable;

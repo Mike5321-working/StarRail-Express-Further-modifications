@@ -312,16 +312,19 @@ public final class CrimeScapegoatComponent implements RoleComponent, ServerTicki
 
     @Override
     public void init() {
+        clear();
+    }
+
+    @Override
+    public void clear() {
+        if (knifeWindowTicks == 0 && mechanismCooldownTicks == 0 && !converted && forcedHotbarSlot == -1) {
+            return;
+        }
         knifeWindowTicks = 0;
         mechanismCooldownTicks = 0;
         converted = false;
         forcedHotbarSlot = -1;
         sync();
-    }
-
-    @Override
-    public void clear() {
-        init();
     }
 
     public void sync() {
