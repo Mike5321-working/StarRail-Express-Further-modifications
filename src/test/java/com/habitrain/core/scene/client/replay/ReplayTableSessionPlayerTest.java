@@ -43,6 +43,35 @@ import static org.junit.jupiter.api.Assertions.*;
  */
 class ReplayTableSessionPlayerTest {
 
+    @Test void fortyDenseTrailsReduceOldGeometryAndPreserveSeeksBreaksAndLiveTails() {
+        int recent = 960;
+        int last = 1000;
+        int crowdStride = ReplayActorPainter.historyStride(recent, 40, false);
+        int focusedStride = ReplayActorPainter.historyStride(recent, 40, true);
+        assertEquals(ReplayActorPainter.historyStride(recent, 1, false), focusedStride);
+        int oldPoints = 0;
+        int crowdPoints = 0;
+        for (int player = 0; player < 40; player++) {
+            var samples = new ArrayList<LastMatchReplay.Sample>();
+            for (int tick = 0; tick <= last; tick++) {
+                int flags = LastMatchReplay.ALIVE | (tick == 483 ? LastMatchReplay.BREAK : 0);
+                samples.add(new LastMatchReplay.Sample(tick, LastMatchReplay.Position.quantize(tick % 63, player, tick % 2),
+                        (byte) 0, (byte) flags));
+            }
+            var participant = new LastMatchReplay.Participant(new UUID(1, player), "Runner", "", 0, "", 0,
+                    MatchWinFaction.PASSENGER, false, 0, 0, 0, 0, samples);
+            var actor = new ReplayBoardModel.Actor(player, participant, new ReplayTrackSampler(samples), 0, false);
+            for (int point = 0; point < recent; point = actor.nextVisualTrailPoint(point, recent, last, focusedStride)) oldPoints++;
+            var visited = new java.util.BitSet();
+            for (int point = 0; point <= last; point = actor.nextVisualTrailPoint(point, recent, last, crowdStride)) visited.set(point);
+            crowdPoints += visited.get(0, recent).cardinality();
+            assertTrue(visited.get(482) && visited.get(483));
+            assertTrue(visited.nextClearBit(recent) > last);
+            assertEquals(214, actor.nextVisualTrailPoint(213, 200, 214, crowdStride));
+        }
+        assertTrue(crowdPoints < oldPoints * 0.30, crowdPoints + " / " + oldPoints);
+    }
+
     @Test
     void trailStridePreservesSegmentEndpointsAndRecentSamplesDuringSeeks() {
         var samples = new ArrayList<LastMatchReplay.Sample>();

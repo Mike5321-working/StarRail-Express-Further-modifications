@@ -43,6 +43,7 @@ public final class ClientVisualPreferences {
     private static final boolean DEFAULT_KINETIC_UI_AUTO_ENTER = false;
     private static final String SCENE_PERFORMANCE = "scenePerformance";
     private static final String REPLAY_VIDEO = "replayVideo";
+    private static final String REPLAY_AUDIO = "replayAudio";
     private static final String DEFAULT_REPLAY_RESOLUTION = "720p";
     private static final boolean DEFAULT_REPLAY_COMPRESS = true;
     private static final String DEFAULT_REPLAY_QUALITY = "balanced";
@@ -67,6 +68,7 @@ public final class ClientVisualPreferences {
             String replayVideoMusic,
             String replayVideoStyle,
             String replayVideoFfmpegPath,
+            ReplayAudioSettings replayAudio,
             int requestTimeoutMs,
             int maxChunkRetries,
             int diskCacheQuotaMiB,
@@ -97,6 +99,7 @@ public final class ClientVisualPreferences {
                     DEFAULT_REPLAY_MUSIC,
                     DEFAULT_REPLAY_STYLE,
                     "",
+                    ReplayAudioSettings.DEFAULT,
                     SceneClientPerformanceRules.DEFAULT_REQUEST_TIMEOUT_MS,
                     SceneClientPerformanceRules.DEFAULT_MAX_CHUNK_RETRIES,
                     SceneClientPerformanceRules.DEFAULT_DISK_CACHE_QUOTA_MIB,
@@ -115,7 +118,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(v, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -124,7 +127,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, v, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -133,7 +136,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, v, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -142,7 +145,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, v, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -151,7 +154,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, v,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -160,7 +163,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     v, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -169,7 +172,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, v, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -178,7 +181,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, v, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -187,7 +190,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, v, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -196,7 +199,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, v,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -205,7 +208,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     v, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -214,7 +217,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, v, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -223,7 +226,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, v, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -232,7 +235,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, v, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -241,7 +244,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, v,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -250,7 +253,17 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    v, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    v, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
+                    meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
+        }
+
+        Snapshot withReplayAudio(ReplayAudioSettings v) {
+            ReplayAudioSettings safe = v == null ? ReplayAudioSettings.DEFAULT : v;
+            return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
+                    lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
+                    replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
+                    replayVideoFfmpegPath, safe, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -259,7 +272,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, v, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, v, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -268,7 +281,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, v, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, v, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -277,7 +290,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, v, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, v, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -286,7 +299,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, v,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, v,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -295,7 +308,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     v, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -304,7 +317,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, v, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -313,7 +326,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, v, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -322,7 +335,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     v, memoryCacheQuotaMiB, meshCacheQuotaMiB);
         }
@@ -331,7 +344,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, v, meshCacheQuotaMiB);
         }
@@ -340,7 +353,7 @@ public final class ClientVisualPreferences {
             return new Snapshot(customTitlePanoramaEnabled, kineticBootUiEnabled, kineticUiSoundEnabled, kineticUiBgmVolume, kineticUiAutoEnter,
                     lightweightInventory, decoratedShopEnabled, idiotFaceOverlay, idiotLargeJackpot, idiotParticles,
                     replayVideoResolution, replayVideoCompress, replayVideoQuality, replayVideoMusic, replayVideoStyle,
-                    replayVideoFfmpegPath, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
+                    replayVideoFfmpegPath, replayAudio, requestTimeoutMs, maxChunkRetries, diskCacheQuotaMiB, partialResumeEnabled,
                     partialCacheQuotaMiB, partialExpiryHours, transferWindowChunks, meshBatchMinSections,
                     meshBuildBudgetMsPerFrame, memoryCacheQuotaMiB, v);
         }
@@ -380,6 +393,7 @@ public final class ClientVisualPreferences {
                 replayVideo.addProperty("ffmpegPath", replayVideoFfmpegPath);
             }
             root.add(REPLAY_VIDEO, replayVideo);
+            root.add(REPLAY_AUDIO, (replayAudio == null ? ReplayAudioSettings.DEFAULT : replayAudio).toJson());
             return root;
         }
     }
@@ -389,6 +403,7 @@ public final class ClientVisualPreferences {
     private static @Nullable ScheduledExecutorService saveExecutor;
     private static @Nullable ScheduledFuture<?> pendingSave;
     private static boolean dirty;
+    private static boolean replayAudioPreviewPending;
     private static boolean shuttingDown;
 
     private ClientVisualPreferences() {
@@ -477,10 +492,15 @@ public final class ClientVisualPreferences {
                     .fromId(readString(replayVideo, "style", DEFAULT_REPLAY_STYLE)).id;
             String rvFfmpeg = readString(replayVideo, "ffmpegPath", "").trim();
 
+            JsonObject replayAudioObj = root.has(REPLAY_AUDIO) && root.get(REPLAY_AUDIO).isJsonObject()
+                    ? root.getAsJsonObject(REPLAY_AUDIO)
+                    : null;
+            ReplayAudioSettings replayAudio = ReplayAudioSettings.fromJson(replayAudioObj);
+
             snapshot = new Snapshot(
                     customTitlePanorama, kineticBoot, kineticSound, kineticBgm, kineticAutoEnter,
                     lightweight, decoratedShop, idiotFace, idiotJackpot, idiotPart,
-                    rvRes, rvCompress, rvQuality, rvMusic, rvStyle, rvFfmpeg,
+                    rvRes, rvCompress, rvQuality, rvMusic, rvStyle, rvFfmpeg, replayAudio,
                     reqTimeout, maxRetries, diskQuota, partialResume, partialQuota, partialExpiry,
                     transferWindow, batchMin, buildBudget, memQuota, meshQuota
             );
@@ -562,9 +582,10 @@ public final class ClientVisualPreferences {
                 pendingSave.cancel(false);
                 pendingSave = null;
             }
-            if (dirty && snapshot != null) {
+            if ((dirty || replayAudioPreviewPending) && snapshot != null) {
                 toWrite = snapshot;
                 dirty = false;
+                replayAudioPreviewPending = false;
             }
             exec = saveExecutor;
             saveExecutor = null;
@@ -888,5 +909,66 @@ public final class ClientVisualPreferences {
     public static boolean setReplayVideoFfmpegPath(String path) {
         String normalized = path == null ? "" : path.trim();
         return update(s -> s.withReplayVideoFfmpegPath(normalized));
+    }
+
+    /** Client-local replay audio preferences (table + 3D history playback). */
+    public static ReplayAudioSettings getReplayAudioSettings() {
+        ReplayAudioSettings audio = ensureLoaded().replayAudio();
+        return audio == null ? ReplayAudioSettings.DEFAULT : audio;
+    }
+
+    public static float getEffectiveReplayVoiceVolume() {
+        return getReplayAudioSettings().effectiveVoiceScale();
+    }
+
+    public static float getEffectiveReplaySfxVolume() {
+        return getReplayAudioSettings().effectiveSfxScale();
+    }
+
+    /** Updates in-memory replay audio immediately during slider drag without spamming disk writes. */
+    public static void previewReplayAudioSettings(ReplayAudioSettings settings) {
+        ReplayAudioSettings safe = settings == null ? ReplayAudioSettings.DEFAULT : settings;
+        synchronized (WRITE_LOCK) {
+            Snapshot current = ensureLoaded();
+            if (!safe.equals(current.replayAudio())) {
+                snapshot = current.withReplayAudio(safe);
+                replayAudioPreviewPending = true;
+            }
+        }
+    }
+
+    public static boolean setReplayAudioSettings(ReplayAudioSettings settings) {
+        ReplayAudioSettings safe = settings == null ? ReplayAudioSettings.DEFAULT : settings;
+        synchronized (WRITE_LOCK) {
+            Snapshot current = ensureLoaded();
+            boolean changed = !safe.equals(current.replayAudio());
+            if (!changed && !replayAudioPreviewPending) {
+                return true;
+            }
+            if (changed) {
+                snapshot = current.withReplayAudio(safe);
+            }
+            replayAudioPreviewPending = false;
+            dirty = true;
+            scheduleSaveLocked();
+            return true;
+        }
+    }
+
+    public static ReplayAudioSettings toggleReplayAudioMute() {
+        synchronized (WRITE_LOCK) {
+            Snapshot current = ensureLoaded();
+            ReplayAudioSettings cur = current.replayAudio() == null ? ReplayAudioSettings.DEFAULT : current.replayAudio();
+            ReplayAudioSettings next = cur.toggledMute();
+            snapshot = current.withReplayAudio(next);
+            replayAudioPreviewPending = false;
+            dirty = true;
+            scheduleSaveLocked();
+            return next;
+        }
+    }
+
+    public static boolean resetReplayAudioSettings() {
+        return setReplayAudioSettings(ReplayAudioSettings.DEFAULT);
     }
 }

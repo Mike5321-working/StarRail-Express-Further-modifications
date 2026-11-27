@@ -182,6 +182,7 @@ public final class ReplayPackets {
         private final LastMatchReplay replay;
         private final byte[] tracks;
         private volatile byte[] encodedTrailer;
+        private volatile byte[] broadcastBytes;
 
         public LastMatchSummaryS2C(LastMatchReplay replay, byte[] tracks) {
             this(replay, tracks, null);
@@ -197,6 +198,11 @@ public final class ReplayPackets {
         public byte[] tracks() { return tracks; }
         public @Nullable byte[] peekEncodedTrailer() { return encodedTrailer; }
         @Override public Type<LastMatchSummaryS2C> type() { return TYPE; }
+
+        public synchronized int prepareBroadcast() {
+            if (broadcastBytes == null) broadcastBytes = ReplayArchiveData.encode(this);
+            return broadcastBytes.length;
+        }
 
         // The same immutable replay is sent to every viewer. Only the first encode needs gzip.
         private byte[] trailer() {
@@ -399,6 +405,11 @@ public final class ReplayPackets {
     }
 
     private static void writeSummary(FriendlyByteBuf b, LastMatchSummaryS2C p) {
+        byte[] prepared = p.broadcastBytes;
+        if (prepared != null) {
+            b.writeBytes(prepared);
+            return;
+        }
         LastMatchReplay s = p.replay;
         b.writeUUID(s.roundId()); b.writeLong(s.playbackAnchorTick()); b.writeVarInt(s.durationTicks());
         b.writeUtf(s.mapName(), 128); b.writeUtf(s.modeId(), 128); b.writeUtf(s.winStatus(), 64);

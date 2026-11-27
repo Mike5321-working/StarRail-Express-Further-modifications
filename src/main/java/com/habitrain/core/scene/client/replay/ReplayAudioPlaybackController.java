@@ -2,6 +2,8 @@ package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayGameSoundData;
+import com.habitrain.core.client.config.ClientVisualPreferences;
+import com.habitrain.core.client.config.ReplayAudioSettings;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.replay.ReplaySoundCuePlan;
 import com.habitrain.core.scene.replay.ReplayTrackSampler;
@@ -11,7 +13,6 @@ import com.habitrain.core.scene.replay.ReplayWsolaTimeStretch;
 import net.fabricmc.fabric.api.client.sound.v1.FabricSoundInstance;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.resources.sounds.AbstractTickableSoundInstance;
-import net.minecraft.client.resources.sounds.SimpleSoundInstance;
 import net.minecraft.client.resources.sounds.Sound;
 import net.minecraft.client.resources.sounds.SoundInstance;
 import net.minecraft.client.sounds.AudioStream;
@@ -71,7 +72,48 @@ public final class ReplayAudioPlaybackController {
     private static final Map<BlockPos, PlaybackPool> BOARDS = new HashMap<>();
     private static @Nullable PlaybackPool history;
 
+    interface VolumeSource {
+        float voiceScale();
+        float sfxScale();
+    }
+
+    private static final VolumeSource DEFAULT_VOLUME_SOURCE = new VolumeSource() {
+        @Override
+        public float voiceScale() {
+            return ClientVisualPreferences.getEffectiveReplayVoiceVolume();
+        }
+
+        @Override
+        public float sfxScale() {
+            return ClientVisualPreferences.getEffectiveReplaySfxVolume();
+        }
+    };
+
+    private static volatile VolumeSource volumeSource = DEFAULT_VOLUME_SOURCE;
+
     private ReplayAudioPlaybackController() {}
+
+    static void setVolumeSourceForTest(@Nullable VolumeSource source) {
+        volumeSource = source == null ? DEFAULT_VOLUME_SOURCE : source;
+    }
+
+    static float currentVoiceVolumeScale() {
+        return ReplayAudioSettings.clampUnit(volumeSource.voiceScale(), ReplayAudioSettings.DEFAULT_VOLUME);
+    }
+
+    static float currentSfxVolumeScale() {
+        return ReplayAudioSettings.clampUnit(volumeSource.sfxScale(), ReplayAudioSettings.DEFAULT_VOLUME);
+    }
+
+    static float computeVoicePlaybackVolume(float spatialGain, float voiceScale) {
+        return Math.clamp(spatialGain, 0f, 1.5f) * REPLAY_GAIN
+                * ReplayAudioSettings.clampUnit(voiceScale, ReplayAudioSettings.DEFAULT_VOLUME);
+    }
+
+    static float computeEffectPlaybackVolume(float spatialGain, float sfxScale) {
+        return Math.max(0f, spatialGain) * REPLAY_GAIN
+                * ReplayAudioSettings.clampUnit(sfxScale, ReplayAudioSettings.DEFAULT_VOLUME);
+    }
 
     private static ThreadPoolExecutor pcmWorkers() {
         int threads = Math.clamp(Runtime.getRuntime().availableProcessors() / 2, 2, 4);
@@ -184,7 +226,7 @@ public final class ReplayAudioPlaybackController {
         final List<PendingVoice> pendingVoices = new ArrayList<>();
         final Map<ReplayVoiceData.VoiceUtterance, Long> startedUtterances = new IdentityHashMap<>();
 
-        void ensureLoaded(Minecraft mc, LastMatchReplay nextReplay, ReplayVoiceData nextVoice) {
+        void ensureLoaded(Minecraft mc, LastMatchReplay nextReplay, ReplayVoiceData nextVoice, @Nullable ReplayBoardModel model) {
             boolean newRound = !nextReplay.roundId().equals(roundId) || replay != nextReplay;
             boolean newVoice = voice != nextVoice;
             if (!newRound && !newVoice) return;
@@ -197,7 +239,8 @@ public final class ReplayAudioPlaybackController {
                 clearPendingVoices();
             }
             voice = nextVoice;
-            audibility = ReplayVoiceAudibilityResolver.Context.of(nextReplay, nextVoice);
+            audibility = model == null ? ReplayVoiceAudibilityResolver.Context.of(nextReplay, nextVoice)
+                    : ReplayVoiceAudibilityResolver.Context.of(nextReplay, nextVoice, player -> model.byId.get(player.id()).track);
             if (nextReplay.gameSounds().isEmpty() || !nextVoice.hasMultitrack()) {
                 legacySchedule = ReplaySoundCuePlan.forLinearReplay(nextReplay, nextVoice,
                         file -> mc.getResourceManager().getResource(file).isPresent());
@@ -222,7 +265,7 @@ public final class ReplayAudioPlaybackController {
                     it.remove();
                 }
             }
-            effects.removeIf(e -> !manager.isActive(e));
+            effects.removeIf(e -> e.isStopped() || !manager.isActive(e));
         }
 
         void stopAll(@Nullable Minecraft mc) {
@@ -378,7 +421,7 @@ public final class ReplayAudioPlaybackController {
                                  ReplayVoiceData currentVoice, double matchTick, float rawSpeed,
                                  @Nullable UUID followPlayerUuid, float masterFade, boolean headRelative,
                                  Vec3 cam, @Nullable ReplayBoardSite site, @Nullable ReplayBoardModel model) {
-        pool.ensureLoaded(mc, replay, currentVoice);
+        pool.ensureLoaded(mc, replay, currentVoice, model);
         pool.pruneFinished(mc);
 
         float speed = Math.clamp(Float.isFinite(rawSpeed) && rawSpeed > 0f ? rawSpeed : 1.0f, 0.5f, 4.0f);
@@ -391,6 +434,9 @@ public final class ReplayAudioPlaybackController {
                 || speedChanged
                 || followChanged;
 
+        float voiceScale = currentVoiceVolumeScale();
+        float sfxScale = currentSfxVolumeScale();
+
         if (discontinuous) {
             long nowNs = System.nanoTime();
             boolean rapidScrub = pool.lastDiscontinuousNs != 0L && (nowNs - pool.lastDiscontinuousNs) < SCRUB_COOLDOWN_NS;
@@ -402,7 +448,8 @@ public final class ReplayAudioPlaybackController {
             pool.nextLegacyVoiceIdx = firstVoiceAtOrAfter(pool.legacySchedule.voices(), matchTick);
             pool.prevMatchTick = Math.max(0.0, matchTick - 0.5);
             // Trigger utterances already in progress unless the user is actively rapid-scrubbing/cycling speed.
-            if (!rapidScrub && masterFade > 0.02f && currentVoice.hasMultitrack() && pool.audibility != null) {
+            if (!rapidScrub && masterFade > 0.02f && voiceScale > ReplayAudioSettings.SILENT_EPSILON
+                    && currentVoice.hasMultitrack() && pool.audibility != null) {
                 long nowMs = Math.round(matchTick * MS_PER_TICK);
                 launchAudibleVoices(pool, followPlayerUuid, nowMs, speed, masterFade, headRelative, cam, site, model, matchTick);
             }
@@ -416,13 +463,17 @@ public final class ReplayAudioPlaybackController {
             return;
         }
 
-        playPreparedVoices(mc, pool, matchTick, speed);
+        if (voiceScale > ReplayAudioSettings.SILENT_EPSILON) {
+            playPreparedVoices(mc, pool, matchTick, speed);
+        } else {
+            pool.clearPendingVoices();
+        }
         long prevMs = Math.round(pool.prevMatchTick * MS_PER_TICK);
         long nowMs = Math.round(matchTick * MS_PER_TICK);
 
         // 1. Server-recorded global game sounds (v2) OR fallback legacy event cues (v1 archives)
         if (!replay.gameSounds().isEmpty() && pool.audibility != null) {
-            if (nowMs > prevMs) {
+            if (sfxScale > ReplayAudioSettings.SILENT_EPSILON && nowMs > prevMs) {
                 List<ReplayVoiceAudibilityResolver.AudibleSound> sounds =
                         pool.audibility.resolveGameSoundsInWindow(followPlayerUuid, (int) (prevMs + 1), (int) nowMs);
                 for (ReplayVoiceAudibilityResolver.AudibleSound sound : sounds) {
@@ -434,7 +485,7 @@ public final class ReplayAudioPlaybackController {
             while (pool.nextLegacySoundIdx < legacySounds.size()) {
                 ReplaySoundCuePlan.SoundCue cue = legacySounds.get(pool.nextLegacySoundIdx);
                 if (cue.time() > matchTick) break;
-                if (cue.time() >= pool.prevMatchTick - 0.5) {
+                if (sfxScale > ReplayAudioSettings.SILENT_EPSILON && cue.time() >= pool.prevMatchTick - 0.5) {
                     Vec3 emitter = headRelative || site == null || model == null
                             ? Vec3.ZERO : clampAudibleDistance(cam, boardEventWorldPos(cam, site, model, cue.eventIndex()), 14.0);
                     playLegacyEffect(mc, pool.effects, cue, Math.min(1.25f, cue.volume() * masterFade), emitter, headRelative);
@@ -445,23 +496,30 @@ public final class ReplayAudioPlaybackController {
 
         // 2. Multi-speaker concurrent voice pool (HRVC v2) OR concurrent legacy v1 clips
         if (currentVoice.hasMultitrack() && pool.audibility != null) {
-            if (nowMs >= prevMs) {
+            if (voiceScale > ReplayAudioSettings.SILENT_EPSILON && nowMs >= prevMs) {
                 launchAudibleVoices(pool, followPlayerUuid, nowMs, speed, masterFade, headRelative, cam, site, model, matchTick);
             }
         } else {
             List<ReplaySoundCuePlan.VoiceCue> legacyVoices = pool.legacySchedule.voices();
-            while (pool.nextLegacyVoiceIdx < legacyVoices.size()) {
-                ReplaySoundCuePlan.VoiceCue voiceCue = legacyVoices.get(pool.nextLegacyVoiceIdx);
-                if (voiceCue.startTime() > matchTick) break;
-                if (matchTick < voiceCue.endTime() - 1.0 && !pool.isPlayingKey(voiceCue.clip())) {
-                    double skipSeconds = (matchTick - voiceCue.sampleStartTime(TICKS_PER_SECOND)) / TICKS_PER_SECOND;
-                    double maxDuration = (voiceCue.endTime() - matchTick) / TICKS_PER_SECOND;
-                    Vec3 emitter = headRelative || site == null || model == null
-                            ? Vec3.ZERO : clampAudibleDistance(cam, boardEventWorldPos(cam, site, model, voiceCue.clip().eventIndex()), 14.0);
-                    prepareVoice(pool, voiceCue.clip(), null, masterFade, false, emitter, headRelative,
-                            matchTick, voiceCue.endTime(), -1L, () -> buildPcm48kSlice(voiceCue.clip(), skipSeconds, maxDuration, speed));
+            if (voiceScale <= ReplayAudioSettings.SILENT_EPSILON) {
+                while (pool.nextLegacyVoiceIdx < legacyVoices.size()
+                        && legacyVoices.get(pool.nextLegacyVoiceIdx).endTime() <= matchTick + 1.0) {
+                    pool.nextLegacyVoiceIdx++;
                 }
-                pool.nextLegacyVoiceIdx++;
+            } else {
+                while (pool.nextLegacyVoiceIdx < legacyVoices.size()) {
+                    ReplaySoundCuePlan.VoiceCue voiceCue = legacyVoices.get(pool.nextLegacyVoiceIdx);
+                    if (voiceCue.startTime() > matchTick) break;
+                    if (matchTick < voiceCue.endTime() - 1.0 && !pool.isPlayingKey(voiceCue.clip())) {
+                        double skipSeconds = (matchTick - voiceCue.sampleStartTime(TICKS_PER_SECOND)) / TICKS_PER_SECOND;
+                        double maxDuration = (voiceCue.endTime() - matchTick) / TICKS_PER_SECOND;
+                        Vec3 emitter = headRelative || site == null || model == null
+                                ? Vec3.ZERO : clampAudibleDistance(cam, boardEventWorldPos(cam, site, model, voiceCue.clip().eventIndex()), 14.0);
+                        prepareVoice(pool, voiceCue.clip(), null, masterFade, false, emitter, headRelative,
+                                matchTick, voiceCue.endTime(), -1L, () -> buildPcm48kSlice(voiceCue.clip(), skipSeconds, maxDuration, speed));
+                    }
+                    pool.nextLegacyVoiceIdx++;
+                }
             }
         }
 
@@ -642,7 +700,9 @@ public final class ReplayAudioPlaybackController {
 
         SoundManager manager = mc.getSoundManager();
         if (pool.effects.size() >= MAX_PLAYING_EFFECTS) {
-            manager.stop(pool.effects.removeFirst());
+            ReplayEffectSound evicted = pool.effects.removeFirst();
+            evicted.stopEffect();
+            manager.stop(evicted);
         }
         ReplayEffectSound instance = new ReplayEffectSound(id, null, volume, sound.cue().pitch(), emitter, useRelative);
         pool.effects.addLast(instance);
@@ -739,14 +799,25 @@ public final class ReplayAudioPlaybackController {
         if (id == null || file != null && mc.getResourceManager().getResource(file).isEmpty()) return;
         SoundManager manager = mc.getSoundManager();
         effects.removeIf(effect -> !manager.isActive(effect));
-        if (effects.size() >= MAX_PLAYING_EFFECTS) manager.stop(effects.removeFirst());
+        if (effects.size() >= MAX_PLAYING_EFFECTS) {
+            ReplayEffectSound evicted = effects.removeFirst();
+            evicted.stopEffect();
+            manager.stop(evicted);
+        }
         var effect = new ReplayEffectSound(id, file, volume, cue.pitch(), position, relative);
         effects.addLast(effect);
         manager.play(effect);
     }
 
     private static void stopEffects(@Nullable Minecraft mc, ArrayDeque<ReplayEffectSound> effects) {
-        if (mc != null && !effects.isEmpty()) effects.forEach(mc.getSoundManager()::stop);
+        if (!effects.isEmpty()) {
+            for (ReplayEffectSound effect : effects) {
+                effect.stopEffect();
+                if (mc != null && mc.getSoundManager() != null) {
+                    mc.getSoundManager().stop(effect);
+                }
+            }
+        }
         effects.clear();
     }
 
@@ -805,22 +876,45 @@ public final class ReplayAudioPlaybackController {
 
     // ------------------------------------------------------------------ OpenAL sound instances
 
-    static final class ReplayEffectSound extends SimpleSoundInstance {
+    static final class ReplayEffectSound extends AbstractTickableSoundInstance {
         private final @Nullable Sound recorded;
+        private final float baseVolume;
 
         ReplayEffectSound(ResourceLocation id, @Nullable ResourceLocation file, float volume, float pitch,
                           Vec3 position, boolean relative) {
-            super(id, SoundSource.PLAYERS, volume * REPLAY_GAIN, pitch, SoundInstance.createUnseededRandom(),
-                    false, 0, relative ? Attenuation.NONE : Attenuation.LINEAR,
-                    position.x, position.y, position.z, relative);
-            recorded = file == null ? null : new Sound(file.withPath(path -> path.substring(7, path.length() - 4)),
+            super(SoundEvent.createVariableRangeEvent(id), SoundSource.PLAYERS, SoundInstance.createUnseededRandom());
+            this.baseVolume = Math.max(0f, volume);
+            this.volume = computeEffectPlaybackVolume(this.baseVolume, currentSfxVolumeScale());
+            this.pitch = pitch;
+            this.x = position.x;
+            this.y = position.y;
+            this.z = position.z;
+            this.looping = false;
+            this.delay = 0;
+            this.relative = relative;
+            this.attenuation = relative ? Attenuation.NONE : Attenuation.LINEAR;
+            this.recorded = file == null ? null : new Sound(file.withPath(path -> path.substring(7, path.length() - 4)),
                     ConstantFloat.of(1f), ConstantFloat.of(1f), 1, Sound.Type.FILE, false, false, 16);
         }
 
-        @Override public WeighedSoundEvents resolve(SoundManager manager) {
+        @Override
+        public WeighedSoundEvents resolve(SoundManager manager) {
             if (recorded == null) return super.resolve(manager);
             this.sound = recorded;
             return new WeighedSoundEvents(this.location, null);
+        }
+
+        @Override
+        public void tick() {
+            this.volume = computeEffectPlaybackVolume(this.baseVolume, currentSfxVolumeScale());
+        }
+
+        float rawVolume() {
+            return this.volume;
+        }
+
+        void stopEffect() {
+            this.stop();
         }
     }
 
@@ -832,13 +926,15 @@ public final class ReplayAudioPlaybackController {
         private final byte[] pcmBytes;
         private final int offset;
         private final int maxTicks;
+        private final float baseVolume;
         private int ticksAlive;
 
         VoiceClipSoundInstance(byte[] pcmBytes, int offset, float volume, double x, double y, double z, boolean relative) {
             super(SoundEvent.createFixedRangeEvent(BOARD_VOICE_ID, 32.0F), SoundSource.PLAYERS, SoundInstance.createUnseededRandom());
             this.pcmBytes = pcmBytes;
             this.offset = offset;
-            this.volume = Math.clamp(volume, 0f, 1.5f) * REPLAY_GAIN;
+            this.baseVolume = Math.clamp(volume, 0f, 1.5f);
+            this.volume = computeVoicePlaybackVolume(this.baseVolume, currentVoiceVolumeScale());
             this.pitch = 1.0f;
             this.x = x;
             this.y = y;
@@ -874,7 +970,13 @@ public final class ReplayAudioPlaybackController {
         public void tick() {
             if (++ticksAlive >= maxTicks) {
                 this.stop();
+                return;
             }
+            this.volume = computeVoicePlaybackVolume(this.baseVolume, currentVoiceVolumeScale());
+        }
+
+        float rawVolume() {
+            return this.volume;
         }
 
         void stopClip() {

@@ -19,6 +19,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.*;
+import java.util.function.Supplier;
 import static com.habitrain.core.network.replay.VisualTape.*;
 
 final class MatchVisualRecorder {
@@ -38,6 +39,9 @@ final class MatchVisualRecorder {
     private long lastGame, lastDay;
     private int lastTime, lastFlags, lastTick = -1, lastWeather;
     private int packetTick = -1;
+    private int lastRecipientTick = -1;
+    private Packet<?> lastRecipientPacket;
+    private byte[] lastRecipientBytes;
     MatchVisualRecorder(UUID round, SceneBounds bounds) { this.round = round; this.bounds = bounds; this.entities=new WorldEntityRecorder(tape,bounds); }
 
     void clock(ServerLevel level, int tick) {
@@ -70,6 +74,7 @@ final class MatchVisualRecorder {
     }
     void body(ServerPlayer player, int tick) {
         UUID id = player.getUUID();
+        if (!tape.writable(id)) { tape.markLimited(); return; }
         if (tick%2 == 0 && (player.isSpectator() || !contributors.contains(id) || !lastFrames.containsKey(id))) {
             var camera = player.getCamera(); var eye = camera.getEyePosition();
             var sample = new VisualFrames.Camera(eye.x,eye.y,eye.z,camera.getYRot(),camera.getXRot(),70,player.isSpectator(),false).encode();
@@ -140,6 +145,7 @@ final class MatchVisualRecorder {
     void frame(ServerPlayer player, int tick, VisualPackets.Frame frame) {
         var id = player.getUUID();
         if (!round.equals(frame.round()) || !contributors.contains(id)) return;
+        if (!tape.writable(id)) { tape.markLimited(); return; }
         if (frame.camera().length == 0 && frame.hud().length == 0 && frame.outlines().length == 0) {
             if (lastFrames.remove(id) != null) tape.append(id,tick,END_VIEW,new byte[0]);
             return;
@@ -172,11 +178,30 @@ final class MatchVisualRecorder {
             var entity = player.level().getBlockEntity(update.getPos());
             if (entity != null && entity.getType() == update.getType()) { initialTiles.add(update.getPos().asLong()); tile(tick, update.getPos(), entity, update.getTag()); }
         } else if (packet instanceof ClientboundLevelEventPacket event && contributors.contains(player.getUUID()) && bounds.contains(event.getPos())) {
-            tape.append(player.getUUID(),tick,LEVEL_EVENT,bytes(out -> { out.writeLong(event.getPos().asLong()); out.writeInt(event.getType()); out.writeInt(event.getData()); }));
+            appendRecipient(player.getUUID(), tick, LEVEL_EVENT, event, () -> bytes(out -> {
+                out.writeLong(event.getPos().asLong()); out.writeInt(event.getType()); out.writeInt(event.getData());
+            }));
         } else if (packet instanceof ClientboundLevelParticlesPacket particles && contributors.contains(player.getUUID()) && bounds.contains(BlockPos.containing(particles.getX(), particles.getY(), particles.getZ()))) {
-            var buf = new RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.buffer(), player.registryAccess());
-            try { ClientboundLevelParticlesPacket.STREAM_CODEC.encode(buf, particles); if (buf.readableBytes() <= MAX_EVENT) { byte[] data = new byte[buf.readableBytes()]; buf.readBytes(data); tape.append(player.getUUID(), tick, PARTICLES, data); } }
-            finally { buf.release(); }
+            appendRecipient(player.getUUID(), tick, PARTICLES, particles, () -> {
+                var buf = new RegistryFriendlyByteBuf(io.netty.buffer.Unpooled.buffer(), player.registryAccess());
+                try {
+                    ClientboundLevelParticlesPacket.STREAM_CODEC.encode(buf, particles);
+                    if (buf.readableBytes() > MAX_EVENT) return null;
+                    byte[] data = new byte[buf.readableBytes()];
+                    buf.readBytes(data);
+                    return data;
+                } finally { buf.release(); }
+            });
         }
+    }
+
+    void appendRecipient(UUID recipient, int tick, int kind, Packet<?> packet, Supplier<byte[]> encode) {
+        if (!tape.writable(recipient)) { tape.markLimited(); return; }
+        if (lastRecipientPacket != packet || lastRecipientTick != tick) {
+            lastRecipientBytes = encode.get();
+            lastRecipientPacket = packet;
+            lastRecipientTick = tick;
+        }
+        if (lastRecipientBytes != null) tape.append(recipient, tick, kind, lastRecipientBytes);
     }
 }

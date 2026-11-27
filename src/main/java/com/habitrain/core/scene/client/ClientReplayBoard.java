@@ -580,6 +580,10 @@ public final class ClientReplayBoard {
             return !failed && attemptsWithoutProgress >= 4 && decoding.isEmpty() && now - retryAt >= 0;
         }
 
+        void waitingForTransfer() {
+            attemptsWithoutProgress = 0;
+        }
+
         void markFailed(long now) {
             failed = true;
             retryAfter = now + 5_000_000_000L;

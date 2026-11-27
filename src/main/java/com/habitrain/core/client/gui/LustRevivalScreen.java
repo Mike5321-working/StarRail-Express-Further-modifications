@@ -84,16 +84,20 @@ public final class LustRevivalScreen extends Screen {
             minecraft.setScreen(null);
         }
     }
-    @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float delta) {
-        renderBackground(graphics, mouseX, mouseY, delta);
+    @Override public void renderBackground(GuiGraphics graphics, int mouseX, int mouseY, float delta) {
+        super.renderBackground(graphics, mouseX, mouseY, delta);
         int cx = width / 2, cy = height / 2;
         graphics.fill(cx - 145, cy - 65, cx + 145, cy + 65, 0xED231322);
         graphics.fill(cx - 145, cy - 65, cx + 145, cy - 63, 0xFFEF72B5);
+    }
+
+    @Override public void render(GuiGraphics graphics, int mouseX, int mouseY, float delta) {
+        super.render(graphics, mouseX, mouseY, delta);
+        int cx = width / 2, cy = height / 2;
         graphics.drawCenteredString(font, title, cx, cy - 47, 0xFFEF9BCC);
         graphics.drawCenteredString(font, Component.translatable("screen.habitrain_core.sin_lust.revive_target", targetName), cx, cy - 25, 0xFFFFFFFF);
         graphics.drawCenteredString(font, Component.translatable("screen.habitrain_core.sin_lust.revive_cost"), cx, cy - 7, 0xFFFFB4B4);
         long remaining = minecraft.player == null ? 0 : LustComponent.KEY.get(minecraft.player).revivalTicksLeft();
         graphics.drawCenteredString(font, Component.translatable("screen.habitrain_core.sin_lust.revive_time", (remaining + 19) / 20), cx, cy + 12, 0xFFF5D7EB);
-        super.render(graphics, mouseX, mouseY, delta);
     }
 }

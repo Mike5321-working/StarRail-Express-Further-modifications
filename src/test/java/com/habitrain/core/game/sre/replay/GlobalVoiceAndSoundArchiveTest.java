@@ -39,6 +39,31 @@ import static org.junit.jupiter.api.Assertions.*;
 class GlobalVoiceAndSoundArchiveTest {
     @TempDir Path tempDir;
 
+    @Test void fortyViewersWaitInOrderWithoutRestartingInFlightArchiveReads() {
+        var lane = new ReplayArchiveService.TransferLane<UUID>(16);
+        var started = new ArrayList<UUID>();
+        var viewers = new ArrayList<UUID>();
+        var lookup = ReplayArchivePackets.Request.lookup(new UUID(1, 0), "");
+        for (int index = 0; index < 40; index++) {
+            var viewer = new UUID(2, index);
+            viewers.add(viewer);
+            for (int retry = 0; retry < 2; retry++) {
+                assertEquals(index < 16 && retry == 0, lane.startOrQueue(viewer, lookup, epoch -> {
+                    started.add(viewer);
+                    assertTrue(lane.installIfCurrent(viewer, epoch, List.of(viewer).iterator()));
+                }));
+            }
+        }
+        assertEquals(16, started.size());
+        for (var viewer : viewers) {
+            assertEquals(viewer, lane.poll(viewer));
+            lane.admitWaiting();
+            assertTrue(lane.size() <= 16);
+        }
+        assertEquals(viewers, started);
+        assertEquals(0, lane.size());
+    }
+
     @Test
     void archiveGroupsSmallSectionPacketsInOrderWithinBandwidth() {
         var lane = new ReplayArchiveService.TransferLane<Integer>(1);

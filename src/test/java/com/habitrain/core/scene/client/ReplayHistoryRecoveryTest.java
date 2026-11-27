@@ -13,6 +13,16 @@ import java.util.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class ReplayHistoryRecoveryTest {
+    @Test void archiveCongestionKeepsTheViewerWaitingAtTheCurrentRetryInterval() {
+        var round = new ReplayHistoryClient.Round(UUID.randomUUID());
+        round.attempts = 12;
+        round.requested = 5000;
+        ReplayHistoryClient.applyReply(round, ReplayArchivePackets.TRANSFER_BUSY);
+        assertEquals(ReplayHistoryClient.Phase.LOADING, round.phase);
+        assertEquals(5000, round.requested);
+        assertEquals(0, round.attempts);
+    }
+
     @Test void terminalHistoryFailuresReleaseTheSharedPlaybackBarrier() {
         assertFalse(ReplayHistoryClient.Phase.LOADING.finishedLoading());
         assertFalse(ReplayHistoryClient.Phase.MAP.finishedLoading());

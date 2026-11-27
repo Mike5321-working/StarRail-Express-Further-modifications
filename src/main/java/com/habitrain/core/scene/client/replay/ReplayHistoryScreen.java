@@ -4,6 +4,8 @@ import com.habitrain.core.api.client.replay.MatchReplayClientApi;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayTimeline;
 import com.habitrain.core.api.scene.asset.SceneAssetCodec;
+import com.habitrain.core.client.config.ClientVisualPreferences;
+import com.habitrain.core.client.config.ReplayAudioSettings;
 import com.habitrain.core.scene.client.ClientReplayBoard;
 import com.habitrain.core.scene.client.ReplayHistoryClient;
 import com.habitrain.core.scene.replay.ReplayBoardSessionState;
@@ -96,8 +98,9 @@ public final class ReplayHistoryScreen extends Screen {
     private final BrassPill[] speedBtns = new BrassPill[SPEEDS.length];
     private BrassPill globalBtn, followPrevBtn, followPlayerBtn, followNextBtn;
     private BrassPill closeupBtn, roofBtn;
-    private BrassPill shareBtn, exportBtn, backBtn, retryBtn;
+    private BrassPill shareBtn, volumeBtn, exportBtn, backBtn, retryBtn;
     private final List<Button> deckWidgets = new ArrayList<>();
+    private final ReplayAudioSettingsOverlay volumeOverlay = new ReplayAudioSettingsOverlay();
 
     // Sync banner clickable pills
     private record BannerPill(String action, int x, int y, int w, int h, Component label, Component tooltip, boolean accent, boolean selected) {
@@ -234,6 +237,7 @@ public final class ReplayHistoryScreen extends Screen {
         followPlayerBtn = addDeck(new BrassPill(fx, row1Y, midW, btnH, pickLabel, b -> {
             if (!participants.isEmpty()) {
                 rosterOpen = !rosterOpen;
+                if (rosterOpen) volumeOverlay.close();
                 rosterScroll = 0;
             }
         }));
@@ -242,13 +246,24 @@ public final class ReplayHistoryScreen extends Screen {
         int nextW = Math.max(arrowW, followRight - fx);
         followNextBtn = addDeck(new BrassPill(fx, row1Y, nextW, btnH, Component.literal("›"), b -> stepFollowPlayer(1)));
 
-        // ---- Row 2: Seamless Session Handoff | Export | Back ----
+        // ---- Row 2: Seamless Session Handoff | Local Volume | Export | Back ----
         int actionGap = 4;
-        int actionW = (w - actionGap * 2) / 3;
-        shareBtn = addDeck(new BrassPill(left, row2Y, actionW, btnH, text("share_handoff"), b -> triggerSessionHandoff()));
-        exportBtn = addDeck(new BrassPill(left + actionW + actionGap, row2Y, actionW, btnH, text("export"), b -> openExport()));
+        int volumeW = Math.min(118, Math.max(66, (w - actionGap * 3) / 4));
+        int remW = Math.max(120, w - volumeW - actionGap * 3);
+        int actionW = remW / 3;
+        int rx2 = left;
+        shareBtn = addDeck(new BrassPill(rx2, row2Y, actionW, btnH, text("share_handoff"), b -> triggerSessionHandoff()));
+        rx2 += actionW + actionGap;
+        volumeBtn = addDeck(new BrassPill(rx2, row2Y, volumeW, btnH, Component.empty(), b -> {
+            rosterOpen = false;
+            volumeOverlay.toggle();
+            refresh();
+        }));
+        rx2 += volumeW + actionGap;
+        exportBtn = addDeck(new BrassPill(rx2, row2Y, actionW, btnH, text("export"), b -> openExport()));
         exportBtn.setTooltip(Tooltip.create(text("export_tip")));
-        backBtn = addDeck(new BrassPill(left + (actionW + actionGap) * 2, row2Y, w - (actionW + actionGap) * 2, btnH,
+        rx2 += actionW + actionGap;
+        backBtn = addDeck(new BrassPill(rx2, row2Y, Math.max(40, right - rx2), btnH,
                 CommonComponents.GUI_BACK, b -> onClose()));
 
         retryBtn = addRenderableWidget(new BrassPill(width / 2 - 48, (top + bottom) / 2 + 8, 96, 20, text("retry"), b -> {
@@ -562,6 +577,12 @@ public final class ReplayHistoryScreen extends Screen {
         roofBtn.setMessage(text(roofCutaway ? "roof_cut" : "roof_full"));
 
         exportBtn.active = ready;
+        ReplayAudioSettings audio = ClientVisualPreferences.getReplayAudioSettings();
+        volumeBtn.active = true;
+        volumeBtn.accent = audio.isEffectivelyMuted();
+        volumeBtn.selected = volumeOverlay.isOpen() || (!audio.isEffectivelyMuted() && !audio.isDefault());
+        volumeBtn.setMessage(ReplayAudioSettingsOverlay.buttonLabel(audio));
+        volumeBtn.setTooltip(Tooltip.create(ReplayAudioSettingsOverlay.buttonTooltip(audio, false)));
         int sharingStatus = id == null ? -1 : ReplayHistoryClient.shareStatus(id);
         shareBtn.active = ready && nearestBoard != null && sharingStatus != READY;
         String viewName = idx >= 0
@@ -644,6 +665,7 @@ public final class ReplayHistoryScreen extends Screen {
     @Override public void onClose() { minecraft.setScreen(parent); }
 
     @Override public void removed() {
+        volumeOverlay.onRemoved();
         if (roundPinned && id != null) {
             ReplayHistoryClient.unpin(id);
             roundPinned = false;
@@ -665,6 +687,10 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     @Override public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (volumeOverlay.isOpen() && volumeOverlay.keyPressed(keyCode)) {
+            refresh();
+            return true;
+        }
         if (rosterOpen) {
             if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
                 rosterOpen = false;
@@ -708,8 +734,19 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     @Override public boolean mouseClicked(double x, double y, int button) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseClicked(x, y, button);
+            refresh();
+            return handled;
+        }
         if (rosterOpen) {
             return handleRosterClick(x, y, button);
+        }
+        if (button == 1 && volumeBtn != null && volumeBtn.active && volumeBtn.isMouseOver(x, y)) {
+            ClientVisualPreferences.toggleReplayAudioMute();
+            playUiClick();
+            refresh();
+            return true;
         }
         if (nearbyActiveTable != null && button == 0) {
             for (BannerPill pill : bannerPills) {
@@ -732,10 +769,19 @@ public final class ReplayHistoryScreen extends Screen {
             playUiClick();
             return true;
         }
-        return super.mouseClicked(x, y, button);
+        boolean handled = super.mouseClicked(x, y, button);
+        if (rosterOpen || volumeOverlay.isOpen()) {
+            setFocused(null);
+        }
+        return handled;
     }
 
     @Override public boolean mouseDragged(double x, double y, int button, double dx, double dy) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseDragged(x, y, button);
+            refresh();
+            return handled;
+        }
         if (rosterOpen) return true;
         if (scrubbingTimeline && button == 0 && duration() > 0) {
             double frac = Math.clamp((x - trackX) / (double) Math.max(1, trackW), 0.0, 1.0);
@@ -756,6 +802,11 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     @Override public boolean mouseReleased(double x, double y, int button) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseReleased(x, y, button);
+            refresh();
+            return handled;
+        }
         if (scrubbingTimeline) {
             if (duration() > 0) {
                 double frac = Math.clamp((x - trackX) / (double) Math.max(1, trackW), 0.0, 1.0);
@@ -768,6 +819,11 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     @Override public boolean mouseScrolled(double x, double y, double sx, double sy) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseScrolled(x, y, sy);
+            refresh();
+            return handled;
+        }
         if (rosterOpen) {
             if (sy != 0) {
                 rosterScroll = Math.clamp(rosterScroll - (int) Math.signum(sy) * ROSTER_ROW_H, 0, maxRosterScroll());
@@ -820,7 +876,13 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     @Override public void render(GuiGraphics g, int mx, int my, float delta) {
-        super.render(g, mx, my, delta);
+        boolean modalOpen = rosterOpen || volumeOverlay.isOpen();
+        if (modalOpen && getFocused() != null) {
+            setFocused(null);
+        }
+        int bgMx = modalOpen ? -9999 : mx;
+        int bgMy = modalOpen ? -9999 : my;
+        super.render(g, bgMx, bgMy, delta);
         var data = view;
         if (data != null && data.replay() != null && (model == null || model.replay != data.replay())) {
             model = new ReplayBoardModel(data.replay(), data.timeline());
@@ -831,7 +893,7 @@ public final class ReplayHistoryScreen extends Screen {
         renderHeader(g, data);
 
         // Nearby active lobby replay table sync banner (<= 16 blocks)
-        Component bannerTooltip = renderNearbyTableBanner(g, mx, my);
+        Component bannerTooltip = renderNearbyTableBanner(g, bgMx, bgMy);
 
         // 3D Diorama Preview FBO
         Component status = loadStatus(id, data);
@@ -891,7 +953,7 @@ public final class ReplayHistoryScreen extends Screen {
         if (shown && model != null) {
             renderViewportStatusHud(g, renderTick);
             int feedBottomY = renderLiveKillFeed(g, renderTick);
-            if (!rosterOpen && bottom - feedBottomY > 40) {
+            if (!modalOpen && bottom - feedBottomY > 40) {
                 ReplaySkillFallbackHud.renderInGui(g, minecraft, model, renderTick,
                         left + 4, feedBottomY + 2, right - left - 8, bottom - feedBottomY - 6, 1.0f);
             }
@@ -901,7 +963,7 @@ public final class ReplayHistoryScreen extends Screen {
         }
 
         // Interactive Art Deco timeline scrubber
-        Component timelineTooltip = renderTimeline(g, mx, my, renderTick);
+        Component timelineTooltip = renderTimeline(g, bgMx, bgMy, renderTick);
 
         // Footer hint / share feedback
         int sharing = id == null ? -1 : ReplayHistoryClient.shareStatus(id);
@@ -920,8 +982,10 @@ public final class ReplayHistoryScreen extends Screen {
         int hintColor = sharing == SHARED ? 0xFF6DCEC0 : (sharing == ERROR || sharing == SHARE_ERROR ? ReplayPalette.RUBY : ReplayPalette.TEXT_MUTED);
         g.drawCenteredString(font, font.plainSubstrByWidth(hint.getString(), right - left), width / 2, height - 10, hintColor);
 
-        // Passenger Roster Overlay (drawn on top of viewport)
-        if (rosterOpen) {
+        // Modal overlays (drawn on top of viewport)
+        if (volumeOverlay.isOpen()) {
+            volumeOverlay.render(g, font, mx, my, left, top, right - left, bottom - top, width, height);
+        } else if (rosterOpen) {
             renderRosterOverlay(g, mx, my, renderTick);
         } else if (bannerTooltip != null) {
             g.renderTooltip(font, bannerTooltip, mx, my);
@@ -1027,6 +1091,10 @@ public final class ReplayHistoryScreen extends Screen {
             audioText = text("audio_global");
         }
         String audioLine = audioText.getString();
+        if (ClientVisualPreferences.getReplayAudioSettings().isEffectivelyMuted()) {
+            audioLine = audioLine + " · " + ReplayBoardTexts.tr("audio.badge_muted").getString();
+            audioBorder = ReplayPalette.RUBY;
+        }
         float vp = id == null ? -1f : ReplayHistoryClient.voiceProgress(id);
         if (vp >= 0f && vp < 0.999f) {
             audioLine = audioLine + " · " + text("voice_streaming", Math.round(vp * 100f)).getString();
@@ -1300,75 +1368,89 @@ public final class ReplayHistoryScreen extends Screen {
     }
 
     private void renderRosterOverlay(GuiGraphics g, int mx, int my, double renderTick) {
-        g.fill(left, top, right, bottom, 0x99040710);
-        int rx = rosterX(), ry = rosterY(), rw = rosterW(), rh = rosterH();
-        g.fillGradient(rx, ry, rx + rw, ry + rh, 0xFA111A33, 0xFA04060D);
-        g.renderOutline(rx, ry, rw, rh, ReplayPalette.BRASS);
-        g.renderOutline(rx + 2, ry + 2, rw - 4, rh - 4, 0x778A6A35);
+        // Flush base-layer widgets and drop-shadow viewport text (+0.03 Z) before lifting
+        // the roster modal onto its own Z plane so underlying glyphs cannot bleed through.
+        g.flush();
+        g.pose().pushPose();
+        g.pose().translate(0.0f, 0.0f, ReplayAudioSettingsOverlay.OVERLAY_Z);
+        try {
+            g.fill(left, top, right, bottom, 0x99040710);
+            int rx = rosterX(), ry = rosterY(), rw = rosterW(), rh = rosterH();
+            g.fillGradient(rx, ry, rx + rw, ry + rh, 0xFA111A33, 0xFA04060D);
+            g.renderOutline(rx, ry, rw, rh, ReplayPalette.BRASS);
+            g.renderOutline(rx + 2, ry + 2, rw - 4, rh - 4, 0x778A6A35);
 
-        Component titleTxt = text("roster_title", participants.size());
-        g.drawCenteredString(font, font.plainSubstrByWidth(titleTxt.getString(), rw - 44),
-                rx + rw / 2, ry + 8, ReplayPalette.BRASS_LIGHT);
+            Component titleTxt = text("roster_title", participants.size());
+            g.drawCenteredString(font, font.plainSubstrByWidth(titleTxt.getString(), rw - 44),
+                    rx + rw / 2, ry + 8, ReplayPalette.BRASS_LIGHT);
 
-        int closeX = rx + rw - 20, closeY = ry + 5;
-        boolean closeHover = mx >= closeX && mx < closeX + 16 && my >= closeY && my < closeY + 14;
-        g.fill(closeX, closeY, closeX + 16, closeY + 14, closeHover ? 0xFF4E1E24 : 0xFF18233F);
-        g.renderOutline(closeX, closeY, 16, 14, closeHover ? ReplayPalette.RUBY : ReplayPalette.BRASS_DIM);
-        g.drawCenteredString(font, "×", closeX + 8, closeY + 3, closeHover ? 0xFFFFFFFF : ReplayPalette.TEXT);
+            int closeX = rx + rw - 20, closeY = ry + 5;
+            boolean closeHover = mx >= closeX && mx < closeX + 16 && my >= closeY && my < closeY + 14;
+            g.fill(closeX, closeY, closeX + 16, closeY + 14, closeHover ? 0xFF4E1E24 : 0xFF18233F);
+            g.renderOutline(closeX, closeY, 16, 14, closeHover ? ReplayPalette.RUBY : ReplayPalette.BRASS_DIM);
+            g.drawCenteredString(font, "×", closeX + 8, closeY + 3, closeHover ? 0xFFFFFFFF : ReplayPalette.TEXT);
 
-        int listLeft = rx + 8, listRight = rx + rw - 8;
-        int listTop = rosterListTop(), listBot = rosterListBottom();
-        rosterScroll = Math.clamp(rosterScroll, 0, maxRosterScroll());
-        g.fill(listLeft, listTop, listRight, listBot, 0xFF070C1A);
-        g.enableScissor(listLeft, listTop, listRight, listBot);
+            int listLeft = rx + 8, listRight = rx + rw - 8;
+            int listTop = rosterListTop(), listBot = rosterListBottom();
+            rosterScroll = Math.clamp(rosterScroll, 0, maxRosterScroll());
+            g.fill(listLeft, listTop, listRight, listBot, 0xFF070C1A);
+            g.flush();
+            g.enableScissor(listLeft, listTop, listRight, listBot);
+            try {
+                int totalRows = 1 + participants.size();
+                for (int i = 0; i < totalRows; i++) {
+                    int rowTop = listTop + i * ROSTER_ROW_H - rosterScroll;
+                    int rowBot = rowTop + ROSTER_ROW_H;
+                    if (rowBot <= listTop || rowTop >= listBot) continue;
+                    boolean hovered = mx >= listLeft && mx < listRight && my >= Math.max(listTop, rowTop) && my < Math.min(listBot, rowBot);
+                    boolean selected = i == 0 ? followPlayerUuid == null : participants.get(i - 1).id().equals(followPlayerUuid);
+                    int bgTop = selected ? (i == 0 ? 0xFF3A2D14 : 0xFF4A2029)
+                            : (hovered ? 0xFF233256 : (i % 2 == 0 ? 0xFF10182D : 0xFF0C1324));
+                    int bgBot = selected ? (i == 0 ? 0xFF21190B : 0xFF2A1118)
+                            : (hovered ? 0xFF151F3B : bgTop);
+                    g.fillGradient(listLeft + 1, rowTop + 1, listRight - 1, rowBot - 1, bgTop, bgBot);
 
-        int totalRows = 1 + participants.size();
-        for (int i = 0; i < totalRows; i++) {
-            int rowTop = listTop + i * ROSTER_ROW_H - rosterScroll;
-            int rowBot = rowTop + ROSTER_ROW_H;
-            if (rowBot <= listTop || rowTop >= listBot) continue;
-            boolean hovered = mx >= listLeft && mx < listRight && my >= Math.max(listTop, rowTop) && my < Math.min(listBot, rowBot);
-            boolean selected = i == 0 ? followPlayerUuid == null : participants.get(i - 1).id().equals(followPlayerUuid);
-            int bgTop = selected ? (i == 0 ? 0xFF3A2D14 : 0xFF4A2029)
-                    : (hovered ? 0xFF233256 : (i % 2 == 0 ? 0xFF10182D : 0xFF0C1324));
-            int bgBot = selected ? (i == 0 ? 0xFF21190B : 0xFF2A1118)
-                    : (hovered ? 0xFF151F3B : bgTop);
-            g.fillGradient(listLeft + 1, rowTop + 1, listRight - 1, rowBot - 1, bgTop, bgBot);
+                    if (i == 0) {
+                        g.fill(listLeft + 1, rowTop + 1, listLeft + 4, rowBot - 1, ReplayPalette.BRASS_LIGHT);
+                        g.drawString(font, font.plainSubstrByWidth(text("roster_global").getString(), listRight - listLeft - 14),
+                                listLeft + 10, rowTop + 7, selected ? ReplayPalette.CHAMPAGNE : ReplayPalette.TEXT, false);
+                    } else {
+                        LastMatchReplay.Participant p = participants.get(i - 1);
+                        int roleColor = ReplayPalette.opaque(p.endColor(), ReplayPalette.PASSENGER);
+                        g.fill(listLeft + 1, rowTop + 1, listLeft + 4, rowBot - 1, selected ? ReplayPalette.FOCUS_TRAIL : roleColor);
+                        PlayerFaceRenderer.draw(g, ReplayHeadSkins.texture(p.id()), listLeft + 7, rowTop + 4, 14);
 
-            if (i == 0) {
-                g.fill(listLeft + 1, rowTop + 1, listLeft + 4, rowBot - 1, ReplayPalette.BRASS_LIGHT);
-                g.drawString(font, font.plainSubstrByWidth(text("roster_global").getString(), listRight - listLeft - 14),
-                        listLeft + 10, rowTop + 7, selected ? ReplayPalette.CHAMPAGNE : ReplayPalette.TEXT, false);
-            } else {
-                LastMatchReplay.Participant p = participants.get(i - 1);
-                int roleColor = ReplayPalette.opaque(p.endColor(), ReplayPalette.PASSENGER);
-                g.fill(listLeft + 1, rowTop + 1, listLeft + 4, rowBot - 1, selected ? ReplayPalette.FOCUS_TRAIL : roleColor);
-                PlayerFaceRenderer.draw(g, ReplayHeadSkins.texture(p.id()), listLeft + 7, rowTop + 4, 14);
+                        boolean aliveNow = true;
+                        if (model != null) {
+                            ReplayBoardModel.Actor actor = model.participant(p.id());
+                            if (actor != null) {
+                                aliveNow = actor.track.sample(renderTick).state() == ReplayTrackSampler.State.ALIVE;
+                            }
+                        }
+                        Component statusTag = ReplayBoardTexts.tr(aliveNow ? "controls.roster_alive" : "controls.roster_dead");
+                        int tagW = font.width(statusTag) + 8;
+                        g.drawString(font, statusTag, listRight - tagW, rowTop + 7, aliveNow ? 0xFF6DCEC0 : ReplayPalette.RUBY, false);
 
-                boolean aliveNow = true;
-                if (model != null) {
-                    ReplayBoardModel.Actor actor = model.participant(p.id());
-                    if (actor != null) {
-                        aliveNow = actor.track.sample(renderTick).state() == ReplayTrackSampler.State.ALIVE;
+                        String nameStr = ReplayBoardTexts.name(p).getString();
+                        String roleStr = ReplayBoardTexts.role(p.endRole()).getString();
+                        int nameX = listLeft + 25;
+                        int avail = Math.max(30, listRight - tagW - nameX - 6);
+                        String combined = nameStr + " · " + roleStr + (p.kills() > 0 ? " (" + p.kills() + "K)" : "");
+                        g.drawString(font, font.plainSubstrByWidth(combined, avail), nameX, rowTop + 7,
+                                selected ? ReplayPalette.FOCUS_TRAIL_HEAD : ReplayPalette.TEXT, false);
                     }
                 }
-                Component statusTag = ReplayBoardTexts.tr(aliveNow ? "controls.roster_alive" : "controls.roster_dead");
-                int tagW = font.width(statusTag) + 8;
-                g.drawString(font, statusTag, listRight - tagW, rowTop + 7, aliveNow ? 0xFF6DCEC0 : ReplayPalette.RUBY, false);
-
-                String nameStr = ReplayBoardTexts.name(p).getString();
-                String roleStr = ReplayBoardTexts.role(p.endRole()).getString();
-                int nameX = listLeft + 25;
-                int avail = Math.max(30, listRight - tagW - nameX - 6);
-                String combined = nameStr + " · " + roleStr + (p.kills() > 0 ? " (" + p.kills() + "K)" : "");
-                g.drawString(font, font.plainSubstrByWidth(combined, avail), nameX, rowTop + 7,
-                        selected ? ReplayPalette.FOCUS_TRAIL_HEAD : ReplayPalette.TEXT, false);
+            } finally {
+                g.flush();
+                g.disableScissor();
             }
+            g.renderOutline(listLeft, listTop, listRight - listLeft, listBot - listTop, 0x668A6A35);
+            g.drawCenteredString(font, font.plainSubstrByWidth(text("roster_hint").getString(), rw - 16),
+                    rx + rw / 2, ry + rh - 12, ReplayPalette.TEXT_MUTED);
+        } finally {
+            g.flush();
+            g.pose().popPose();
         }
-        g.disableScissor();
-        g.renderOutline(listLeft, listTop, listRight - listLeft, listBot - listTop, 0x668A6A35);
-        g.drawCenteredString(font, font.plainSubstrByWidth(text("roster_hint").getString(), rw - 16),
-                rx + rw / 2, ry + rh - 12, ReplayPalette.TEXT_MUTED);
     }
 
     // ------------------------------------------------------------------ Helpers & Art Deco Pill

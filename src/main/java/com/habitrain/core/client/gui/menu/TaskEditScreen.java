@@ -184,12 +184,17 @@ public class TaskEditScreen extends Screen {
 
     @Override
     public void render(GuiGraphics g, int mx, int my, float delta) {
+        // Single background pass only. Screen.render() would call renderBackground again
+        // and cover custom header/footer with blur; widgets are drawn manually below.
         renderBackground(g, mx, my, delta);
         MenuTheme.drawBackdrop(g, width, height, modeAccentColor);
         MenuTheme.editorHeader(g, font, width, def.getDisplayName(),
                 modeDisplayName + "  /  " + def.getFullId(), modeAccentColor);
         MenuTheme.editorFooter(g, width, height, FOOTER_H);
-        super.render(g, mx, my, delta);
+        saveBtn.render(g, mx, my, delta);
+        saveReturnBtn.render(g, mx, my, delta);
+        resetBtn.render(g, mx, my, delta);
+        topBackBtn.render(g, mx, my, delta);
 
         int bodyTop = getBodyTop();
         int bodyBot = getBodyBottom();

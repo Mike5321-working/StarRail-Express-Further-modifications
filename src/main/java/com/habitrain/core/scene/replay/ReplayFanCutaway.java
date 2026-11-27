@@ -96,7 +96,7 @@ public final class ReplayFanCutaway {
         double sideExtent = hx * Math.abs(directionZ) + hz * Math.abs(directionX);
         int kept = 0;
         for (int i = 0; i < count * 4; i += 4) {
-            if (maxY + 0.51 <= projected[i + 1] + 0.01) continue;
+            if (maxY + 0.51 <= projected[i + 1] + 0.01) break;
             double radius = projected[i + 3] + EDGE_WIDTH;
             double forward = forwardMax - projected[i];
             double sideways = Math.abs(side - projected[i + 2]) - sideExtent;
@@ -110,10 +110,14 @@ public final class ReplayFanCutaway {
         if (!projectionDirty) return;
         for (int i = 0; i < count * 4; i += 4) {
             float x = anchors[i], z = anchors[i + 2];
-            projected[i] = x * directionX + z * directionZ;
-            projected[i + 1] = anchors[i + 1];
-            projected[i + 2] = x * directionZ - z * directionX;
-            projected[i + 3] = anchors[i + 3];
+            float footY = anchors[i + 1];
+            int slot = i;
+            while (slot > 0 && projected[slot - 3] > footY) slot -= 4;
+            if (slot < i) System.arraycopy(projected, slot, projected, slot + 4, i - slot);
+            projected[slot] = x * directionX + z * directionZ;
+            projected[slot + 1] = footY;
+            projected[slot + 2] = x * directionZ - z * directionX;
+            projected[slot + 3] = anchors[i + 3];
         }
         projectionDirty = false;
     }

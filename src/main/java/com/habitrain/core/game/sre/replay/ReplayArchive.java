@@ -1,6 +1,7 @@
 package com.habitrain.core.game.sre.replay;
 
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
+import com.habitrain.core.network.replay.ReplayArchiveData;
 import com.habitrain.core.network.replay.ReplayPackets;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import org.slf4j.LoggerFactory;
@@ -40,6 +41,9 @@ final class ReplayArchive {
     private boolean recordVoice = true;
 
     private record Entry(UUID id, Path file, long when, String map, long bytes, long voiceBytes) {}
+    record BoardSummary(ReplayPackets.LastMatchSummaryS2C packet, String digest) {}
+    private Entry cachedEntry;
+    private BoardSummary cachedSummary;
 
     ReplayArchive(Path root) throws IOException {
         this.root = root.toAbsolutePath().normalize();
@@ -293,6 +297,19 @@ final class ReplayArchive {
         }
     }
 
+    BoardSummary boardSummary(UUID id) throws IOException {
+        Entry entry = entries.get(id);
+        if (entry == null) return null;
+        if (entry != cachedEntry) {
+            byte[] bytes = summary(id);
+            var packet = ReplayArchiveData.decode(bytes);
+            packet.prepareBroadcast();
+            cachedSummary = new BoardSummary(packet, ReplayArchiveData.digest(bytes));
+            cachedEntry = entry;
+        }
+        return cachedSummary;
+    }
+
     com.habitrain.core.network.replay.VisualPackets.Page visualPage(com.habitrain.core.network.replay.VisualPackets.Request request) throws IOException {
         var id = request.round(); var subject = request.subject(); int offset = request.offset();
         var entry = entries.get(id);
@@ -383,6 +400,10 @@ final class ReplayArchive {
             }
             Files.deleteIfExists(entry.file);
             entries.remove(entry.id);
+            if (cachedEntry != null && entry.id.equals(cachedEntry.id)) {
+                cachedEntry = null;
+                cachedSummary = null;
+            }
             visualSummaries.remove(entry.id); visualIndex.remove(entry.id);
             bytes -= entry.bytes;
             if (references.merge(entry.map, -1, Integer::sum) == 0) dropMap(entry.map);

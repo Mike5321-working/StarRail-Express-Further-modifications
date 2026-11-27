@@ -14,6 +14,7 @@ import java.util.UUID;
 public final class ReplayArchivePackets {
     public static final int LOOKUP = 0, SECTIONS = 1, SHARE = 2, STATS = 3, LIMIT = 4, BOARD_READY = 5, VOICE = 6;
     public static final int READY = 0, CACHED = 1, MISSING = 2, ERROR = 3, SHARED = 4, NO_TABLE = 5, TABLE_BUSY = 6, SHARE_ERROR = 7;
+    public static final int TRANSFER_BUSY = 8;
     private ReplayArchivePackets() {}
 
     public record Request(int action, UUID round, String digest, BitSet missing, BlockPos board, long limit)

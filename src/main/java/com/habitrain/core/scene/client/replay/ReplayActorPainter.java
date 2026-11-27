@@ -28,6 +28,14 @@ final class ReplayActorPainter {
     private static int[] colors = new int[512];
     private static float[] haloWidths = new float[512];
     private static int[] haloColors = new int[512];
+    private static final int HISTORY_POINTS_PER_ACTOR = 96;
+    private static final int CROWD_HISTORY_POINTS = 960;
+
+    static int historyStride(int recent, int actors, boolean priority) {
+        int budget = priority ? HISTORY_POINTS_PER_ACTOR
+                : Math.clamp(CROWD_HISTORY_POINTS / Math.max(1, actors), 1, HISTORY_POINTS_PER_ACTOR);
+        return Math.max(1, Math.ceilDiv(recent, budget));
+    }
 
     static void paint(ReplayFrame f, ReplayBoardSite s, Matrix4f d, ReplayActorSizing heads) {
         paint(f, s, d, heads, null);
@@ -335,7 +343,8 @@ final class ReplayActorPainter {
         int tip = ReplayPalette.lerp(actor.color, 0xFFFFFFFF, 0.35);
         int recent = Math.max(0, track.indexAt(cometStart));
         int first = detail || focused ? 0 : recent;
-        int stride = f.video ? 1 : Math.max(1, (recent + 95) / 96);
+        int stride = f.video ? 1 : historyStride(recent, model.actors.length, focused || f.mvpSpotlightActor != null
+                || f.highlight.isFocused(actor.p.id()) || f.focusSample.emphasis(actor.p.id()) > 0);
         float trailScale = focused ? (videoReview ? elemScale * 1.45f : elemScale) : (videoReview ? elemScale * 1.65f : elemScale);
         float yLift = focused ? 0.014f : 0.012f;
         float[] px = actor.projX, py = actor.projY, pz = actor.projZ;

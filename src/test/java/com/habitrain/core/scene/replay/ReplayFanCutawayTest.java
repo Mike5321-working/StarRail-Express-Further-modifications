@@ -131,6 +131,9 @@ class ReplayFanCutawayTest {
         for (double angle : new double[]{0, 0.54, 1.58, 2.32, 3.14, 5.7}) {
             cut.direction(Math.sin(angle), Math.cos(angle));
             var full = cut.shaderFans();
+            for (int index = 1; index < full.count(); index++) {
+                assertTrue(full.anchors()[index * 4 - 3] <= full.anchors()[index * 4 + 1]);
+            }
             for (int x = 0; x < 200; x += 16) {
                 var selected = cut.shaderFans(x, 4, x + 16, 9.5, 22);
                 fullCheckCount += full.count();
@@ -141,20 +144,23 @@ class ReplayFanCutawayTest {
                     float sx = 0.5f * (px + (float) Math.floor(px) + 0.5f);
                     float sz = 0.5f * (pz + (float) Math.floor(pz) + 0.5f);
                     float cy = (float) Math.floor(py) + 0.5f;
-                    assertEquals(edgeDistance(full, sx, cy, sz), edgeDistance(selected, sx, cy, sz), 1e-6f);
+                    assertEquals(edgeDistance(full, sx, cy, sz, false), edgeDistance(selected, sx, cy, sz, true), 1e-6f);
                 }
             }
         }
         assertTrue(selectedCheckCount < fullCheckCount * 0.6, "the long-map fixture should eliminate many fan checks");
     }
 
-    private static float edgeDistance(ReplayFanCutaway.ShaderFans fans, float x, float cellY, float z) {
+    private static float edgeDistance(ReplayFanCutaway.ShaderFans fans, float x, float cellY, float z, boolean earlyExit) {
         float forward = x * fans.directionX() + z * fans.directionZ();
         float side = x * fans.directionZ() - z * fans.directionX();
         float nearest = ReplayFanCutaway.EDGE_WIDTH;
         var anchors = fans.anchors();
         for (int i = 0; i < fans.count() * 4; i += 4) {
-            if (cellY <= anchors[i + 1] + 0.01f) continue;
+            if (cellY <= anchors[i + 1] + 0.01f) {
+                if (earlyExit) break;
+                continue;
+            }
             float f = forward - anchors[i], s = side - anchors[i + 2], r = anchors[i + 3];
             float distance = f >= 0 ? Math.abs(s) - r - f * ReplayFanCutaway.HALF_ANGLE_TANGENT
                     : (float) Math.sqrt(f * f + s * s) - r;

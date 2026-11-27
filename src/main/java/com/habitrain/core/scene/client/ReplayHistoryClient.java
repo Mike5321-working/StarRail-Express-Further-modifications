@@ -395,6 +395,12 @@ public final class ReplayHistoryClient {
     }
 
     static void applyReply(Round r, int status) {
+        if (status == TRANSFER_BUSY) {
+            if (r.phase == Phase.LOADING) r.attempts = 0;
+            if (r.phase == Phase.MAP && r.map != null) r.map.waitingForTransfer();
+            if (r.phase == Phase.READY) r.voiceAttempts = 0;
+            return;
+        }
         if (r.phase == Phase.READY) {
             if (!r.voiceReady && r.voiceRequested != 0 && (status == MISSING || status == ERROR)) stopVoiceRequests(r);
             return;

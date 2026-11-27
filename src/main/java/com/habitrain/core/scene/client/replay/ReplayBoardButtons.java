@@ -1,6 +1,8 @@
 package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.client.config.ClientVisualPreferences;
+import com.habitrain.core.client.config.ReplayAudioSettings;
 import com.habitrain.core.network.replay.ReplayPackets;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.client.ClientReplayBoard;
@@ -47,7 +49,8 @@ public final class ReplayBoardButtons {
         STEP_BACK, TOGGLE_PAUSE, STEP_FORWARD, END_SESSION,
         SPEED_0_5, SPEED_1_0, SPEED_2_0, SPEED_4_0,
         VIEW_GLOBAL, FOLLOW_PREV, OPEN_ROSTER, FOLLOW_NEXT,
-        TOGGLE_CLOSEUP, TOGGLE_ROOF
+        TOGGLE_CLOSEUP, TOGGLE_ROOF, VOLUME,
+        VOLUME_SLIDER, VOLUME_MUTE, VOLUME_DETAILS, VOLUME_CLOSE
     }
 
     /** What the table is showing when idle, derived from shared client replay state and synced session. */
@@ -66,14 +69,16 @@ public final class ReplayBoardButtons {
     private record Plaque(Target target, Matrix4f sign, float halfWidth, float halfHeight,
                           float scale, float textScale, Phase phase, Component label, double fade) {}
 
-    private record DeckWidget(Action action, float x0, float y0, float x1, float y1,
-                              Component label, Component hint, boolean selected, boolean accentRuby,
-                              boolean accentGold, boolean accentCyan, boolean enabled,
-                              @Nullable UUID avatarPlayer, @Nullable UUID nextFollow, boolean nextFlag) {}
+    record DeckWidget(Action action, float x0, float y0, float x1, float y1,
+                      Component label, Component hint, boolean selected, boolean accentRuby,
+                      boolean accentGold, boolean accentCyan, boolean enabled,
+                      @Nullable UUID avatarPlayer, @Nullable UUID nextFollow, boolean nextFlag) {}
 
     private record DeckSurface(BlockPos board, Matrix4f matrix, float worldScale, double fade,
                                ReplayBoardModel model, ReplayBoardSessionState session,
-                               double displayTick, boolean finishedHold, List<DeckWidget> widgets) {}
+                               double displayTick, boolean finishedHold, List<DeckWidget> widgets,
+                               boolean volumeDrawerOpen, ReplayAudioSettings audioSettings,
+                               List<DeckWidget> volumeWidgets) {}
 
     static final float TIMELINE_X0 = -1.22f;
     static final float TIMELINE_X1 = 1.22f;
@@ -84,12 +89,31 @@ public final class ReplayBoardButtons {
     static final float DECK_Y0 = -0.57f;
     static final float DECK_Y1 = -0.195f;
 
+    // 3D pop-out volume slider wing mounted flush to the right of the lower console apron
+    static final float VOL_PANEL_X0 = 1.34f;
+    static final float VOL_PANEL_X1 = 2.28f;
+    static final float VOL_PANEL_Y0 = DECK_Y0;
+    static final float VOL_PANEL_Y1 = DECK_Y1;
+    static final float VOL_SLIDER_Y = -0.375f;
+    static final float VOL_SLIDER_Y0 = -0.438f;
+    static final float VOL_SLIDER_Y1 = -0.312f;
+    static final float VOL_RAIL_LEFT_X0 = 1.40f;
+    static final float VOL_RAIL_LEFT_X1 = 1.71f;
+    static final float VOL_MUTE_CX = 1.81f;
+    static final float VOL_MUTE_X0 = 1.750f;
+    static final float VOL_MUTE_X1 = 1.870f;
+    static final float VOL_MUTE_Y0 = -0.433f;
+    static final float VOL_MUTE_Y1 = -0.317f;
+    static final float VOL_RAIL_RIGHT_X0 = 1.91f;
+    static final float VOL_RAIL_RIGHT_X1 = 2.22f;
+
     private static final int GOLD_HALO = 0xFFE89E30, GOLD_CORE = 0xFFFFE6A8;
     private static final int CYAN_HALO = 0xFF28A4FF, CYAN_CORE = 0xFFAEE8FF;
     private static final int RUBY_HALO = 0xFFE83A4E, RUBY_CORE = 0xFFFFB2BC;
 
     private static final long STALE_NS = 250_000_000L, DEBOUNCE_NS = 240_000_000L,
-            SEEK_THROTTLE_NS = 90_000_000L, PRESS_NS = 900_000_000L, FLASH_NS = 160_000_000L;
+            SEEK_THROTTLE_NS = 90_000_000L, PRESS_NS = 900_000_000L, FLASH_NS = 160_000_000L,
+            VOLUME_DRAG_GRACE_NS = 220_000_000L, VOLUME_CLICK_THROTTLE_NS = 140_000_000L;
     private static final double HIT_PAD = 0.02;
 
     private static final Map<BlockPos, Long> PRESSED = new HashMap<>();
@@ -101,10 +125,11 @@ public final class ReplayBoardButtons {
     private static @Nullable DeckSurface hoveredDeckSurface;
     private static @Nullable DeckWidget hoveredDeckWidget;
     private static double hoveredDistance = -1;
-    private static long hoveredStamp, lastTrigger, lastSeekSent;
+    private static long hoveredStamp, lastTrigger, lastSeekSent, lastVolumeDragNs, lastVolumeSoundNs;
     private static @Nullable BlockPos scrubPreviewBoard;
     private static double scrubPreviewTick;
     private static long scrubPreviewUntilNs;
+    private static @Nullable BlockPos volumeDrawerBoard;
 
     private ReplayBoardButtons() {}
 
@@ -134,6 +159,81 @@ public final class ReplayBoardButtons {
         DECKS.clear();
         scrubPreviewBoard = null;
         scrubPreviewUntilNs = 0;
+        volumeDrawerBoard = null;
+        lastVolumeDragNs = 0;
+        lastVolumeSoundNs = 0;
+    }
+
+    static boolean isVolumeDrawerOpen(@Nullable BlockPos pos) {
+        return pos != null && pos.equals(volumeDrawerBoard);
+    }
+
+    static void setVolumeDrawerOpen(@Nullable BlockPos pos) {
+        volumeDrawerBoard = pos == null ? null : pos.immutable();
+    }
+
+    static boolean toggleVolumeDrawer(BlockPos pos) {
+        if (pos.equals(volumeDrawerBoard)) {
+            volumeDrawerBoard = null;
+            return false;
+        }
+        volumeDrawerBoard = pos.immutable();
+        return true;
+    }
+
+    static boolean shouldTreatMuteHitAsSliderDrag(long nowNs, long lastDragNs) {
+        return lastDragNs != 0L && nowNs >= lastDragNs && nowNs - lastDragNs < VOLUME_DRAG_GRACE_NS;
+    }
+
+    /**
+     * Maps a plaque-local X coordinate inside the split volume slider to {@code [0, 1]} snapped to 1%:
+     * left rail maps {@code 0%..50%}, right rail maps {@code 50%..100%}, and the centered mute gap maps {@code 50%}
+     * so continuous drags glide smoothly across the middle.
+     */
+    static float volumeFromSliderX(float localX) {
+        if (localX <= VOL_RAIL_LEFT_X0) return 0.0f;
+        if (localX >= VOL_RAIL_RIGHT_X1) return 1.0f;
+        if (localX <= VOL_RAIL_LEFT_X1) {
+            double ratio = (localX - VOL_RAIL_LEFT_X0) / (double) (VOL_RAIL_LEFT_X1 - VOL_RAIL_LEFT_X0);
+            return ReplayAudioSettingsOverlay.snapRatioToVolume(ratio * 0.5);
+        }
+        if (localX >= VOL_RAIL_RIGHT_X0) {
+            double ratio = (localX - VOL_RAIL_RIGHT_X0) / (double) (VOL_RAIL_RIGHT_X1 - VOL_RAIL_RIGHT_X0);
+            return ReplayAudioSettingsOverlay.snapRatioToVolume(0.5 + ratio * 0.5);
+        }
+        return 0.5f;
+    }
+
+    /** Maps a normalized volume {@code [0, 1]} to its visual playhead X coordinate along the split rail. */
+    static float sliderXFromVolume(float volume) {
+        float v = ReplayAudioSettings.clampUnit(volume, ReplayAudioSettings.DEFAULT_VOLUME);
+        if (v <= 0.5f) {
+            return Mth.lerp(v * 2.0f, VOL_RAIL_LEFT_X0, VOL_RAIL_LEFT_X1);
+        }
+        return Mth.lerp((v - 0.5f) * 2.0f, VOL_RAIL_RIGHT_X0, VOL_RAIL_RIGHT_X1);
+    }
+
+    static boolean isPointInVolumeMute(float localX, float localY) {
+        return localX >= VOL_MUTE_X0 - 0.008f && localX <= VOL_MUTE_X1 + 0.008f
+                && localY >= VOL_MUTE_Y0 - 0.008f && localY <= VOL_MUTE_Y1 + 0.008f;
+    }
+
+    static boolean isPointInVolumeSlider(float localX, float localY) {
+        return localX >= VOL_RAIL_LEFT_X0 - 0.025f && localX <= VOL_RAIL_RIGHT_X1 + 0.025f
+                && localY >= VOL_SLIDER_Y0 && localY <= VOL_SLIDER_Y1
+                && !isPointInVolumeMute(localX, localY);
+    }
+
+    static List<DeckWidget> buildVolumeDrawerWidgets() {
+        float btnY0 = -0.542f, btnY1 = -0.460f;
+        return List.of(
+                new DeckWidget(Action.VOLUME_DETAILS, 1.40f, btnY0, 1.91f, btnY1,
+                        ReplayBoardTexts.tr("deck.volume_details"), ReplayBoardTexts.tr("deck.volume_details_tip"),
+                        false, false, false, false, true, null, null, false),
+                new DeckWidget(Action.VOLUME_CLOSE, 1.94f, btnY0, 2.22f, btnY1,
+                        ReplayBoardTexts.tr("deck.volume_close"), ReplayBoardTexts.tr("deck.volume_close_tip"),
+                        false, false, true, false, true, null, null, false)
+        );
     }
 
     /** Returns an optimistic local tick preview briefly after right-click timeline scrubbing. */
@@ -184,13 +284,32 @@ public final class ReplayBoardButtons {
             return 1;
         }
 
+        if (target.action() == Action.VOLUME_SLIDER) {
+            lastVolumeDragNs = now;
+            float vol = ReplayAudioSettingsOverlay.snapRatioToVolume(target.hoverFraction());
+            ReplayAudioSettings cur = ClientVisualPreferences.getReplayAudioSettings();
+            ReplayAudioSettings next = cur.withMasterVolume(vol);
+            boolean changed = !next.equals(cur);
+            if (changed) {
+                ClientVisualPreferences.setReplayAudioSettings(next);
+            }
+            if ((changed || now - lastVolumeSoundNs >= VOLUME_CLICK_THROTTLE_NS * 2L)
+                    && now - lastVolumeSoundNs >= VOLUME_CLICK_THROTTLE_NS) {
+                lastVolumeSoundNs = now;
+                mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 0.85f + vol * 0.55f));
+            }
+            return 1;
+        }
+
         if (now - lastTrigger < DEBOUNCE_NS) return 6;
         lastTrigger = now;
         if (!target.enabled()) {
             mc.player.displayClientMessage(target.reason(), true);
             return 6;
         }
-        mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0f));
+        if (target.action() != Action.VOLUME_MUTE) {
+            mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, 1.0f));
+        }
         switch (target.action()) {
             case PLAY -> {
                 UUID round = ClientReplayBoard.availableRound();
@@ -205,7 +324,10 @@ public final class ReplayBoardButtons {
                 else ClientReplayBoard.togglePause(target.board());
             }
             case STEP_FORWARD -> ClientReplayBoard.stepBoard(target.board(), 200.0);
-            case END_SESSION -> ClientReplayBoard.endBoardSession(target.board());
+            case END_SESSION -> {
+                if (target.board().equals(volumeDrawerBoard)) volumeDrawerBoard = null;
+                ClientReplayBoard.endBoardSession(target.board());
+            }
             case SPEED_0_5 -> ClientReplayBoard.setBoardSpeed(target.board(), 0.5f);
             case SPEED_1_0 -> ClientReplayBoard.setBoardSpeed(target.board(), 1.0f);
             case SPEED_2_0 -> ClientReplayBoard.setBoardSpeed(target.board(), 2.0f);
@@ -215,9 +337,37 @@ public final class ReplayBoardButtons {
             case OPEN_ROSTER -> mc.setScreen(new ReplayBoardControlsScreen(mc.level, target.board()));
             case TOGGLE_CLOSEUP -> ClientReplayBoard.setBoardKillCloseup(target.board(), target.nextFlag());
             case TOGGLE_ROOF -> ClientReplayBoard.setBoardRoofCutaway(target.board(), target.nextFlag());
-            case TIMELINE -> {}
+            case VOLUME -> {
+                if (mc.player.isShiftKeyDown()) {
+                    toggleMuteWithToast(mc, false);
+                } else {
+                    toggleVolumeDrawer(target.board());
+                }
+            }
+            case VOLUME_MUTE -> toggleMuteWithToast(mc, true);
+            case VOLUME_DETAILS -> {
+                volumeDrawerBoard = null;
+                mc.setScreen(ReplayBoardControlsScreen.openVolumeSettings(mc.level, target.board()));
+            }
+            case VOLUME_CLOSE -> volumeDrawerBoard = null;
+            case TIMELINE, VOLUME_SLIDER -> {}
         }
         return 6;
+    }
+
+    private static void toggleMuteWithToast(Minecraft mc, boolean playDistinctClick) {
+        ReplayAudioSettings updated = ClientVisualPreferences.toggleReplayAudioMute();
+        boolean muted = updated.isEffectivelyMuted();
+        if (playDistinctClick) {
+            mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.UI_BUTTON_CLICK, muted ? 0.85f : 1.15f));
+        }
+        if (mc.player != null) {
+            Component feedback = muted
+                    ? ReplayBoardTexts.tr("audio.toast_muted")
+                    : ReplayBoardTexts.tr("audio.toast_unmuted",
+                            ReplayAudioSettings.toPercent(updated.masterVolume()));
+            mc.player.displayClientMessage(feedback, true);
+        }
     }
 
     // ------------------------------------------------------------------ idle state helpers
@@ -404,24 +554,30 @@ public final class ReplayBoardButtons {
         boolean canControl = ClientPlayNetworking.canSend(ReplayPackets.BoardSessionControlC2S.TYPE);
         boolean canExport = ClientReplayBoard.mapAvailable() || session.shared();
 
-        List<DeckWidget> widgets = buildDeckWidgets(model, session, finishedHold, canControl, canExport);
+        ReplayAudioSettings audio = ClientVisualPreferences.getReplayAudioSettings();
+        boolean volumeOpen = isVolumeDrawerOpen(s.pos());
+        List<DeckWidget> widgets = buildDeckWidgets(model, session, finishedHold, canControl, canExport,
+                audio, volumeOpen);
+        List<DeckWidget> volumeWidgets = volumeOpen ? buildVolumeDrawerWidgets() : List.of();
         List<DeckSurface> surfaces = new ArrayList<>(2);
         DECKS.put(s.pos(), surfaces);
 
         int duration = Math.max(1, model.replay.durationTicks());
+        long now = System.nanoTime();
         for (int side = 0; side < 4; side++) {
             Matrix4f m = ReplayTrayPainter.plaqueMatrix(s, side);
             if (!ReplayTrayPainter.plaqueFacesCamera(m)) continue;
             float pScale = ReplayTrayPainter.plaqueScale((side & 1) == 0 ? s.hw() : s.hd());
             float wScale = s.scale() * pScale;
             DeckSurface surface = new DeckSurface(s.pos(), m, wScale, alpha, model, session,
-                    displayTick, finishedHold, widgets);
+                    displayTick, finishedHold, widgets, volumeOpen, audio, volumeWidgets);
             surfaces.add(surface);
 
             if (!aiming) continue;
-            // Test entire combined plaque + cantilevered lower console region in one ray-plane hit!
+            // Test entire combined plaque + cantilevered lower console (+ optional volume wing) in one ray-plane hit!
+            float maxHitX = volumeOpen ? VOL_PANEL_X1 + 0.03f : DECK_X1 + 0.03f;
             PlaneHit hit = hitPlaquePlane(frameEye, frameDir, m, frameCam,
-                    DECK_X0 - 0.03f, DECK_Y0 - 0.03f, DECK_X1 + 0.03f, ReplayTrayPainter.PLAQUE_H * 0.5f, reach);
+                    DECK_X0 - 0.03f, DECK_Y0 - 0.03f, maxHitX, ReplayTrayPainter.PLAQUE_H * 0.5f, reach);
             if (hit == null || occluded(f, hit.distance())) continue;
             if (hoveredDistance >= 0 && hit.distance() >= hoveredDistance) continue;
 
@@ -435,11 +591,61 @@ public final class ReplayBoardButtons {
                 hoveredDeckSurface = surface;
                 hoveredDeckWidget = null;
                 hoveredDistance = hit.distance();
-                hoveredStamp = System.nanoTime();
+                hoveredStamp = now;
                 continue;
             }
 
-            // 2. Check lower cantilevered Art Deco control buttons
+            // 2. Check popped-out 3D volume slider wing (centered mute icon + split 0..50% / 50..100% slider + utility pills)
+            if (volumeOpen && hit.localX() >= VOL_PANEL_X0 - 0.03f && hit.localX() <= VOL_PANEL_X1 + 0.03f
+                    && hit.localY() >= VOL_PANEL_Y0 - 0.02f && hit.localY() <= VOL_PANEL_Y1 + 0.02f) {
+                if (isPointInVolumeMute(hit.localX(), hit.localY())) {
+                    if (shouldTreatMuteHitAsSliderDrag(now, lastVolumeDragNs)) {
+                        hovered = new Target(Action.VOLUME_SLIDER, s.pos(), true,
+                                ReplayBoardTexts.tr("deck.volume_slider_tip", 50), VOL_MUTE_CX, 0.5f, null, false);
+                    } else {
+                        int restoredPct = ReplayAudioSettings.toPercent(
+                                audio.masterVolume() <= ReplayAudioSettings.SILENT_EPSILON
+                                        ? ReplayAudioSettings.DEFAULT_VOLUME : audio.masterVolume());
+                        Component muteTip = audio.isEffectivelyMuted()
+                                ? ReplayBoardTexts.tr("deck.volume_unmute_tip", restoredPct)
+                                : ReplayBoardTexts.tr("deck.volume_mute_tip");
+                        hovered = new Target(Action.VOLUME_MUTE, s.pos(), true, muteTip);
+                    }
+                    hoveredDeckSurface = surface;
+                    hoveredDeckWidget = null;
+                    hoveredDistance = hit.distance();
+                    hoveredStamp = now;
+                    continue;
+                }
+                if (isPointInVolumeSlider(hit.localX(), hit.localY())) {
+                    float vol = volumeFromSliderX(hit.localX());
+                    float clampedX = Mth.clamp(hit.localX(), VOL_RAIL_LEFT_X0, VOL_RAIL_RIGHT_X1);
+                    hovered = new Target(Action.VOLUME_SLIDER, s.pos(), true,
+                            ReplayBoardTexts.tr("deck.volume_slider_tip", ReplayAudioSettings.toPercent(vol)),
+                            clampedX, vol, null, false);
+                    hoveredDeckSurface = surface;
+                    hoveredDeckWidget = null;
+                    hoveredDistance = hit.distance();
+                    hoveredStamp = now;
+                    continue;
+                }
+                boolean hitVolBtn = false;
+                for (DeckWidget vw : volumeWidgets) {
+                    if (hit.localX() >= vw.x0() - 0.01f && hit.localX() <= vw.x1() + 0.01f
+                            && hit.localY() >= vw.y0() - 0.01f && hit.localY() <= vw.y1() + 0.01f) {
+                        hovered = new Target(vw.action(), s.pos(), vw.enabled(), vw.hint());
+                        hoveredDeckSurface = surface;
+                        hoveredDeckWidget = vw;
+                        hoveredDistance = hit.distance();
+                        hoveredStamp = now;
+                        hitVolBtn = true;
+                        break;
+                    }
+                }
+                if (hitVolBtn) continue;
+            }
+
+            // 3. Check lower cantilevered Art Deco control buttons
             for (DeckWidget w : widgets) {
                 if (hit.localX() >= w.x0() - 0.01f && hit.localX() <= w.x1() + 0.01f
                         && hit.localY() >= w.y0() - 0.01f && hit.localY() <= w.y1() + 0.01f) {
@@ -448,16 +654,23 @@ public final class ReplayBoardButtons {
                     hoveredDeckSurface = surface;
                     hoveredDeckWidget = w;
                     hoveredDistance = hit.distance();
-                    hoveredStamp = System.nanoTime();
+                    hoveredStamp = now;
                     break;
                 }
             }
         }
     }
 
-    private static List<DeckWidget> buildDeckWidgets(ReplayBoardModel model, ReplayBoardSessionState session,
-                                                     boolean finishedHold, boolean canControl, boolean canExport) {
-        List<DeckWidget> out = new ArrayList<>(15);
+    static List<DeckWidget> buildDeckWidgets(ReplayBoardModel model, ReplayBoardSessionState session,
+                                             boolean finishedHold, boolean canControl, boolean canExport,
+                                             ReplayAudioSettings audioSettings) {
+        return buildDeckWidgets(model, session, finishedHold, canControl, canExport, audioSettings, false);
+    }
+
+    static List<DeckWidget> buildDeckWidgets(ReplayBoardModel model, ReplayBoardSessionState session,
+                                             boolean finishedHold, boolean canControl, boolean canExport,
+                                             ReplayAudioSettings audioSettings, boolean volumeDrawerOpen) {
+        List<DeckWidget> out = new ArrayList<>(16);
         float rowAY0 = -0.365f, rowAY1 = -0.220f;
         float rowBY0 = -0.535f, rowBY1 = -0.390f;
 
@@ -492,45 +705,53 @@ public final class ReplayBoardButtons {
                 Component.literal("4x"), ReplayBoardTexts.tr("deck.speed_tip", "4x"),
                 Math.abs(curSpeed - 4.0f) < 0.05f, false, true, false, canControl, null, null, false));
 
-        // Row B: Perspective follow, toggles, export
+        // Row B: Perspective follow | View toggles, local volume settings, export
         UUID follow = session.followPlayerUuid();
         ReplayBoardModel.Actor followedActor = model.participant(follow);
         boolean hasActors = model.actors.length > 0;
         UUID prevFollow = cycleFollow(model, follow, -1);
         UUID nextFollow = cycleFollow(model, follow, 1);
 
-        out.add(new DeckWidget(Action.VIEW_GLOBAL, -1.25f, rowBY0, -0.88f, rowBY1,
+        out.add(new DeckWidget(Action.VIEW_GLOBAL, -1.25f, rowBY0, -0.92f, rowBY1,
                 ReplayBoardTexts.tr("deck.global"), ReplayBoardTexts.tr("deck.follow_tip"),
                 followedActor == null, false, true, false, canControl, null, null, false));
-        out.add(new DeckWidget(Action.FOLLOW_PREV, -0.86f, rowBY0, -0.74f, rowBY1,
+        out.add(new DeckWidget(Action.FOLLOW_PREV, -0.90f, rowBY0, -0.80f, rowBY1,
                 Component.literal("‹"), ReplayBoardTexts.tr("deck.follow_prev"),
                 false, false, false, false, canControl && hasActors, null, prevFollow, false));
         Component followLabel = followedActor != null
                 ? ReplayBoardTexts.tr("deck.follow_prefix", followedActor.name)
                 : ReplayBoardTexts.tr("deck.roster");
-        out.add(new DeckWidget(Action.OPEN_ROSTER, -0.72f, rowBY0, 0.04f, rowBY1,
+        out.add(new DeckWidget(Action.OPEN_ROSTER, -0.78f, rowBY0, -0.10f, rowBY1,
                 followLabel, ReplayBoardTexts.tr("deck.follow_tip"),
                 followedActor != null, false, false, followedActor != null, true,
                 followedActor == null ? null : followedActor.p.id(), null, false));
-        out.add(new DeckWidget(Action.FOLLOW_NEXT, 0.06f, rowBY0, 0.18f, rowBY1,
+        out.add(new DeckWidget(Action.FOLLOW_NEXT, -0.08f, rowBY0, 0.02f, rowBY1,
                 Component.literal("›"), ReplayBoardTexts.tr("deck.follow_next"),
                 false, false, false, false, canControl && hasActors, null, nextFollow, false));
 
         boolean closeup = session.killCloseupEnabled();
-        out.add(new DeckWidget(Action.TOGGLE_CLOSEUP, 0.24f, rowBY0, 0.58f, rowBY1,
+        out.add(new DeckWidget(Action.TOGGLE_CLOSEUP, 0.08f, rowBY0, 0.36f, rowBY1,
                 ReplayBoardTexts.tr(closeup ? "deck.closeup_on" : "deck.closeup_off"),
                 ReplayBoardTexts.tr("deck.closeup_tip"),
                 closeup, false, closeup, false, canControl, null, null, !closeup));
 
         boolean roofCut = session.roofCutaway();
-        out.add(new DeckWidget(Action.TOGGLE_ROOF, 0.60f, rowBY0, 0.92f, rowBY1,
+        out.add(new DeckWidget(Action.TOGGLE_ROOF, 0.38f, rowBY0, 0.66f, rowBY1,
                 ReplayBoardTexts.tr(roofCut ? "deck.roof_cut" : "deck.roof_full"),
                 ReplayBoardTexts.tr("deck.roof_tip"),
                 roofCut, false, roofCut, false, canControl, null, null, !roofCut));
 
-        out.add(new DeckWidget(Action.EXPORT, 0.94f, rowBY0, 1.25f, rowBY1,
+        out.add(new DeckWidget(Action.EXPORT, 0.68f, rowBY0, 0.93f, rowBY1,
                 ReplayBoardTexts.tr("deck.export"), ReplayBoardTexts.tr("button.export"),
                 false, false, true, false, canExport, null, null, false));
+
+        ReplayAudioSettings audio = audioSettings == null ? ReplayAudioSettings.DEFAULT : audioSettings;
+        boolean audioMuted = audio.isEffectivelyMuted();
+        boolean audioActive = volumeDrawerOpen || (!audioMuted && !audio.isDefault());
+        out.add(new DeckWidget(Action.VOLUME, 0.95f, rowBY0, 1.25f, rowBY1,
+                ReplayAudioSettingsOverlay.deckButtonLabel(audio),
+                ReplayAudioSettingsOverlay.buttonTooltip(audio, true),
+                audioActive, audioMuted, false, audioActive, true, null, null, false));
         return out;
     }
 
@@ -577,10 +798,10 @@ public final class ReplayBoardButtons {
                     ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.97 * a));
             chamferOutline(glow, deckM, cw, ch, 0.038f, 0.002f, 0.007f * ws,
                     ReplayPalette.alpha(ReplayPalette.BRASS, 0.88 * a));
-            // Vertical Art Deco section dividers
+            // Vertical Art Deco section dividers (aligned across Row A and Row B)
             int divCol = ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.70 * a);
             ReplayDraw.segment(glow, m, 0.05f, -0.355f, 0.005f, 0.05f, -0.230f, 0.005f, 0.005f * ws, divCol, divCol);
-            ReplayDraw.segment(glow, m, 0.21f, -0.525f, 0.005f, 0.21f, -0.400f, 0.005f, 0.005f * ws, divCol, divCol);
+            ReplayDraw.segment(glow, m, 0.05f, -0.525f, 0.005f, 0.05f, -0.400f, 0.005f, 0.005f * ws, divCol, divCol);
 
             // 3. Render every interactive Art Deco button pill into the same depth-writing PANEL pass
             for (DeckWidget w : surf.widgets()) {
@@ -588,10 +809,18 @@ public final class ReplayBoardButtons {
                 paintDeckWidget(f, panel, glow, m, w, isHover, ws, a);
             }
 
-            // 4. Floating hover tooltip below the console (or above the timeline bar)
+            // 4. Optional popped-out 3D volume slider wing (mounted right beside the VOLUME button)
+            if (surf.volumeDrawerOpen()) {
+                paintVolumeDrawer(f, panel, glow, surf, hoverThisSurface);
+            }
+
+            // 5. Floating hover tooltip below the console (or above the timeline / volume wing)
             if (hoverThisSurface) {
                 if (hovered.action() == Action.TIMELINE) {
                     paintTimelineHoverTooltip(f, panel, glow, surf, hovered.hoverFraction(), hovered.seekTick());
+                } else if (hovered.action() == Action.VOLUME_SLIDER || hovered.action() == Action.VOLUME_MUTE
+                        || hovered.action() == Action.VOLUME_DETAILS || hovered.action() == Action.VOLUME_CLOSE) {
+                    paintVolumeDrawerTooltip(f, panel, glow, m, hovered.reason(), ws, a);
                 } else if (hoveredDeckWidget != null) {
                     paintDeckTooltip(f, panel, glow, m, hoveredDeckWidget.hint(), ws, a);
                 }
@@ -768,8 +997,209 @@ public final class ReplayBoardButtons {
             float textLeft = faceX + faceSize * 0.5f + 0.025f;
             float avail = Math.max(0.10f, hw - textLeft - 0.025f);
             f.text(wm, w.label(), textLeft, 0f, 0.006f, textScale, textCol, -1, true, avail);
+        } else if (w.action() == Action.VOLUME) {
+            float iconX = -hw + 0.044f;
+            int iconCol = w.accentRuby() ? ReplayPalette.alpha(0xFFFFD4D8, a) : textCol;
+            int slashCol = ReplayPalette.alpha(RUBY_CORE, a);
+            drawSpeakerIcon(glow, wm, iconX, 0f, 0.006f, 0.021f, ws, w.accentRuby(), iconCol, slashCol);
+            float zoneLeft = iconX + 0.028f;
+            float zoneRight = hw - 0.018f;
+            f.text(wm, w.label(), (zoneLeft + zoneRight) * 0.5f, 0f, 0.006f, textScale, textCol, 0, true,
+                    Math.max(0.08f, zoneRight - zoneLeft));
         } else {
             f.text(wm, w.label(), 0f, 0f, 0.006f, textScale, textCol, 0, true, Math.max(0.06f, hw * 2f - 0.04f));
+        }
+    }
+
+    private static void paintVolumeDrawer(ReplayFrame f, VertexConsumer panel, VertexConsumer glow,
+                                          DeckSurface surf, boolean hoverThisSurface) {
+        Matrix4f m = surf.matrix();
+        double a = surf.fade();
+        float ws = surf.worldScale();
+        ReplayAudioSettings audio = surf.audioSettings() == null ? ReplayAudioSettings.DEFAULT : surf.audioSettings();
+        boolean muted = audio.isEffectivelyMuted();
+        float vol = audio.masterVolume();
+
+        // Subtle Art Deco brass hinge tabs connecting the console apron's VOLUME slot to the wing
+        int bridgeCol = ReplayPalette.alpha(ReplayPalette.BRASS, 0.85 * a);
+        ReplayDraw.segment(glow, m, DECK_X1, -0.430f, 0.004f, VOL_PANEL_X0, -0.430f, 0.004f, 0.0055f * ws, bridgeCol, bridgeCol);
+        ReplayDraw.segment(glow, m, DECK_X1, -0.500f, 0.004f, VOL_PANEL_X0, -0.500f, 0.004f, 0.0055f * ws, bridgeCol, bridgeCol);
+
+        // Main chamfered wing plate (same depth-writing night-blue + brass outline language as console apron)
+        float cw = (VOL_PANEL_X1 - VOL_PANEL_X0) * 0.5f;
+        float ch = (VOL_PANEL_Y1 - VOL_PANEL_Y0) * 0.5f;
+        float cx = (VOL_PANEL_X0 + VOL_PANEL_X1) * 0.5f;
+        float cy = (VOL_PANEL_Y0 + VOL_PANEL_Y1) * 0.5f;
+        Matrix4f vm = new Matrix4f(m).translate(cx, cy, 0.002f);
+        chamferPanel(panel, vm, cw, ch, 0.032f, 0f,
+                ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.95 * a),
+                ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.98 * a));
+        chamferOutline(glow, vm, cw, ch, 0.032f, 0.002f, 0.007f * ws,
+                ReplayPalette.alpha(muted ? ReplayPalette.RUBY : ReplayPalette.BRASS_LIGHT, 0.92 * a));
+
+        // Header row: Local Volume title | Live % or Muted badge
+        float headerY = -0.248f;
+        f.text(m, ReplayBoardTexts.tr("deck.volume_panel_title"), VOL_RAIL_LEFT_X0, headerY, 0.008f, 0.0043f,
+                ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a), -1, true, 0.44f);
+        Component valueComp = muted
+                ? ReplayBoardTexts.tr("deck.volume_status_muted")
+                : ReplayVideoCanvas.font(Component.literal(ReplayAudioSettings.toPercent(vol) + "%"), ReplayVideoCanvas.UI);
+        int valueCol = muted ? ReplayPalette.RUBY : ReplayPalette.BRASS_LIGHT;
+        f.text(m, valueComp, VOL_RAIL_RIGHT_X1, headerY, 0.008f, 0.0044f,
+                ReplayPalette.alpha(valueCol, a), 1, true, 0.36f);
+
+        int ruleCol = ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.65 * a);
+        ReplayDraw.segment(glow, m, VOL_RAIL_LEFT_X0, -0.292f, 0.004f, VOL_RAIL_RIGHT_X1, -0.292f, 0.004f,
+                0.0038f * ws, ruleCol, ruleCol);
+
+        // Split horizontal slider track: left rail (0%..50%) + centered one-click mute medallion + right rail (50%..100%)
+        boolean hoverSlider = hoverThisSurface && hovered.action() == Action.VOLUME_SLIDER;
+        boolean hoverMute = hoverThisSurface && hovered.action() == Action.VOLUME_MUTE;
+        float barY = VOL_SLIDER_Y;
+        float barHalfH = hoverSlider ? 0.028f : 0.022f;
+
+        int bedTop = ReplayPalette.alpha(0xFF060A16, 0.95 * a);
+        int bedBot = ReplayPalette.alpha(0xFF0C1428, 0.95 * a);
+        int railFrame = ReplayPalette.alpha(
+                hoverSlider ? ReplayPalette.BRASS_LIGHT : (muted ? 0xFF7D3B46 : ReplayPalette.BRASS_DIM), 0.88 * a);
+
+        // Left rail bed & frame
+        ReplayDraw.rectXY(panel, m, VOL_RAIL_LEFT_X0, barY - barHalfH, VOL_RAIL_LEFT_X1, barY + barHalfH, 0.004f, bedTop, bedBot);
+        ReplayDraw.segment(glow, m, VOL_RAIL_LEFT_X0, barY + barHalfH, 0.005f, VOL_RAIL_LEFT_X1, barY + barHalfH, 0.005f, 0.0042f * ws, railFrame, railFrame);
+        ReplayDraw.segment(glow, m, VOL_RAIL_LEFT_X0, barY - barHalfH, 0.005f, VOL_RAIL_LEFT_X1, barY - barHalfH, 0.005f, 0.0042f * ws, railFrame, railFrame);
+        ReplayDraw.segment(glow, m, VOL_RAIL_LEFT_X0, barY - barHalfH, 0.005f, VOL_RAIL_LEFT_X0, barY + barHalfH, 0.005f, 0.0042f * ws, railFrame, railFrame);
+
+        // Right rail bed & frame
+        ReplayDraw.rectXY(panel, m, VOL_RAIL_RIGHT_X0, barY - barHalfH, VOL_RAIL_RIGHT_X1, barY + barHalfH, 0.004f, bedTop, bedBot);
+        ReplayDraw.segment(glow, m, VOL_RAIL_RIGHT_X0, barY + barHalfH, 0.005f, VOL_RAIL_RIGHT_X1, barY + barHalfH, 0.005f, 0.0042f * ws, railFrame, railFrame);
+        ReplayDraw.segment(glow, m, VOL_RAIL_RIGHT_X0, barY - barHalfH, 0.005f, VOL_RAIL_RIGHT_X1, barY - barHalfH, 0.005f, 0.0042f * ws, railFrame, railFrame);
+        ReplayDraw.segment(glow, m, VOL_RAIL_RIGHT_X1, barY - barHalfH, 0.005f, VOL_RAIL_RIGHT_X1, barY + barHalfH, 0.005f, 0.0042f * ws, railFrame, railFrame);
+
+        // Subtle stubs visually joining both rail halves into the centered mute medallion
+        ReplayDraw.segment(glow, m, VOL_RAIL_LEFT_X1, barY, 0.005f, VOL_MUTE_X0, barY, 0.005f, 0.0042f * ws, railFrame, railFrame);
+        ReplayDraw.segment(glow, m, VOL_MUTE_X1, barY, 0.005f, VOL_RAIL_RIGHT_X0, barY, 0.005f, 0.0042f * ws, railFrame, railFrame);
+
+        // Filled progress along left half (0%..50%) and right half (50%..100%)
+        int fillStart = ReplayPalette.alpha(muted ? 0xFF5A2530 : ReplayPalette.BRASS_DIM, (muted ? 0.72 : 0.90) * a);
+        int fillMid = ReplayPalette.alpha(muted ? 0xFF8C3646 : ReplayPalette.BRASS_LIGHT, (muted ? 0.78 : 0.95) * a);
+        int fillEnd = ReplayPalette.alpha(muted ? 0xFFAA4252 : ReplayPalette.CHAMPAGNE, (muted ? 0.80 : 0.96) * a);
+        float fillHalfH = barHalfH * 0.70f;
+
+        float leftEndX = vol >= 0.5f ? VOL_RAIL_LEFT_X1 : Mth.lerp(vol * 2.0f, VOL_RAIL_LEFT_X0, VOL_RAIL_LEFT_X1);
+        if (leftEndX > VOL_RAIL_LEFT_X0 + 0.004f) {
+            ReplayDraw.quad(glow, m,
+                    VOL_RAIL_LEFT_X0, barY - fillHalfH, 0.006f,
+                    leftEndX, barY - fillHalfH, 0.006f,
+                    leftEndX, barY + fillHalfH, 0.006f,
+                    VOL_RAIL_LEFT_X0, barY + fillHalfH, 0.006f,
+                    fillStart, fillMid, fillMid, fillStart);
+        }
+        if (vol > 0.5f) {
+            float rightEndX = Mth.lerp((vol - 0.5f) * 2.0f, VOL_RAIL_RIGHT_X0, VOL_RAIL_RIGHT_X1);
+            if (rightEndX > VOL_RAIL_RIGHT_X0 + 0.004f) {
+                ReplayDraw.quad(glow, m,
+                        VOL_RAIL_RIGHT_X0, barY - fillHalfH, 0.006f,
+                        rightEndX, barY - fillHalfH, 0.006f,
+                        rightEndX, barY + fillHalfH, 0.006f,
+                        VOL_RAIL_RIGHT_X0, barY + fillHalfH, 0.006f,
+                        fillMid, fillEnd, fillEnd, fillMid);
+            }
+        }
+
+        // Playhead diamond knob along the active track half
+        float thumbX = sliderXFromVolume(vol);
+        drawDiamond(glow, m, thumbX, barY, 0.010f, 0.030f,
+                ReplayPalette.alpha(muted ? 0xFFFFB2BC : ReplayPalette.CHAMPAGNE, a));
+        drawDiamond(glow, m, thumbX, barY, 0.009f, 0.044f,
+                ReplayPalette.alpha(muted ? ReplayPalette.RUBY : ReplayPalette.BRASS_LIGHT, 0.42 * a));
+
+        // Hover ghost preview marker on slider rail
+        if (hoverSlider) {
+            float hx = Mth.clamp((float) hovered.seekTick(), VOL_RAIL_LEFT_X0, VOL_RAIL_RIGHT_X1);
+            if (!isPointInVolumeMute(hx, barY)) {
+                int curCol = ReplayPalette.alpha(CYAN_CORE, 0.92 * a);
+                ReplayDraw.segment(glow, m, hx, barY - 0.044f, 0.010f, hx, barY + 0.044f, 0.010f,
+                        0.0055f * ws, curCol, curCol);
+            }
+        }
+
+        // Centered One-Click Mute Medallion right in the middle of the slider
+        float mhw = (VOL_MUTE_X1 - VOL_MUTE_X0) * 0.5f;
+        float mhh = (VOL_MUTE_Y1 - VOL_MUTE_Y0) * 0.5f;
+        float mcChamfer = 0.024f;
+        Matrix4f mm = new Matrix4f(m).translate(VOL_MUTE_CX, barY, 0.005f);
+        int muteTop, muteBot, muteBorder, iconCol, slashCol;
+        if (muted) {
+            muteTop = ReplayPalette.alpha(hoverMute ? 0xFF7A2835 : 0xFF531A24, 0.96 * a);
+            muteBot = ReplayPalette.alpha(0xFF2B0D13, 0.97 * a);
+            muteBorder = ReplayPalette.alpha(hoverMute ? RUBY_CORE : ReplayPalette.RUBY, a);
+            iconCol = ReplayPalette.alpha(0xFFFFE2E5, a);
+            slashCol = ReplayPalette.alpha(hoverMute ? 0xFFFFFFFF : RUBY_CORE, a);
+        } else if (hoverMute) {
+            muteTop = ReplayPalette.alpha(0xFF224268, 0.96 * a);
+            muteBot = ReplayPalette.alpha(0xFF0E1D34, 0.97 * a);
+            muteBorder = ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a);
+            iconCol = ReplayPalette.alpha(0xFFFFFFFF, a);
+            slashCol = ReplayPalette.alpha(RUBY_CORE, a);
+        } else {
+            muteTop = ReplayPalette.alpha(0xFF1A2847, 0.94 * a);
+            muteBot = ReplayPalette.alpha(0xFF0B1224, 0.96 * a);
+            muteBorder = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.90 * a);
+            iconCol = ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a);
+            slashCol = ReplayPalette.alpha(RUBY_CORE, a);
+        }
+        chamferPanel(panel, mm, mhw, mhh, mcChamfer, 0f, muteTop, muteBot);
+        chamferOutline(glow, mm, mhw, mhh, mcChamfer, 0.002f, (hoverMute ? 0.0065f : 0.0048f) * ws, muteBorder);
+        drawSpeakerIcon(glow, mm, 0f, 0f, 0.004f, 0.034f, ws, muted, iconCol, slashCol);
+
+        // Bottom utility pills (Detailed Mixer | Close)
+        for (DeckWidget vw : surf.volumeWidgets()) {
+            boolean isHover = hoverThisSurface && hoveredDeckWidget == vw;
+            paintDeckWidget(f, panel, glow, m, vw, isHover, ws, a);
+        }
+    }
+
+    private static void paintVolumeDrawerTooltip(ReplayFrame f, VertexConsumer panel, VertexConsumer glow,
+                                                 Matrix4f m, Component hint, float ws, double a) {
+        float ts = 0.0040f;
+        float halfW = Math.min(0.72f, Math.max(0.28f, f.mc.font.width(hint) * ts * 0.5f + 0.07f));
+        float halfH = 0.048f;
+        Matrix4f tm = new Matrix4f(m).translate(VOL_MUTE_CX, VOL_PANEL_Y1 + 0.066f, 0.014f);
+        chamferPanel(panel, tm, halfW, halfH, 0.018f, 0f,
+                ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.95 * a),
+                ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.97 * a));
+        chamferOutline(glow, tm, halfW, halfH, 0.018f, 0.002f, 0.005f * ws,
+                ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.88 * a));
+        f.text(tm, hint, 0f, 0f, 0.005f, ts, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a), 0, true, halfW * 2f - 0.08f);
+    }
+
+    /** Crisp pure-geometry Art Deco speaker glyph (with sound waves when active, or bold mute slash when muted). */
+    private static void drawSpeakerIcon(VertexConsumer glow, Matrix4f m, float cx, float cy, float z,
+                                        float r, float ws, boolean muted, int color, int slashColor) {
+        // Rear speaker cabinet
+        ReplayDraw.rectXY(glow, m, cx - 0.82f * r, cy - 0.34f * r, cx - 0.36f * r, cy + 0.34f * r, z, color, color);
+        // Flared speaker cone
+        ReplayDraw.quad(glow, m,
+                cx - 0.36f * r, cy - 0.34f * r, z,
+                cx + 0.14f * r, cy - 0.78f * r, z,
+                cx + 0.14f * r, cy + 0.78f * r, z,
+                cx - 0.36f * r, cy + 0.34f * r, z,
+                color, color, color, color);
+        float stroke = Math.max(0.0038f, r * 0.16f) * ws;
+        if (muted) {
+            // Crisp symmetric X beside the speaker cone (classic mute glyph, legible at all distances)
+            ReplayDraw.segment(glow, m, cx + 0.34f * r, cy + 0.30f * r, z + 0.001f,
+                    cx + 0.86f * r, cy - 0.30f * r, z + 0.001f, stroke * 1.30f, slashColor, slashColor);
+            ReplayDraw.segment(glow, m, cx + 0.34f * r, cy - 0.30f * r, z + 0.001f,
+                    cx + 0.86f * r, cy + 0.30f * r, z + 0.001f, stroke * 1.30f, slashColor, slashColor);
+        } else {
+            // Inner sound wave arc
+            ReplayDraw.segment(glow, m, cx + 0.36f * r, cy + 0.36f * r, z, cx + 0.48f * r, cy, z, stroke, color, color);
+            ReplayDraw.segment(glow, m, cx + 0.48f * r, cy, z, cx + 0.36f * r, cy - 0.36f * r, z, stroke, color, color);
+            // Outer sound wave arc
+            ReplayDraw.segment(glow, m, cx + 0.62f * r, cy + 0.64f * r, z, cx + 0.82f * r, cy + 0.22f * r, z, stroke, color, color);
+            ReplayDraw.segment(glow, m, cx + 0.82f * r, cy + 0.22f * r, z, cx + 0.82f * r, cy - 0.22f * r, z, stroke, color, color);
+            ReplayDraw.segment(glow, m, cx + 0.82f * r, cy - 0.22f * r, z, cx + 0.62f * r, cy - 0.64f * r, z, stroke, color, color);
         }
     }
 

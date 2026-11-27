@@ -503,7 +503,7 @@ public final class MatchReplayRecorder {
         if (base.startsWith("tacz:")) {
             CustomData custom = stack.get(DataComponents.CUSTOM_DATA);
             if (custom != null) {
-                CompoundTag tag = custom.copyTag();
+                CompoundTag tag = custom.getUnsafe();
                 if (tag.contains("GunId")) {
                     String gunId = tag.getString("GunId");
                     if (!gunId.isBlank()) return bounded(base + "#" + gunId, 128);

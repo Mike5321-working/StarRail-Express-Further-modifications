@@ -2,6 +2,8 @@ package com.habitrain.core.scene.client.replay;
 
 import com.habitrain.core.api.match.MatchWinFaction;
 import com.habitrain.core.api.match.replay.LastMatchReplay;
+import com.habitrain.core.client.config.ClientVisualPreferences;
+import com.habitrain.core.client.config.ReplayAudioSettings;
 import com.habitrain.core.network.replay.ReplayPackets;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.client.ClientReplayBoard;
@@ -55,7 +57,8 @@ final class ReplayBoardControlsScreen extends Screen {
     private DeckButton startPlayButton;
     private DeckButton stepBackButton, playPauseButton, stepForwardButton, endSessionButton;
     private final DeckButton[] speedButtons = new DeckButton[SPEEDS.length];
-    private DeckButton closeupButton, roofButton, exportButton, doneButton;
+    private DeckButton closeupButton, roofButton, volumeButton, exportButton, doneButton;
+    private final ReplayAudioSettingsOverlay volumeOverlay = new ReplayAudioSettingsOverlay();
 
     private ClientReplayBoard.View view;
     private @Nullable ReplayBoardSessionState session;
@@ -73,9 +76,20 @@ final class ReplayBoardControlsScreen extends Screen {
     private boolean playTimedOut;
 
     ReplayBoardControlsScreen(ClientLevel level, BlockPos pos) {
+        this(level, pos, false);
+    }
+
+    private ReplayBoardControlsScreen(ClientLevel level, BlockPos pos, boolean openVolumeInitially) {
         super(tr("controls.panel_title"));
         this.level = level;
         this.pos = pos.immutable();
+        if (openVolumeInitially) {
+            this.volumeOverlay.open();
+        }
+    }
+
+    static ReplayBoardControlsScreen openVolumeSettings(ClientLevel level, BlockPos pos) {
+        return new ReplayBoardControlsScreen(level, pos, true);
     }
 
     private static Component tr(String key, Object... args) {
@@ -147,23 +161,36 @@ final class ReplayBoardControlsScreen extends Screen {
             speedButtons[i] = btn;
         }
 
-        // Row 2: view toggles + export
+        // Row 2: view toggles + local volume settings + export
         int row2Y = top + 98;
-        int third = (innerW - gap * 2) / 3;
-        closeupButton = addRenderableWidget(new DeckButton(left + pad, row2Y, third, 20,
+        int row2Usable = innerW - gap * 3;
+        int closeupW = Math.max(50, row2Usable * 20 / 100);
+        int roofW = Math.max(50, row2Usable * 20 / 100);
+        int volumeW = Math.max(76, row2Usable * 32 / 100);
+        int row2X = left + pad;
+
+        closeupButton = addRenderableWidget(new DeckButton(row2X, row2Y, closeupW, 20,
                 Component.empty(), b -> {
             if (session != null) ClientReplayBoard.setBoardKillCloseup(pos, !session.killCloseupEnabled());
         }, false));
         closeupButton.setTooltip(Tooltip.create(tr("deck.closeup_tip")));
+        row2X += closeupW + gap;
 
-        roofButton = addRenderableWidget(new DeckButton(left + pad + third + gap, row2Y, third, 20,
+        roofButton = addRenderableWidget(new DeckButton(row2X, row2Y, roofW, 20,
                 Component.empty(), b -> {
             if (session != null) ClientReplayBoard.setBoardRoofCutaway(pos, !session.roofCutaway());
         }, false));
         roofButton.setTooltip(Tooltip.create(tr("deck.roof_tip")));
+        row2X += roofW + gap;
 
-        int exportX = left + pad + (third + gap) * 2;
-        exportButton = addRenderableWidget(new DeckButton(exportX, row2Y, (left + panelWidth - pad) - exportX, 20,
+        volumeButton = addRenderableWidget(new DeckButton(row2X, row2Y, volumeW, 20,
+                Component.empty(), b -> {
+            volumeOverlay.toggle();
+            refresh();
+        }, false));
+        row2X += volumeW + gap;
+
+        exportButton = addRenderableWidget(new DeckButton(row2X, row2Y, Math.max(54, (left + panelWidth - pad) - row2X), 20,
                 tr("controls.open_export"), b -> {
             if (minecraft != null && level != null) {
                 minecraft.setScreen(new ReplayExportScreen(level, pos));
@@ -296,6 +323,13 @@ final class ReplayBoardControlsScreen extends Screen {
         roofButton.setMessage(tr(roofOn ? "deck.roof_cut" : "deck.roof_full"));
         roofButton.highlighted = active && roofOn;
 
+        ReplayAudioSettings audio = ClientVisualPreferences.getReplayAudioSettings();
+        volumeButton.active = true;
+        volumeButton.danger = audio.isEffectivelyMuted();
+        volumeButton.highlighted = volumeOverlay.isOpen() || (!audio.isEffectivelyMuted() && !audio.isDefault());
+        volumeButton.setMessage(ReplayAudioSettingsOverlay.buttonLabel(audio));
+        volumeButton.setTooltip(Tooltip.create(ReplayAudioSettingsOverlay.buttonTooltip(audio, false)));
+
         exportButton.active = hasReplay && (ClientReplayBoard.mapAvailable() || (active && session.shared()));
     }
 
@@ -322,7 +356,23 @@ final class ReplayBoardControlsScreen extends Screen {
 
     // ------------------------------------------------------------------ input handling
 
+    @Override public void removed() {
+        volumeOverlay.onRemoved();
+        super.removed();
+    }
+
     @Override public boolean mouseClicked(double mouseX, double mouseY, int button) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseClicked(mouseX, mouseY, button);
+            refresh();
+            return handled;
+        }
+        if (button == 1 && volumeButton != null && volumeButton.active && volumeButton.isMouseOver(mouseX, mouseY)) {
+            ClientVisualPreferences.toggleReplayAudioMute();
+            if (minecraft != null) doneButton.playDownSound(minecraft.getSoundManager());
+            refresh();
+            return true;
+        }
         if (button == 0) {
             // 1. Timeline click -> start scrub
             if (isSessionActive() && !session.preparing() && view != null && view.replay() != null
@@ -345,10 +395,20 @@ final class ReplayBoardControlsScreen extends Screen {
                 }
             }
         }
-        return super.mouseClicked(mouseX, mouseY, button);
+        boolean handled = super.mouseClicked(mouseX, mouseY, button);
+        if (volumeOverlay.isOpen()) {
+            draggingTimeline = false;
+            setFocused(null);
+        }
+        return handled;
     }
 
     @Override public boolean mouseDragged(double mouseX, double mouseY, int button, double dx, double dy) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseDragged(mouseX, mouseY, button);
+            refresh();
+            return handled;
+        }
         if (button == 0 && draggingTimeline) {
             updateDragSeek(mouseX, false);
             return true;
@@ -357,6 +417,11 @@ final class ReplayBoardControlsScreen extends Screen {
     }
 
     @Override public boolean mouseReleased(double mouseX, double mouseY, int button) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseReleased(mouseX, mouseY, button);
+            refresh();
+            return handled;
+        }
         if (button == 0 && draggingTimeline) {
             updateDragSeek(mouseX, true);
             draggingTimeline = false;
@@ -366,6 +431,11 @@ final class ReplayBoardControlsScreen extends Screen {
     }
 
     @Override public boolean mouseScrolled(double mouseX, double mouseY, double scrollX, double scrollY) {
+        if (volumeOverlay.isOpen()) {
+            boolean handled = volumeOverlay.mouseScrolled(mouseX, mouseY, scrollY);
+            refresh();
+            return handled;
+        }
         if (mouseX >= rosterX0 && mouseX <= rosterX1 && mouseY >= rosterY0 && mouseY <= rosterY1) {
             int maxScroll = maxRosterScroll();
             if (maxScroll > 0) {
@@ -377,6 +447,10 @@ final class ReplayBoardControlsScreen extends Screen {
     }
 
     @Override public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        if (volumeOverlay.isOpen() && volumeOverlay.keyPressed(keyCode)) {
+            refresh();
+            return true;
+        }
         if (isSessionActive() && !session.preparing()) {
             if (keyCode == GLFW.GLFW_KEY_SPACE) {
                 if (isFinishedHold()) {
@@ -417,7 +491,7 @@ final class ReplayBoardControlsScreen extends Screen {
 
     // ------------------------------------------------------------------ Star-Night Express rendering
 
-    @Override public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+    @Override public void renderBackground(GuiGraphics g, int mouseX, int mouseY, float delta) {
         // 1. Star-Night Express midnight panel body + double brass chamfered border
         g.fillGradient(left, top, left + panelWidth, top + panelHeight,
                 ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.95),
@@ -435,6 +509,19 @@ final class ReplayBoardControlsScreen extends Screen {
         g.fill(left, top + panelHeight - cs, left + 2, top + panelHeight, ReplayPalette.BRASS_LIGHT);
         g.fill(left + panelWidth - cs, top + panelHeight - 2, left + panelWidth, top + panelHeight, ReplayPalette.BRASS_LIGHT);
         g.fill(left + panelWidth - 2, top + panelHeight - cs, left + panelWidth, top + panelHeight, ReplayPalette.BRASS_LIGHT);
+    }
+
+    @Override public void render(GuiGraphics g, int mouseX, int mouseY, float delta) {
+        boolean modalOpen = volumeOverlay.isOpen();
+        if (modalOpen && getFocused() != null) {
+            setFocused(null);
+        }
+        int bgMouseX = modalOpen ? -9999 : mouseX;
+        int bgMouseY = modalOpen ? -9999 : mouseY;
+
+        // Render panel background (via renderBackground) + DeckButton widgets first so
+        // Screen.renderBackground never draws over custom header/timeline/roster content.
+        super.render(g, bgMouseX, bgMouseY, delta);
 
         // 2. Art Deco header with flanking brass rules
         int centerX = left + panelWidth / 2;
@@ -451,10 +538,10 @@ final class ReplayBoardControlsScreen extends Screen {
         renderSubtitle(g, tick);
 
         // 4. Interactive Art Deco timeline scrubber
-        renderTimeline(g, mouseX, mouseY, tick);
+        renderTimeline(g, bgMouseX, bgMouseY, tick);
 
         // 5. Passenger roster section header + scrollable list
-        renderRoster(g, mouseX, mouseY, tick);
+        renderRoster(g, bgMouseX, bgMouseY, tick);
 
         // 6. Session-only isolation note at footer
         Component tempNote = tr("controls.session_temp_note");
@@ -462,7 +549,10 @@ final class ReplayBoardControlsScreen extends Screen {
         g.drawString(font, font.plainSubstrByWidth(tempNote.getString(), noteMaxW),
                 left + 12, top + panelHeight - 19, ReplayPalette.TEXT_MUTED, false);
 
-        super.render(g, mouseX, mouseY, delta);
+        // 7. Client-local volume settings overlay (rendered above all widgets and base text)
+        if (modalOpen) {
+            volumeOverlay.render(g, font, mouseX, mouseY, left, top, panelWidth, panelHeight, width, height);
+        }
     }
 
     private void renderSubtitle(GuiGraphics g, double tick) {
@@ -594,27 +684,32 @@ final class ReplayBoardControlsScreen extends Screen {
         g.fill(rosterX0, rosterY0, rosterX1, rosterY1, 0xAA070B16);
         g.renderOutline(rosterX0, rosterY0, rosterX1 - rosterX0, rosterY1 - rosterY0, ReplayPalette.BRASS_DIM);
 
-        g.enableScissor(rosterX0 + 1, rosterY0 + 1, rosterX1 - 1, rosterY1 - 1);
         UUID currentFollow = isSessionActive() ? session.followPlayerUuid() : null;
         int totalRows = 1 + participants.size();
         int maxScroll = maxRosterScroll();
         int rowW = (rosterX1 - rosterX0) - (maxScroll > 0 ? 8 : 2);
 
-        for (int i = 0; i < totalRows; i++) {
-            int ry = rosterY0 + 1 + i * ROW_H - rosterScroll;
-            if (ry + ROW_H < rosterY0 || ry > rosterY1) continue;
-            boolean hovered = mouseX >= rosterX0 + 1 && mouseX <= rosterX0 + rowW
-                    && mouseY >= Math.max(rosterY0, ry) && mouseY < Math.min(rosterY1, ry + ROW_H);
-            if (i == 0) {
-                boolean selected = isSessionActive() && currentFollow == null;
-                renderGlobalRow(g, rosterX0 + 1, ry, rowW, selected, hovered);
-            } else {
-                var p = participants.get(i - 1);
-                boolean selected = isSessionActive() && Objects.equals(currentFollow, p.id());
-                renderParticipantRow(g, rosterX0 + 1, ry, rowW, p, tick, selected, hovered);
+        g.flush();
+        g.enableScissor(rosterX0 + 1, rosterY0 + 1, rosterX1 - 1, rosterY1 - 1);
+        try {
+            for (int i = 0; i < totalRows; i++) {
+                int ry = rosterY0 + 1 + i * ROW_H - rosterScroll;
+                if (ry + ROW_H < rosterY0 || ry > rosterY1) continue;
+                boolean hovered = mouseX >= rosterX0 + 1 && mouseX <= rosterX0 + rowW
+                        && mouseY >= Math.max(rosterY0, ry) && mouseY < Math.min(rosterY1, ry + ROW_H);
+                if (i == 0) {
+                    boolean selected = isSessionActive() && currentFollow == null;
+                    renderGlobalRow(g, rosterX0 + 1, ry, rowW, selected, hovered);
+                } else {
+                    var p = participants.get(i - 1);
+                    boolean selected = isSessionActive() && Objects.equals(currentFollow, p.id());
+                    renderParticipantRow(g, rosterX0 + 1, ry, rowW, p, tick, selected, hovered);
+                }
             }
+        } finally {
+            g.flush();
+            g.disableScissor();
         }
-        g.disableScissor();
 
         // Scrollbar if needed
         if (maxScroll > 0) {
@@ -715,7 +810,7 @@ final class ReplayBoardControlsScreen extends Screen {
     // ------------------------------------------------------------------ Art Deco button widget
 
     private static final class DeckButton extends Button {
-        final boolean danger;
+        boolean danger;
         boolean highlighted;
 
         DeckButton(int x, int y, int width, int height, Component message, OnPress onPress, boolean danger) {

@@ -21,6 +21,23 @@ import static org.junit.jupiter.api.Assertions.*;
 class ReplayArchiveTest {
     @TempDir Path world;
 
+    @Test void fortyLookupsReuseOneSummaryAndEvictionMakesItUnavailable() throws Exception {
+        var archive = new ReplayArchive(world);
+        UUID round = UUID.randomUUID();
+        var replay = new LastMatchReplay(round, 0, 40, "Train", "murder", "", MatchWinKind.NONE,
+                "", "", "", 0, new SceneBounds(0, 0, 0, 16, 16, 16), null,
+                List.of(), List.of(), List.of(), null, 0, false);
+        byte[] bytes = ReplayArchiveData.encode(new ReplayPackets.LastMatchSummaryS2C(replay, new byte[0]));
+        byte[] section = new byte[256 * 1024];
+        assertTrue(archive.save(round, 1, "a".repeat(64), bytes, List.of(section, section, section, section), new byte[0]));
+        var cached = archive.boardSummary(round);
+        assertEquals(ReplayArchiveData.digest(bytes), cached.digest());
+        assertArrayEquals(bytes, ReplayArchiveData.encode(cached.packet()));
+        for (int viewer = 1; viewer < 40; viewer++) assertSame(cached, archive.boardSummary(round));
+        archive.setLimit(1024 * 1024);
+        assertNull(archive.boardSummary(round));
+    }
+
     @Test void preservesRecordsAndSharedMapsAcrossRestart() throws Exception {
         Path root = world.resolve("archive");
         var store = new ReplayArchive(root);

@@ -8,14 +8,12 @@ import com.habitrain.core.scene.replay.ReplayBoardSessionState;
 import com.habitrain.core.scene.replay.ReplayMapCapture;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import com.habitrain.core.scene.server.SceneBandwidthGovernor;
-import io.netty.buffer.Unpooled;
 import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.core.BlockPos;
-import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -371,13 +369,7 @@ public final class ReplayBoardService {
                                             boolean tracksThinned, VoiceSource voice,
                                             @Nullable byte[] reusableTrailer) {
         var packet = makePacket(s, tracks, map, tracksThinned, reusableTrailer);
-        var buffer = new FriendlyByteBuf(Unpooled.buffer());
-        try {
-            LastMatchSummaryS2C.CODEC.encode(buffer, packet);
-            return new Published(packet, buffer.readableBytes(), map, voice);
-        } finally {
-            buffer.release();
-        }
+        return new Published(packet, packet.prepareBroadcast(), map, voice);
     }
 
     private static LastMatchSummaryS2C makePacket(LastMatchReplay s, byte[] tracks, ReplayMapCapture.Result map,
@@ -659,7 +651,8 @@ public final class ReplayBoardService {
                 byte[] patch = t.round.map.patches().get(t.indices[t.cursor]);
                 int end = Math.min(t.offset + FRAGMENT_BYTES, patch.length);
                 ServerPlayNetworking.send(player, new ReplaySectionPatchS2C(t.round.packet.replay().roundId(),
-                        t.indices[t.cursor], t.offset, patch.length, Arrays.copyOfRange(patch, t.offset, end)));
+                        t.indices[t.cursor], t.offset, patch.length,
+                        t.offset == 0 && end == patch.length ? patch : Arrays.copyOfRange(patch, t.offset, end)));
                 t.offset = end;
                 if (end == patch.length) {
                     t.offset = 0;

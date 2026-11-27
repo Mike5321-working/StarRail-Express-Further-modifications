@@ -7,6 +7,7 @@ import com.habitrain.core.api.match.replay.ReplayProjection;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.*;
+import java.util.function.Function;
 
 /**
  * Pure, deterministic, side-neutral audibility & spatial mixing solver for replay voice and game sound.
@@ -60,7 +61,8 @@ public final class ReplayVoiceAudibilityResolver {
         private final Map<UUID, List<ReplayVoiceData.SpeakerStateSpan>> spansByPlayer;
         private final Map<String, List<ReplayVoiceData.RecordedVoicePolicy>> policiesByRole;
 
-        private Context(LastMatchReplay replay, @Nullable ReplayVoiceData voice) {
+        private Context(LastMatchReplay replay, @Nullable ReplayVoiceData voice,
+                        Function<LastMatchReplay.Participant, ReplayTrackSampler> samplerFor) {
             this.replay = Objects.requireNonNull(replay, "replay");
             this.voice = voice == null ? ReplayVoiceData.EMPTY : voice;
             this.layout = ReplayProjection.layout(replay);
@@ -69,7 +71,7 @@ public final class ReplayVoiceAudibilityResolver {
             Map<UUID, LastMatchReplay.Participant> partMap = new HashMap<>(replay.participants().size() * 2);
             for (var p : replay.participants()) {
                 partMap.put(p.id(), p);
-                samplerMap.put(p.id(), new ReplayTrackSampler(p.track()));
+                samplerMap.put(p.id(), samplerFor.apply(p));
             }
             this.samplers = Map.copyOf(samplerMap);
             this.participants = Map.copyOf(partMap);
@@ -98,7 +100,12 @@ public final class ReplayVoiceAudibilityResolver {
         }
 
         public static Context of(LastMatchReplay replay, @Nullable ReplayVoiceData voice) {
-            return new Context(replay, voice);
+            return of(replay, voice, player -> new ReplayTrackSampler(player.track()));
+        }
+
+        public static Context of(LastMatchReplay replay, @Nullable ReplayVoiceData voice,
+                                 Function<LastMatchReplay.Participant, ReplayTrackSampler> samplerFor) {
+            return new Context(replay, voice, samplerFor);
         }
 
         public LastMatchReplay replay() { return replay; }

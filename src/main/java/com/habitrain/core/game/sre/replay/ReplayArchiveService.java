@@ -31,6 +31,7 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.BiConsumer;
+import java.util.function.LongConsumer;
 import java.util.function.Predicate;
 import java.util.function.ToIntFunction;
 
@@ -238,7 +239,10 @@ public final class ReplayArchiveService {
      * async fetch or partially drained stream for that player without affecting other lanes (Defect #14).
      */
     static final class TransferLane<T> {
+        private record Waiting(Request request, LongConsumer start) {}
+
         private static final class Slot<T> {
+            @Nullable Request request;
             final long epoch;
             @Nullable Iterator<T> packets;
             @Nullable T next;
@@ -263,6 +267,7 @@ public final class ReplayArchiveService {
         private final int capacity;
         private final long maxTotalBytes;
         private final Map<UUID, Slot<T>> slots = new LinkedHashMap<>();
+        private final LinkedHashMap<UUID, Waiting> waiting = new LinkedHashMap<>();
         private long nextEpoch;
         private long totalBytes;
 
@@ -292,6 +297,31 @@ public final class ReplayArchiveService {
             Slot<T> prev = slots.put(player, new Slot<>(epoch));
             releaseSlot(prev);
             return epoch;
+        }
+
+        boolean startOrQueue(UUID player, Request request, LongConsumer start) {
+            Slot<T> active = slots.get(player);
+            if (active != null && request.equals(active.request)) return false;
+            if (active == null && (slots.size() >= capacity || !waiting.isEmpty())) {
+                if (waiting.size() >= 64 && !waiting.containsKey(player)) return false;
+                waiting.put(player, new Waiting(request, start));
+                return false;
+            }
+            startRead(player, request, start);
+            return true;
+        }
+
+        private void startRead(UUID player, Request request, LongConsumer start) {
+            long epoch = begin(player);
+            slots.get(player).request = request;
+            start.accept(epoch);
+        }
+
+        void admitWaiting() {
+            while (slots.size() < capacity && !waiting.isEmpty()) {
+                var entry = waiting.pollFirstEntry();
+                startRead(entry.getKey(), entry.getValue().request(), entry.getValue().start());
+            }
         }
 
         /**
@@ -350,6 +380,7 @@ public final class ReplayArchiveService {
         }
 
         void remove(UUID player) {
+            waiting.remove(player);
             releaseSlot(slots.remove(player));
         }
 
@@ -702,31 +733,35 @@ public final class ReplayArchiveService {
                 return;
             }
             if (r.round().equals(ReplayPackets.EMPTY)) return;
-            if (r.action() == VOICE) {
-                if (!ServerPlayNetworking.canSend(p, Voice.TYPE)) return;
+            UUID id = p.getUUID();
+            TransferLane<CustomPacketPayload> lane = r.action() == VOICE ? voiceLane : summaryLane;
+            if (r.action() == SECTIONS && (r.missing().isEmpty() || r.missing().cardinality() > ReplayPackets.MAX_REQUESTED)) return;
+            if (!lane.startOrQueue(id, r, epoch -> startRead(p, r, lane, epoch))) {
+                ServerPlayNetworking.send(p, new Reply(r.round(), TRANSFER_BUSY));
+            }
+        }
+
+        private void startRead(ServerPlayer p, Request r, TransferLane<CustomPacketPayload> lane, long epoch) {
+            UUID id = p.getUUID();
+            boolean isVoice = r.action() == VOICE;
+            if (!online(p) || isVoice && !ServerPlayNetworking.canSend(p, Voice.TYPE)) {
+                lane.cancelIfCurrent(id, epoch);
+                return;
+            }
+            if (isVoice) {
                 if (!ServerPlayNetworking.canSend(p, ReplayPackets.VoiceExportAccessS2C.TYPE)) {
+                    lane.cancelIfCurrent(id, epoch);
                     ServerPlayNetworking.send(p, new Voice(new ReplayPackets.ReplayVoiceChunkS2C(r.round(), 0, 0, new byte[0])));
                     return;
                 }
                 Set<UUID> visible = viewed.get(p.getUUID());
                 boolean allowedViaBoard = isNearActiveBoardPlaying(p, r.round());
                 if ((visible == null || !visible.contains(r.round())) && !allowedViaBoard) {
+                    lane.cancelIfCurrent(id, epoch);
                     ServerPlayNetworking.send(p, new Reply(r.round(), ERROR));
                     return;
                 }
             }
-            if (r.action() == SECTIONS && (r.missing().isEmpty() || r.missing().cardinality() > ReplayPackets.MAX_REQUESTED)) return;
-
-            UUID id = p.getUUID();
-            boolean isVoice = (r.action() == VOICE);
-            TransferLane<CustomPacketPayload> lane = isVoice ? voiceLane : summaryLane;
-            // Cancel any stale transfer for this player cleanly instead of silently dropping (Defect #14 fix).
-            long epoch = lane.begin(id);
-            if (epoch < 0L) {
-                ServerPlayNetworking.send(p, new Reply(r.round(), ERROR));
-                return;
-            }
-
             boolean isAdmin = admin(p);
 
             submit(() -> {
@@ -747,12 +782,12 @@ public final class ReplayArchiveService {
                     boolean wasCurrent = lane.isCurrent(id, epoch);
                     if (!lane.installIfCurrent(id, epoch, fetched.packets(), fetched.estimatedBytes())
                             && wasCurrent && isVoice) {
-                        ServerPlayNetworking.send(p, new Reply(r.round(), TABLE_BUSY));
+                        ServerPlayNetworking.send(p, new Reply(r.round(), TRANSFER_BUSY));
                     }
                 });
             }, () -> server.execute(() -> {
                 if (lane.cancelIfCurrent(id, epoch) && online(p)) {
-                    ServerPlayNetworking.send(p, new Reply(r.round(), ERROR));
+                    ServerPlayNetworking.send(p, new Reply(r.round(), TRANSFER_BUSY));
                 }
             }));
         }
@@ -875,12 +910,12 @@ public final class ReplayArchiveService {
                 });
                 return packets;
             }
-            byte[] raw = archive.summary(round);
-            if (raw == null) return List.of(new Reply(round, MISSING));
-            var data = ReplayArchiveData.decode(raw);
+            var cached = archive.boardSummary(round);
+            if (cached == null) return List.of(new Reply(round, MISSING));
+            var data = cached.packet();
             if (!round.equals(data.replay().roundId()) || data.replay().manifest() == null) return List.of(new Reply(round, ERROR));
             rememberDuration(round, data.replay().durationTicks());
-            if (r.action() == LOOKUP && !r.digest().isEmpty() && r.digest().equals(ReplayArchiveData.digest(raw))) {
+            if (r.action() == LOOKUP && r.digest().equals(cached.digest())) {
                 return List.of(new Reply(round, CACHED));
             }
             return List.of(new Summary(data));
@@ -1081,13 +1116,15 @@ public final class ReplayArchiveService {
             pumpLane(summaryLane, false);
             pumpLane(voiceLane, true);
             pumpLane(visualLane, true);
+            summaryLane.admitWaiting();
+            voiceLane.admitWaiting();
         }
 
         private static int estimateBytes(CustomPacketPayload payload) {
             return payload instanceof Section s ? s.data().bytes().length + 64
                     : payload instanceof VisualPackets.Page page ? page.data().length + 64
                     : payload instanceof Voice v ? v.data().bytes().length + 64
-                    : payload instanceof Summary s ? s.data().tracks().length + 128 * 1024 : 64;
+                    : payload instanceof Summary s ? s.data().prepareBroadcast() + 64 : 64;
         }
 
         private void pumpLane(TransferLane<CustomPacketPayload> lane, boolean isVoiceLane) {

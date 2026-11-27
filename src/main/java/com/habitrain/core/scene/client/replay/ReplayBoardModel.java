@@ -381,7 +381,7 @@ final class ReplayBoardModel {
             if (current >= end) return current + 1;
             int vNext = visualNext[current];
             if (vNext > end) vNext = end;
-            if (current < recent && stride > 1) {
+            if (current < recent) {
                 int nextOnStride = current + stride - current % stride;
                 int target = Math.max(vNext, nextOnStride);
                 return Math.min(recent, Math.min(target, end));

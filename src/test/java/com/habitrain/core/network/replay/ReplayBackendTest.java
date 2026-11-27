@@ -221,6 +221,25 @@ class ReplayBackendTest {
         } finally { buf.release(); }
     }
 
+    @Test void fortyViewersGetTheSamePreparedFortyPlayerSummary() {
+        var players = new ArrayList<Participant>();
+        for (int index = 0; index < 40; index++) {
+            players.add(new Participant(new UUID(1, index), "Runner" + index, "", 0, "", 0,
+                    MatchWinFaction.PASSENGER, true, 60, 0, 0, 0,
+                    List.of(point(0, index, 0, ALIVE), point(1200, index, 16, ALIVE))));
+        }
+        var replay = new LastMatchReplay(ROUND, 1000, 1200, "Train", "classic", "", MatchWinKind.INNOCENT,
+                "", "", "", 0, BOUNDS, null, players, List.of(), List.of(), null, 0, false);
+        byte[] tracks = ReplayTracks.encode(players.stream().map(Participant::track).toList());
+        var packet = new LastMatchSummaryS2C(replay, tracks);
+        byte[] reference = ReplayArchiveData.encode(packet);
+        assertEquals(reference.length, packet.prepareBroadcast());
+        for (int viewer = 0; viewer < 40; viewer++) {
+            assertArrayEquals(reference, ReplayArchiveData.encode(packet));
+        }
+        assertEquals(players, ReplayTracks.expand(ReplayArchiveData.decode(reference)).participants());
+    }
+
     @Test void droneTrackRoundTripPreservesIndependentLifecycleAndOwner() {
         var operator = new Participant(PLAYER, "Pilot", "", 0, "", 0,
                 MatchWinFaction.PASSENGER, false, 0, 0, 0, 0, List.of(point(0, 0, 0, ALIVE)));
