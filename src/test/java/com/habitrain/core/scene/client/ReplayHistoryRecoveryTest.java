@@ -1,5 +1,7 @@
 package com.habitrain.core.scene.client;
 
+import com.habitrain.core.api.match.MatchWinKind;
+import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.network.replay.ReplayArchivePackets;
@@ -118,5 +120,59 @@ class ReplayHistoryRecoveryTest {
             return true;
         });
         assertSame(partial, data.partial.get(0));
+    }
+
+    @Test void cachedReplyWithMissingOrCorruptedLocalSummaryResetsForFullServerFetch() {
+        var missingCache = new ReplayHistoryClient.Round(UUID.randomUUID());
+        missingCache.requested = 5000;
+        missingCache.attempts = 4;
+        missingCache.cached = null;
+        ReplayHistoryClient.applyReply(missingCache, ReplayArchivePackets.CACHED);
+        assertEquals(ReplayHistoryClient.Phase.LOADING, missingCache.phase);
+        assertEquals(0, missingCache.requested);
+        assertEquals(0, missingCache.attempts);
+
+        var corruptedCache = new ReplayHistoryClient.Round(UUID.randomUUID());
+        corruptedCache.requested = 5000;
+        corruptedCache.attempts = 4;
+        corruptedCache.cached = new byte[]{1, 2, 3, 4};
+        ReplayHistoryClient.applyReply(corruptedCache, ReplayArchivePackets.CACHED);
+        assertEquals(ReplayHistoryClient.Phase.LOADING, corruptedCache.phase);
+        assertNull(corruptedCache.cached);
+        assertEquals(0, corruptedCache.requested);
+        assertEquals(0, corruptedCache.attempts);
+    }
+
+    @Test void installingSummaryAfterMissingResetsVoiceUnavailableAndSkipsLocalCacheWhenForced() {
+        UUID roundId = UUID.randomUUID();
+        var manifest = new ReplayMapManifest("Train", "minecraft:overworld", new SceneBounds(0, 0, 0, 32, 16, 16),
+                "0".repeat(64), List.of(
+                        new ReplayMapManifest.Entry(new ReplayMapManifest.Section(0, 0, 0), 1),
+                        new ReplayMapManifest.Entry(new ReplayMapManifest.Section(1, 0, 0), 2)));
+        var replay = new LastMatchReplay(roundId, 0L, 120, "Train", "murder", "", MatchWinKind.NONE,
+                "", "", "", 0, new SceneBounds(0, 0, 0, 32, 16, 16), manifest,
+                List.of(), List.of(), List.of(), null, 0, false);
+        var packet = new ReplayPackets.LastMatchSummaryS2C(replay, new byte[0]);
+
+        var round = new ReplayHistoryClient.Round(roundId);
+        round.skipLocalMapCache = true;
+        ReplayHistoryClient.applyReply(round, ReplayArchivePackets.MISSING);
+        assertEquals(ReplayHistoryClient.Phase.MISSING, round.phase);
+        assertTrue(round.voiceUnavailable);
+
+        ReplayHistoryClient.install(round, packet);
+        assertEquals(ReplayHistoryClient.Phase.MAP, round.phase);
+        assertFalse(round.voiceUnavailable);
+        assertFalse(round.voiceReady);
+        assertNotNull(round.map);
+        assertFalse(round.map.diskLoading);
+
+        var requested = new ArrayList<BitSet>();
+        round.map.step(0L, bits -> {
+            requested.add((BitSet) bits.clone());
+            return true;
+        });
+        assertEquals(1, requested.size());
+        assertEquals(BitSet.valueOf(new long[]{0b11L}), requested.getFirst());
     }
 }

@@ -3,6 +3,7 @@ package com.habitrain.core.game.sre.replay;
 import com.habitrain.core.api.match.replay.ReplayMapManifest;
 import com.habitrain.core.network.replay.ReplayArchiveData;
 import com.habitrain.core.network.replay.ReplayPackets;
+import com.habitrain.core.scene.replay.ReplayMapCapture;
 import com.habitrain.core.scene.replay.ReplayVoiceData;
 import org.slf4j.LoggerFactory;
 
@@ -42,6 +43,7 @@ final class ReplayArchive {
 
     private record Entry(UUID id, Path file, long when, String map, long bytes, long voiceBytes) {}
     record BoardSummary(ReplayPackets.LastMatchSummaryS2C packet, String digest) {}
+    record LatestEntry(UUID id, ReplayPackets.LastMatchSummaryS2C packet, ReplayMapCapture.Result map, byte[] voice) {}
     private Entry cachedEntry;
     private BoardSummary cachedSummary;
 
@@ -308,6 +310,36 @@ final class ReplayArchive {
             cachedEntry = entry;
         }
         return cachedSummary;
+    }
+
+    /** Loads the most recently recorded complete round (summary, all map patches, and voice) for startup hydration. */
+    LatestEntry loadLatest() throws IOException {
+        Entry newest = entries.values().stream()
+                .max(Comparator.comparingLong(Entry::when).thenComparing(Entry::id))
+                .orElse(null);
+        if (newest == null) return null;
+        BoardSummary summary = boardSummary(newest.id);
+        if (summary == null || summary.packet() == null || summary.packet().replay().manifest() == null) return null;
+        ReplayMapManifest manifest = summary.packet().replay().manifest();
+        int sectionCount = manifest.sections().size();
+        BitSet all = new BitSet(sectionCount);
+        all.set(0, sectionCount);
+        Map<Integer, byte[]> sectionMap = sections(newest.id, all);
+        if (sectionMap == null || sectionMap.size() != sectionCount) return null;
+        List<byte[]> patches = new ArrayList<>(sectionCount);
+        long totalBytes = 0L;
+        for (int i = 0; i < sectionCount; i++) {
+            byte[] patch = sectionMap.get(i);
+            if (patch == null || patch.length == 0) return null;
+            patches.add(patch);
+            totalBytes += patch.length;
+        }
+        byte[] voiceBytes = voice(newest.id);
+        return new LatestEntry(
+                newest.id,
+                summary.packet(),
+                new ReplayMapCapture.Result(manifest, List.copyOf(patches), totalBytes),
+                voiceBytes == null ? new byte[0] : voiceBytes);
     }
 
     com.habitrain.core.network.replay.VisualPackets.Page visualPage(com.habitrain.core.network.replay.VisualPackets.Request request) throws IOException {

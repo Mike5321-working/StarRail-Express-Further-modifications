@@ -30,6 +30,7 @@ public final class ReplayHistoryClient {
     private static final long SETTINGS_COOLDOWN_NS = 300_000_000L;
     private static final long MAX_ROUNDS_BYTES = 128L * 1024L * 1024L;
     private static final Map<UUID, Round> rounds = new LinkedHashMap<>(8, .75f, true);
+    private static final Set<UUID> forceFullRounds = new HashSet<>();
     private static Settings settings;
     private static VoiceRecordingSettings voiceSettings;
     private static UUID sharing;
@@ -73,7 +74,7 @@ public final class ReplayHistoryClient {
         byte[] cached, voiceBuffer;
         BitSet voiceHave;
         int voiceReceivedParts, voiceTotalParts;
-        boolean reading = true, voiceReady, voiceUnavailable;
+        boolean reading = true, voiceReady, voiceUnavailable, skipLocalMapCache;
         int voiceAttempts;
         int pins;
         Phase phase = Phase.LOADING;
@@ -148,6 +149,7 @@ public final class ReplayHistoryClient {
         ClientTickEvents.END_CLIENT_TICK.register(ReplayHistoryClient::tick);
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(() -> {
             rounds.clear();
+            forceFullRounds.clear();
             lastReady.clear();
             boardPins = Set.of();
             pinCounts.clear();
@@ -186,7 +188,20 @@ public final class ReplayHistoryClient {
 
     private static boolean due(long deadline) { return deadline == 0 || System.nanoTime() - deadline >= 0; }
 
-    public static void retry(UUID id) { rounds.remove(id); }
+    public static void retry(UUID id) {
+        if (id == null) return;
+        rounds.remove(id);
+        forceFullRounds.add(id);
+    }
+
+    /** Clears a cached MISSING/FAILED round so reopening a replay screen triggers a clean full server fetch. */
+    public static void retryIfFailedOrMissing(@Nullable UUID id) {
+        if (id == null) return;
+        Round existing = rounds.get(id);
+        if (existing != null && (existing.phase == Phase.MISSING || existing.phase == Phase.FAILED)) {
+            retry(id);
+        }
+    }
 
     /** Keeps a round resident while a screen, export, or shared board is using it. */
     public static void pin(UUID id) {
@@ -285,6 +300,7 @@ public final class ReplayHistoryClient {
                 rounds.remove(victim);
             }
             r = new Round(id);
+            r.skipLocalMapCache = forceFullRounds.remove(id);
             r.pins = pinCounts.getOrDefault(id, 0);
             rounds.put(id, r);
             evictIfOverBudget(id);
@@ -302,13 +318,18 @@ public final class ReplayHistoryClient {
         Minecraft mc = Minecraft.getInstance();
         Path dir = cacheDirectory();
         r.path = dir.resolve(r.id + ".bin");
+        if (r.skipLocalMapCache) {
+            r.cached = null;
+            r.reading = false;
+            return;
+        }
         CACHE_IO.execute(() -> {
             byte[] contents = null;
             try {
                 if (Files.isRegularFile(r.path, LinkOption.NOFOLLOW_LINKS)) {
                     try (var input = Files.newInputStream(r.path, LinkOption.NOFOLLOW_LINKS)) {
                         contents = input.readNBytes(ReplayPackets.MAX_SUMMARY + 1);
-                        if (contents.length > ReplayPackets.MAX_SUMMARY) contents = null;
+                        if (contents.length == 0 || contents.length > ReplayPackets.MAX_SUMMARY) contents = null;
                     }
                 }
             } catch (IOException ignored) { }
@@ -321,20 +342,36 @@ public final class ReplayHistoryClient {
     }
 
     private static void save(Round r, ReplayPackets.LastMatchSummaryS2C data) {
-        CACHE_IO.execute(() -> {
-            Path tmp = null;
-            try {
-                Files.createDirectories(r.path.getParent());
-                tmp = Files.createTempFile(r.path.getParent(), "replay-", ".part");
-                Files.write(tmp, ReplayArchiveData.encode(data));
-                Files.move(tmp, r.path, StandardCopyOption.REPLACE_EXISTING);
-                ReplayRoundCache.prune(r.path.getParent(), ReplayRoundCache.LIMIT, System.currentTimeMillis());
-            } catch (IOException | RuntimeException ignored) {
-                // A read-only client directory should not prevent playback.
-            } finally {
-                if (tmp != null) try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
-            }
-        });
+        saveToPath(r.path, data);
+    }
+
+    private static void saveToPath(@Nullable Path path, ReplayPackets.LastMatchSummaryS2C data) {
+        if (path == null || CACHE_IO.isShutdown()) return;
+        try {
+            CACHE_IO.execute(() -> {
+                Path tmp = null;
+                try {
+                    Files.createDirectories(path.getParent());
+                    tmp = Files.createTempFile(path.getParent(), "replay-", ".part");
+                    Files.write(tmp, ReplayArchiveData.encode(data));
+                    Files.move(tmp, path, StandardCopyOption.REPLACE_EXISTING);
+                    ReplayRoundCache.prune(path.getParent(), ReplayRoundCache.LIMIT, System.currentTimeMillis());
+                } catch (IOException | RuntimeException ignored) {
+                    // A read-only client directory should not prevent playback.
+                } finally {
+                    if (tmp != null) try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) { }
+    }
+
+    private static void deleteCorruptedCache(@Nullable Path path) {
+        if (path == null || CACHE_IO.isShutdown()) return;
+        try {
+            CACHE_IO.execute(() -> {
+                try { Files.deleteIfExists(path); } catch (IOException ignored) {}
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) { }
     }
 
     private static void onVoice(ReplayPackets.ReplayVoiceChunkS2C chunk) {
@@ -407,8 +444,19 @@ public final class ReplayHistoryClient {
         }
         switch (status) {
             case CACHED -> {
+                if (r.phase != Phase.LOADING) return;
+                if (r.cached == null) {
+                    r.requested = 0;
+                    r.attempts = 0;
+                    return;
+                }
                 try { install(r, ReplayArchiveData.decode(r.cached)); }
-                catch (RuntimeException invalid) { r.cached = null; r.requested = 0; r.attempts = 0; }
+                catch (RuntimeException invalid) {
+                    deleteCorruptedCache(r.path);
+                    r.cached = null;
+                    r.requested = 0;
+                    r.attempts = 0;
+                }
             }
             case MISSING -> {
                 r.phase = Phase.MISSING;
@@ -422,8 +470,16 @@ public final class ReplayHistoryClient {
     }
 
     private static void onSummary(ReplayPackets.LastMatchSummaryS2C data) {
-        Round r = rounds.get(data.replay().roundId());
-        if (r == null || r.replay != null) return;
+        if (data == null || data.replay() == null) return;
+        UUID roundId = data.replay().roundId();
+        Round r = rounds.get(roundId);
+        if (r == null) {
+            if (data.replay().manifest() != null) {
+                saveToPath(cacheDirectory().resolve(roundId + ".bin"), data);
+            }
+            return;
+        }
+        if (r.replay != null) return;
         try {
             install(r, data);
             save(r, data);
@@ -433,14 +489,24 @@ public final class ReplayHistoryClient {
         }
     }
 
-    private static void install(Round r, ReplayPackets.LastMatchSummaryS2C data) {
+    static void install(Round r, ReplayPackets.LastMatchSummaryS2C data) {
         if (!r.id.equals(data.replay().roundId()) || data.replay().manifest() == null) {
             throw new IllegalArgumentException("Unexpected replay archive round");
         }
         r.replay = ClientReplayBoard.expand(data);
         r.timeline = new ReplayTimeline(r.replay);
-        r.map = ClientReplayBoard.loadMap(r.replay.manifest());
+        r.map = ClientReplayBoard.loadMap(r.replay.manifest(), r.skipLocalMapCache);
         r.cached = null;
+        r.voice = ReplayVoiceData.EMPTY;
+        r.voiceReady = false;
+        r.voiceUnavailable = false;
+        r.voiceAttempts = 0;
+        r.voiceRequested = 0;
+        r.voiceBuffer = null;
+        r.voiceHave = null;
+        r.voiceReceivedParts = 0;
+        r.voiceTotalParts = 0;
+        r.estimatedVoiceBytes = 0L;
         r.phase = Phase.MAP;
         evictIfOverBudget(r.id);
     }

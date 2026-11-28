@@ -98,8 +98,16 @@ public final class MatchReplayRecorder {
     );
 
     private static volatile Round current;
-    private static PendingFinish pendingFinish;
+    private static volatile PendingFinish pendingFinish;
     private MatchReplayRecorder() {}
+
+    static boolean isPendingRound(@Nullable UUID roundId) {
+        if (roundId == null) return false;
+        PendingFinish pending = pendingFinish;
+        if (pending != null && roundId.equals(pending.round().id)) return true;
+        Round active = current;
+        return active != null && active.start >= 0 && roundId.equals(active.id);
+    }
 
     public static boolean isRecordingVisuals() {
         Round round = current;
@@ -413,28 +421,31 @@ public final class MatchReplayRecorder {
     private static void finishPendingNow(boolean synchronous) {
         PendingFinish pending = pendingFinish;
         if (pending == null) return;
-        pendingFinish = null;
-        MatchVoiceRecorder.stop(pending.level());
-        if (synchronous) {
-            byte[] voice = MatchVoiceRecorder.finishRound(pending.round().id, pending.round().events);
-            publishFinished(pending.level(), pending.round(), pending.summary(), voice);
-            return;
+        try {
+            MatchVoiceRecorder.stop(pending.level());
+            if (synchronous) {
+                byte[] voice = MatchVoiceRecorder.finishRound(pending.round().id, pending.round().events);
+                publishFinished(pending.level(), pending.round(), pending.summary(), voice);
+                return;
+            }
+            MatchVoiceRecorder.DetachedRound detached = MatchVoiceRecorder.detachRound(pending.round().id);
+            publishFinishedDetached(pending.level(), pending.round(), pending.summary(), detached);
+        } finally {
+            if (pendingFinish == pending) pendingFinish = null;
         }
-        MatchVoiceRecorder.DetachedRound detached = MatchVoiceRecorder.detachRound(pending.round().id);
-        publishFinishedDetached(pending.level(), pending.round(), pending.summary(), detached);
     }
 
     private static void publishFinished(ServerLevel level, Round round, LastMatchReplay summary, byte[] voice) {
+        ReplayBoardService.publish(summary, round.map, voice, round.visual.tape);
         if (current == round) current = null;
         if (pendingFinish != null && pendingFinish.round() == round) pendingFinish = null;
-        ReplayBoardService.publish(summary, round.map, voice, round.visual.tape);
     }
 
     private static void publishFinishedDetached(ServerLevel level, Round round, LastMatchReplay summary,
                                                 @Nullable MatchVoiceRecorder.DetachedRound detachedVoice) {
+        ReplayBoardService.publish(summary, round.map, detachedVoice, round.visual.tape);
         if (current == round) current = null;
         if (pendingFinish != null && pendingFinish.round() == round) pendingFinish = null;
-        ReplayBoardService.publish(summary, round.map, detachedVoice, round.visual.tape);
     }
 
     public static void visualPacket(ServerPlayer player, net.minecraft.network.protocol.Packet<?> packet) {
@@ -731,7 +742,9 @@ public final class MatchReplayRecorder {
 
     public static UUID recordId(ServerLevel level) {
         Round r = current;
-        return r != null && r.level == level && r.start >= 0 ? r.id : null;
+        if (r != null && r.level == level && r.start >= 0) return r.id;
+        PendingFinish pending = pendingFinish;
+        return pending != null && pending.level() == level ? pending.round().id : null;
     }
 
     private static final class Round {

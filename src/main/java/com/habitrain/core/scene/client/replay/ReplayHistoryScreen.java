@@ -160,6 +160,7 @@ public final class ReplayHistoryScreen extends Screen {
     @Override protected void init() {
         deckWidgets.clear();
         if (!roundPinned && id != null) {
+            ReplayHistoryClient.retryIfFailedOrMissing(id);
             ReplayHistoryClient.pin(id);
             roundPinned = true;
         }
@@ -447,6 +448,7 @@ public final class ReplayHistoryScreen extends Screen {
         }
         id = nextId;
         if (!roundPinned) {
+            ReplayHistoryClient.retryIfFailedOrMissing(id);
             ReplayHistoryClient.pin(id);
             roundPinned = true;
         }

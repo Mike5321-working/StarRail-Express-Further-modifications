@@ -2,6 +2,7 @@ package com.habitrain.core.game.sre.replay;
 
 import com.habitrain.core.api.match.replay.LastMatchReplay;
 import com.habitrain.core.api.match.replay.ReplayGameSoundData;
+import com.habitrain.core.network.replay.ReplayArchiveData;
 import com.habitrain.core.network.replay.ReplayTracks;
 import com.habitrain.core.scene.block.SettlementSummaryBoard;
 import com.habitrain.core.scene.replay.ReplayBoardSessionState;
@@ -47,10 +48,27 @@ public final class ReplayBoardService {
     private static long lastVoicePrepareDoneTick = -1L;
     private static final long VOICE_PREPARED_IDLE_RELEASE_TICKS = 600L;
     private static MinecraftServer server;
-    private static Published latest;
+    private static volatile Published latest;
+    private static final Set<UUID> PUBLISHING_ROUNDS = ConcurrentHashMap.newKeySet();
     private static long nextPublication, lastPublication;
 
-    private record Published(LastMatchSummaryS2C packet, int bytes, ReplayMapCapture.Result map, VoiceSource voice) {}
+    private record Published(LastMatchSummaryS2C packet, int bytes, String digest, ReplayMapCapture.Result map, VoiceSource voice) {}
+
+    /** Immutable in-memory snapshot of the latest published round used as a fallback when disk archive is absent or pending. */
+    record LatestFallback(LastMatchSummaryS2C packet, String digest, @Nullable ReplayMapCapture.Result map, byte[] voice) {
+        @Nullable Map<Integer, byte[]> sections(BitSet requested) {
+            if (map == null || requested == null || requested.isEmpty()) return null;
+            List<byte[]> patches = map.patches();
+            if (requested.length() > patches.size()) return null;
+            Map<Integer, byte[]> out = new LinkedHashMap<>();
+            for (int index = requested.nextSetBit(0); index >= 0; index = requested.nextSetBit(index + 1)) {
+                byte[] data = patches.get(index);
+                if (data == null || data.length == 0) return null;
+                out.put(index, data);
+            }
+            return out;
+        }
+    }
 
     private static final class VoiceSource {
         final byte[] bytes;
@@ -92,6 +110,8 @@ public final class ReplayBoardService {
         MatchReplayRecorder.register();
         ServerLifecycleEvents.SERVER_STARTING.register(s -> {
             server = s;
+            latest = null;
+            PUBLISHING_ROUNDS.clear();
             nextPublication = lastPublication = 0;
             worker = new ThreadPoolExecutor(1, 1, 0, TimeUnit.SECONDS, new ArrayBlockingQueue<>(8), task -> {
                 Thread thread = new Thread(task, "habitrain-replay-encode"); thread.setDaemon(true); return thread;
@@ -108,6 +128,7 @@ public final class ReplayBoardService {
             MatchReplayRecorder.reset();
             server = null;
             latest = null;
+            PUBLISHING_ROUNDS.clear();
             TRANSFERS.clear();
             VOICE_TRANSFERS.clear();
             PENDING_VOICE.clear();
@@ -213,9 +234,14 @@ public final class ReplayBoardService {
                                         com.habitrain.core.network.replay.VisualTape.Builder visuals) {
         MinecraftServer owner = server;
         if (owner == null) return;
+        UUID roundId = summary.roundId();
+        PUBLISHING_ROUNDS.add(roundId);
         long finishedAt = System.currentTimeMillis();
         dispatch(owner, () -> {
-            if (server != owner) return;
+            if (server != owner) {
+                PUBLISHING_ROUNDS.remove(roundId);
+                return;
+            }
             long sequence = ++nextPublication;
             Runnable prepare = () -> preparePublication(owner, summary, map, voice, detachedVoice, finishedAt, visuals, sequence);
             try {
@@ -253,6 +279,8 @@ public final class ReplayBoardService {
                                            CompletableFuture<ReplayMapCapture.Result> map, byte[] voice,
                                            @Nullable MatchVoiceRecorder.DetachedRound detachedVoice, long finishedAt,
                                            com.habitrain.core.network.replay.VisualTape.Builder visuals, long sequence) {
+        UUID roundId = summary.roundId();
+        boolean trackedByArchive = false;
         try {
             byte[] resolvedVoice = voice;
             boolean voiceOwned = false;
@@ -267,17 +295,32 @@ public final class ReplayBoardService {
             Published preEncoded = encodeRevisionWithFallback(summary, encoded.bytes(), resolved, true, encoded.thinned(), voiceSource, null);
             byte[] reusableTrailer = preEncoded != null && preEncoded.packet.replay().gameSounds() == summary.gameSounds()
                     ? preEncoded.packet.peekEncodedTrailer() : null;
-            if (map != null) map.thenCompose(result -> result == null
-                    ? CompletableFuture.<Void>failedFuture(new IOException("No complete replay geometry"))
-                    : ReplayArchiveService.archive(owner, makePacket(summary, encoded.bytes(), result, encoded.thinned(), reusableTrailer),
-                            result, finishedAt, voiceSource.bytes, visuals))
-                    .whenComplete((saved, failure) -> {
-                        if (failure == null) LOG.debug("Saved 3D replay {}", summary.roundId());
-                        else LOG.warn("3D replay history unavailable for round {}", summary.roundId(), failure);
-                    });
+            if (map != null) {
+                trackedByArchive = true;
+                map.thenCompose(result -> {
+                    if (result == null) {
+                        return CompletableFuture.<Void>failedFuture(new IOException("No complete replay geometry"));
+                    }
+                    LastMatchSummaryS2C archivePacket = preEncoded != null && preEncoded.map == result
+                            ? preEncoded.packet
+                            : encodeArchivePacket(summary, encoded.bytes(), result, encoded.thinned(), reusableTrailer);
+                    if (archivePacket == null) {
+                        return CompletableFuture.<Void>failedFuture(new IOException("Replay summary exceeds wire limit"));
+                    }
+                    return ReplayArchiveService.archive(owner, archivePacket, result, finishedAt, voiceSource.bytes, visuals);
+                }).whenComplete((saved, failure) -> {
+                    PUBLISHING_ROUNDS.remove(roundId);
+                    if (failure == null) LOG.debug("Saved 3D replay {}", roundId);
+                    else LOG.warn("3D replay history unavailable for round {}", roundId, failure);
+                });
+            }
             dispatch(owner, () -> publishReady(owner, summary, map, encoded, voiceSource, preEncoded, resolved, reusableTrailer, sequence));
         } catch (RuntimeException encodingFailure) {
-            LOG.warn("Could not prepare replay {}", summary.roundId(), encodingFailure);
+            LOG.warn("Could not prepare replay {}", roundId, encodingFailure);
+        } finally {
+            if (!trackedByArchive) {
+                PUBLISHING_ROUNDS.remove(roundId);
+            }
         }
     }
 
@@ -350,6 +393,13 @@ public final class ReplayBoardService {
         installRevision(revision, newRound);
     }
 
+    static @Nullable LastMatchSummaryS2C encodeArchivePacket(LastMatchReplay s, byte[] tracks,
+                                                           ReplayMapCapture.Result map, boolean tracksThinned,
+                                                           @Nullable byte[] reusableTrailer) {
+        Published encoded = encodeRevisionWithFallback(s, tracks, map, false, tracksThinned, new VoiceSource(new byte[0], true), reusableTrailer);
+        return encoded == null ? null : encoded.packet;
+    }
+
     private static void installRevision(Published revision, boolean newRound) {
         latest = revision;
         LAST_SUMMARY_REQUEST.clear();
@@ -363,13 +413,18 @@ public final class ReplayBoardService {
                     ? new Transfer(transfer.board, revision, (int[]) null) : transfer);
         }
         for (ServerPlayer p : server.getPlayerList().getPlayers()) announce(p);
+        if (revision.map != null) {
+            ReplayArchiveService.onRoundReady(server, revision.packet.replay().roundId());
+        }
     }
 
     private static Published encodeRevision(LastMatchReplay s, byte[] tracks, ReplayMapCapture.Result map,
                                             boolean tracksThinned, VoiceSource voice,
                                             @Nullable byte[] reusableTrailer) {
         var packet = makePacket(s, tracks, map, tracksThinned, reusableTrailer);
-        return new Published(packet, packet.prepareBroadcast(), map, voice);
+        int bytes = packet.prepareBroadcast();
+        String digest = ReplayArchiveData.digest(ReplayArchiveData.encode(packet));
+        return new Published(packet, bytes, digest, map, voice);
     }
 
     private static LastMatchSummaryS2C makePacket(LastMatchReplay s, byte[] tracks, ReplayMapCapture.Result map,
@@ -396,6 +451,29 @@ public final class ReplayBoardService {
     static LastMatchReplay latestReplay(UUID roundId) {
         Published source = latest;
         return source != null && source.packet.replay().roundId().equals(roundId) ? source.packet.replay() : null;
+    }
+
+    static @Nullable LatestFallback latestFallback(@Nullable UUID roundId) {
+        if (roundId == null) return null;
+        Published source = latest;
+        if (source == null || !roundId.equals(source.packet.replay().roundId())) return null;
+        return new LatestFallback(source.packet, source.digest, source.map, source.voice.bytes);
+    }
+
+    static boolean isPublishing(@Nullable UUID roundId) {
+        return roundId != null && PUBLISHING_ROUNDS.contains(roundId);
+    }
+
+    static void restoreLatestFromArchive(MinecraftServer owner, LastMatchSummaryS2C packet,
+                                         ReplayMapCapture.Result map, byte[] voice) {
+        if (owner == null || packet == null || map == null) return;
+        int bytes = packet.prepareBroadcast();
+        String digest = ReplayArchiveData.digest(ReplayArchiveData.encode(packet));
+        Published restored = new Published(packet, bytes, digest, map, new VoiceSource(voice, true));
+        dispatch(owner, () -> {
+            if (server != owner || latest != null) return;
+            installRevision(restored, true);
+        });
     }
 
     static int resolveDuration(UUID roundId) {

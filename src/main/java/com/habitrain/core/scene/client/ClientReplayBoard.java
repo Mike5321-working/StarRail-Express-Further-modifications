@@ -397,7 +397,16 @@ public final class ClientReplayBoard {
     }
 
     static MapData loadMap(ReplayMapManifest manifest) {
+        return loadMap(manifest, false);
+    }
+
+    static MapData loadMap(ReplayMapManifest manifest, boolean skipLocalCache) {
         MapData state = new MapData(manifest);
+        if (skipLocalCache) {
+            state.diskLoading = false;
+            state.skipLocalLookup();
+            return state;
+        }
         SceneAssetCache.getInstance().readReplayMap(manifest).whenComplete((asset, failure) ->
                 Minecraft.getInstance().execute(() -> {
                     state.diskLoading = false;
@@ -584,6 +593,10 @@ public final class ClientReplayBoard {
             attemptsWithoutProgress = 0;
         }
 
+        void skipLocalLookup() {
+            localChecked = true;
+        }
+
         void markFailed(long now) {
             failed = true;
             retryAfter = now + 5_000_000_000L;
@@ -638,9 +651,9 @@ public final class ClientReplayBoard {
             }
             var entries = manifest.sections();
             if (diskLoading || decoding.cardinality() >= MAX_REQUESTED) return;
-            boolean finalizingLocal = LOCAL.finalizingGeometry();
-            if (finalizingLocal && now - localDeadline < 0) return;
             if (!localChecked) {
+                boolean finalizingLocal = LOCAL.finalizingGeometry();
+                if (finalizingLocal && now - localDeadline < 0) return;
                 for (int index = received.nextClearBit(0); index < entries.size(); index = received.nextClearBit(index + 1)) {
                     if (decoding.get(index)) continue;
                     var local = LOCAL.lookup(manifest, entries.get(index));

@@ -342,6 +342,7 @@ final class ReplayExportScreen extends Screen {
         customizerTab1Widgets.clear();
         customizerTab2Widgets.clear();
         if (!historyPinned) {
+            ReplayHistoryClient.retryIfFailedOrMissing(history);
             ReplayHistoryClient.pin(history);
             historyPinned = true;
         }
@@ -1269,8 +1270,8 @@ final class ReplayExportScreen extends Screen {
             if (startError != null) return startError;
             if (probingFfmpeg()) return tr("export.ffmpeg_probing");
             if (needsFfmpegAction()) return ReplayFfmpegManager.statusText();
-            if (history != null && ReplayHistoryClient.voiceUnavailable(history)) return tr("controls.missing_voice_hint");
             if (history != null && !ReplayExportClient.mapReady(view)) return ReplayHistoryScreen.loadStatus(history, view);
+            if (history != null && ReplayHistoryClient.voiceUnavailable(history)) return tr("controls.missing_voice_hint");
             if (view != null && view.presentSections() < view.totalSections()) {
                 return tr("controls.receiving_map", view.presentSections(), view.totalSections());
             }

@@ -40,9 +40,11 @@ import static com.habitrain.core.network.replay.ReplayArchivePackets.*;
 public final class ReplayArchiveService {
     private static final Logger LOG = LoggerFactory.getLogger(ReplayArchiveService.class);
     private static final int CAPACITY = 16;
-    private static final long WRITE_BUDGET_BYTES = 128L * 1024 * 1024;
+    private static final long WRITE_BUDGET_BYTES = 256L * 1024 * 1024;
     private static final long MAX_VOICE_LANE_BYTES = 96L * 1024 * 1024;
     private static final long RATE = 768 * 1024L, GLOBAL = 4L * 1024 * 1024;
+    private static final int MAX_WAITING_ROUNDS = 16;
+    private static final int MAX_WAITERS_PER_ROUND = 64;
     private static volatile State state;
 
     private ReplayArchiveService() {}
@@ -103,6 +105,7 @@ public final class ReplayArchiveService {
                 s.lastVisual.remove(id);
                 s.lastRecording.remove(id);
                 s.viewed.remove(id);
+                s.removeWaitingPlayer(id);
                 s.bandwidth.forget(id);
             }
         });
@@ -175,20 +178,60 @@ public final class ReplayArchiveService {
         return false;
     }
 
+    static void onRoundReady(MinecraftServer owner, UUID roundId) {
+        State s = state;
+        if (s != null && s.server == owner && roundId != null) {
+            s.notifyWaitingForRound(roundId);
+        }
+    }
+
+    static boolean saveWithQuotaFallback(ReplayArchive archive, UUID roundId, long finishedAt, String mapHash,
+                                         byte[] summary, List<byte[]> patches, byte[] voice,
+                                         Map<UUID, byte[]> compressedVisuals) throws IOException {
+        if (archive.save(roundId, finishedAt, mapHash, summary, patches, voice, compressedVisuals)) {
+            return true;
+        }
+        if (!compressedVisuals.isEmpty()) {
+            LOG.warn("Replay {} with visual streams did not fit archive quota; retrying without visual streams", roundId);
+            if (archive.save(roundId, finishedAt, mapHash, summary, patches, voice, Map.of())) {
+                return true;
+            }
+        }
+        if (voice != null && voice.length > 0) {
+            LOG.warn("Replay {} with voice did not fit archive quota; retrying without voice", roundId);
+            return archive.save(roundId, finishedAt, mapHash, summary, patches, new byte[0], Map.of());
+        }
+        return false;
+    }
+
     static CompletableFuture<Void> archive(MinecraftServer owner, ReplayPackets.LastMatchSummaryS2C data,
                                            ReplayMapCapture.Result map, long finishedAt, byte[] voice, VisualTape.Builder visuals) {
         State s = state;
         if (s == null || s.server != owner) return CompletableFuture.failedFuture(new IOException("Replay archive is closed"));
-        s.rememberDuration(data.replay().roundId(), data.replay().durationTicks());
-        return s.io.submitSettlement(map.bytes() + ReplayPackets.MAX_SUMMARY + (long) voice.length + visuals.size(), () -> {
+        UUID roundId = data.replay().roundId();
+        s.rememberDuration(roundId, data.replay().durationTicks());
+        s.archivingRounds.add(roundId);
+        CompletableFuture<Void> write = s.io.submitSettlement(map.bytes() + ReplayPackets.MAX_SUMMARY + (long) voice.length + visuals.size(), () -> {
+            if (s.archive == null) s.tryOpenArchiveOnIoThread();
             if (s.archive == null) throw new IOException(s.lockBusy
                     ? "A previous replay archive writer is still draining" : "Replay archive initialization failed");
-            if (!s.archive.save(data.replay().roundId(), finishedAt, map.manifest().hash(),
-                    ReplayArchiveData.encode(data), map.patches(), voice, visuals.compress(data.replay().participants().stream().map(LastMatchReplay.Participant::id).collect(java.util.stream.Collectors.toSet())))) {
+            Map<UUID, byte[]> compressedVisuals = visuals.compress(data.replay().participants().stream()
+                    .map(LastMatchReplay.Participant::id).collect(java.util.stream.Collectors.toSet()));
+            if (!saveWithQuotaFallback(s.archive, roundId, finishedAt, map.manifest().hash(),
+                    ReplayArchiveData.encode(data), map.patches(), voice, compressedVisuals)) {
                 throw new IOException("Replay does not fit the archive quota");
             }
             return null;
         });
+        write.whenComplete((ignored, failure) -> {
+            s.archivingRounds.remove(roundId);
+            if (failure == null) {
+                owner.execute(() -> {
+                    if (state == s) s.notifyWaitingForRound(roundId);
+                });
+            }
+        });
+        return write;
     }
 
     /**
@@ -368,6 +411,12 @@ public final class ReplayArchiveService {
 
         boolean hasActive(UUID player) {
             return slots.containsKey(player);
+        }
+
+        boolean isLookupFor(UUID player, UUID round) {
+            Slot<T> slot = slots.get(player);
+            return slot != null && slot.request != null
+                    && slot.request.action() == LOOKUP && round.equals(slot.request.round());
         }
 
         boolean hasReady(UUID player) {
@@ -555,10 +604,145 @@ public final class ReplayArchiveService {
         }
     }
 
-    private record FetchedStream(Iterator<CustomPacketPayload> packets, long estimatedBytes) {
+    record FetchedStream(Iterator<CustomPacketPayload> packets, long estimatedBytes) {
         static FetchedStream ofSingle(CustomPacketPayload payload) {
             return new FetchedStream(List.of(payload).iterator(), 0L);
         }
+    }
+
+    record ResolvedStream(FetchedStream stream, boolean registerWaiting) {}
+
+    private static FetchedStream voiceStream(UUID round, byte[] voice) {
+        if (voice.length == 0) {
+            return FetchedStream.ofSingle(new Voice(new ReplayPackets.ReplayVoiceChunkS2C(round, 0, 0, new byte[0])));
+        }
+        return new FetchedStream(new VoiceChunkIterator(round, voice), voice.length);
+    }
+
+    private static FetchedStream sectionStream(UUID round, Map<Integer, byte[]> patches) {
+        long total = 0L;
+        for (byte[] data : patches.values()) {
+            if (data != null) total += data.length;
+        }
+        return new FetchedStream(new SectionChunkIterator(round, patches), total);
+    }
+
+    static ResolvedStream resolveArchiveRequest(
+            Request r,
+            UUID requesterId,
+            boolean isAdmin,
+            @Nullable ReplayArchive archive,
+            @Nullable ReplayBoardService.LatestFallback latest,
+            boolean archiveOpening,
+            boolean roundInFlight,
+            @Nullable BiConsumer<UUID, Integer> onDuration) throws Exception {
+        UUID round = r.round();
+        ReplayBoardService.LatestFallback matchingLatest = latest != null
+                && round.equals(latest.packet().replay().roundId()) ? latest : null;
+
+        if (r.action() == VOICE) {
+            if (archive != null) {
+                ReplayPackets.LastMatchSummaryS2C summary = null;
+                boolean presentInArchive = true;
+                if (!isAdmin) {
+                    byte[] rawSum = archive.summary(round);
+                    if (rawSum == null) {
+                        presentInArchive = false;
+                    } else {
+                        summary = ReplayArchiveData.decode(rawSum);
+                        if (onDuration != null) onDuration.accept(round, summary.replay().durationTicks());
+                        if (!canExportVoice(summary.replay(), requesterId, false)) {
+                            return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, ERROR)), false);
+                        }
+                    }
+                }
+                if (presentInArchive) {
+                    byte[] voice = archive.voice(round);
+                    if (voice != null) {
+                        if (summary != null) voice = ReplayVoiceDelivery.forRecipient(summary, voice, requesterId, false);
+                        return new ResolvedStream(voiceStream(round, voice), false);
+                    }
+                }
+            }
+            if (matchingLatest != null) {
+                ReplayPackets.LastMatchSummaryS2C latestPacket = matchingLatest.packet();
+                if (onDuration != null) onDuration.accept(round, latestPacket.replay().durationTicks());
+                if (!isAdmin && !canExportVoice(latestPacket.replay(), requesterId, false)) {
+                    return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, ERROR)), false);
+                }
+                byte[] voice = matchingLatest.voice();
+                if (voice == null) voice = new byte[0];
+                if (!isAdmin) voice = ReplayVoiceDelivery.forRecipient(latestPacket, voice, requesterId, false);
+                return new ResolvedStream(voiceStream(round, voice), false);
+            }
+            if (archiveOpening || roundInFlight) {
+                return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, TRANSFER_BUSY)), false);
+            }
+            return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, archive == null ? ERROR : MISSING)), false);
+        }
+
+        if (r.action() == SECTIONS) {
+            if (archive != null) {
+                var patches = archive.sections(round, r.missing());
+                if (patches != null) {
+                    return new ResolvedStream(sectionStream(round, patches), false);
+                }
+            }
+            if (matchingLatest != null) {
+                if (matchingLatest.map() != null) {
+                    var patches = matchingLatest.sections(r.missing());
+                    if (patches == null) {
+                        return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, ERROR)), false);
+                    }
+                    return new ResolvedStream(sectionStream(round, patches), false);
+                }
+                if (roundInFlight) {
+                    return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, TRANSFER_BUSY)), false);
+                }
+            }
+            if (archiveOpening || roundInFlight) {
+                return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, TRANSFER_BUSY)), false);
+            }
+            return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, archive == null ? ERROR : MISSING)), false);
+        }
+
+        boolean isShare = r.action() == SHARE;
+        if (archive != null) {
+            var cached = archive.boardSummary(round);
+            if (cached != null) {
+                var data = cached.packet();
+                if (!round.equals(data.replay().roundId()) || data.replay().manifest() == null) {
+                    return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, isShare ? SHARE_ERROR : ERROR)), false);
+                }
+                if (onDuration != null) onDuration.accept(round, data.replay().durationTicks());
+                if (r.action() == LOOKUP && !r.digest().isEmpty() && r.digest().equals(cached.digest())) {
+                    return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, CACHED)), false);
+                }
+                return new ResolvedStream(FetchedStream.ofSingle(new Summary(data)), false);
+            }
+        }
+        if (matchingLatest != null) {
+            var data = matchingLatest.packet();
+            if (matchingLatest.map() != null && data.replay().manifest() != null) {
+                if (onDuration != null) onDuration.accept(round, data.replay().durationTicks());
+                if (r.action() == LOOKUP && !r.digest().isEmpty() && r.digest().equals(matchingLatest.digest())) {
+                    return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, CACHED)), false);
+                }
+                return new ResolvedStream(FetchedStream.ofSingle(new Summary(data)), false);
+            }
+            if (roundInFlight) {
+                return new ResolvedStream(
+                        FetchedStream.ofSingle(new Reply(round, isShare ? SHARE_ERROR : TRANSFER_BUSY)),
+                        r.action() == LOOKUP);
+            }
+        }
+        if (archiveOpening || roundInFlight) {
+            return new ResolvedStream(
+                    FetchedStream.ofSingle(new Reply(round, isShare ? SHARE_ERROR : TRANSFER_BUSY)),
+                    r.action() == LOOKUP);
+        }
+        int status = archive == null ? (isShare ? SHARE_ERROR : ERROR) : MISSING;
+        return new ResolvedStream(FetchedStream.ofSingle(new Reply(round, status)), false);
     }
 
     private record ShareParams(double currentTick, float speed, boolean paused,
@@ -601,8 +785,10 @@ public final class ReplayArchiveService {
         }
         final Map<UUID, Long> lastExport = new HashMap<>(), lastRecording = new HashMap<>();
         final Map<UUID, LinkedHashSet<UUID>> viewed = new HashMap<>();
+        final Set<UUID> archivingRounds = ConcurrentHashMap.newKeySet();
+        final Map<UUID, Set<UUID>> waitingLookup = new HashMap<>();
         final SceneBandwidthGovernor bandwidth = new SceneBandwidthGovernor(System::nanoTime, GLOBAL);
-        ReplayArchive archive;
+        volatile ReplayArchive archive;
         ReplayArchiveOwnership ownership;
         volatile boolean lockBusy;
         volatile boolean openPending;
@@ -626,6 +812,106 @@ public final class ReplayArchiveService {
             durationCache.put(roundId, durationTicks);
         }
 
+        boolean isArchiveOpening() {
+            return archive == null && (openPending || lockBusy);
+        }
+
+        boolean isRoundInFlight(UUID roundId) {
+            return roundId != null && (archivingRounds.contains(roundId)
+                    || ReplayBoardService.isPublishing(roundId)
+                    || MatchReplayRecorder.isPendingRound(roundId));
+        }
+
+        void registerWaitingLookup(UUID roundId, UUID playerId) {
+            if (roundId == null || playerId == null) return;
+            removeWaitingPlayer(playerId);
+            Set<UUID> waiters = waitingLookup.get(roundId);
+            if (waiters == null) {
+                if (waitingLookup.size() >= MAX_WAITING_ROUNDS) return;
+                waiters = new LinkedHashSet<>();
+                waitingLookup.put(roundId, waiters);
+            }
+            if (waiters.size() < MAX_WAITERS_PER_ROUND) {
+                waiters.add(playerId);
+            }
+        }
+
+        void removeWaitingPlayer(UUID playerId) {
+            if (playerId == null || waitingLookup.isEmpty()) return;
+            var it = waitingLookup.values().iterator();
+            while (it.hasNext()) {
+                Set<UUID> waiters = it.next();
+                waiters.remove(playerId);
+                if (waiters.isEmpty()) it.remove();
+            }
+        }
+
+        void notifyWaitingForRound(UUID roundId) {
+            if (roundId == null || state != this) return;
+            Set<UUID> waiters = waitingLookup.remove(roundId);
+            if (waiters == null || waiters.isEmpty()) return;
+            Request lookup = Request.lookup(roundId, "");
+            for (UUID id : waiters) {
+                ServerPlayer player = server.getPlayerList().getPlayer(id);
+                if (player == null || !online(player) || !ServerPlayNetworking.canSend(player, Summary.TYPE)) continue;
+                if (summaryLane.isLookupFor(id, roundId)) {
+                    summaryLane.remove(id);
+                }
+                if (summaryLane.hasActive(id)) continue;
+                summaryLane.startOrQueue(id, lookup, epoch -> startRead(player, lookup, summaryLane, epoch, true));
+            }
+        }
+
+        void retryAllWaitingAfterOpen() {
+            if (state != this || waitingLookup.isEmpty()) return;
+            for (UUID roundId : List.copyOf(waitingLookup.keySet())) {
+                notifyWaitingForRound(roundId);
+            }
+        }
+
+        private void hydrateLatestFromArchive(ReplayArchive opened) {
+            try {
+                ReplayArchive.LatestEntry entry = opened.loadLatest();
+                if (entry != null) {
+                    rememberDuration(entry.id(), entry.packet().replay().durationTicks());
+                    ReplayBoardService.restoreLatestFromArchive(server, entry.packet(), entry.map(), entry.voice());
+                }
+            } catch (Exception failure) {
+                LOG.warn("Could not hydrate latest replay board from archive {}", root, failure);
+            }
+        }
+
+        void tryOpenArchiveOnIoThread() {
+            if (archive != null) return;
+            try {
+                ownership = ReplayArchiveOwnership.tryAcquire(root);
+                if (ownership == null) {
+                    lockBusy = true;
+                    LOG.warn("Replay archive is already owned, will retry: {}", root);
+                    return;
+                }
+                ReplayArchive opened = new ReplayArchive(root);
+                boolean openedRecordVoice = opened.recordVoice();
+                archive = opened;
+                recordVoice = openedRecordVoice;
+                lockBusy = false;
+                retryDelayTicks = 20;
+                LOG.debug("Opened replay archive at {} (rounds={}, quarantined={})",
+                        root, opened.roundCount(), opened.quarantinedCount());
+                hydrateLatestFromArchive(opened);
+                server.execute(this::retryAllWaitingAfterOpen);
+            } catch (Exception failure) {
+                lockBusy = false;
+                LOG.error("Could not initialize replay archive at {}, will retry", root, failure);
+            } finally {
+                if (archive == null) {
+                    releaseOwnership();
+                    nextOpenTick = server.getTickCount() + retryDelayTicks;
+                    retryDelayTicks = Math.min(retryDelayTicks * 2, 20 * 60);
+                }
+            }
+        }
+
         private static boolean readVoicePolicy(Path root) {
             Path config = root.resolve("record-voice.txt");
             try {
@@ -641,30 +927,9 @@ public final class ReplayArchiveService {
             openPending = true;
             submit(() -> {
                 try {
-                    ownership = ReplayArchiveOwnership.tryAcquire(root);
-                    if (ownership == null) {
-                        lockBusy = true;
-                        LOG.warn("Replay archive is already owned, will retry: {}", root);
-                        return;
-                    }
-                    ReplayArchive opened = new ReplayArchive(root);
-                    boolean openedRecordVoice = opened.recordVoice();
-                    archive = opened;
-                    recordVoice = openedRecordVoice;
-                    lockBusy = false;
-                    retryDelayTicks = 20;
-                    LOG.debug("Opened replay archive at {} (rounds={}, quarantined={})",
-                            root, opened.roundCount(), opened.quarantinedCount());
-                } catch (Exception failure) {
-                    lockBusy = false;
-                    LOG.error("Could not initialize replay archive at {}, will retry", root, failure);
+                    tryOpenArchiveOnIoThread();
                 } finally {
-                    if (archive == null) releaseOwnership();
                     openPending = false;
-                    if (archive == null) {
-                        nextOpenTick = server.getTickCount() + retryDelayTicks;
-                        retryDelayTicks = Math.min(retryDelayTicks * 2, 20 * 60);
-                    }
                 }
             }, () -> {
                 openPending = false;
@@ -735,13 +1000,16 @@ public final class ReplayArchiveService {
             if (r.round().equals(ReplayPackets.EMPTY)) return;
             UUID id = p.getUUID();
             TransferLane<CustomPacketPayload> lane = r.action() == VOICE ? voiceLane : summaryLane;
+            if (r.action() == LOOKUP) {
+                removeWaitingPlayer(id);
+            }
             if (r.action() == SECTIONS && (r.missing().isEmpty() || r.missing().cardinality() > ReplayPackets.MAX_REQUESTED)) return;
-            if (!lane.startOrQueue(id, r, epoch -> startRead(p, r, lane, epoch))) {
+            if (!lane.startOrQueue(id, r, epoch -> startRead(p, r, lane, epoch, true))) {
                 ServerPlayNetworking.send(p, new Reply(r.round(), TRANSFER_BUSY));
             }
         }
 
-        private void startRead(ServerPlayer p, Request r, TransferLane<CustomPacketPayload> lane, long epoch) {
+        private void startRead(ServerPlayer p, Request r, TransferLane<CustomPacketPayload> lane, long epoch, boolean allowImmediateRetry) {
             UUID id = p.getUUID();
             boolean isVoice = r.action() == VOICE;
             if (!online(p) || isVoice && !ServerPlayNetworking.canSend(p, Voice.TYPE)) {
@@ -765,22 +1033,33 @@ public final class ReplayArchiveService {
             boolean isAdmin = admin(p);
 
             submit(() -> {
-                FetchedStream stream;
+                ResolvedStream resolved;
                 try {
-                    stream = fetchStream(r, id, isAdmin);
+                    resolved = resolveStream(r, id, isAdmin);
                 } catch (Exception failed) {
                     LOG.debug("Replay request failed for {}", r.round(), failed);
-                    stream = FetchedStream.ofSingle(new Reply(r.round(), ERROR));
+                    resolved = new ResolvedStream(FetchedStream.ofSingle(new Reply(r.round(), ERROR)), false);
                 }
-                FetchedStream fetched = stream;
+                ResolvedStream fetched = resolved;
                 server.execute(() -> {
                     if (!online(p)) {
                         lane.cancelIfCurrent(id, epoch);
-                        if (fetched.packets() instanceof ReleasableIterator releasable) releasable.release();
+                        if (fetched.stream().packets() instanceof ReleasableIterator releasable) releasable.release();
                         return;
                     }
                     boolean wasCurrent = lane.isCurrent(id, epoch);
-                    if (!lane.installIfCurrent(id, epoch, fetched.packets(), fetched.estimatedBytes())
+                    if (fetched.registerWaiting() && wasCurrent) {
+                        if (isRoundInFlight(r.round()) || isArchiveOpening()) {
+                            registerWaitingLookup(r.round(), id);
+                        } else if (allowImmediateRetry) {
+                            if (fetched.stream().packets() instanceof ReleasableIterator releasable) releasable.release();
+                            lane.cancelIfCurrent(id, epoch);
+                            Request retry = Request.lookup(r.round(), r.digest());
+                            lane.startOrQueue(id, retry, nextEpoch -> startRead(p, retry, lane, nextEpoch, false));
+                            return;
+                        }
+                    }
+                    if (!lane.installIfCurrent(id, epoch, fetched.stream().packets(), fetched.stream().estimatedBytes())
                             && wasCurrent && isVoice) {
                         ServerPlayNetworking.send(p, new Reply(r.round(), TRANSFER_BUSY));
                     }
@@ -834,91 +1113,28 @@ public final class ReplayArchiveService {
             }));
         }
 
-        FetchedStream fetchStream(Request r, UUID requesterId, boolean isAdmin) throws Exception {
-            UUID round = r.round();
-            if (archive == null) return FetchedStream.ofSingle(new Reply(round, ERROR));
-            if (r.action() == VOICE) {
-                ReplayPackets.LastMatchSummaryS2C summary = null;
-                if (!isAdmin) {
-                    byte[] rawSum = archive.summary(round);
-                    if (rawSum == null) return FetchedStream.ofSingle(new Reply(round, MISSING));
-                    summary = ReplayArchiveData.decode(rawSum);
-                    rememberDuration(round, summary.replay().durationTicks());
-                    if (!canExportVoice(summary.replay(), requesterId, false)) {
-                        return FetchedStream.ofSingle(new Reply(round, ERROR));
-                    }
-                }
-                byte[] voice = archive.voice(round);
-                if (voice == null) return FetchedStream.ofSingle(new Reply(round, MISSING));
-                if (summary != null) voice = ReplayVoiceDelivery.forRecipient(summary, voice, requesterId, false);
-                if (voice.length == 0) {
-                    return FetchedStream.ofSingle(new Voice(new ReplayPackets.ReplayVoiceChunkS2C(round, 0, 0, new byte[0])));
-                }
-                return new FetchedStream(new VoiceChunkIterator(round, voice), voice.length);
-            }
-            if (r.action() == SECTIONS) {
-                var patches = archive.sections(round, r.missing());
-                if (patches == null) return FetchedStream.ofSingle(new Reply(round, MISSING));
-                long total = 0L;
-                for (byte[] data : patches.values()) {
-                    if (data != null) total += data.length;
-                }
-                return new FetchedStream(new SectionChunkIterator(round, patches), total);
-            }
-            List<CustomPacketPayload> single = fetch(r, requesterId, isAdmin);
-            return new FetchedStream(single.iterator(), 0L);
+        ResolvedStream resolveStream(Request r, UUID requesterId, boolean isAdmin) throws Exception {
+            return resolveArchiveRequest(
+                    r,
+                    requesterId,
+                    isAdmin,
+                    archive,
+                    ReplayBoardService.latestFallback(r.round()),
+                    isArchiveOpening(),
+                    isRoundInFlight(r.round()),
+                    this::rememberDuration);
         }
 
         List<CustomPacketPayload> fetch(Request r, UUID requesterId, boolean isAdmin) throws Exception {
-            UUID round = r.round();
-            if (archive == null) return List.of(new Reply(round, ERROR));
-            if (r.action() == VOICE) {
-                ReplayPackets.LastMatchSummaryS2C summary = null;
-                if (!isAdmin) {
-                    byte[] rawSum = archive.summary(round);
-                    if (rawSum == null) return List.of(new Reply(round, MISSING));
-                    summary = ReplayArchiveData.decode(rawSum);
-                    rememberDuration(round, summary.replay().durationTicks());
-                    if (!canExportVoice(summary.replay(), requesterId, false)) {
-                        return List.of(new Reply(round, ERROR));
-                    }
-                }
-                byte[] voice = archive.voice(round);
-                if (voice == null) return List.of(new Reply(round, MISSING));
-                if (summary != null) voice = ReplayVoiceDelivery.forRecipient(summary, voice, requesterId, false);
-                if (voice.length == 0) {
-                    return List.of(new Voice(new ReplayPackets.ReplayVoiceChunkS2C(round, 0, 0, new byte[0])));
-                }
-                List<CustomPacketPayload> packets = new ArrayList<>();
-                for (int off = 0; off < voice.length; off += ReplayPackets.FRAGMENT_BYTES) {
-                    int end = Math.min(voice.length, off + ReplayPackets.FRAGMENT_BYTES);
-                    packets.add(new Voice(new ReplayPackets.ReplayVoiceChunkS2C(round, off, voice.length,
-                            Arrays.copyOfRange(voice, off, end))));
-                }
-                return packets;
+            ResolvedStream resolved = resolveStream(r, requesterId, isAdmin);
+            List<CustomPacketPayload> packets = new ArrayList<>();
+            Iterator<CustomPacketPayload> it = resolved.stream().packets();
+            try {
+                while (it.hasNext()) packets.add(it.next());
+            } finally {
+                if (it instanceof ReleasableIterator releasable) releasable.release();
             }
-            if (r.action() == SECTIONS) {
-                var patches = archive.sections(round, r.missing());
-                if (patches == null) return List.of(new Reply(round, MISSING));
-                List<CustomPacketPayload> packets = new ArrayList<>();
-                patches.forEach((idx, data) -> {
-                    for (int off = 0; off < data.length; off += ReplayPackets.FRAGMENT_BYTES) {
-                        int end = Math.min(data.length, off + ReplayPackets.FRAGMENT_BYTES);
-                        packets.add(new Section(new ReplayPackets.ReplaySectionPatchS2C(round, idx, off, data.length,
-                                Arrays.copyOfRange(data, off, end))));
-                    }
-                });
-                return packets;
-            }
-            var cached = archive.boardSummary(round);
-            if (cached == null) return List.of(new Reply(round, MISSING));
-            var data = cached.packet();
-            if (!round.equals(data.replay().roundId()) || data.replay().manifest() == null) return List.of(new Reply(round, ERROR));
-            rememberDuration(round, data.replay().durationTicks());
-            if (r.action() == LOOKUP && r.digest().equals(cached.digest())) {
-                return List.of(new Reply(round, CACHED));
-            }
-            return List.of(new Summary(data));
+            return packets;
         }
 
         boolean admin(ServerPlayer player) {
