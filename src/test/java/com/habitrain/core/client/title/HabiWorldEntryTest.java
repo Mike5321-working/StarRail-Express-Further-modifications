@@ -211,7 +211,7 @@ class HabiWorldEntryTest {
     }
 
     @Test
-    void worldEntryAudioFadesOutHomepageMenuBgmWithinOneSecondAndPlaysNoTunnelMusic() throws Exception {
+    void worldEntryAudioRestoresFullThreeActSoundscapeWithDeepBufferAndCleanBreakout() throws Exception {
         HabiBootAudioEngine engine = HabiBootAudioEngine.getInstance();
         assertTrue(engine.preloadAsync().get(10, java.util.concurrent.TimeUnit.SECONDS), "boot_v3 stems must preload");
         engine.stopImmediately();
@@ -230,39 +230,129 @@ class HabiWorldEntryTest {
         }
         assertTrue(menuRms > 0.02, "Homepage menu BGM must be audible before entering world, rms=" + menuRms);
 
-        // 2) Entering a world fades out homepage BGM smoothly within <= 1.0 second and stops cleanly
-        assertTrue(HabiBootAudioEngine.WORLD_ENTRY_MENU_FADE_SEC <= 1.0,
-                "World-entry menu fade must complete within 1.0 second");
+        // 2) Entering world from Station 01 fades out menu.wav while launching Act 1 engine charge,
+        //    bandpass wind bed, and Act 2 100 BPM tunnel arpeggio across deep 128 ms chunks (> 3.5 s cushion!)
+        assertTrue(HabiTunnelOpenAlPlayer.TARGET_BUFFER_SECONDS >= 3.0,
+                "Dedicated OpenAL tunnel queue must hold >= 3.0 s cushion, got "
+                        + HabiTunnelOpenAlPlayer.TARGET_BUFFER_SECONDS);
         engine.startTunnelEntry(true);
         assertEquals(HabiBootAudioEngine.State.TUNNEL, engine.currentStateForTest());
+        int gen = engine.currentTunnelGenerationForTest();
 
-        double earlyFadeRms = 0.0;
-        double lateFadeRms = 0.0;
+        byte[] chunkBuf = new byte[HabiTunnelOpenAlPlayer.CHUNK_BYTES];
+        HabiTunnelOpenAlPlayer.ChunkMeta meta = new HabiTunnelOpenAlPlayer.ChunkMeta();
+        double act1EarlyRms = 0.0;
+        double act2ArpRms = 0.0;
+        long prevStartSample = Long.MIN_VALUE;
+
+        // Pull 32 consecutive 128 ms chunks (~4.10 s: Act 1 menu fade + engine sweep + Act 2 100 BPM arpeggio)
+        for (int c = 0; c < 32; c++) {
+            if (c == 20) {
+                engine.updateTunnelProgress(0.75);
+            }
+            assertTrue(engine.pullDedicatedTunnelChunkForTest(gen, chunkBuf, meta),
+                    "Dedicated tunnel mixer must keep producing audio continuously across Act 1 & Act 2, chunk=" + c);
+            assertTrue(meta.hasAudio, "Tunnel chunk must carry active soundscape at chunk=" + c);
+            if (prevStartSample != Long.MIN_VALUE) {
+                assertEquals(prevStartSample + HabiTunnelOpenAlPlayer.CHUNK_FRAMES, meta.startSample,
+                        "Dedicated tunnel chunk sample clock must advance monotonically by exact CHUNK_FRAMES");
+            }
+            prevStartSample = meta.startSample;
+            double r = pcm16Rms(ByteBuffer.wrap(chunkBuf));
+            if (c < 10) act1EarlyRms = Math.max(act1EarlyRms, r);
+            if (c >= 20) act2ArpRms = Math.max(act2ArpRms, r); // Past 2.56 s: menu.wav already faded, Act 2 wind + 100 BPM arp active!
+        }
+        assertTrue(act1EarlyRms > 0.015, "Act 1 menu fade + charge must be audible, rms=" + act1EarlyRms);
+        assertTrue(act2ArpRms > 0.004, "Act 2 wind bed + 100 BPM tunnel arpeggio must remain audible past menu fade, rms=" + act2ArpRms);
+        assertEquals(HabiBootAudioEngine.State.TUNNEL, engine.currentStateForTest());
+
+        // 3) Act 3 breakout pre-renders full 1.55 s static wind-surge-and-dissolve buffer (immune to 3D warmup stutters)
+        byte[] breakoutWind = engine.renderBreakoutWindForTest(1100.0, 0.15, 0);
+        int expectedMinBytes = (int) (1.55 * HabiBootAudioEngine.SAMPLE_RATE) * 4;
+        assertTrue(breakoutWind.length >= expectedMinBytes,
+                "Static breakout wind buffer must span >= 1.55 s, got bytes=" + breakoutWind.length);
+        double surgePeakRms = slicePcm16Rms(breakoutWind, 0.55, 0.85);
+        double dissolveTailRms = slicePcm16Rms(breakoutWind, 1.40, 1.54);
+        assertTrue(surgePeakRms > 0.01, "Breakout wind surge around 0.7s must be clearly audible, rms=" + surgePeakRms);
+        assertTrue(surgePeakRms > dissolveTailRms * 5.0,
+                "Breakout wind must dissolve smoothly by 1.55 s: surge=" + surgePeakRms + " tail=" + dissolveTailRms);
+
+        // Trigger breakout & verify stems can be released immediately on world join while breakout state completes cleanly
+        engine.triggerTunnelBreakout();
+        assertTrue(engine.isTunnelBreakoutTriggeredForTest());
+        engine.fadeOutAndReleaseStems();
+        assertFalse(engine.areStemsLoaded(), "Boot WAV stems must be released immediately on world join after breakout");
+        assertEquals(HabiBootAudioEngine.State.TUNNEL, engine.currentStateForTest(),
+                "Act 3 breakout tail must not be abruptly aborted by stem release");
+
+        // Advance headless breakout wind envelope through 1.55 s -> reaches STOPPED cleanly
         int chunksUntilStopped = 0;
-        for (int i = 0; i < 20; i++) {
-            ByteBuffer buf = engine.pullOpenAlChunkForTest();
-            if (buf == null) {
+        for (int c = 0; c < 20; c++) {
+            if (!engine.pullDedicatedTunnelChunkForTest(gen, chunkBuf, meta)) {
                 break;
             }
             chunksUntilStopped++;
-            double r = pcm16Rms(buf);
-            if (i < 3) earlyFadeRms = Math.max(earlyFadeRms, r);
-            if (i >= 8) lateFadeRms = Math.max(lateFadeRms, r);
         }
-        // Each chunk is 64ms -> <= 15 chunks = <= 0.96s (fade finishes at 0.78s = ~13 chunks)
-        assertTrue(chunksUntilStopped >= 10 && chunksUntilStopped <= 15,
-                "Menu fade should complete smoothly right under 1.0s (~13 chunks), got chunks=" + chunksUntilStopped);
-        assertTrue(earlyFadeRms > lateFadeRms * 2.0,
-                "Homepage BGM must fade down smoothly: early=" + earlyFadeRms + " late=" + lateFadeRms);
-        assertEquals(HabiBootAudioEngine.State.STOPPED, engine.currentStateForTest(),
-                "Engine must reach STOPPED immediately once 1s menu fade completes");
-        assertNull(engine.pullOpenAlChunkForTest(), "No tunnel music may play after menu fade finishes");
+        assertTrue(chunksUntilStopped >= 10 && chunksUntilStopped <= 16,
+                "Breakout envelope should finish cleanly around ~1.55 s (~12-13 chunks), got " + chunksUntilStopped);
+        assertEquals(HabiBootAudioEngine.State.STOPPED, engine.currentStateForTest());
 
-        // 3) Direct world entry (no homepage BGM playing) plays zero music immediately
+        // 4) Direct world entry (no prior menu BGM) must ALSO play audible tunnel soundscape
         engine.startTunnelEntry(false);
-        assertEquals(HabiBootAudioEngine.State.STOPPED, engine.currentStateForTest(),
-                "Direct world entry without active menu BGM must stay completely silent");
-        assertNull(engine.pullOpenAlChunkForTest(), "Direct world entry must not produce tunnel BGM audio");
+        assertEquals(HabiBootAudioEngine.State.TUNNEL, engine.currentStateForTest());
+        int directGen = engine.currentTunnelGenerationForTest();
+        double directRms = 0.0;
+        for (int c = 0; c < 8; c++) {
+            assertTrue(engine.pullDedicatedTunnelChunkForTest(directGen, chunkBuf, meta));
+            directRms = Math.max(directRms, pcm16Rms(ByteBuffer.wrap(chunkBuf)));
+        }
+        assertTrue(directRms > 0.004, "Direct world entry must produce audible wind + 100 BPM arpeggio, rms=" + directRms);
+
+        // 5) Mute & unmute during tunnel stops cleanly and resumes tunnel (never flashing boot/menu stems)
+        engine.setUserMuted(true, 0.0, false, 0.0);
+        assertEquals(HabiBootAudioEngine.State.STOPPED, engine.currentStateForTest());
+        assertFalse(engine.pullDedicatedTunnelChunkForTest(directGen, chunkBuf, meta));
+
+        engine.unmuteForTunnel(true, 0.50);
+        assertEquals(HabiBootAudioEngine.State.TUNNEL, engine.currentStateForTest());
+        engine.stopTunnelAudio();
+        assertEquals(HabiBootAudioEngine.State.STOPPED, engine.currentStateForTest());
+    }
+
+    @Test
+    void dedicatedTunnelPlayerQueuePlannerAndSampleLockedSpectrumSelectorWorkAccurately() {
+        // Queue fill planner saturates full 28-buffer (3.584 s) target and halts on EOF / breakout fade-out
+        assertEquals(25, HabiTunnelOpenAlPlayer.computeChunksToFill(3, 28, 25, false, false));
+        assertEquals(10, HabiTunnelOpenAlPlayer.computeChunksToFill(3, 28, 10, false, false));
+        assertEquals(0, HabiTunnelOpenAlPlayer.computeChunksToFill(28, 28, 4, false, false));
+        assertEquals(0, HabiTunnelOpenAlPlayer.computeChunksToFill(5, 28, 20, true, false));
+        assertEquals(0, HabiTunnelOpenAlPlayer.computeChunksToFill(5, 28, 20, false, true));
+
+        // Sample-locked spectrum delay line returns the chunk matching the audible speaker sample,
+        // NOT the chunk mixed 3.5 seconds ahead into the OpenAL queue!
+        var ring = new java.util.concurrent.atomic.AtomicReferenceArray<HabiTunnelOpenAlPlayer.SpectrumSnapshot>(8);
+        ring.set(0, new HabiTunnelOpenAlPlayer.SpectrumSnapshot(0L, new float[16], 0.20, 0.30));
+        ring.set(1, new HabiTunnelOpenAlPlayer.SpectrumSnapshot(6144L, new float[16], 0.55, 0.65));
+        ring.set(2, new HabiTunnelOpenAlPlayer.SpectrumSnapshot(12288L, new float[16], 0.90, 0.95));
+
+        var atAudible = HabiTunnelOpenAlPlayer.selectSpectrumSnapshot(ring, 7500L);
+        assertNotNull(atAudible);
+        assertEquals(6144L, atAudible.startSample());
+        assertEquals(0.55, atAudible.bass(), 1e-6);
+
+        var atLatest = HabiTunnelOpenAlPlayer.selectSpectrumSnapshot(ring, 50_000L);
+        assertNotNull(atLatest);
+        assertEquals(12288L, atLatest.startSample());
+        assertEquals(0.90, atLatest.bass(), 1e-6);
+    }
+
+    private static double slicePcm16Rms(byte[] pcmLe, double startSec, double endSec) {
+        int startFrame = Math.max(0, (int) Math.round(startSec * HabiBootAudioEngine.SAMPLE_RATE));
+        int endFrame = Math.min(pcmLe.length / 4, (int) Math.round(endSec * HabiBootAudioEngine.SAMPLE_RATE));
+        int byteOff = startFrame * 4;
+        int byteLen = Math.max(0, (endFrame - startFrame) * 4);
+        if (byteLen < 4) return 0.0;
+        return pcm16Rms(ByteBuffer.wrap(pcmLe, byteOff, byteLen));
     }
 
     private static void stepMany(HabiWorldEntrySession session, int count, double dt, boolean inWorldNoScreen) {

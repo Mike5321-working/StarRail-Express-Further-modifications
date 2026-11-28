@@ -386,7 +386,12 @@ public final class HabiBootSession {
                 ClientVisualPreferences.setKineticUiBgmVolume(1.0f);
             }
             audio.syncMinecraftVolumes(mc);
-            audio.setUserMuted(false, getTimelineSeconds(), phase == Phase.STATION_01, getStationElapsed());
+            HabiWorldEntrySession worldEntry = HabiWorldEntrySession.getInstance();
+            if (worldEntry.isActive()) {
+                audio.unmuteForTunnel(worldEntry.getPhase() != HabiWorldEntrySession.Phase.END, worldEntry.getProgress());
+            } else {
+                audio.setUserMuted(false, getTimelineSeconds(), phase == Phase.STATION_01, getStationElapsed());
+            }
             audio.syncMinecraftVolumes(mc);
         } else {
             audio.setUserMuted(true, getTimelineSeconds(), phase == Phase.STATION_01, getStationElapsed());

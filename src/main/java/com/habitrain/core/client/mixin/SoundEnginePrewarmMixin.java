@@ -55,9 +55,12 @@ public abstract class SoundEnginePrewarmMixin implements HabiSoundEnginePrewarmA
 
     @Inject(method = "loadLibrary", at = @At("TAIL"))
     private void habitrain$enableKeepaliveAfterLoad(CallbackInfo ci) {
+        boolean ready;
         synchronized (this.habitrain$pumpLock) {
             this.habitrain$pumpingAllowed = this.loaded;
+            ready = this.loaded;
         }
+        HabiBootAudioEngine.getInstance().onOpenAlContextReady(ready);
     }
 
     @Inject(method = "destroy", at = @At("HEAD"))
@@ -66,6 +69,16 @@ public abstract class SoundEnginePrewarmMixin implements HabiSoundEnginePrewarmA
             this.habitrain$destroying = true;
             this.habitrain$pumpingAllowed = false;
         }
+        HabiBootAudioEngine.getInstance().onOpenAlContextDestroying();
+    }
+
+    @Inject(method = "emergencyShutdown", at = @At("HEAD"))
+    private void habitrain$releaseTunnelAudioBeforeEmergencyShutdown(CallbackInfo ci) {
+        synchronized (this.habitrain$pumpLock) {
+            this.habitrain$destroying = true;
+            this.habitrain$pumpingAllowed = false;
+        }
+        HabiBootAudioEngine.getInstance().onOpenAlContextDestroying();
     }
 
     @Inject(method = "destroy", at = @At("TAIL"))

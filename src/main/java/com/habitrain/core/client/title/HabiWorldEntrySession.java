@@ -454,18 +454,26 @@ public final class HabiWorldEntrySession {
         }
 
         if (phase == Phase.START) {
-            // Track Act 1 timeline cues (world entry intentionally plays no extra tunnel music/SFX;
-            // homepage BGM smoothly fades out within 1 second via startTunnelEntry).
+            // Act 1 timeline cues (10 seam/split/assembly clicks + ascending Dmaj9 plucks)
             for (int i = 0; i < START_CUES.length; i++) {
                 if (!cueFired[i] && phaseT >= START_CUES[i]) {
                     cueFired[i] = true;
+                    if (audioEnabled) {
+                        HabiBootAudioEngine.getInstance().playLayerAbsorb(i);
+                    }
                 }
             }
             if (!doorsSoundFired && phaseT >= DOORS_AT) {
                 doorsSoundFired = true;
+                if (audioEnabled) {
+                    HabiBootAudioEngine.getInstance().playSingularityImplode();
+                }
             }
             if (!eruptSoundFired && phaseT >= BOARD_AT) {
                 eruptSoundFired = true;
+                if (audioEnabled) {
+                    HabiBootAudioEngine.getInstance().playTunnelErupt();
+                }
             }
             if (phaseT > BOARD_AT) {
                 double ek = sat((phaseT - BOARD_AT) / (START_DUR - BOARD_AT));
@@ -529,13 +537,19 @@ public final class HabiWorldEntrySession {
             }
             progress = clamp(progress, 0.0, 1.0);
 
-            // Mark 5-stage manifest completion (silent during world entry)
+            // Feed real loading progress to tunnel wind filter & 100 BPM arpeggio, and chime on stage completion
+            if (audioEnabled) {
+                HabiBootAudioEngine.getInstance().updateTunnelProgress(progress);
+            }
             double acc = 0.0;
             for (int i = 0; i < WORLD_STAGES.length; i++) {
                 acc += WORLD_STAGES[i].weight();
                 boolean done = progress >= acc - 0.001 || progress >= 0.999;
                 if (done && !stageDone[i]) {
                     stageDone[i] = true;
+                    if (audioEnabled) {
+                        HabiBootAudioEngine.getInstance().playTunnelStageTick(i);
+                    }
                 }
             }
 
@@ -591,6 +605,9 @@ public final class HabiWorldEntrySession {
         Arrays.fill(stageDone, true);
         if (!breakoutSoundFired) {
             breakoutSoundFired = true;
+            if (audioEnabled) {
+                HabiBootAudioEngine.getInstance().triggerTunnelBreakout();
+            }
         }
     }
 

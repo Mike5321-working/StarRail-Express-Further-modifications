@@ -62,8 +62,11 @@ public final class HabiBootAudioEngine {
     public static final double EXIT_HANDOFF = 1.2;      // 2 beats (57,600 samples)
     public static final double IDLE_LOOP = 4.8;         // 8 beats
     public static final double MENU_LOOP = 19.2;        // 32 beats (8 bars)
-    /** Smooth homepage BGM fade-out duration when entering a world (finishes strictly within 1.0 s audible). */
-    public static final double WORLD_ENTRY_MENU_FADE_SEC = 0.78;
+    /** Smooth homepage BGM lowpass fade-out duration when entering a world (matches audio_engine.js 1.75 s). */
+    public static final double WORLD_ENTRY_MENU_FADE_SEC = 1.75;
+    static final double WORLD_ENTRY_MENU_FADE_CUTOFF_HZ = 165.0;
+    private static final double UNIT_OPENAL_GAIN = 0.85 * 0.92;
+    private static final int TUNNEL_HANDOFF_DECLICK_FRAMES = 192; // 4 ms cosine attack on menu handoff
 
     private static final int MIX_BLOCK_FRAMES = 256;    // ~5.33 ms control resolution
     private static final int LINE_BUFFER_FRAMES = 4096; // ~85.3 ms buffer for early SourceDataLine fallback
@@ -227,13 +230,24 @@ public final class HabiBootAudioEngine {
     // ── Polyphonic procedural D-major SFX voices (used by early fallback) ────
     private final List<SfxVoice> sfxVoices = new ArrayList<>();
     private final TunnelSoundscape tunnelSoundscape = new TunnelSoundscape();
+    private final HabiTunnelOpenAlPlayer tunnelPlayer =
+            new HabiTunnelOpenAlPlayer(this::mixDedicatedTunnelChunk, this::onDedicatedTunnelIdle);
+    private int tunnelGeneration;
+    private long tunnelOriginSample;
+    private boolean tunnelBreakoutTriggered;
+    private boolean tunnelMenuHandoffDeclick;
 
-    // Pre-synthesized raw stereo 48 kHz float buffers for heavy one-shot tunnel SFX (eliminates 10-37ms render-thread synthesis spikes)
+    // Pre-synthesized raw stereo 48 kHz float + unit-gain PCM16 buffers for tunnel SFX (zero render-thread synthesis spikes)
     private final float[][] prebakedLayerAbsorb = new float[10][];
     private final float[][] prebakedTunnelStageTick = new float[5][];
     private volatile float @Nullable [] prebakedSingularityImplode;
     private volatile float @Nullable [] prebakedTunnelErupt;
     private volatile float @Nullable [] prebakedTunnelBreakout;
+    private final byte[][] prebakedLayerAbsorbPcm = new byte[10][];
+    private final byte[][] prebakedTunnelStageTickPcm = new byte[5][];
+    private volatile byte @Nullable [] prebakedSingularityImplodePcm;
+    private volatile byte @Nullable [] prebakedTunnelEruptPcm;
+    private volatile byte @Nullable [] prebakedTunnelBreakoutPcm;
     private final AtomicBoolean tunnelSfxPrebakeStarted = new AtomicBoolean(false);
 
     // ── Real-time spectrum telemetry (written by active mixer, read by render) ─
@@ -345,6 +359,7 @@ public final class HabiBootAudioEngine {
                     if (loaded) {
                         openAlObservedReady = true;
                         lastOpenAlProbeNanos = 0L;
+                        tunnelPlayer.onOpenAlContextReady(true);
                     }
                     return loaded;
                 }
@@ -375,8 +390,25 @@ public final class HabiBootAudioEngine {
         return Boolean.TRUE.equals(checkSoundEngineLoaded(mc));
     }
 
-    /** True while an OpenAL kinetic boot/title BGM stream is currently active. */
+    /** Notified by {@code SoundEnginePrewarmMixin} right after {@code SoundEngine#loadLibrary()}. */
+    public void onOpenAlContextReady(boolean loaded) {
+        if (loaded) {
+            openAlObservedReady = true;
+        }
+        tunnelPlayer.onOpenAlContextReady(loaded);
+    }
+
+    /** Notified by {@code SoundEnginePrewarmMixin} right before {@code SoundEngine#destroy()} / {@code emergencyShutdown()}. */
+    public void onOpenAlContextDestroying() {
+        tunnelPlayer.onOpenAlContextDestroying();
+    }
+
+    /** True while an OpenAL kinetic boot/title or world-entry BGM stream is currently active. */
     public boolean isOpenAlStreamActive() {
+        return tunnelPlayer.isActive() || isSoundManagerBgmStreamActive();
+    }
+
+    private boolean isSoundManagerBgmStreamActive() {
         synchronized (stateLock) {
             return outputMode == OutputMode.OPENAL
                     && openAlBgmInstance != null
@@ -422,7 +454,10 @@ public final class HabiBootAudioEngine {
             this.userMuted = muted;
             mc = this.lastMinecraft;
             if (muted) {
+                tunnelGeneration++;
+                tunnelBreakoutTriggered = false;
                 clearMusicChannelsLocked();
+                sfxVoices.clear();
                 state = State.STOPPED;
                 loadingTimelineAnchored = false;
                 loadingSequenceStartSample = -1L;
@@ -451,10 +486,22 @@ public final class HabiBootAudioEngine {
             }
         }
         if (muted) {
+            tunnelPlayer.stopImmediately();
             stopOpenAlStream(mc);
         } else {
             lastOpenAlProbeNanos = 0L;
             ensureOutputBackendOnRenderThread(mc);
+        }
+    }
+
+    /** Unmutes directly into world-entry tunnel soundscape without flashing boot/menu stems. */
+    public void unmuteForTunnel(boolean resumeTunnel, double progress) {
+        synchronized (stateLock) {
+            this.userMuted = false;
+        }
+        if (resumeTunnel) {
+            startTunnelEntry(false);
+            updateTunnelProgress(progress);
         }
     }
 
@@ -491,6 +538,12 @@ public final class HabiBootAudioEngine {
         externalSoundDisabled = !prefEnabled;
 
         boolean nowEnabled = isSoundEffectivelyEnabled();
+        if (mc != null && isSoundEngineLoaded(mc) && !tunnelPlayer.isOpenAlContextValid()) {
+            tunnelPlayer.onOpenAlContextReady(true);
+        }
+        float liveGain = nowEnabled ? bgmVolumePref : 0.0f;
+        tunnelPlayer.setTargetGains(liveGain, liveGain);
+
         if (!nowEnabled) {
             boolean shouldStopOpenAl;
             synchronized (stateLock) {
@@ -508,6 +561,7 @@ public final class HabiBootAudioEngine {
                 }
             }
             if (shouldStopOpenAl) {
+                tunnelPlayer.stopImmediately();
                 stopOpenAlStream(mc);
             }
             return;
@@ -515,10 +569,21 @@ public final class HabiBootAudioEngine {
 
         lastMuteReasonLogged = null;
         boolean needOutput;
+        boolean needStartDedicatedTunnel = false;
+        int tunnelGenToStart = 0;
         synchronized (stateLock) {
             if (activeSession && !fadingOut && !userMuted && state != State.STOPPED) {
                 if (state == State.TUNNEL) {
-                    needOutput = tunnelSoundscape.active || hasActiveMusicChannelLocked();
+                    boolean tunnelAlive = tunnelSoundscape.active || hasActiveMusicChannelLocked();
+                    if (tunnelPlayer.isActive() || tunnelBreakoutTriggered) {
+                        needOutput = false;
+                    } else if (tunnelAlive && tunnelPlayer.isOpenAlContextValid()) {
+                        needStartDedicatedTunnel = true;
+                        tunnelGenToStart = tunnelGeneration;
+                        needOutput = false;
+                    } else {
+                        needOutput = tunnelAlive;
+                    }
                 } else {
                     if (!stemsLoaded) {
                         if (state == State.MENU || state == State.DEPARTING) {
@@ -541,7 +606,10 @@ public final class HabiBootAudioEngine {
                 needOutput = false;
             }
         }
-        if (needOutput) {
+        if (needStartDedicatedTunnel) {
+            stopOpenAlStream(mc);
+            tunnelPlayer.startStream(tunnelGenToStart, liveGain, liveGain);
+        } else if (needOutput) {
             ensureOutputBackendOnRenderThread(mc);
         }
     }
@@ -602,7 +670,8 @@ public final class HabiBootAudioEngine {
     /** True while our kinetic title/boot audio owns the client BGM slot (suppresses vanilla MusicManager). */
     public boolean isBlockingVanillaMusic() {
         synchronized (stateLock) {
-            return activeSession && !fadingOut && state != State.STOPPED && isSoundEffectivelyEnabled();
+            return activeSession && !fadingOut && !tunnelBreakoutTriggered
+                    && state != State.STOPPED && isSoundEffectivelyEnabled();
         }
     }
 
@@ -621,6 +690,7 @@ public final class HabiBootAudioEngine {
     /** Begins or resyncs the loading sequence (intro -> idle + load_layer). */
     public void startLoadingSequence(double timelineT, double progress) {
         preloadAsync();
+        tunnelPlayer.stopImmediately();
         // On a fresh t = 0.0 start (initial boot or R replay), flush any stale OpenAL stream
         // first so previously queued menu.wav buffers never delay intro.wav by ~256 ms.
         if (timelineT <= 0.001) {
@@ -866,6 +936,7 @@ public final class HabiBootAudioEngine {
     /** Directly enters Station 01 looping BGM (used when returning to title screen or unmuting). */
     public void startMenuDirect(double menuElapsedSec) {
         preloadAsync();
+        tunnelPlayer.stopImmediately();
         Minecraft mc;
         boolean shouldEnsureOutput = false;
         synchronized (stateLock) {
@@ -924,17 +995,33 @@ public final class HabiBootAudioEngine {
 
     /** Smoothly fades out and releases session audio (when entering a world or vanilla TitleScreen). */
     public void fadeOutAndStop() {
+        boolean fadeDedicated = false;
         synchronized (stateLock) {
             if (!activeSession && state == State.STOPPED) return;
+            if (state == State.TUNNEL && tunnelBreakoutTriggered) {
+                return; // Let Act 3 breakout arrival chord finish its brief natural ring-out
+            }
             fadingOut = true;
             pendingStartLoading = false;
             pendingStartMenu = false;
+            fadeDedicated = (state == State.TUNNEL);
+        }
+        if (fadeDedicated) {
+            tunnelPlayer.fadeOutStream();
         }
     }
 
     /** Fades out and drops decoded boot PCM stems once playback finishes so gameplay heap stays lean. */
     public void fadeOutAndReleaseStems() {
+        boolean fadeDedicated = false;
         synchronized (stateLock) {
+            if (state == State.TUNNEL && tunnelBreakoutTriggered) {
+                // Boot WAV stems are unused during Act 3 breakout tail: drop ~7.3 MB stems immediately
+                // while letting the static Dmaj9 arrival chord finish ringing out smoothly!
+                menuCh = null;
+                releaseBootStemsOnlyLocked();
+                return;
+            }
             releaseStemsOnStop = true;
             if (!activeSession && state == State.STOPPED) {
                 releaseStemsLocked();
@@ -943,11 +1030,19 @@ public final class HabiBootAudioEngine {
             fadingOut = true;
             pendingStartLoading = false;
             pendingStartMenu = false;
+            fadeDedicated = (state == State.TUNNEL);
+        }
+        if (fadeDedicated) {
+            tunnelPlayer.fadeOutStream();
         }
     }
 
-    private void releaseStemsLocked() {
-        clearMusicChannelsLocked();
+    private void releaseBootStemsOnlyLocked() {
+        introCh = null;
+        idleCh = null;
+        loadCh = null;
+        exitCh = null;
+        menuCh = null;
         stemIntro = null;
         stemIdle = null;
         stemLoadLayer = null;
@@ -960,11 +1055,19 @@ public final class HabiBootAudioEngine {
         releaseStemsOnStop = false;
     }
 
+    private void releaseStemsLocked() {
+        clearMusicChannelsLocked();
+        releaseBootStemsOnlyLocked();
+    }
+
     /** Immediately stops all music &amp; SFX. */
     public void stopImmediately() {
         Minecraft mc;
         synchronized (stateLock) {
             mc = this.lastMinecraft;
+            tunnelGeneration++;
+            tunnelBreakoutTriggered = false;
+            tunnelMenuHandoffDeclick = false;
             activeSession = false;
             fadingOut = false;
             fadeOutGain = 1.0;
@@ -980,11 +1083,13 @@ public final class HabiBootAudioEngine {
             sfxVoices.clear();
             state = State.STOPPED;
         }
+        tunnelPlayer.stopImmediately();
         stopOpenAlStream(mc);
     }
 
     public void shutdown() {
         stopImmediately();
+        tunnelPlayer.shutdown();
         synchronized (stateLock) {
             releaseStemsLocked();
         }
@@ -1061,17 +1166,35 @@ public final class HabiBootAudioEngine {
     // ── World-Entry Cutscene Soundscape (100 BPM · Dmaj9, ported from audio_engine.js) ──
 
     /**
-     * Handles world-entry audio transition: plays NO extra world-entry music, and if the Station 01
-     * homepage BGM ({@code menu.wav}) is currently playing, smoothly fades it out to silence within
-     * 1 second ({@link #WORLD_ENTRY_MENU_FADE_SEC}).
+     * Starts the full 3-act World-Entry cutscene soundscape ({@code habitrain_logo_v3/audio_engine.js}):
+     * <ul>
+     *   <li>Smoothly lowpass-fades any playing Station 01 homepage BGM ({@code menu.wav}) down to 165 Hz over 1.75 s
+     *       from its exact audible sample position (zero glitch or double-play).</li>
+     *   <li>Runs the Act 1 engine charge sub-bass sweep ({@code 0.10..2.50 s}), stereo pink-noise bandpass wind bed,
+     *       and 100 BPM eighth-note crystalline Time Tunnel arpeggio on a dedicated 3.58 s deeply-buffered native
+     *       OpenAL stream immune to {@code SoundEngine#stopAll()} and Minecraft world-loading stalls.</li>
+     * </ul>
      */
     public void startTunnelEntry(boolean fromStationStart) {
-        Minecraft mc;
-        boolean shouldEnsureOutput = false;
-        boolean shouldStopOpenAl = false;
+        preloadAsync();
+        Minecraft mc = this.lastMinecraft;
+        if (mc != null && isSoundEffectivelyEnabled()) {
+            if (isSoundEngineLoaded(mc)) {
+                tunnelPlayer.onOpenAlContextReady(true);
+            } else if (mc.isSameThread()) {
+                prewarmSoundEngine(mc);
+            }
+        }
+
+        long nowNanos = System.nanoTime();
+        int gen;
+        boolean enabledNow;
         synchronized (stateLock) {
             mc = this.lastMinecraft;
-            tunnelSoundscape.stop();
+            enabledNow = isSoundEffectivelyEnabled();
+            tunnelGeneration++;
+            gen = tunnelGeneration;
+            tunnelBreakoutTriggered = false;
             sfxVoices.clear();
             pendingStartLoading = false;
             pendingStartMenu = false;
@@ -1082,42 +1205,72 @@ public final class HabiBootAudioEngine {
             fadingOut = false;
             fadeOutGain = 1.0;
 
-            if (isSoundEffectivelyEnabled() && menuCh != null && menuCh.active) {
-                activeSession = true;
-                state = State.TUNNEL;
-                menuCh.scheduleSmoothVolumeFadeOut(
-                        mixerSampleClock,
-                        Math.round(WORLD_ENTRY_MENU_FADE_SEC * SAMPLE_RATE),
-                        4_500.0
-                );
-                if (mc == null && !openAlObservedReady && outputMode != OutputMode.OPENAL) {
-                    ensureEarlyMixerRunningLocked();
-                }
-                shouldEnsureOutput = true;
-            } else {
+            if (!enabledNow) {
                 clearMusicChannelsLocked();
                 state = State.STOPPED;
                 activeSession = false;
                 earlyMixerRequested = false;
-                shouldStopOpenAl = true;
+            } else {
+                // Hand off any active Station 01 menu.wav from the exact audible sample so there is zero jump
+                if (menuCh != null && menuCh.active) {
+                    long heard = getEstimatedHeardSampleLocked(nowNanos);
+                    if (heard >= 0L && mixerSampleClock > heard) {
+                        long lead = Math.min(mixerSampleClock - heard,
+                                (long) OPENAL_PREFILL_CHUNKS * OPENAL_CHUNK_FRAMES);
+                        menuCh.rewindFrames(lead);
+                    }
+                    menuCh.scheduleFadeOut(
+                            mixerSampleClock,
+                            Math.round(WORLD_ENTRY_MENU_FADE_SEC * SAMPLE_RATE),
+                            WORLD_ENTRY_MENU_FADE_CUTOFF_HZ
+                    );
+                    tunnelMenuHandoffDeclick = true;
+                } else {
+                    menuCh = null;
+                    tunnelMenuHandoffDeclick = false;
+                }
+                tunnelSoundscape.start(mixerSampleClock, fromStationStart);
+                tunnelOriginSample = mixerSampleClock + Math.round((fromStationStart ? 2.22 : 0.12) * SAMPLE_RATE);
+                activeSession = true;
+                state = State.TUNNEL;
+                earlyMixerRequested = false;
             }
         }
-        if (shouldStopOpenAl) {
+
+        if (!enabledNow) {
+            tunnelPlayer.stopImmediately();
             stopOpenAlStream(mc);
-        } else if (shouldEnsureOutput) {
-            lastOpenAlProbeNanos = 0L;
-            ensureOutputBackendOnRenderThread(mc);
+            return;
+        }
+
+        // Stop SoundEngine-managed KineticBgmSoundInstance first so menu.wav never double-plays,
+        // then start our dedicated 3.58 s native OpenAL player (immune to SoundEngine.stopAll()).
+        stopOpenAlStream(mc);
+        float vol = bgmVolumePref;
+        boolean startedDedicated = tunnelPlayer.startStream(gen, vol, vol);
+        if (!startedDedicated) {
+            // Fallback for headless tests or pre-OpenAL environments
+            synchronized (stateLock) {
+                if (state == State.TUNNEL && activeSession && mc == null
+                        && !openAlObservedReady && outputMode != OutputMode.OPENAL) {
+                    ensureEarlyMixerRunningLocked();
+                }
+            }
         }
     }
 
-    /** Stops any remaining world-entry fade audio cleanly without touching non-tunnel music states. */
+    /** Stops any active world-entry music &amp; cues cleanly without touching non-tunnel music states. */
     public void stopTunnelAudio() {
         Minecraft mc = null;
         boolean shouldStopOpenAl = false;
         synchronized (stateLock) {
             tunnelSoundscape.stop();
+            tunnelBreakoutTriggered = false;
+            tunnelMenuHandoffDeclick = false;
             if (state == State.TUNNEL) {
+                tunnelGeneration++;
                 clearMusicChannelsLocked();
+                sfxVoices.clear();
                 state = State.STOPPED;
                 activeSession = false;
                 earlyMixerRequested = false;
@@ -1125,6 +1278,7 @@ public final class HabiBootAudioEngine {
                 shouldStopOpenAl = true;
             }
         }
+        tunnelPlayer.stopImmediately();
         if (shouldStopOpenAl) {
             stopOpenAlStream(mc);
         }
@@ -1133,22 +1287,22 @@ public final class HabiBootAudioEngine {
     /** Act 1 ten seam/split/assembly cues: mechanical metallic click + ascending Dmaj9 plucks. */
     public void playLayerAbsorb(int layerIdx) {
         int idx = Math.max(0, Math.min(9, layerIdx));
-        List<SfxSpec> specs = buildLayerAbsorbSpecs(idx);
-        float[] cached = prebakedLayerAbsorb[idx];
-        playSfxSpecsWithNoise(specs, null, cached);
+        playTunnelOneShot(buildLayerAbsorbSpecs(idx), null, prebakedLayerAbsorb[idx], prebakedLayerAbsorbPcm[idx]);
     }
 
     /** Act 1 (1.94s) doors opening: pneumatic highpass hiss + 2-tone station chime. */
     public void playSingularityImplode() {
-        playSfxSpecsWithNoise(buildSingularityImplodeSpecs(), SINGULARITY_IMPLODE_NOISE, prebakedSingularityImplode);
+        playTunnelOneShot(buildSingularityImplodeSpecs(), SINGULARITY_IMPLODE_NOISE,
+                prebakedSingularityImplode, prebakedSingularityImplodePcm);
     }
 
     /** Act 1 (2.22s) doorway rush: sub-bass dive + lowpass rush wave + 7-note Dmaj9 star-gate chord. */
     public void playTunnelErupt() {
-        playSfxSpecsWithNoise(buildTunnelEruptSpecs(), TUNNEL_ERUPT_NOISE, prebakedTunnelErupt);
+        playTunnelOneShot(buildTunnelEruptSpecs(), TUNNEL_ERUPT_NOISE,
+                prebakedTunnelErupt, prebakedTunnelEruptPcm);
     }
 
-    /** Updates tunnel wind-bed bandpass cutoff & arpeggio energy from real world-loading progress. */
+    /** Updates tunnel wind-bed bandpass cutoff &amp; arpeggio energy from real world-loading progress. */
     public void updateTunnelProgress(double progress) {
         synchronized (stateLock) {
             tunnelSoundscape.setProgress(clamp01(progress));
@@ -1158,18 +1312,77 @@ public final class HabiBootAudioEngine {
     /** Stage completion chime inside the Time Tunnel. */
     public void playTunnelStageTick(int stageIdx) {
         int idx = Math.floorMod(stageIdx, 5);
-        playSfxSpecsWithNoise(buildTunnelStageTickSpecs(idx), null, prebakedTunnelStageTick[idx]);
+        playTunnelOneShot(buildTunnelStageTickSpecs(idx), null,
+                prebakedTunnelStageTick[idx], prebakedTunnelStageTickPcm[idx]);
     }
 
     /**
-     * Act 3 breakout audio: postmark slam thump -> wind surge & dissolve -> warm Dmaj9 arrival chord
+     * Act 3 breakout audio: postmark slam thump -> wind surge &amp; dissolve -> warm Dmaj9 arrival chord
      * at +0.86s as the Apple Portal reveals the real Minecraft world.
+     *
+     * <p>When running on the dedicated OpenAL backend, pre-renders the entire 1.55 s wind surge &amp;
+     * dissolve plus the 2.40 s postmark/arrival chord as static OpenAL buffers while crossfading out
+     * the deep-buffered Act 2 stream over 65 ms — ensuring instant breakout timing and 100% stutter
+     * immunity through first-frame 3D world warmup.</p>
      */
     public void triggerTunnelBreakout() {
+        long nowNanos = System.nanoTime();
+        long audibleSample = tunnelPlayer.getAudibleSample(nowNanos);
+        int gen;
+        double startCutoff;
+        double startGain;
+        int startNoiseCursor;
+        boolean enabledNow = isSoundEffectivelyEnabled();
+
         synchronized (stateLock) {
+            gen = tunnelGeneration;
+            tunnelBreakoutTriggered = true;
+            double[] windState = tunnelSoundscape.estimateAudibleWindState(audibleSample >= 0L ? audibleSample : mixerSampleClock);
+            startCutoff = windState[0];
+            startGain = windState[1];
+            startNoiseCursor = (int) windState[2];
             tunnelSoundscape.triggerBreakout(mixerSampleClock);
         }
+
+        if (!enabledNow) {
+            tunnelPlayer.stopImmediately();
+            return;
+        }
+
+        if (tunnelPlayer.isOpenAlContextValid() && (tunnelPlayer.isActive() || openAlObservedReady)) {
+            byte[] windSurgePcm = tunnelSoundscape.renderBreakoutWindPcm16(
+                    startCutoff, startGain, startNoiseCursor, UNIT_OPENAL_GAIN);
+            byte[] arrivalPcm = prebakedTunnelBreakoutPcm != null
+                    ? prebakedTunnelBreakoutPcm
+                    : renderSfxPcm(buildTunnelBreakoutSpecs(), null, UNIT_OPENAL_GAIN);
+            tunnelPlayer.triggerBreakout(gen, windSurgePcm, arrivalPcm);
+            return;
+        }
+
         playSfxSpecsWithNoise(buildTunnelBreakoutSpecs(), null, prebakedTunnelBreakout);
+    }
+
+    private void playTunnelOneShot(List<SfxSpec> specs, @Nullable NoiseBurstSpec noiseSpec,
+                                   float @Nullable [] prebakedRaw, byte @Nullable [] prebakedUnitPcm) {
+        if (!isSoundEffectivelyEnabled()) return;
+        int gen;
+        boolean inTunnel;
+        synchronized (stateLock) {
+            inTunnel = (state == State.TUNNEL);
+            gen = tunnelGeneration;
+        }
+        if (inTunnel && tunnelPlayer.isOpenAlContextValid()) {
+            byte[] pcm = prebakedUnitPcm != null
+                    ? prebakedUnitPcm
+                    : (prebakedRaw != null
+                            ? renderScaledPcmFromRaw(prebakedRaw, UNIT_OPENAL_GAIN)
+                            : renderSfxPcm(specs, noiseSpec, UNIT_OPENAL_GAIN));
+            if (pcm.length >= 4) {
+                tunnelPlayer.enqueueOneShot(gen, pcm, false, false);
+            }
+            return;
+        }
+        playSfxSpecsWithNoise(specs, noiseSpec, prebakedRaw);
     }
 
     private static final NoiseBurstSpec SINGULARITY_IMPLODE_NOISE =
@@ -1228,18 +1441,32 @@ public final class HabiBootAudioEngine {
         return specs;
     }
 
-    /** Pre-synthesizes heavy tunnel SFX raw buffers on a background thread so Act 1/3 cues cost <0.2ms on render thread. */
+    /** Pre-synthesizes heavy tunnel SFX + pink-noise loop on a background thread so Act 1..3 cues cost <0.2ms. */
     void prebakeTunnelSfxSync() {
         if (!tunnelSfxPrebakeStarted.compareAndSet(false, true)) return;
         try {
-            prebakedSingularityImplode = renderRawSfxStereo(buildSingularityImplodeSpecs(), SINGULARITY_IMPLODE_NOISE);
-            prebakedTunnelErupt = renderRawSfxStereo(buildTunnelEruptSpecs(), TUNNEL_ERUPT_NOISE);
-            prebakedTunnelBreakout = renderRawSfxStereo(buildTunnelBreakoutSpecs(), null);
+            tunnelSoundscape.prewarmNoiseBuffer();
+            float[] implode = renderRawSfxStereo(buildSingularityImplodeSpecs(), SINGULARITY_IMPLODE_NOISE);
+            prebakedSingularityImplode = implode;
+            prebakedSingularityImplodePcm = renderScaledPcmFromRaw(implode, UNIT_OPENAL_GAIN);
+
+            float[] erupt = renderRawSfxStereo(buildTunnelEruptSpecs(), TUNNEL_ERUPT_NOISE);
+            prebakedTunnelErupt = erupt;
+            prebakedTunnelEruptPcm = renderScaledPcmFromRaw(erupt, UNIT_OPENAL_GAIN);
+
+            float[] breakout = renderRawSfxStereo(buildTunnelBreakoutSpecs(), null);
+            prebakedTunnelBreakout = breakout;
+            prebakedTunnelBreakoutPcm = renderScaledPcmFromRaw(breakout, UNIT_OPENAL_GAIN);
+
             for (int i = 0; i < prebakedLayerAbsorb.length; i++) {
-                prebakedLayerAbsorb[i] = renderRawSfxStereo(buildLayerAbsorbSpecs(i), null);
+                float[] raw = renderRawSfxStereo(buildLayerAbsorbSpecs(i), null);
+                prebakedLayerAbsorb[i] = raw;
+                prebakedLayerAbsorbPcm[i] = renderScaledPcmFromRaw(raw, UNIT_OPENAL_GAIN);
             }
             for (int i = 0; i < prebakedTunnelStageTick.length; i++) {
-                prebakedTunnelStageTick[i] = renderRawSfxStereo(buildTunnelStageTickSpecs(i), null);
+                float[] raw = renderRawSfxStereo(buildTunnelStageTickSpecs(i), null);
+                prebakedTunnelStageTick[i] = raw;
+                prebakedTunnelStageTickPcm[i] = renderScaledPcmFromRaw(raw, UNIT_OPENAL_GAIN);
             }
         } catch (Throwable t) {
             HabiTrainCore.LOGGER.warn("[HabiBootAudio] Failed to prebake tunnel SFX buffers", t);
@@ -1526,8 +1753,26 @@ public final class HabiBootAudioEngine {
             }
             currentState = state;
             q = quantize;
-            if (enabledNow && isOutputActiveLocked() && mixerProducingSound && (stemsLoaded || state == State.TUNNEL)) {
-                long origin = (state == State.MENU || state == State.TUNNEL) ? menuOriginSample : idleOriginSample;
+            if (enabledNow && state == State.TUNNEL && tunnelPlayer.isActive()) {
+                long heardSample = tunnelPlayer.getAudibleSample(nowNanos);
+                if (heardSample < 0L) {
+                    heardSample = mixerSampleClock;
+                }
+                double elapsed = Math.max(0.0, (heardSample - tunnelOriginSample) / (double) SAMPLE_RATE);
+                beatPhase = (elapsed / BEAT) % 8.0;
+                HabiTunnelOpenAlPlayer.SpectrumSnapshot snap = tunnelPlayer.findSpectrumForSample(heardSample);
+                if (snap != null) {
+                    energy = snap.energy();
+                    bass = snap.bass();
+                    System.arraycopy(snap.bars(), 0, bars, 0, SPECTRUM_BANDS);
+                } else {
+                    energy = liveEnergy;
+                    bass = liveBass;
+                    System.arraycopy(liveBars, 0, bars, 0, SPECTRUM_BANDS);
+                }
+            } else if (enabledNow && isOutputActiveLocked() && mixerProducingSound && (stemsLoaded || state == State.TUNNEL)) {
+                long origin = state == State.MENU ? menuOriginSample
+                        : (state == State.TUNNEL ? tunnelOriginSample : idleOriginSample);
                 long heardSample = getEstimatedHeardSampleLocked(nowNanos);
                 if (heardSample < 0L) {
                     heardSample = outputMode == OutputMode.OPENAL
@@ -1721,7 +1966,7 @@ public final class HabiBootAudioEngine {
 
     private void runOpenAlKeepaliveLoop() {
         try {
-            while (openAlKeepaliveRunning && isOpenAlStreamActive()) {
+            while (openAlKeepaliveRunning && isSoundManagerBgmStreamActive()) {
                 Minecraft mc = this.lastMinecraft;
                 if (mc == null || !mc.isRunning()) {
                     break;
@@ -1965,8 +2210,71 @@ public final class HabiBootAudioEngine {
         }
     }
 
+    /**
+     * Mixes one 128 ms ({@value HabiTunnelOpenAlPlayer#CHUNK_FRAMES} frames) stereo 16-bit LE PCM chunk
+     * for {@link HabiTunnelOpenAlPlayer}'s 3.58 s native OpenAL queue at nominal unit preference gain
+     * (live volume/mute is applied directly on OpenAL {@code AL_GAIN}).
+     */
+    boolean mixDedicatedTunnelChunk(int generation, byte[] dstPcm, HabiTunnelOpenAlPlayer.ChunkMeta metaOut) {
+        synchronized (stateLock) {
+            if (generation != tunnelGeneration || state != State.TUNNEL || !activeSession) {
+                return false;
+            }
+            if (!tunnelSoundscape.active && !hasActiveMusicChannelLocked() && sfxVoices.isEmpty()) {
+                return false;
+            }
+            metaOut.startSample = mixerSampleClock;
+        }
+
+        boolean chunkHasAudio = false;
+        int blockBytes = MIX_BLOCK_FRAMES * 4;
+        for (int b = 0; b < HabiTunnelOpenAlPlayer.CHUNK_BLOCKS; b++) {
+            boolean blockActive = mixBlock(
+                    metaOut.bgmL, metaOut.bgmR, metaOut.sfxL, metaOut.sfxR,
+                    metaOut.blockPcm, true, true
+            );
+            chunkHasAudio |= blockActive;
+            System.arraycopy(metaOut.blockPcm, 0, dstPcm, b * blockBytes, blockBytes);
+        }
+        mixerProducingSound = chunkHasAudio;
+        metaOut.hasAudio = chunkHasAudio;
+        metaOut.bass = liveBass;
+        metaOut.energy = liveEnergy;
+        System.arraycopy(liveBars, 0, metaOut.bars, 0, SPECTRUM_BANDS);
+
+        synchronized (stateLock) {
+            if (generation != tunnelGeneration) {
+                return false;
+            }
+            return chunkHasAudio || tunnelSoundscape.active || hasActiveMusicChannelLocked() || !sfxVoices.isEmpty();
+        }
+    }
+
+    private void onDedicatedTunnelIdle(int generation) {
+        synchronized (stateLock) {
+            if (generation == tunnelGeneration && state == State.TUNNEL) {
+                tunnelSoundscape.stop();
+                clearMusicChannelsLocked();
+                sfxVoices.clear();
+                state = State.STOPPED;
+                activeSession = false;
+                tunnelBreakoutTriggered = false;
+                tunnelMenuHandoffDeclick = false;
+                mixerProducingSound = false;
+                if (releaseStemsOnStop) {
+                    releaseStemsLocked();
+                }
+            }
+        }
+    }
+
     private boolean mixBlock(float[] bgmL, float[] bgmR, float[] sfxL, float[] sfxR,
                              byte[] pcmOut, boolean forOpenAl) {
+        return mixBlock(bgmL, bgmR, sfxL, sfxR, pcmOut, forOpenAl, false);
+    }
+
+    private boolean mixBlock(float[] bgmL, float[] bgmR, float[] sfxL, float[] sfxR,
+                             byte[] pcmOut, boolean forOpenAl, boolean unitPrefGain) {
         for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
             bgmL[i] = 0f;
             bgmR[i] = 0f;
@@ -1976,15 +2284,24 @@ public final class HabiBootAudioEngine {
 
         boolean anyActive = false;
         boolean enabledNow = isSoundEffectivelyEnabled();
-        double bgmVol = forOpenAl
-                ? computeOpenAlBgmGain(enabledNow, bgmVolumePref)
-                : computeBgmVolume(enabledNow, mcMasterVolume, bgmVolumePref);
-        double sfxVol = forOpenAl
-                ? computeOpenAlSfxGain(enabledNow, bgmVolumePref)
-                : computeSfxVolume(enabledNow, mcMasterVolume, bgmVolumePref);
+        double bgmVol = unitPrefGain
+                ? (enabledNow ? 0.85 : 0.0)
+                : (forOpenAl
+                        ? computeOpenAlBgmGain(enabledNow, bgmVolumePref)
+                        : computeBgmVolume(enabledNow, mcMasterVolume, bgmVolumePref));
+        double sfxVol = unitPrefGain
+                ? (enabledNow ? 0.85 : 0.0)
+                : (forOpenAl
+                        ? computeOpenAlSfxGain(enabledNow, bgmVolumePref)
+                        : computeSfxVolume(enabledNow, mcMasterVolume, bgmVolumePref));
+        boolean applyHandoffDeclick = false;
 
         synchronized (stateLock) {
             long startSample = mixerSampleClock;
+            if (state == State.TUNNEL && tunnelMenuHandoffDeclick) {
+                applyHandoffDeclick = true;
+                tunnelMenuHandoffDeclick = false;
+            }
 
             if (fadingOut) {
                 fadeOutGain -= (MIX_BLOCK_FRAMES / (double) SAMPLE_RATE) / 0.35;
@@ -2018,10 +2335,11 @@ public final class HabiBootAudioEngine {
                 }
             }
 
-            if (state == State.TUNNEL && !tunnelSoundscape.active && !hasActiveMusicChannelLocked()) {
+            if (state == State.TUNNEL && !tunnelSoundscape.active && !hasActiveMusicChannelLocked() && sfxVoices.isEmpty()) {
                 menuCh = null;
                 state = State.STOPPED;
                 activeSession = false;
+                tunnelBreakoutTriggered = false;
                 if (releaseStemsOnStop) {
                     releaseStemsLocked();
                 }
@@ -2063,6 +2381,11 @@ public final class HabiBootAudioEngine {
             }
             double l = softLimit(bl * effBgm + sfxL[i] * effSfx);
             double r = softLimit(br * effBgm + sfxR[i] * effSfx);
+            if (applyHandoffDeclick && i < TUNNEL_HANDOFF_DECLICK_FRAMES) {
+                double ramp = 0.5 - 0.5 * Math.cos(Math.PI * i / (double) TUNNEL_HANDOFF_DECLICK_FRAMES);
+                l *= ramp;
+                r *= ramp;
+            }
             float mono = (float) ((l + r) * 0.5);
             monoAnalysisRing[i] = mono;
             energySq += mono * mono;
@@ -2212,6 +2535,26 @@ public final class HabiBootAudioEngine {
 
     void setEarlyJavaSoundUnavailableForTest(boolean unavailable) {
         this.earlyJavaSoundUnavailable = unavailable;
+    }
+
+    int currentTunnelGenerationForTest() {
+        synchronized (stateLock) {
+            return tunnelGeneration;
+        }
+    }
+
+    boolean isTunnelBreakoutTriggeredForTest() {
+        synchronized (stateLock) {
+            return tunnelBreakoutTriggered;
+        }
+    }
+
+    boolean pullDedicatedTunnelChunkForTest(int generation, byte[] dstPcm, HabiTunnelOpenAlPlayer.ChunkMeta metaOut) {
+        return mixDedicatedTunnelChunk(generation, dstPcm, metaOut);
+    }
+
+    byte[] renderBreakoutWindForTest(double startCutoff, double startGain, int startNoiseCursor) {
+        return tunnelSoundscape.renderBreakoutWindPcm16(startCutoff, startGain, startNoiseCursor, UNIT_OPENAL_GAIN);
     }
 
     public static double calcLoadLayerGain(double progress) {
@@ -2582,11 +2925,20 @@ public final class HabiBootAudioEngine {
             this.smoothCutoffTarget = targetCutoff;
         }
 
+        void rewindFrames(long frames) {
+            if (frames <= 0L || totalFrames <= 0) return;
+            if (loop) {
+                this.cursorFrame = Math.floorMod(this.cursorFrame - frames, totalFrames);
+            } else {
+                this.cursorFrame = Math.max(0L, this.cursorFrame - frames);
+            }
+        }
+
         void scheduleFadeOut(long whenSample, long durSamples, double endCutoffHz) {
             this.smoothTracking = false;
             this.fadeOutStart = whenSample;
             this.fadeOutDur = Math.max(64L, durSamples);
-            this.fadeOutStartGain = this.gain;
+            this.fadeOutStartGain = Math.max(this.gain, 0.05);
             this.fadeOutStartCutoff = this.cutoff;
             this.fadeOutEndCutoff = endCutoffHz;
             this.smoothVolumeFade = false;
@@ -2888,10 +3240,16 @@ public final class HabiBootAudioEngine {
 
         private final List<NoiseBurstVoice> bursts = new ArrayList<>();
 
+        private static final int NOISE_CROSSFADE_FRAMES = 2048;
+
+        void prewarmNoiseBuffer() {
+            ensureNoiseBuffer();
+        }
+
         private void ensureNoiseBuffer() {
             if (pinkL != null) return;
-            pinkL = new float[NOISE_FRAMES];
-            pinkR = new float[NOISE_FRAMES];
+            float[] l = new float[NOISE_FRAMES];
+            float[] r = new float[NOISE_FRAMES];
             long seedL = 20261126L, seedR = 20261127L;
             double b0L = 0, b1L = 0, b2L = 0, b0R = 0, b1R = 0, b2R = 0;
             for (int i = 0; i < NOISE_FRAMES; i++) {
@@ -2900,15 +3258,129 @@ public final class HabiBootAudioEngine {
                 b0L = 0.997 * b0L + wL * 0.029;
                 b1L = 0.985 * b1L + wL * 0.032;
                 b2L = 0.950 * b2L + wL * 0.048;
-                pinkL[i] = (float) ((b0L + b1L + b2L + wL * 0.015) * 1.4);
+                l[i] = (float) ((b0L + b1L + b2L + wL * 0.015) * 1.4);
 
                 seedR = (seedR * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
                 double wR = ((seedR >>> 24) / (double) 0x800000) - 1.0;
                 b0R = 0.997 * b0R + wR * 0.029;
                 b1R = 0.985 * b1R + wR * 0.032;
                 b2R = 0.950 * b2R + wR * 0.048;
-                pinkR[i] = (float) ((b0R + b1R + b2R + wR * 0.015) * 1.4);
+                r[i] = (float) ((b0R + b1R + b2R + wR * 0.015) * 1.4);
             }
+            // Equal-power cosine wrap at the 3.0 s loop seam so pink noise loops click-free forever
+            for (int i = 0; i < NOISE_CROSSFADE_FRAMES; i++) {
+                seedL = (seedL * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
+                double wL = ((seedL >>> 24) / (double) 0x800000) - 1.0;
+                b0L = 0.997 * b0L + wL * 0.029;
+                b1L = 0.985 * b1L + wL * 0.032;
+                b2L = 0.950 * b2L + wL * 0.048;
+                double tailL = (b0L + b1L + b2L + wL * 0.015) * 1.4;
+
+                seedR = (seedR * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
+                double wR = ((seedR >>> 24) / (double) 0x800000) - 1.0;
+                b0R = 0.997 * b0R + wR * 0.029;
+                b1R = 0.985 * b1R + wR * 0.032;
+                b2R = 0.950 * b2R + wR * 0.048;
+                double tailR = (b0R + b1R + b2R + wR * 0.015) * 1.4;
+
+                double angle = (i / (double) NOISE_CROSSFADE_FRAMES) * (Math.PI * 0.5);
+                double fadeIn = Math.sin(angle);
+                double fadeOut = Math.cos(angle);
+                l[i] = (float) (l[i] * fadeIn + tailL * fadeOut);
+                r[i] = (float) (r[i] * fadeIn + tailR * fadeOut);
+            }
+            pinkL = l;
+            pinkR = r;
+        }
+
+        /** Estimates the audible wind cutoff, gain, and pink-noise phase at {@code samplePos}. */
+        double[] estimateAudibleWindState(long samplePos) {
+            double t = Math.max(0.0, (samplePos - startSample) / (double) SAMPLE_RATE);
+            double fc;
+            double g;
+            if (fromStart) {
+                if (t < 1.90) {
+                    fc = 210.0 * Math.pow(1280.0 / 210.0, clamp01(t / 1.90));
+                    g = 0.20 * clamp01(t / 1.88);
+                } else if (t < 2.18) {
+                    double u = clamp01((t - 1.90) / 0.28);
+                    fc = 1280.0 * Math.pow(280.0 / 1280.0, u);
+                    g = 0.20 + (0.04 - 0.20) * u;
+                } else if (t < 2.55) {
+                    double u = clamp01((t - 2.18) / 0.37);
+                    fc = 280.0 * Math.pow(720.0 / 280.0, u);
+                    g = 0.04 + (0.15 - 0.04) * u;
+                } else {
+                    fc = 520.0 + Math.pow(progress, 1.35) * 1850.0;
+                    g = 0.15;
+                }
+            } else {
+                fc = 520.0 + Math.pow(progress, 1.35) * 1850.0;
+                g = 0.15 * clamp01(t / 0.35);
+            }
+            int cursor = (int) Math.floorMod(Math.max(0L, samplePos - startSample), NOISE_FRAMES);
+            return new double[]{clamp(fc, 240.0, 2600.0), clamp(g, 0.06, 0.25), cursor};
+        }
+
+        /**
+         * Pre-renders the entire 1.55 s Act 3 breakout wind-surge-and-dissolve envelope into a single
+         * 48 kHz stereo 16-bit LE PCM buffer so OpenAL Soft plays it completely stutter-free through
+         * first-frame 3D world warmup.
+         */
+        byte[] renderBreakoutWindPcm16(double startCutoff, double startGain, int startNoiseCursor, double unitGain) {
+            ensureNoiseBuffer();
+            float[] lBuf = pinkL;
+            float[] rBuf = pinkR;
+            int totalFrames = (int) Math.round(1.55 * SAMPLE_RATE);
+            int blocks = (totalFrames + MIX_BLOCK_FRAMES - 1) / MIX_BLOCK_FRAMES;
+            int paddedFrames = blocks * MIX_BLOCK_FRAMES;
+            byte[] pcm = new byte[paddedFrames * 4];
+            double curFc = clamp(startCutoff, 240.0, 2600.0);
+            double curG = clamp(startGain, 0.06, 0.25);
+            int cursor = Math.floorMod(startNoiseCursor, NOISE_FRAMES);
+            StereoBiquad filter = new StereoBiquad(FilterMode.BANDPASS, curFc, 1.8);
+            int fadeInFrames = 720; // 15 ms cosine fade-in to crossfade smoothly with 65 ms Act 2 stream fade-out
+            double blockDt = MIX_BLOCK_FRAMES / (double) SAMPLE_RATE;
+
+            for (int b = 0; b < blocks; b++) {
+                double bt = (b * MIX_BLOCK_FRAMES + MIX_BLOCK_FRAMES * 0.5) / (double) SAMPLE_RATE;
+                if (bt < 0.85) {
+                    curFc = clamp(curFc * Math.pow(3800.0 / Math.max(120.0, curFc),
+                            clamp01(blockDt / Math.max(0.04, 0.85 - bt))), 120.0, 4200.0);
+                } else {
+                    curFc = 3800.0;
+                }
+                if (bt < 0.82) {
+                    curG += (0.28 - curG) * clamp01(blockDt / Math.max(0.05, 0.82 - bt));
+                } else if (bt < 1.45) {
+                    double fu = clamp01((bt - 0.82) / 0.63);
+                    curG = 0.28 * Math.pow(0.0004, fu);
+                } else {
+                    double tail = 1.0 - clamp01((bt - 1.45) / 0.10);
+                    curG = 0.28 * 0.0004 * tail;
+                }
+                filter.setCutoff(curFc);
+                for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
+                    int frameIdx = b * MIX_BLOCK_FRAMES + i;
+                    double inRamp = frameIdx < fadeInFrames
+                            ? (0.5 - 0.5 * Math.cos(Math.PI * frameIdx / (double) fadeInFrames))
+                            : 1.0;
+                    double[] f = filter.process(lBuf[cursor], rBuf[cursor]);
+                    cursor++;
+                    if (cursor >= NOISE_FRAMES) cursor = 0;
+                    double gain = curG * inRamp * unitGain;
+                    double slVal = softLimit(f[0] * gain);
+                    double srVal = softLimit(f[1] * gain);
+                    short sl = (short) Math.max(-32767, Math.min(32767, Math.round(slVal * 32767.0)));
+                    short sr = (short) Math.max(-32767, Math.min(32767, Math.round(srVal * 32767.0)));
+                    int p = frameIdx * 4;
+                    pcm[p] = (byte) (sl & 0xFF);
+                    pcm[p + 1] = (byte) ((sl >>> 8) & 0xFF);
+                    pcm[p + 2] = (byte) (sr & 0xFF);
+                    pcm[p + 3] = (byte) ((sr >>> 8) & 0xFF);
+                }
+            }
+            return pcm;
         }
 
         void start(long nowSample, boolean fromStationStart) {

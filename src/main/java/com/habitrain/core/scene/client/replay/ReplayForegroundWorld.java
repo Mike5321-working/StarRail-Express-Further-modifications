@@ -32,6 +32,13 @@ public final class ReplayForegroundWorld {
     private static final org.slf4j.Logger LOGGER = org.slf4j.LoggerFactory.getLogger(ReplayForegroundWorld.class);
     private static final long TERRAIN_WARMUP_FALLBACK_NS = 8_000_000_000L;
     private static final int TERRAIN_WARMUP_MAX_FRAMES = 120;
+    static final byte ALL_MODEL_PARTS = allModelPartsMask();
+
+    private static byte allModelPartsMask() {
+        int mask = 0;
+        for (PlayerModelPart part : PlayerModelPart.values()) mask |= part.getMask();
+        return (byte) mask;
+    }
 
     public interface RendererFields {
         void habitrain$camera(Camera camera);
@@ -247,9 +254,7 @@ public final class ReplayForegroundWorld {
                 }
                 var player = actors.get(other.p.id());
                 if (player == null) {
-                    player = new RemotePlayer(level, new GameProfile(other.p.id(), other.p.name())) {
-                        @Override public PlayerSkin getSkin() { return ReplayHeadSkins.skin(other.p.id(), other.p.name()); }
-                    };
+                    player = new RecordedActor(level, other.p.id(), other.p.name());
                     posePlayer(player, other, otherPose, tick);
                     level.addEntity(player);
                     actors.put(other.p.id(), player);
@@ -322,6 +327,9 @@ public final class ReplayForegroundWorld {
         player.setXRot(sample.pitch()); player.setYRot(sample.headYaw());
         player.yHeadRot = player.yHeadRotO = sample.headYaw(); player.yBodyRot = player.yBodyRotO = sample.yaw();
         player.setOldPosAndRot(); player.tickCount = (int)tick;
+        player.xCloak = player.xCloakO = player.getX();
+        player.yCloak = player.yCloakO = player.getY();
+        player.zCloak = player.zCloakO = player.getZ();
         player.setOnGround(sample.hasAction(LastMatchReplay.ACT_ON_GROUND));
         player.setSprinting(sample.hasAction(LastMatchReplay.ACT_SPRINT));
         player.setShiftKeyDown(sample.hasAction(LastMatchReplay.ACT_SNEAK));
@@ -384,11 +392,31 @@ public final class ReplayForegroundWorld {
         boundLiveLevel = null;
     }
 
+    static final class RecordedActor extends RemotePlayer {
+        private final UUID actorId;
+        private final String actorName;
+
+        RecordedActor(ClientLevel level, UUID actorId, String actorName) {
+            super(level, new GameProfile(actorId, actorName));
+            this.actorId = actorId;
+            this.actorName = actorName;
+            enableAllModelParts(this.getEntityData());
+        }
+
+        static void enableAllModelParts(net.minecraft.network.syncher.SynchedEntityData data) {
+            data.set(DATA_PLAYER_MODE_CUSTOMISATION, ALL_MODEL_PARTS);
+        }
+
+        @Override public PlayerSkin getSkin() { return ReplayHeadSkins.skin(actorId, actorName); }
+        @Override public boolean isModelPartShown(PlayerModelPart part) { return true; }
+    }
+
     private static final class RecordedPlayer extends LocalPlayer {
         private LastMatchReplay.Participant subject;
         private InteractionHand used = InteractionHand.MAIN_HAND;
         RecordedPlayer(Minecraft client, ClientLevel level) {
             super(client, level, client.getConnection(), client.player.getStats(), client.player.getRecipeBook(), false, false);
+            RecordedActor.enableAllModelParts(this.getEntityData());
         }
         @Override public PlayerSkin getSkin() { return subject == null ? super.getSkin() : ReplayHeadSkins.skin(subject.id(), subject.name()); }
         @Override public boolean isModelPartShown(PlayerModelPart part) { return true; }

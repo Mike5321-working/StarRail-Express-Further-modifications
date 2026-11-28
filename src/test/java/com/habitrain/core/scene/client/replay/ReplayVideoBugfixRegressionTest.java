@@ -311,6 +311,21 @@ class ReplayVideoBugfixRegressionTest {
         assertEquals(2, waitCalls.get());
     }
 
+    @Test
+    void nativeFirstPersonExportShowsOuterSkinLayersForOtherPlayers() throws Exception {
+        var unsafeField = sun.misc.Unsafe.class.getDeclaredField("theUnsafe");
+        unsafeField.setAccessible(true);
+        var unsafe = (sun.misc.Unsafe) unsafeField.get(null);
+        var actor = (ReplayForegroundWorld.RecordedActor) unsafe.allocateInstance(ReplayForegroundWorld.RecordedActor.class);
+
+        for (var part : net.minecraft.world.entity.player.PlayerModelPart.values()) {
+            assertEquals(part.getMask(), ReplayForegroundWorld.ALL_MODEL_PARTS & part.getMask(),
+                    "ALL_MODEL_PARTS mask must enable " + part);
+            assertTrue(actor.isModelPartShown(part),
+                    "Native first-person export actor must render outer skin layer " + part);
+        }
+    }
+
     private static double luminance(int argb) {
         int r = (argb >> 16) & 0xFF;
         int g = (argb >> 8) & 0xFF;
