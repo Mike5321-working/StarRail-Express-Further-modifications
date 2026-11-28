@@ -790,6 +790,8 @@ public final class ReplayBoardRenderer {
             }
         }
         source.endBatch(ReplayDraw.FILL);
+        source.endBatch(ReplayDraw.PANEL);
+        source.endBatch(ReplayDraw.UI_OVERLAY);
         f.flushModels();
         source.endBatch(ReplayDraw.GLOW);
         f.flushTexts();
@@ -880,8 +882,9 @@ public final class ReplayBoardRenderer {
     private static void flushBoardPasses(ReplayFrame f) {
         var source = f.buffers;
         source.endBatch(ReplayDraw.FILL);
-        // Depth-writing panels (Side-Edge Deck Console, idle buttons, kill-feed slabs) flush before models/glow/text.
+        // Depth-writing base panels establish occlusion before flat UI overlays, models, additive glow, and text.
         source.endBatch(ReplayDraw.PANEL);
+        source.endBatch(ReplayDraw.UI_OVERLAY);
         f.flushModels();
         source.endBatch(ReplayDraw.GLOW);
         f.flushTexts();
@@ -999,11 +1002,12 @@ public final class ReplayBoardRenderer {
 
     private static MultiBufferSource.BufferSource buffers() {
         if (buffers == null) {
-            trayType = RenderType.entityCutoutNoCull(InventoryMenu.BLOCK_ATLAS);
+            trayType = RenderType.entitySolid(InventoryMenu.BLOCK_ATLAS);
             SequencedMap<RenderType, ByteBufferBuilder> fixed = new LinkedHashMap<>();
             fixed.put(trayType, own(1 << 17));
             fixed.put(ReplayDraw.FILL, own(1 << 18));
             fixed.put(ReplayDraw.PANEL, own(1 << 16));
+            fixed.put(ReplayDraw.UI_OVERLAY, own(1 << 17));
             fixed.put(ReplayDraw.GLOW, own(1 << 18));
             for (var type : ReplayFrame.glintTypes()) fixed.put(type, own(4096));
             buffers = MultiBufferSource.immediateWithBuffers(fixed, own(1 << 17));

@@ -70,28 +70,34 @@ final class ReplayHonorsPainter {
             ReplayDraw.quad(glow, m, sx - px, sy - py, 0.001f, sx + px, sy + py, 0.001f, ex + px * 3, ey + py * 3, 0.001f,
                     ex - px * 3, ey - py * 3, 0.001f, rayC, rayC, rayClear, rayClear);
         }
-        // double brass border with stepped Art Deco corners
-        frame(glow, m, hw - 0.04f, top - 0.04f, 0.010f * worldScale, ReplayPalette.alpha(ReplayPalette.BRASS, 0.95 * a));
-        frame(glow, m, hw - 0.075f, top - 0.075f, 0.005f * worldScale, ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.9 * a));
-        int brass = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.9 * a);
+        VertexConsumer ui = f.buffers.getBuffer(ReplayDraw.UI_OVERLAY);
+        // double brass border with stepped Art Deco corners (flat in-plane mitered frames)
+        frame(ui, m, hw - 0.04f, top - 0.04f, 0.012f, ReplayPalette.alpha(ReplayPalette.BRASS, 0.95 * a));
+        frame(ui, m, hw - 0.075f, top - 0.075f, 0.006f, ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.85 * a));
+        int brass = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.90 * a);
         for (int cx = -1; cx <= 1; cx += 2) {
             for (int cy = -1; cy <= 1; cy += 2) {
                 float x = cx * (hw - 0.04f), y = cy * (top - 0.04f);
+                float t = 0.006f;
                 for (int step = 1; step <= 3; step++) {
                     float o = step * 0.05f;
-                    ReplayDraw.segment(glow, m, x - cx * o, y, 0.002f, x - cx * o, y - cy * o, 0.002f, 0.006f * worldScale, brass, brass);
-                    ReplayDraw.segment(glow, m, x - cx * o, y - cy * o, 0.002f, x, y - cy * o, 0.002f, 0.006f * worldScale, brass, brass);
+                    float vx = x - cx * o;
+                    float hy = y - cy * o;
+                    ReplayDraw.rectXY(ui, m, vx - t * 0.5f, Math.min(y, hy - cy * t * 0.5f),
+                            vx + t * 0.5f, Math.max(y, hy - cy * t * 0.5f), 0.003f, brass, brass);
+                    ReplayDraw.rectXY(ui, m, Math.min(x, vx + cx * t * 0.5f), hy - t * 0.5f,
+                            Math.max(x, vx + cx * t * 0.5f), hy + t * 0.5f, 0.003f, brass, brass);
                 }
             }
         }
 
-        float z = 0.006f;
+        float z = 0.008f;
         double row1 = fadeIn(time, 0.25), row2 = fadeIn(time, 0.55), row3 = fadeIn(time, 1.6), row4 = fadeIn(time, 2.4);
         f.text(m, ReplayBoardTexts.tr("header"), 0, top - 0.14f, z, 0.0056f,
                 ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, a * row1), 0, false, pw - 0.4f);
-        ReplayDraw.segment(glow, m, -hw * 0.55f, top - 0.21f, 0.002f, hw * 0.55f, top - 0.21f, 0.002f, 0.005f * worldScale,
-                ReplayPalette.alpha(ReplayPalette.BRASS, 0.8 * a * row1), ReplayPalette.alpha(ReplayPalette.BRASS, 0.8 * a * row1));
-        diamond(glow, m, 0, top - 0.21f, 0.03f, ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, a * row1));
+        ReplayDraw.lineXY(ui, m, -hw * 0.55f, top - 0.21f, hw * 0.55f, top - 0.21f, 0.003f, 0.006f,
+                ReplayPalette.alpha(ReplayPalette.BRASS, 0.85 * a * row1), ReplayPalette.alpha(ReplayPalette.BRASS, 0.85 * a * row1));
+        diamond(ui, m, 0, top - 0.21f, 0.03f, ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, a * row1));
         // win banner + subtitle
         int win = model.winColor;
         f.text(m, model.title, 0, top - 0.42f, z, 0.019f, ReplayPalette.alpha(win, a * row2), 0, true, pw - 1.1f);
@@ -138,8 +144,8 @@ final class ReplayHonorsPainter {
         }
 
         // stats
-        ReplayDraw.segment(glow, m, -hw + 0.3f, bottom + 0.56f, 0.002f, hw - 0.3f, bottom + 0.56f, 0.002f, 0.004f * worldScale,
-                ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * a * row4), ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.8 * a * row4));
+        ReplayDraw.lineXY(ui, m, -hw + 0.3f, bottom + 0.56f, hw - 0.3f, bottom + 0.56f, 0.003f, 0.005f,
+                ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.85 * a * row4), ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.85 * a * row4));
         if (model.mvp != null) {
             var p = model.mvp.p;
             Component mvp = ReplayBoardTexts.tr("mvp_line", model.mvp.name, p.score(), p.kills(),
@@ -169,15 +175,12 @@ final class ReplayHonorsPainter {
         return ReplayStagePlan.easeOutCubic((time - start) / 0.45);
     }
 
-    private static void frame(VertexConsumer glow, Matrix4f m, float hw, float hh, float w, int c) {
-        ReplayDraw.segment(glow, m, -hw, hh, 0.002f, hw, hh, 0.002f, w, c, c);
-        ReplayDraw.segment(glow, m, hw, hh, 0.002f, hw, -hh, 0.002f, w, c, c);
-        ReplayDraw.segment(glow, m, hw, -hh, 0.002f, -hw, -hh, 0.002f, w, c, c);
-        ReplayDraw.segment(glow, m, -hw, -hh, 0.002f, -hw, hh, 0.002f, w, c, c);
+    private static void frame(VertexConsumer ui, Matrix4f m, float hw, float hh, float w, int c) {
+        ReplayDraw.rectOutlineXY(ui, m, -hw, -hh, hw, hh, 0.003f, w, c);
     }
 
-    private static void diamond(VertexConsumer glow, Matrix4f m, float x, float y, float r, int c) {
-        ReplayDraw.quad(glow, m, x, y + r, 0.003f, x + r, y, 0.003f, x, y - r, 0.003f, x - r, y, 0.003f, c, c, c, c);
+    private static void diamond(VertexConsumer vc, Matrix4f m, float x, float y, float r, int c) {
+        ReplayDraw.quad(vc, m, x, y + r, 0.004f, x + r, y, 0.004f, x, y - r, 0.004f, x - r, y, 0.004f, c, c, c, c);
     }
 
     private static void stamp(ReplayFrame f, Matrix4f m, float x, float y, int color, double time, double a, float worldScale) {

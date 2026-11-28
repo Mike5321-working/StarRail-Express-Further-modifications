@@ -2,9 +2,11 @@ package com.habitrain.core.game.sre.replay;
 
 import io.wifi.starrailexpress.api.replay.ReplayEventTypes.EventType;
 import io.wifi.starrailexpress.api.replay.ReplayTimelineEvent;
+import net.minecraft.SharedConstants;
 import net.minecraft.network.chat.Component;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.protocol.game.ClientboundLevelEventPacket;
+import net.minecraft.server.Bootstrap;
 import com.habitrain.core.api.scene.model.SceneBounds;
 import com.habitrain.core.network.replay.VisualTape;
 import org.junit.jupiter.api.Test;
@@ -19,6 +21,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class MatchReplayRecorderTest {
     @Test void fortyRecipientsShareEncodingButKeepIndependentEventStreams() throws Exception {
+        SharedConstants.tryDetectVersion();
+        Bootstrap.bootStrap();
         var recorder = new MatchVisualRecorder(new UUID(5, 1), new SceneBounds(0, 0, 0, 16, 16, 16));
         var broadcast = new ClientboundLevelEventPacket(2001, BlockPos.ZERO, 1, false);
         var individual = new ClientboundLevelEventPacket(2001, BlockPos.ZERO, 2, false);

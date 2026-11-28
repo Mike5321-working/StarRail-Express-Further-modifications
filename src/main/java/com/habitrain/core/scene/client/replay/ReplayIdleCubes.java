@@ -185,8 +185,8 @@ final class ReplayIdleCubes {
     private static void paintFloorAstrolabe(VertexConsumer fill, VertexConsumer glow, Matrix4f board,
                                             double rawAnim, double t, float centerY, float bob,
                                             float localScale, float wScale, double a, boolean detail) {
-        float yWell = BASE_TOP + 0.003f;
-        float yDial = BASE_TOP + 0.006f;
+        float yWell = BASE_TOP + 0.004f;
+        float yDial = BASE_TOP + 0.007f;
         float rOuter = 1.68f * localScale;
 
         // Deep midnight-velvet projection well for rich contrast in both night and bright daylight
@@ -224,7 +224,7 @@ final class ReplayIdleCubes {
         double angB = wrapAngleRad(-t * 0.18 + Math.PI * 0.25);
         drawFloorRotatedSquare(glow, board, yDial + 0.002f, sqHalf, angA, 0.012f * wScale,
                 ReplayPalette.alpha(GOLD_CORE, 0.42 * a));
-        drawFloorRotatedSquare(glow, board, yDial + 0.002f, sqHalf, angB, 0.010f * wScale,
+        drawFloorRotatedSquare(glow, board, yDial + 0.0035f, sqHalf, angB, 0.010f * wScale,
                 ReplayPalette.alpha(CYAN_CORE, 0.34 * a));
 
         if (detail) {
@@ -843,27 +843,30 @@ final class ReplayIdleCubes {
         s.board().transformPosition(0f, bannerY, 0f, TMP_A);
         Matrix4f sign = new Matrix4f().translate(TMP_A.x, TMP_A.y, TMP_A.z).rotate(f.rotation);
 
-        int bgTop = ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.90 * fade);
-        int bgBot = ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.92 * fade);
-        ReplayDraw.rectXY(fill, sign, -halfW, -halfH, halfW, halfH, 0f, bgTop, bgBot);
+        VertexConsumer panel = f.buffers.getBuffer(ReplayDraw.PANEL);
+        VertexConsumer ui = f.buffers.getBuffer(ReplayDraw.UI_OVERLAY);
+        float chamfer = 0.032f * wScale;
+        int bgTop = ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.93 * fade);
+        int bgBot = ReplayPalette.alpha(ReplayPalette.NIGHT_0, 0.95 * fade);
+        ReplayDraw.chamferRectXY(panel, sign, -halfW, -halfH, halfW, halfH, 0f, chamfer, bgTop, bgBot);
 
-        int brass = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.85 * fade);
-        int brassDim = ReplayPalette.alpha(ReplayPalette.BRASS, 0.52 * fade);
-        float borderW = 0.0085f * wScale;
-        ReplayDraw.segment(glow, sign, -halfW, halfH, 0.002f, halfW, halfH, 0.002f, borderW, brass, brass);
-        ReplayDraw.segment(glow, sign, -halfW, -halfH, 0.002f, halfW, -halfH, 0.002f, borderW, brass, brass);
-        ReplayDraw.segment(glow, sign, -halfW, -halfH, 0.002f, -halfW, halfH, 0.002f, borderW * 0.75f, brassDim, brassDim);
-        ReplayDraw.segment(glow, sign, halfW, -halfH, 0.002f, halfW, halfH, 0.002f, borderW * 0.75f, brassDim, brassDim);
+        int brass = ReplayPalette.alpha(ReplayPalette.BRASS_LIGHT, 0.90 * fade);
+        int brassDim = ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.45 * fade);
+        float borderW = 0.011f * wScale;
+        ReplayDraw.chamferOutlineXY(ui, sign, halfW, halfH, chamfer, 0.004f * wScale, borderW, brass);
+        ReplayDraw.chamferOutlineXY(ui, sign, halfW - 0.018f * wScale, halfH - 0.018f * wScale,
+                Math.max(0f, chamfer - 0.010f * wScale), 0.004f * wScale, borderW * 0.42f, brassDim);
 
-        float dr = 0.025f * wScale;
-        int diaCol = ReplayPalette.alpha(loading ? CYAN_CORE : ReplayPalette.CHAMPAGNE, 0.90 * fade);
+        float dr = 0.024f * wScale;
+        int diaCol = ReplayPalette.alpha(loading ? CYAN_CORE : ReplayPalette.CHAMPAGNE, 0.92 * fade);
         for (int side = -1; side <= 1; side += 2) {
-            float dx = side * (halfW + 0.034f * wScale);
-            ReplayDraw.quad(glow, sign, dx, dr, 0.002f, dx + dr, 0, 0.002f, dx, -dr, 0.002f, dx - dr, 0, 0.002f,
+            float dx = side * (halfW + 0.042f * wScale);
+            ReplayDraw.quad(ui, sign, dx, dr, 0.004f * wScale, dx + dr, 0, 0.004f * wScale,
+                    dx, -dr, 0.004f * wScale, dx - dr, 0, 0.004f * wScale,
                     diaCol, diaCol, diaCol, diaCol);
         }
 
-        f.text(sign, text, 0, 0, 0.005f, textScale, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, fade), 0, true, 0);
+        f.text(sign, text, 0, 0, 0.009f * wScale, textScale, ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, fade), 0, true, 0);
     }
 
     /**

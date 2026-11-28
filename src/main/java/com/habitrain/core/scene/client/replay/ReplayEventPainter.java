@@ -437,9 +437,10 @@ final class ReplayEventPainter {
         float skew = 0.042f;
         int accent = feedAccentColor(node, killer, victim);
 
+        VertexConsumer ui = f.buffers.getBuffer(ReplayDraw.UI_OVERLAY);
         // Slanted Star-Night Express Art Deco plate (matches ReplayVideoOverlay.feed slab)
-        int leftCol = ReplayPalette.alpha(ReplayPalette.NIGHT_1, 0.78 * a);
-        int rightCol = ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.94 * a);
+        int leftCol = ReplayPalette.alpha(ReplayPalette.NIGHT_1, 0.84 * a);
+        int rightCol = ReplayPalette.alpha(ReplayPalette.NIGHT_2, 0.95 * a);
         ReplayDraw.quad(panel, m,
                 -hw, -hh, 0f,
                 hw, -hh, 0f,
@@ -447,21 +448,21 @@ final class ReplayEventPainter {
                 -hw + skew, hh, 0f,
                 leftCol, rightCol, rightCol, leftCol);
 
-        // Faction / event glowing right side light strip
+        // Faction / event right side accent strip (flat in UI_OVERLAY, crisp even in daylight)
         float barW = 0.030f;
         int barCol = ReplayPalette.alpha(accent, 0.96 * a);
-        ReplayDraw.quad(glow, m,
-                hw - barW, -hh, 0.002f,
-                hw, -hh, 0.002f,
-                hw + skew, hh, 0.002f,
-                hw - barW + skew, hh, 0.002f,
+        ReplayDraw.quad(ui, m,
+                hw - barW, -hh, 0.004f,
+                hw, -hh, 0.004f,
+                hw + skew, hh, 0.004f,
+                hw - barW + skew, hh, 0.004f,
                 barCol, barCol, barCol, barCol);
 
-        // Subtle brass top & bottom Art Deco hairlines
-        int brassHi = ReplayPalette.alpha(ReplayPalette.BRASS, 0.78 * a);
-        int brassLo = ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.30 * a);
-        ReplayDraw.segment(glow, m, -hw + skew, hh, 0.002f, hw + skew, hh, 0.002f, 0.0045f * worldScale, brassLo, brassHi);
-        ReplayDraw.segment(glow, m, -hw, -hh, 0.002f, hw, -hh, 0.002f, 0.0035f * worldScale, brassLo, brassLo);
+        // Crisp flat brass top & bottom Art Deco hairlines (zero billboard depth clipping)
+        int brassHi = ReplayPalette.alpha(ReplayPalette.BRASS, 0.86 * a);
+        int brassLo = ReplayPalette.alpha(ReplayPalette.BRASS_DIM, 0.38 * a);
+        ReplayDraw.lineXY(ui, m, -hw + skew, hh - 0.003f, hw + skew, hh - 0.003f, 0.005f, 0.006f, brassLo, brassHi);
+        ReplayDraw.lineXY(ui, m, -hw, -hh + 0.003f, hw, -hh + 0.003f, 0.005f, 0.005f, brassLo, brassLo);
 
         float textScale = 0.0056f;
         float leftPad = -hw + 0.06f;
@@ -472,27 +473,28 @@ final class ReplayEventPainter {
             float cursorX = leftPad;
             // Killer avatar + role-colored name
             if (killer != null) {
-                drawFeedAvatar(f, m, killer.p.id(), cursorX + faceSize * 0.5f, 0f, 0.004f, faceSize, 0xFFFFFFFF, a);
+                drawFeedAvatar(f, m, killer.p.id(), cursorX + faceSize * 0.5f, 0f, 0.008f, faceSize, 0xFFFFFFFF, a);
                 cursorX += faceSize + 0.04f;
                 int kColor = ReplayPalette.alpha(ReplayPalette.lerp(killer.color, 0xFFFFFFFF, 0.20), a);
                 float killerMaxW = (rightLimit - cursorX) * 0.36f;
-                f.text(m, killer.name, cursorX, 0f, 0.005f, textScale, kColor, -1, true, killerMaxW);
+                f.text(m, killer.name, cursorX, 0f, 0.011f, textScale, kColor, -1, true, killerMaxW);
                 cursorX += Math.min(killerMaxW, font.width(killer.name) * textScale) + 0.045f;
             } else {
                 Component env = ReplayBoardTexts.tr("environment");
                 float envMaxW = (rightLimit - cursorX) * 0.28f;
-                f.text(m, env, cursorX, 0f, 0.005f, textScale, ReplayPalette.alpha(ReplayPalette.TEXT_MUTED, a), -1, true, envMaxW);
+                f.text(m, env, cursorX, 0f, 0.011f, textScale, ReplayPalette.alpha(ReplayPalette.TEXT_MUTED, a), -1, true, envMaxW);
                 cursorX += Math.min(envMaxW, font.width(env) * textScale) + 0.045f;
             }
 
-            // Weapon icon medallion in center
+            // Weapon icon diamond medallion in center (clean symmetric Art Deco badge)
             float wx = cursorX + 0.075f;
-            int discCol = ReplayPalette.alpha(accent, 0.24 * a);
-            int discEdge = ReplayPalette.alpha(accent, 0.0);
-            ReplayDraw.quad(glow, m, wx - 0.068f, -0.068f, 0.002f, wx + 0.068f, -0.068f, 0.002f,
-                    wx + 0.068f, 0.068f, 0.002f, wx - 0.068f, 0.068f, 0.002f, discEdge, discCol, discEdge, discCol);
+            float mr = 0.066f;
+            int discCol = ReplayPalette.alpha(accent, 0.22 * a);
+            ReplayDraw.quad(ui, m, wx, mr, 0.004f, wx + mr, 0f, 0.004f, wx, -mr, 0.004f, wx - mr, 0f, 0.004f,
+                    discCol, discCol, discCol, discCol);
+            ReplayDraw.ringXY(ui, m, wx, 0f, 0.005f, 0.058f, 0.005f, 16, ReplayPalette.alpha(accent, 0.55 * a));
             var weaponStack = mark.item();
-            Matrix4f itemM = new Matrix4f(m).translate(wx, 0f, 0.008f).scale(0.135f);
+            Matrix4f itemM = new Matrix4f(m).translate(wx, 0f, 0.010f).scale(0.135f);
             f.model(itemM, pose -> Minecraft.getInstance().getItemRenderer().renderStatic(
                     weaponStack, ItemDisplayContext.GUI, LightTexture.FULL_BRIGHT,
                     OverlayTexture.NO_OVERLAY, pose, f.modelBuffers(), f.level, 0));
@@ -500,26 +502,25 @@ final class ReplayEventPainter {
 
             // Victim red-X + strikethrough name on the right
             Component victimName = ReplayBoardTexts.name(victim == null ? null : victim.p);
-            float xMarkR = 0.032f;
+            float xMarkR = 0.030f;
             float xMarkCx = cursorX + xMarkR;
             int rubyCol = ReplayPalette.alpha(ReplayPalette.RUBY, 0.95 * a);
-            ReplayDraw.segment(glow, m, xMarkCx - xMarkR, -xMarkR, 0.005f, xMarkCx + xMarkR, xMarkR, 0.005f, 0.0055f * worldScale, rubyCol, rubyCol);
-            ReplayDraw.segment(glow, m, xMarkCx - xMarkR, xMarkR, 0.005f, xMarkCx + xMarkR, -xMarkR, 0.005f, 0.0055f * worldScale, rubyCol, rubyCol);
+            ReplayDraw.lineXY(ui, m, xMarkCx - xMarkR, -xMarkR, xMarkCx + xMarkR, xMarkR, 0.007f, 0.008f, rubyCol, rubyCol);
+            ReplayDraw.lineXY(ui, m, xMarkCx - xMarkR, xMarkR, xMarkCx + xMarkR, -xMarkR, 0.007f, 0.008f, rubyCol, rubyCol);
             float vTextX = xMarkCx + xMarkR + 0.035f;
             float vAvail = Math.max(0.15f, rightLimit - vTextX);
             float vRawW = font.width(victimName) * textScale;
             float vDrawnW = Math.min(vAvail, vRawW);
-            f.text(m, victimName, vTextX, 0f, 0.005f, textScale, ReplayPalette.alpha(ReplayPalette.TEXT, 0.92 * a), -1, true, vAvail);
+            f.text(m, victimName, vTextX, 0f, 0.010f, textScale, ReplayPalette.alpha(ReplayPalette.TEXT, 0.92 * a), -1, true, vAvail);
             // Ruby strikethrough bar across victim name (matches ReplayVideoOverlay.card)
-            ReplayDraw.segment(glow, m, vTextX, 0.002f, 0.006f, vTextX + vDrawnW, 0.002f, 0.006f,
-                    0.0045f * worldScale, rubyCol, rubyCol);
+            ReplayDraw.lineXY(glow, m, vTextX, 0.002f, vTextX + vDrawnW, 0.002f, 0.012f, 0.006f, rubyCol, rubyCol);
         } else {
             ReplayBoardModel.Actor subject = node.kind() == Kind.SHIELD_BROKEN && victim != null ? victim
                     : killer != null ? killer : victim;
             float faceSize = cardH * 0.66f;
             float cursorX = leftPad;
             if (subject != null) {
-                drawFeedAvatar(f, m, subject.p.id(), cursorX + faceSize * 0.5f, 0f, 0.004f, faceSize, 0xFFFFFFFF, a);
+                drawFeedAvatar(f, m, subject.p.id(), cursorX + faceSize * 0.5f, 0f, 0.008f, faceSize, 0xFFFFFFFF, a);
                 cursorX += faceSize + 0.045f;
             }
             Component summary = switch (node.kind()) {
@@ -537,7 +538,7 @@ final class ReplayEventPainter {
                         ReplayBoardTexts.name(subject == null ? null : subject.p));
                 default -> ReplayBoardTexts.name(subject == null ? null : subject.p);
             };
-            f.text(m, summary, cursorX, 0f, 0.005f, textScale,
+            f.text(m, summary, cursorX, 0f, 0.011f, textScale,
                     ReplayPalette.alpha(ReplayPalette.CHAMPAGNE, a), -1, true, Math.max(0.2f, rightLimit - cursorX));
         }
     }
@@ -569,8 +570,8 @@ final class ReplayEventPainter {
             int light = LightTexture.FULL_BRIGHT;
             // Base face UV: 8..16 / 64
             emitFaceQuad(vc, pose, half, 0f, 8f / 64f, 8f / 64f, 16f / 64f, 16f / 64f, color, light);
-            // Hat overlay UV: 40..48 / 64, slightly proud in Z
-            emitFaceQuad(vc, pose, half * 1.07f, 0.0015f, 40f / 64f, 8f / 64f, 48f / 64f, 16f / 64f, color, light);
+            // Hat overlay UV: 40..48 / 64, clearly proud in Z to avoid z-fighting with base face
+            emitFaceQuad(vc, pose, half * 1.07f, 0.003f, 40f / 64f, 8f / 64f, 48f / 64f, 16f / 64f, color, light);
         });
     }
 

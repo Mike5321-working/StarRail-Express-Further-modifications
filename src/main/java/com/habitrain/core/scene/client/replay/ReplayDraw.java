@@ -51,8 +51,8 @@ final class ReplayDraw {
     // ------------------------------------------------------------------ flat quads in a local frame
 
     /**
-     * Alpha-blended panels that also write depth. Used for the in-world buttons: the additive {@link #GLOW} pass
-     * is flushed afterwards, so anything glowing <em>behind</em> a button is rejected instead of shining through it.
+     * Alpha-blended panels that also write depth. Used for base backing slabs of in-world UI panels:
+     * subsequent {@link #UI_OVERLAY} and {@link #GLOW} passes respect this depth without glowing through.
      */
     static final RenderType PANEL = RenderType.create("habitrain_replay_panel", DefaultVertexFormat.POSITION_COLOR,
             VertexFormat.Mode.QUADS, 1 << 14, false, false,
@@ -60,6 +60,22 @@ final class ReplayDraw {
                     .setShaderState(RenderStateShard.POSITION_COLOR_SHADER)
                     .setTransparencyState(RenderStateShard.TRANSLUCENT_TRANSPARENCY)
                     .setWriteMaskState(RenderStateShard.COLOR_DEPTH_WRITE)
+                    .setCullState(RenderStateShard.NO_CULL)
+                    .setDepthTestState(RenderStateShard.LEQUAL_DEPTH_TEST)
+                    .setLayeringState(RenderStateShard.VIEW_OFFSET_Z_LAYERING)
+                    .createCompositeState(false));
+
+    /**
+     * Alpha-blended flat UI overlays (button pills, mitered borders, recessed tracks, dividers, icons)
+     * flushed strictly after {@link #PANEL} and before deferred models, {@link #GLOW}, and text.
+     * Color-only writes preserve strict painter's order across stacked UI elements with zero inter-layer z-fighting.
+     */
+    static final RenderType UI_OVERLAY = RenderType.create("habitrain_replay_ui_overlay", DefaultVertexFormat.POSITION_COLOR,
+            VertexFormat.Mode.QUADS, 1 << 16, false, false,
+            RenderType.CompositeState.builder()
+                    .setShaderState(RenderStateShard.POSITION_COLOR_SHADER)
+                    .setTransparencyState(RenderStateShard.TRANSLUCENT_TRANSPARENCY)
+                    .setWriteMaskState(RenderStateShard.COLOR_WRITE)
                     .setCullState(RenderStateShard.NO_CULL)
                     .setDepthTestState(RenderStateShard.LEQUAL_DEPTH_TEST)
                     .setLayeringState(RenderStateShard.VIEW_OFFSET_Z_LAYERING)
@@ -254,20 +270,129 @@ final class ReplayDraw {
         quad(vc, m, x1, y0, z1, x1, y0, z0, x1, y1, z0, x1, y1, z1, sideX, sideX, sideX, sideX);
     }
 
-    /** 45°-chamfered Art Deco plate in the local XY plane. */
+    private static final float CHAMFER_INSET_K = 2.0f - (float) Math.sqrt(2.0);
+
+    /** 45°-chamfered Art Deco plate in the local XY plane with continuous vertical gradient and filled bevel corners. */
     static void chamferRectXY(VertexConsumer vc, Matrix4f m, float x0, float y0, float x1, float y1, float z,
                               float cut, int top, int bottom) {
-        float c = Math.max(0f, Math.min(cut, Math.min((x1 - x0) * 0.45f, (y1 - y0) * 0.45f)));
-        if (c <= 1e-4f) {
+        float h = y1 - y0;
+        float c = Math.max(0f, Math.min(cut, Math.min((x1 - x0) * 0.45f, h * 0.45f)));
+        if (c <= 1e-4f || h <= 1e-5f) {
             rectXY(vc, m, x0, y0, x1, y1, z, top, bottom);
             return;
         }
-        // Centre band
-        quad(vc, m, x0, y0 + c, z, x1, y0 + c, z, x1, y1 - c, z, x0, y1 - c, z, bottom, bottom, top, top);
+        int midLow = ReplayPalette.lerp(bottom, top, c / h);
+        int midHigh = ReplayPalette.lerp(bottom, top, (h - c) / h);
         // Bottom chamfer trapezoid
-        quad(vc, m, x0 + c, y0, z, x1 - c, y0, z, x1, y0 + c, z, x0, y0 + c, z, bottom, bottom, bottom, bottom);
+        quad(vc, m, x0 + c, y0, z, x1 - c, y0, z, x1, y0 + c, z, x0, y0 + c, z, bottom, bottom, midLow, midLow);
+        // Centre band
+        quad(vc, m, x0, y0 + c, z, x1, y0 + c, z, x1, y1 - c, z, x0, y1 - c, z, midLow, midLow, midHigh, midHigh);
         // Top chamfer trapezoid
-        quad(vc, m, x0, y1 - c, z, x1, y1 - c, z, x1 - c, y1, z, x0 + c, y1, z, top, top, top, top);
+        quad(vc, m, x0, y1 - c, z, x1, y1 - c, z, x1 - c, y1, z, x0 + c, y1, z, midHigh, midHigh, top, top);
+    }
+
+    /**
+     * Exact mitered 45°-chamfered octagon border strictly in the local XY plane at constant {@code z},
+     * inset inward from {@code (hw, hh, cut)} by uniform perpendicular thickness {@code stroke}.
+     */
+    static void chamferOutlineXY(VertexConsumer vc, Matrix4f m, float hw, float hh, float cut, float z,
+                                 float stroke, int color) {
+        float c = Math.max(0f, Math.min(cut, Math.min(hw * 0.90f, hh * 0.90f)));
+        float t = Math.min(stroke, Math.min(hw, hh) * 0.45f);
+        if (t <= 1e-5f) return;
+        float ihw = hw - t;
+        float ihh = hh - t;
+        float ic = Math.max(0f, c - t * CHAMFER_INSET_K);
+        chamferRingXY(vc, m, hw, hh, c, ihw, ihh, ic, z, color, color);
+    }
+
+    /**
+     * Soft outward halo hugging a 45°-chamfered octagon {@code (hw, hh, cut)} from its exact outer perimeter
+     * outward by {@code spread}, fading from {@code innerColor} to {@code outerColor} with no protruding corners.
+     */
+    static void chamferHaloXY(VertexConsumer vc, Matrix4f m, float hw, float hh, float cut, float z,
+                              float spread, int innerColor, int outerColor) {
+        float c = Math.max(0f, Math.min(cut, Math.min(hw * 0.90f, hh * 0.90f)));
+        if (spread <= 1e-5f) return;
+        float ohw = hw + spread;
+        float ohh = hh + spread;
+        float oc = c + spread * CHAMFER_INSET_K;
+        chamferRingXY(vc, m, ohw, ohh, oc, hw, hh, c, z, outerColor, innerColor);
+    }
+
+    private static void chamferRingXY(VertexConsumer vc, Matrix4f m,
+                                      float ohw, float ohh, float oc,
+                                      float ihw, float ihh, float ic,
+                                      float z, int outerCol, int innerCol) {
+        float[] ox = {-ohw + oc, ohw - oc, ohw, ohw, ohw - oc, -ohw + oc, -ohw, -ohw};
+        float[] oy = {ohh, ohh, ohh - oc, -ohh + oc, -ohh, -ohh, -ohh + oc, ohh - oc};
+        float[] ix = {-ihw + ic, ihw - ic, ihw, ihw, ihw - ic, -ihw + ic, -ihw, -ihw};
+        float[] iy = {ihh, ihh, ihh - ic, -ihh + ic, -ihh, -ihh, -ihh + ic, ihh - ic};
+        for (int i = 0; i < 8; i++) {
+            int n = (i + 1) & 7;
+            quad(vc, m, ox[i], oy[i], z, ox[n], oy[n], z, ix[n], iy[n], z, ix[i], iy[i], z,
+                    outerCol, outerCol, innerCol, innerCol);
+        }
+    }
+
+    /** Exact mitered rectangular border strictly in the local XY plane at constant {@code z}, inset inward by {@code stroke}. */
+    static void rectOutlineXY(VertexConsumer vc, Matrix4f m, float x0, float y0, float x1, float y1, float z,
+                              float stroke, int color) {
+        float t = Math.min(stroke, Math.min(x1 - x0, y1 - y0) * 0.45f);
+        if (t <= 1e-5f) return;
+        float ix0 = x0 + t, iy0 = y0 + t, ix1 = x1 - t, iy1 = y1 - t;
+        quad(vc, m, x0, y1, z, x1, y1, z, ix1, iy1, z, ix0, iy1, z, color, color, color, color);
+        quad(vc, m, x1, y1, z, x1, y0, z, ix1, iy0, z, ix1, iy1, z, color, color, color, color);
+        quad(vc, m, x1, y0, z, x0, y0, z, ix0, iy0, z, ix1, iy0, z, color, color, color, color);
+        quad(vc, m, x0, y0, z, x0, y1, z, ix0, iy1, z, ix0, iy0, z, color, color, color, color);
+    }
+
+    /** Flat in-plane stroke quad in the local XY plane at constant {@code z} (zero billboard depth-clipping). */
+    static void lineXY(VertexConsumer vc, Matrix4f m, float x0, float y0, float x1, float y1, float z,
+                       float width, int c0, int c1) {
+        float dx = x1 - x0, dy = y1 - y0;
+        float len = (float) Math.sqrt(dx * dx + dy * dy);
+        if (len < 1e-6f || width <= 1e-6f) return;
+        float nx = -dy / len * (width * 0.5f);
+        float ny = dx / len * (width * 0.5f);
+        quad(vc, m, x0 - nx, y0 - ny, z, x1 - nx, y1 - ny, z, x1 + nx, y1 + ny, z, x0 + nx, y0 + ny, z,
+                c0, c1, c1, c0);
+    }
+
+    /** Flat closed annulus in the local XY plane at constant {@code z}. */
+    static void ringXY(VertexConsumer vc, Matrix4f m, float cx, float cy, float z, float radius, float thickness,
+                       int segments, int color) {
+        if (segments < 6 || radius <= 1e-5f || thickness <= 1e-5f) return;
+        float r0 = Math.max(0f, radius - thickness * 0.5f);
+        float r1 = radius + thickness * 0.5f;
+        float c0 = 1f, s0 = 0f;
+        for (int i = 0; i < segments; i++) {
+            float a1 = Mth.TWO_PI * (i + 1) / segments;
+            float c1 = Mth.cos(a1), s1 = Mth.sin(a1);
+            quad(vc, m, cx + c0 * r0, cy + s0 * r0, z, cx + c0 * r1, cy + s0 * r1, z,
+                    cx + c1 * r1, cy + s1 * r1, z, cx + c1 * r0, cy + s1 * r0, z,
+                    color, color, color, color);
+            c0 = c1;
+            s0 = s1;
+        }
+    }
+
+    /** Flat partial annulus arc in the local XY plane at constant {@code z} (angles in radians). */
+    static void arcXY(VertexConsumer vc, Matrix4f m, float cx, float cy, float z, float radius, float thickness,
+                      float startRad, float endRad, int segments, int color) {
+        if (segments <= 0 || Math.abs(endRad - startRad) < 1e-4f || thickness <= 1e-5f) return;
+        float r0 = Math.max(0f, radius - thickness * 0.5f);
+        float r1 = radius + thickness * 0.5f;
+        float c0 = Mth.cos(startRad), s0 = Mth.sin(startRad);
+        for (int i = 0; i < segments; i++) {
+            float a1 = startRad + (endRad - startRad) * (i + 1) / segments;
+            float c1 = Mth.cos(a1), s1 = Mth.sin(a1);
+            quad(vc, m, cx + c0 * r0, cy + s0 * r0, z, cx + c0 * r1, cy + s0 * r1, z,
+                    cx + c1 * r1, cy + s1 * r1, z, cx + c1 * r0, cy + s1 * r0, z,
+                    color, color, color, color);
+            c0 = c1;
+            s0 = s1;
+        }
     }
 
     // ------------------------------------------------------------------ camera-space strips
@@ -457,19 +582,25 @@ final class ReplayDraw {
      */
     static void box(VertexConsumer vc, PoseStack.Pose pose, float x0, float y0, float z0, float x1, float y1, float z1,
                     TextureAtlasSprite side, TextureAtlasSprite top, int tint, int light, float tile) {
+        box(vc, pose, x0, y0, z0, x1, y1, z1, side, tint, top, tint, light, tile);
+    }
+
+    static void box(VertexConsumer vc, PoseStack.Pose pose, float x0, float y0, float z0, float x1, float y1, float z1,
+                    TextureAtlasSprite side, int sideTint, TextureAtlasSprite top, int topTint, int light, float tile) {
         // up / down
-        face(vc, pose, top, tint, light, 0, 1, 0, x0, y1, z0, x1, y1, z0, x0, y1, z1, tile);
-        face(vc, pose, side, scaleTint(tint, 0.55f), light, 0, -1, 0, x0, y0, z1, x1, y0, z1, x0, y0, z0, tile);
+        face(vc, pose, top, topTint, light, 0, 1, 0, x0, y1, z0, x1, y1, z0, x0, y1, z1, tile);
+        face(vc, pose, side, scaleTint(sideTint, 0.55f), light, 0, -1, 0, x0, y0, z1, x1, y0, z1, x0, y0, z0, tile);
         // north / south
-        face(vc, pose, side, scaleTint(tint, 0.8f), light, 0, 0, -1, x1, y1, z0, x0, y1, z0, x1, y0, z0, tile);
-        face(vc, pose, side, scaleTint(tint, 0.8f), light, 0, 0, 1, x0, y1, z1, x1, y1, z1, x0, y0, z1, tile);
+        face(vc, pose, side, scaleTint(sideTint, 0.8f), light, 0, 0, -1, x1, y1, z0, x0, y1, z0, x1, y0, z0, tile);
+        face(vc, pose, side, scaleTint(sideTint, 0.8f), light, 0, 0, 1, x0, y1, z1, x1, y1, z1, x0, y0, z1, tile);
         // west / east
-        face(vc, pose, side, scaleTint(tint, 0.65f), light, -1, 0, 0, x0, y1, z0, x0, y1, z1, x0, y0, z0, tile);
-        face(vc, pose, side, scaleTint(tint, 0.65f), light, 1, 0, 0, x1, y1, z1, x1, y1, z0, x1, y0, z1, tile);
+        face(vc, pose, side, scaleTint(sideTint, 0.65f), light, -1, 0, 0, x0, y1, z0, x0, y1, z1, x0, y0, z0, tile);
+        face(vc, pose, side, scaleTint(sideTint, 0.65f), light, 1, 0, 0, x1, y1, z1, x1, y1, z0, x1, y0, z1, tile);
     }
 
     /**
-     * Parallelogram face spanned by origin {@code o}, u-edge end {@code u} and v-edge end {@code v}.
+     * Parallelogram face spanned by origin {@code o}, u-edge end {@code u} and v-edge end {@code v},
+     * emitted with outward counter-clockwise winding ({@code ev × eu}) so backface culling works cleanly.
      */
     static void face(VertexConsumer vc, PoseStack.Pose pose, TextureAtlasSprite sprite, int tint, int light,
                      float nx, float ny, float nz, float ox, float oy, float oz, float ux, float uy, float uz,
@@ -494,9 +625,9 @@ final class ReplayDraw {
                 float b0 = j * tile / lv, b1 = Math.min(1f, (j + 1) * tile / lv);
                 float v1 = sprite.getV(Math.min(1f, (b1 - b0) * lv / tile));
                 vertex(vc, matrix, position, normal, x0 + evx * b0, y0 + evy * b0, z0 + evz * b0, tint, u0, v0, light);
-                vertex(vc, matrix, position, normal, x1 + evx * b0, y1 + evy * b0, z1 + evz * b0, tint, u1, v0, light);
-                vertex(vc, matrix, position, normal, x1 + evx * b1, y1 + evy * b1, z1 + evz * b1, tint, u1, v1, light);
                 vertex(vc, matrix, position, normal, x0 + evx * b1, y0 + evy * b1, z0 + evz * b1, tint, u0, v1, light);
+                vertex(vc, matrix, position, normal, x1 + evx * b1, y1 + evy * b1, z1 + evz * b1, tint, u1, v1, light);
+                vertex(vc, matrix, position, normal, x1 + evx * b0, y1 + evy * b0, z1 + evz * b0, tint, u1, v0, light);
             }
         }
     }
