@@ -62,6 +62,8 @@ public final class HabiBootAudioEngine {
     public static final double EXIT_HANDOFF = 1.2;      // 2 beats (57,600 samples)
     public static final double IDLE_LOOP = 4.8;         // 8 beats
     public static final double MENU_LOOP = 19.2;        // 32 beats (8 bars)
+    /** Smooth homepage BGM fade-out duration when entering a world (finishes strictly within 1.0 s audible). */
+    public static final double WORLD_ENTRY_MENU_FADE_SEC = 0.78;
 
     private static final int MIX_BLOCK_FRAMES = 256;    // ~5.33 ms control resolution
     private static final int LINE_BUFFER_FRAMES = 4096; // ~85.3 ms buffer for early SourceDataLine fallback
@@ -70,6 +72,7 @@ public final class HabiBootAudioEngine {
     private static final int OPENAL_PREFILL_CHUNKS = 4; // matches Minecraft Channel.attachBufferStream -> pumpBuffers(4)
     private static final long OPENAL_LATENCY_SAMPLES = 3L * OPENAL_CHUNK_FRAMES;
     private static final long OPENAL_PROBE_INTERVAL_NANOS = 50_000_000L;
+    private static final long OPENAL_KEEPALIVE_INTERVAL_MS = 35L;
     private static final int SPECTRUM_BANDS = 16;
     private static final AudioFormat STREAM_AUDIO_FORMAT = new AudioFormat(SAMPLE_RATE, 16, 2, true, false);
     private static final ResourceLocation KINETIC_BGM_SOUND_ID =
@@ -97,7 +100,7 @@ public final class HabiBootAudioEngine {
     private static final String AUDIO_BASE = "assets/habitrain_core/audio/boot_v3/";
 
     public enum State {
-        STOPPED, INTRO, LOADING, DEPARTING, MENU
+        STOPPED, INTRO, LOADING, DEPARTING, MENU, TUNNEL
     }
 
     public enum FocusMode {
@@ -158,6 +161,9 @@ public final class HabiBootAudioEngine {
     private volatile boolean earlyMixerRunning;
     private volatile boolean earlyMixerRequested;
     private volatile boolean earlyJavaSoundUnavailable;
+
+    private Thread openAlKeepaliveThread;
+    private volatile boolean openAlKeepaliveRunning;
 
     // ── Playback & musical clock state (guarded by stateLock) ────────────────
     private boolean userMuted;
@@ -220,6 +226,15 @@ public final class HabiBootAudioEngine {
 
     // ── Polyphonic procedural D-major SFX voices (used by early fallback) ────
     private final List<SfxVoice> sfxVoices = new ArrayList<>();
+    private final TunnelSoundscape tunnelSoundscape = new TunnelSoundscape();
+
+    // Pre-synthesized raw stereo 48 kHz float buffers for heavy one-shot tunnel SFX (eliminates 10-37ms render-thread synthesis spikes)
+    private final float[][] prebakedLayerAbsorb = new float[10][];
+    private final float[][] prebakedTunnelStageTick = new float[5][];
+    private volatile float @Nullable [] prebakedSingularityImplode;
+    private volatile float @Nullable [] prebakedTunnelErupt;
+    private volatile float @Nullable [] prebakedTunnelBreakout;
+    private final AtomicBoolean tunnelSfxPrebakeStarted = new AtomicBoolean(false);
 
     // ── Real-time spectrum telemetry (written by active mixer, read by render) ─
     private final float[] liveBars = new float[SPECTRUM_BANDS];
@@ -295,6 +310,7 @@ public final class HabiBootAudioEngine {
                         }
                     }
                     future.complete(true);
+                    prebakeTunnelSfxSync();
                 } catch (Throwable t) {
                     stemsFailed = true;
                     HabiTrainCore.LOGGER.warn("[HabiBootAudio] Failed to decode boot_v3 WAV stems", t);
@@ -501,22 +517,26 @@ public final class HabiBootAudioEngine {
         boolean needOutput;
         synchronized (stateLock) {
             if (activeSession && !fadingOut && !userMuted && state != State.STOPPED) {
-                if (!stemsLoaded) {
-                    if (state == State.MENU || state == State.DEPARTING) {
-                        pendingStartMenu = true;
-                        pendingStartLoading = false;
-                    } else {
-                        pendingStartLoading = true;
-                        pendingStartMenu = false;
+                if (state == State.TUNNEL) {
+                    needOutput = tunnelSoundscape.active || hasActiveMusicChannelLocked();
+                } else {
+                    if (!stemsLoaded) {
+                        if (state == State.MENU || state == State.DEPARTING) {
+                            pendingStartMenu = true;
+                            pendingStartLoading = false;
+                        } else {
+                            pendingStartLoading = true;
+                            pendingStartMenu = false;
+                        }
+                    } else if (!hasActiveMusicChannelLocked()) {
+                        if (state == State.MENU || state == State.DEPARTING) {
+                            startMenuDirectLocked(pendingMenuElapsed);
+                        } else {
+                            startLoadingLocked(pendingStartTimelineT, loadProgress);
+                        }
                     }
-                } else if (!hasActiveMusicChannelLocked()) {
-                    if (state == State.MENU || state == State.DEPARTING) {
-                        startMenuDirectLocked(pendingMenuElapsed);
-                    } else {
-                        startLoadingLocked(pendingStartTimelineT, loadProgress);
-                    }
+                    needOutput = stemsLoaded || pendingStartLoading || pendingStartMenu;
                 }
-                needOutput = stemsLoaded || pendingStartLoading || pendingStartMenu;
             } else {
                 needOutput = false;
             }
@@ -956,6 +976,7 @@ public final class HabiBootAudioEngine {
             pendingStartMenu = false;
             earlyMixerRequested = false;
             clearMusicChannelsLocked();
+            tunnelSoundscape.stop();
             sfxVoices.clear();
             state = State.STOPPED;
         }
@@ -969,13 +990,20 @@ public final class HabiBootAudioEngine {
         }
         earlyMixerRunning = false;
         earlyMixerRequested = false;
+        openAlKeepaliveRunning = false;
         Thread t;
+        Thread keepalive;
         synchronized (stateLock) {
             t = earlyMixerThread;
             earlyMixerThread = null;
+            keepalive = openAlKeepaliveThread;
+            openAlKeepaliveThread = null;
         }
         if (t != null) {
             t.interrupt();
+        }
+        if (keepalive != null) {
+            keepalive.interrupt();
         }
     }
 
@@ -1030,6 +1058,232 @@ public final class HabiBootAudioEngine {
         ));
     }
 
+    // ── World-Entry Cutscene Soundscape (100 BPM · Dmaj9, ported from audio_engine.js) ──
+
+    /**
+     * Handles world-entry audio transition: plays NO extra world-entry music, and if the Station 01
+     * homepage BGM ({@code menu.wav}) is currently playing, smoothly fades it out to silence within
+     * 1 second ({@link #WORLD_ENTRY_MENU_FADE_SEC}).
+     */
+    public void startTunnelEntry(boolean fromStationStart) {
+        Minecraft mc;
+        boolean shouldEnsureOutput = false;
+        boolean shouldStopOpenAl = false;
+        synchronized (stateLock) {
+            mc = this.lastMinecraft;
+            tunnelSoundscape.stop();
+            sfxVoices.clear();
+            pendingStartLoading = false;
+            pendingStartMenu = false;
+            introCh = null;
+            idleCh = null;
+            loadCh = null;
+            exitCh = null;
+            fadingOut = false;
+            fadeOutGain = 1.0;
+
+            if (isSoundEffectivelyEnabled() && menuCh != null && menuCh.active) {
+                activeSession = true;
+                state = State.TUNNEL;
+                menuCh.scheduleSmoothVolumeFadeOut(
+                        mixerSampleClock,
+                        Math.round(WORLD_ENTRY_MENU_FADE_SEC * SAMPLE_RATE),
+                        4_500.0
+                );
+                if (mc == null && !openAlObservedReady && outputMode != OutputMode.OPENAL) {
+                    ensureEarlyMixerRunningLocked();
+                }
+                shouldEnsureOutput = true;
+            } else {
+                clearMusicChannelsLocked();
+                state = State.STOPPED;
+                activeSession = false;
+                earlyMixerRequested = false;
+                shouldStopOpenAl = true;
+            }
+        }
+        if (shouldStopOpenAl) {
+            stopOpenAlStream(mc);
+        } else if (shouldEnsureOutput) {
+            lastOpenAlProbeNanos = 0L;
+            ensureOutputBackendOnRenderThread(mc);
+        }
+    }
+
+    /** Stops any remaining world-entry fade audio cleanly without touching non-tunnel music states. */
+    public void stopTunnelAudio() {
+        Minecraft mc = null;
+        boolean shouldStopOpenAl = false;
+        synchronized (stateLock) {
+            tunnelSoundscape.stop();
+            if (state == State.TUNNEL) {
+                clearMusicChannelsLocked();
+                state = State.STOPPED;
+                activeSession = false;
+                earlyMixerRequested = false;
+                mc = this.lastMinecraft;
+                shouldStopOpenAl = true;
+            }
+        }
+        if (shouldStopOpenAl) {
+            stopOpenAlStream(mc);
+        }
+    }
+
+    /** Act 1 ten seam/split/assembly cues: mechanical metallic click + ascending Dmaj9 plucks. */
+    public void playLayerAbsorb(int layerIdx) {
+        int idx = Math.max(0, Math.min(9, layerIdx));
+        List<SfxSpec> specs = buildLayerAbsorbSpecs(idx);
+        float[] cached = prebakedLayerAbsorb[idx];
+        playSfxSpecsWithNoise(specs, null, cached);
+    }
+
+    /** Act 1 (1.94s) doors opening: pneumatic highpass hiss + 2-tone station chime. */
+    public void playSingularityImplode() {
+        playSfxSpecsWithNoise(buildSingularityImplodeSpecs(), SINGULARITY_IMPLODE_NOISE, prebakedSingularityImplode);
+    }
+
+    /** Act 1 (2.22s) doorway rush: sub-bass dive + lowpass rush wave + 7-note Dmaj9 star-gate chord. */
+    public void playTunnelErupt() {
+        playSfxSpecsWithNoise(buildTunnelEruptSpecs(), TUNNEL_ERUPT_NOISE, prebakedTunnelErupt);
+    }
+
+    /** Updates tunnel wind-bed bandpass cutoff & arpeggio energy from real world-loading progress. */
+    public void updateTunnelProgress(double progress) {
+        synchronized (stateLock) {
+            tunnelSoundscape.setProgress(clamp01(progress));
+        }
+    }
+
+    /** Stage completion chime inside the Time Tunnel. */
+    public void playTunnelStageTick(int stageIdx) {
+        int idx = Math.floorMod(stageIdx, 5);
+        playSfxSpecsWithNoise(buildTunnelStageTickSpecs(idx), null, prebakedTunnelStageTick[idx]);
+    }
+
+    /**
+     * Act 3 breakout audio: postmark slam thump -> wind surge & dissolve -> warm Dmaj9 arrival chord
+     * at +0.86s as the Apple Portal reveals the real Minecraft world.
+     */
+    public void triggerTunnelBreakout() {
+        synchronized (stateLock) {
+            tunnelSoundscape.triggerBreakout(mixerSampleClock);
+        }
+        playSfxSpecsWithNoise(buildTunnelBreakoutSpecs(), null, prebakedTunnelBreakout);
+    }
+
+    private static final NoiseBurstSpec SINGULARITY_IMPLODE_NOISE =
+            new NoiseBurstSpec(FilterMode.HIGHPASS, 2400.0, 5200.0, 0.32, 0.03, 0.42, 0.46, 0.11, 0.707);
+    private static final NoiseBurstSpec TUNNEL_ERUPT_NOISE =
+            new NoiseBurstSpec(FilterMode.LOWPASS, 4600.0, 340.0, 0.88, 0.018, 0.92, 0.96, 0.28, 0.707);
+
+    private static List<SfxSpec> buildLayerAbsorbSpecs(int idx) {
+        double[] scale = {293.66, 369.99, 440.00, 554.37, 587.33, 659.25, 739.99, 880.00, 1108.73, 1174.66};
+        double f = scale[idx];
+        double pan = Math.sin(idx * 0.85) * 0.38;
+        return List.of(
+                new SfxSpec(2600.0 + idx * 120.0, 900.0, 0.03, 0.05, Wave.SQUARE, pan, 0.0),
+                new SfxSpec(f, f * 1.002, 0.22, 0.066 + idx * 0.003, Wave.TRIANGLE, pan, 0.0),
+                new SfxSpec(f * 2.0, f * 2.0, 0.12, 0.022, Wave.SINE, -pan * 0.6, 0.0)
+        );
+    }
+
+    private static List<SfxSpec> buildSingularityImplodeSpecs() {
+        return List.of(
+                new SfxSpec(739.99, 739.99, 0.42, 0.075, Wave.SINE, -0.15, 0.0),
+                new SfxSpec(587.33, 587.33, 0.55, 0.075, Wave.SINE, 0.15, 0.15)
+        );
+    }
+
+    private static List<SfxSpec> buildTunnelEruptSpecs() {
+        List<SfxSpec> specs = new ArrayList<>(10);
+        specs.add(new SfxSpec(155.0, 34.0, 0.92, 0.38, Wave.SINE, 0.0, 0.0));
+        specs.add(new SfxSpec(92.5, 36.7, 0.68, 0.22, Wave.TRIANGLE, 0.0, 0.0));
+        double[] chord = {146.83, 220.0, 293.66, 369.99, 440.0, 554.37, 659.25};
+        for (int i = 0; i < chord.length; i++) {
+            double f = chord[i];
+            specs.add(new SfxSpec(f, f * 1.004, 1.15, 0.068 - i * 0.004, Wave.TRIANGLE, (i - 3) * 0.22, i * 0.016));
+        }
+        return specs;
+    }
+
+    private static List<SfxSpec> buildTunnelStageTickSpecs(int idx) {
+        double[] notes = {587.33, 739.99, 880.0, 1108.73, 1318.51};
+        double f = notes[idx];
+        return List.of(
+                new SfxSpec(f, f * 1.006, 0.16, 0.085, Wave.TRIANGLE, (idx % 2 == 1) ? 0.28 : -0.28, 0.0)
+        );
+    }
+
+    private static List<SfxSpec> buildTunnelBreakoutSpecs() {
+        List<SfxSpec> specs = new ArrayList<>(9);
+        specs.add(new SfxSpec(175.0, 48.0, 0.22, 0.28, Wave.SINE, 0.0, 0.0));
+        specs.add(new SfxSpec(1650.0, 620.0, 0.055, 0.12, Wave.TRIANGLE, 0.10, 0.0));
+        specs.add(new SfxSpec(110.0, 44.0, 0.95, 0.24, Wave.SINE, 0.0, 0.86));
+        double[] arrivalChord = {293.66, 440.0, 554.37, 659.25, 739.99};
+        for (int i = 0; i < arrivalChord.length; i++) {
+            double f = arrivalChord[i];
+            specs.add(new SfxSpec(f, f, 1.40, 0.068, Wave.SINE, (i - 2) * 0.24, 0.86 + i * 0.032));
+        }
+        return specs;
+    }
+
+    /** Pre-synthesizes heavy tunnel SFX raw buffers on a background thread so Act 1/3 cues cost <0.2ms on render thread. */
+    void prebakeTunnelSfxSync() {
+        if (!tunnelSfxPrebakeStarted.compareAndSet(false, true)) return;
+        try {
+            prebakedSingularityImplode = renderRawSfxStereo(buildSingularityImplodeSpecs(), SINGULARITY_IMPLODE_NOISE);
+            prebakedTunnelErupt = renderRawSfxStereo(buildTunnelEruptSpecs(), TUNNEL_ERUPT_NOISE);
+            prebakedTunnelBreakout = renderRawSfxStereo(buildTunnelBreakoutSpecs(), null);
+            for (int i = 0; i < prebakedLayerAbsorb.length; i++) {
+                prebakedLayerAbsorb[i] = renderRawSfxStereo(buildLayerAbsorbSpecs(i), null);
+            }
+            for (int i = 0; i < prebakedTunnelStageTick.length; i++) {
+                prebakedTunnelStageTick[i] = renderRawSfxStereo(buildTunnelStageTickSpecs(i), null);
+            }
+        } catch (Throwable t) {
+            HabiTrainCore.LOGGER.warn("[HabiBootAudio] Failed to prebake tunnel SFX buffers", t);
+        }
+    }
+
+    private void playSfxSpecsWithNoise(List<SfxSpec> specs, @Nullable NoiseBurstSpec noiseSpec,
+                                       float @Nullable [] prebakedRawStereo) {
+        if ((specs == null || specs.isEmpty()) && noiseSpec == null) return;
+        if (!isSoundEffectivelyEnabled()) return;
+
+        Minecraft mc = lastMinecraft;
+        if (openAlObservedReady && mc != null && mc.isSameThread() && mc.getSoundManager() != null) {
+            double gain = computeOpenAlSfxGain(true, bgmVolumePref) * 0.92;
+            if (gain > 0.0005) {
+                byte[] pcm = prebakedRawStereo != null
+                        ? renderScaledPcmFromRaw(prebakedRawStereo, gain)
+                        : renderSfxPcm(specs, noiseSpec, gain);
+                if (pcm.length > 0) {
+                    mc.getSoundManager().play(new KineticOneShotSfxSoundInstance(pcm));
+                }
+            }
+            return;
+        }
+
+        synchronized (stateLock) {
+            if (earlyJavaSoundUnavailable && outputMode != OutputMode.OPENAL) return;
+            if (outputMode != OutputMode.OPENAL) {
+                ensureEarlyMixerRunningLocked();
+            }
+            if (specs != null) {
+                for (SfxSpec spec : specs) {
+                    if (sfxVoices.size() >= 32) sfxVoices.remove(0);
+                    long start = mixerSampleClock + Math.round(spec.delaySec * SAMPLE_RATE);
+                    long durSamples = Math.max(64L, Math.round(spec.durSec * SAMPLE_RATE));
+                    sfxVoices.add(new SfxVoice(start, durSamples, spec.f0, spec.f1, spec.amp, spec.wave, spec.pan));
+                }
+            }
+            if (noiseSpec != null) {
+                tunnelSoundscape.addNoiseBurst(mixerSampleClock, noiseSpec);
+            }
+        }
+    }
+
     private void playSfxSpecs(List<SfxSpec> specs) {
         if (specs.isEmpty() || !isSoundEffectivelyEnabled()) return;
 
@@ -1066,21 +1320,38 @@ public final class HabiBootAudioEngine {
 
     /** Renders one or more procedural D-major tone specs into stereo 48 kHz 16-bit LE PCM bytes. */
     static byte[] renderSfxPcm(List<SfxSpec> specs, double gain) {
-        if (specs == null || specs.isEmpty() || gain <= 0.0005) return new byte[0];
+        return renderSfxPcm(specs, null, gain);
+    }
+
+    static byte[] renderSfxPcm(@Nullable List<SfxSpec> specs, @Nullable NoiseBurstSpec noiseSpec, double gain) {
+        if (((specs == null || specs.isEmpty()) && noiseSpec == null) || gain <= 0.0005) return new byte[0];
+        float[] raw = renderRawSfxStereo(specs, noiseSpec);
+        return renderScaledPcmFromRaw(raw, gain);
+    }
+
+    static float[] renderRawSfxStereo(@Nullable List<SfxSpec> specs, @Nullable NoiseBurstSpec noiseSpec) {
+        if ((specs == null || specs.isEmpty()) && noiseSpec == null) return new float[0];
         long totalFrames = 0L;
-        List<SfxVoice> voices = new ArrayList<>(specs.size());
-        for (SfxSpec spec : specs) {
-            long start = Math.max(0L, Math.round(spec.delaySec * SAMPLE_RATE));
-            long dur = Math.max(64L, Math.round(spec.durSec * SAMPLE_RATE));
-            voices.add(new SfxVoice(start, dur, spec.f0, spec.f1, spec.amp, spec.wave, spec.pan));
-            totalFrames = Math.max(totalFrames, start + dur);
+        List<SfxVoice> voices = new ArrayList<>(specs != null ? specs.size() : 0);
+        if (specs != null) {
+            for (SfxSpec spec : specs) {
+                long start = Math.max(0L, Math.round(spec.delaySec * SAMPLE_RATE));
+                long dur = Math.max(64L, Math.round(spec.durSec * SAMPLE_RATE));
+                voices.add(new SfxVoice(start, dur, spec.f0, spec.f1, spec.amp, spec.wave, spec.pan));
+                totalFrames = Math.max(totalFrames, start + dur);
+            }
         }
-        int frames = (int) Math.min(SAMPLE_RATE * 2L, totalFrames);
-        if (frames <= 0) return new byte[0];
+        NoiseBurstVoice noiseVoice = null;
+        if (noiseSpec != null) {
+            noiseVoice = new NoiseBurstVoice(0L, noiseSpec);
+            totalFrames = Math.max(totalFrames, Math.round(noiseSpec.stopSec * SAMPLE_RATE));
+        }
+        int frames = (int) Math.min(SAMPLE_RATE * 3L, totalFrames);
+        if (frames <= 0) return new float[0];
 
         int blocks = (frames + MIX_BLOCK_FRAMES - 1) / MIX_BLOCK_FRAMES;
         int paddedFrames = blocks * MIX_BLOCK_FRAMES;
-        byte[] pcm = new byte[paddedFrames * 4];
+        float[] stereo = new float[paddedFrames * 2];
         float[] outL = new float[MIX_BLOCK_FRAMES];
         float[] outR = new float[MIX_BLOCK_FRAMES];
 
@@ -1093,18 +1364,32 @@ public final class HabiBootAudioEngine {
             for (SfxVoice v : voices) {
                 v.renderBlock(blockStart, outL, outR);
             }
-            int byteBase = b * MIX_BLOCK_FRAMES * 4;
-            for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
-                double l = softLimit(outL[i] * gain);
-                double r = softLimit(outR[i] * gain);
-                short sl = (short) Math.max(-32767, Math.min(32767, Math.round(l * 32767.0)));
-                short sr = (short) Math.max(-32767, Math.min(32767, Math.round(r * 32767.0)));
-                int p = byteBase + i * 4;
-                pcm[p] = (byte) (sl & 0xFF);
-                pcm[p + 1] = (byte) ((sl >>> 8) & 0xFF);
-                pcm[p + 2] = (byte) (sr & 0xFF);
-                pcm[p + 3] = (byte) ((sr >>> 8) & 0xFF);
+            if (noiseVoice != null) {
+                noiseVoice.renderBlock(blockStart, outL, outR);
             }
+            int base = b * MIX_BLOCK_FRAMES * 2;
+            for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
+                stereo[base + i * 2] = outL[i];
+                stereo[base + i * 2 + 1] = outR[i];
+            }
+        }
+        return stereo;
+    }
+
+    static byte[] renderScaledPcmFromRaw(float @Nullable [] rawStereo, double gain) {
+        if (rawStereo == null || rawStereo.length < 2 || gain <= 0.0005) return new byte[0];
+        int frames = rawStereo.length / 2;
+        byte[] pcm = new byte[frames * 4];
+        for (int i = 0; i < frames; i++) {
+            double l = softLimit(rawStereo[i * 2] * gain);
+            double r = softLimit(rawStereo[i * 2 + 1] * gain);
+            short sl = (short) Math.max(-32767, Math.min(32767, Math.round(l * 32767.0)));
+            short sr = (short) Math.max(-32767, Math.min(32767, Math.round(r * 32767.0)));
+            int p = i * 4;
+            pcm[p] = (byte) (sl & 0xFF);
+            pcm[p + 1] = (byte) ((sl >>> 8) & 0xFF);
+            pcm[p + 2] = (byte) (sr & 0xFF);
+            pcm[p + 3] = (byte) ((sr >>> 8) & 0xFF);
         }
         return pcm;
     }
@@ -1241,8 +1526,8 @@ public final class HabiBootAudioEngine {
             }
             currentState = state;
             q = quantize;
-            if (enabledNow && isOutputActiveLocked() && mixerProducingSound && stemsLoaded) {
-                long origin = (state == State.MENU) ? menuOriginSample : idleOriginSample;
+            if (enabledNow && isOutputActiveLocked() && mixerProducingSound && (stemsLoaded || state == State.TUNNEL)) {
+                long origin = (state == State.MENU || state == State.TUNNEL) ? menuOriginSample : idleOriginSample;
                 long heardSample = getEstimatedHeardSampleLocked(nowNanos);
                 if (heardSample < 0L) {
                     heardSample = outputMode == OutputMode.OPENAL
@@ -1305,6 +1590,7 @@ public final class HabiBootAudioEngine {
                     openAlObservedReady = true;
                     outputMode = OutputMode.OPENAL;
                     earlyMixerRequested = false;
+                    ensureOpenAlKeepaliveRunningLocked();
                 }
                 return;
             }
@@ -1363,6 +1649,7 @@ public final class HabiBootAudioEngine {
                 openAlObservedReady = true;
                 outputMode = OutputMode.OPENAL;
                 earlyMixerRequested = false;
+                ensureOpenAlKeepaliveRunningLocked();
             }
             if (!loggedOpenAlAttach) {
                 loggedOpenAlAttach = true;
@@ -1412,6 +1699,61 @@ public final class HabiBootAudioEngine {
 
     private boolean isOutputActiveLocked() {
         return outputMode == OutputMode.OPENAL || earlyMixerRunning;
+    }
+
+    /**
+     * Keeps Minecraft's background {@code SoundEngineExecutor} pumping OpenAL stream buffers every
+     * {@link #OPENAL_KEEPALIVE_INTERVAL_MS} while boot/title audio is active, eliminating audio
+     * dropouts whenever heavy mod resource reloads stall the render thread past 256 ms.
+     */
+    private void ensureOpenAlKeepaliveRunningLocked() {
+        if (lastMinecraft == null) return;
+        if (openAlKeepaliveRunning && openAlKeepaliveThread != null && openAlKeepaliveThread.isAlive()) {
+            return;
+        }
+        openAlKeepaliveRunning = true;
+        Thread t = new Thread(this::runOpenAlKeepaliveLoop, "habitrain-openal-keepalive");
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY + 1);
+        openAlKeepaliveThread = t;
+        t.start();
+    }
+
+    private void runOpenAlKeepaliveLoop() {
+        try {
+            while (openAlKeepaliveRunning && isOpenAlStreamActive()) {
+                Minecraft mc = this.lastMinecraft;
+                if (mc == null || !mc.isRunning()) {
+                    break;
+                }
+                pumpOpenAlSoundEngine(mc);
+                try {
+                    Thread.sleep(OPENAL_KEEPALIVE_INTERVAL_MS);
+                } catch (InterruptedException ignored) {
+                    if (!openAlKeepaliveRunning) break;
+                }
+            }
+        } finally {
+            synchronized (stateLock) {
+                if (openAlKeepaliveThread == Thread.currentThread()) {
+                    openAlKeepaliveThread = null;
+                    openAlKeepaliveRunning = false;
+                }
+            }
+        }
+    }
+
+    private static void pumpOpenAlSoundEngine(@Nullable Minecraft mc) {
+        if (mc == null || mc.getSoundManager() == null) return;
+        try {
+            if (mc.getSoundManager() instanceof SoundManagerAccessor smAccess) {
+                SoundEngine engine = smAccess.habitrain$getSoundEngine();
+                if (engine instanceof HabiSoundEnginePrewarmAccess prewarmAccess) {
+                    prewarmAccess.habitrain$pumpOpenAlStreamTick();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /**
@@ -1670,6 +2012,19 @@ public final class HabiBootAudioEngine {
                 anyActive |= mixStem(loadCh, startSample, bgmL, bgmR);
                 anyActive |= mixStem(exitCh, startSample, bgmL, bgmR);
                 anyActive |= mixStem(menuCh, startSample, bgmL, bgmR);
+                if (tunnelSoundscape.active) {
+                    boolean tActive = tunnelSoundscape.mixInto(startSample, bgmL, bgmR, sfxL, sfxR, sfxVoices);
+                    anyActive |= tActive;
+                }
+            }
+
+            if (state == State.TUNNEL && !tunnelSoundscape.active && !hasActiveMusicChannelLocked()) {
+                menuCh = null;
+                state = State.STOPPED;
+                activeSession = false;
+                if (releaseStemsOnStop) {
+                    releaseStemsLocked();
+                }
             }
 
             if (state == State.DEPARTING && menuOriginSample > 0 && startSample + MIX_BLOCK_FRAMES >= menuOriginSample) {
@@ -1778,7 +2133,8 @@ public final class HabiBootAudioEngine {
                 || (idleCh != null && idleCh.active)
                 || (loadCh != null && loadCh.active)
                 || (exitCh != null && exitCh.active)
-                || (menuCh != null && menuCh.active);
+                || (menuCh != null && menuCh.active)
+                || tunnelSoundscape.active;
     }
 
     private void clearMusicChannelsLocked() {
@@ -1787,6 +2143,7 @@ public final class HabiBootAudioEngine {
         loadCh = null;
         exitCh = null;
         menuCh = null;
+        tunnelSoundscape.stop();
     }
 
     // ── Package-private hooks for unit tests ─────────────────────────────────
@@ -2184,6 +2541,7 @@ public final class HabiBootAudioEngine {
         double fadeOutStartGain;
         double fadeOutStartCutoff;
         double fadeOutEndCutoff;
+        boolean smoothVolumeFade;
 
         final StereoLowpass filter = new StereoLowpass(20_000.0, 0.707);
 
@@ -2231,6 +2589,17 @@ public final class HabiBootAudioEngine {
             this.fadeOutStartGain = this.gain;
             this.fadeOutStartCutoff = this.cutoff;
             this.fadeOutEndCutoff = endCutoffHz;
+            this.smoothVolumeFade = false;
+        }
+
+        void scheduleSmoothVolumeFadeOut(long whenSample, long durSamples, double endCutoffHz) {
+            this.smoothTracking = false;
+            this.fadeOutStart = whenSample;
+            this.fadeOutDur = Math.max(64L, durSamples);
+            this.fadeOutStartGain = Math.max(this.gain, this.gainTarget);
+            this.fadeOutStartCutoff = this.cutoff;
+            this.fadeOutEndCutoff = endCutoffHz;
+            this.smoothVolumeFade = true;
         }
 
         boolean mixInto(long blockStart, float[] outL, float[] outR) {
@@ -2240,12 +2609,17 @@ public final class HabiBootAudioEngine {
             long mid = blockStart + MIX_BLOCK_FRAMES / 2;
             if (fadeOutStart >= 0 && mid >= fadeOutStart) {
                 double u = clamp01((mid - fadeOutStart) / (double) fadeOutDur);
-                gain = Math.max(0.0001, fadeOutStartGain * Math.pow(0.0001 / Math.max(0.001, fadeOutStartGain), u));
-                cutoff = fadeOutStartCutoff * Math.pow(fadeOutEndCutoff / Math.max(80.0, fadeOutStartCutoff), u);
                 if (u >= 1.0) {
+                    gain = 0.0;
                     active = false;
                     return false;
                 }
+                if (smoothVolumeFade) {
+                    gain = fadeOutStartGain * Math.pow(1.0 - u, 1.65);
+                } else {
+                    gain = Math.max(0.0001, fadeOutStartGain * Math.pow(0.0001 / Math.max(0.001, fadeOutStartGain), u));
+                }
+                cutoff = fadeOutStartCutoff * Math.pow(fadeOutEndCutoff / Math.max(80.0, fadeOutStartCutoff), u);
             } else if (gainRampDur > 0 && mid < gainRampStart + gainRampDur) {
                 double u = clamp01((mid - gainRampStart) / (double) gainRampDur);
                 gain = gainStart + (gainTarget - gainStart) * u;
@@ -2299,7 +2673,12 @@ public final class HabiBootAudioEngine {
         }
     }
 
-    enum Wave { SINE, TRIANGLE, SAW }
+    enum Wave { SINE, TRIANGLE, SAW, SQUARE }
+
+    enum FilterMode { LOWPASS, HIGHPASS, BANDPASS }
+
+    record NoiseBurstSpec(FilterMode mode, double f0, double f1, double freqRampSec,
+                          double attackSec, double decaySec, double stopSec, double amp, double q) {}
 
     private static final class SfxVoice {
         final long startSample;
@@ -2336,6 +2715,7 @@ public final class HabiBootAudioEngine {
                     case SINE -> Math.sin(phase);
                     case TRIANGLE -> (2.0 / Math.PI) * Math.asin(Math.sin(phase));
                     case SAW -> (phase / Math.PI) - 1.0;
+                    case SQUARE -> phase < Math.PI ? 0.85 : -0.85;
                 };
                 double env = age < attack
                         ? (age / (double) Math.max(1, attack))
@@ -2345,6 +2725,359 @@ public final class HabiBootAudioEngine {
                 outR[i] += (float) (v * panR);
             }
             return true;
+        }
+    }
+
+    /** 2nd-order RBJ stereo biquad supporting LOWPASS, HIGHPASS, and BANDPASS modes. */
+    private static final class StereoBiquad {
+        private final FilterMode mode;
+        private final double q;
+        private double lastCutoff = -1.0;
+        private double b0, b1, b2, a1, a2;
+        private double x1L, x2L, y1L, y2L;
+        private double x1R, x2R, y1R, y2R;
+        private final double[] out = new double[2];
+
+        StereoBiquad(FilterMode mode, double cutoffHz, double q) {
+            this.mode = mode;
+            this.q = q;
+            setCutoff(cutoffHz);
+        }
+
+        void reset() {
+            x1L = x2L = y1L = y2L = 0.0;
+            x1R = x2R = y1R = y2R = 0.0;
+        }
+
+        void setCutoff(double hz) {
+            double clamped = clamp(hz, 60.0, SAMPLE_RATE * 0.45);
+            if (Math.abs(clamped - lastCutoff) < 2.0) return;
+            lastCutoff = clamped;
+            double w0 = 2.0 * Math.PI * clamped / SAMPLE_RATE;
+            double cosW = Math.cos(w0);
+            double sinW = Math.sin(w0);
+            double alpha = sinW / (2.0 * q);
+            double a0 = 1.0 + alpha;
+            switch (mode) {
+                case LOWPASS -> {
+                    b0 = ((1.0 - cosW) * 0.5) / a0;
+                    b1 = (1.0 - cosW) / a0;
+                    b2 = b0;
+                }
+                case HIGHPASS -> {
+                    b0 = ((1.0 + cosW) * 0.5) / a0;
+                    b1 = -(1.0 + cosW) / a0;
+                    b2 = b0;
+                }
+                case BANDPASS -> {
+                    b0 = alpha / a0;
+                    b1 = 0.0;
+                    b2 = -alpha / a0;
+                }
+            }
+            a1 = (-2.0 * cosW) / a0;
+            a2 = (1.0 - alpha) / a0;
+        }
+
+        double[] process(double inL, double inR) {
+            double oL = b0 * inL + b1 * x1L + b2 * x2L - a1 * y1L - a2 * y2L;
+            x2L = x1L; x1L = inL; y2L = y1L; y1L = oL;
+            double oR = b0 * inR + b1 * x1R + b2 * x2R - a1 * y1R - a2 * y2R;
+            x2R = x1R; x1R = inR; y2R = y1R; y1R = oR;
+            out[0] = oL;
+            out[1] = oR;
+            return out;
+        }
+    }
+
+    /** Pink-noise one-shot burst (for pneumatic door hiss and doorway eruption rush wave). */
+    private static final class NoiseBurstVoice {
+        private final long startSample;
+        private final long stopSamples;
+        private final NoiseBurstSpec spec;
+        private final StereoBiquad filter;
+        private double b0L, b1L, b2L, b0R, b1R, b2R;
+        private long rngL = 0x5DEECE66DL;
+        private long rngR = 0x1337BEEFL;
+
+        NoiseBurstVoice(long startSample, NoiseBurstSpec spec) {
+            this.startSample = startSample;
+            this.stopSamples = Math.max(64L, Math.round(spec.stopSec * SAMPLE_RATE));
+            this.spec = spec;
+            this.filter = new StereoBiquad(spec.mode, spec.f0, spec.q);
+        }
+
+        private double nextWhiteL() {
+            rngL = (rngL * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
+            return ((rngL >>> 24) / (double) 0x800000) - 1.0;
+        }
+
+        private double nextWhiteR() {
+            rngR = (rngR * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
+            return ((rngR >>> 24) / (double) 0x800000) - 1.0;
+        }
+
+        boolean renderBlock(long blockStart, float[] outL, float[] outR) {
+            if (blockStart >= startSample + stopSamples) return false;
+            if (blockStart + MIX_BLOCK_FRAMES <= startSample) return true;
+            long mid = blockStart + MIX_BLOCK_FRAMES / 2;
+            double sec = Math.max(0.0, (mid - startSample) / (double) SAMPLE_RATE);
+            double fu = clamp01(sec / Math.max(0.01, spec.freqRampSec));
+            double fc = spec.f0 * Math.pow(spec.f1 / Math.max(40.0, spec.f0), fu);
+            filter.setCutoff(fc);
+
+            int i0 = (int) Math.max(0, startSample - blockStart);
+            for (int i = i0; i < MIX_BLOCK_FRAMES; i++) {
+                long age = (blockStart + i) - startSample;
+                if (age >= stopSamples) return false;
+                double t = age / (double) SAMPLE_RATE;
+                double env;
+                if (t < spec.attackSec) {
+                    env = spec.amp * (t / Math.max(0.001, spec.attackSec));
+                } else {
+                    double du = clamp01((t - spec.attackSec) / Math.max(0.01, spec.decaySec - spec.attackSec));
+                    env = spec.amp * Math.pow(0.0005, du);
+                }
+                double wL = nextWhiteL();
+                b0L = 0.997 * b0L + wL * 0.029;
+                b1L = 0.985 * b1L + wL * 0.032;
+                b2L = 0.950 * b2L + wL * 0.048;
+                double pL = (b0L + b1L + b2L + wL * 0.015) * 1.4;
+
+                double wR = nextWhiteR();
+                b0R = 0.997 * b0R + wR * 0.029;
+                b1R = 0.985 * b1R + wR * 0.032;
+                b2R = 0.950 * b2R + wR * 0.048;
+                double pR = (b0R + b1R + b2R + wR * 0.015) * 1.4;
+
+                double[] f = filter.process(pL, pR);
+                outL[i] += (float) (f[0] * env);
+                outR[i] += (float) (f[1] * env);
+            }
+            return true;
+        }
+    }
+
+    /**
+     * Sample-accurate 48 kHz synthesizer for the World-Entry Tunnel Soundscape:
+     * sub-bass assembly charge + stereo pink-noise bandpass wind bed + 100 BPM Dmaj9 crystalline arpeggio.
+     */
+    private static final class TunnelSoundscape {
+        private static final double[] ARP_NOTES = {587.33, 739.99, 880.0, 1108.73, 1318.51, 880.0, 739.99, 659.25};
+        private static final int NOISE_FRAMES = SAMPLE_RATE * 3;
+        private static final long ARP_INTERVAL_SAMPLES = Math.round(EIGHTH * SAMPLE_RATE);
+
+        private float[] pinkL;
+        private float[] pinkR;
+        private int noiseCursor;
+
+        boolean active;
+        private boolean fromStart;
+        private long startSample;
+        private long breakoutSample = -1L;
+        private double progress;
+
+        private double subPhase;
+        private double windCutoff = 210.0;
+        private double windGain = 0.0001;
+        private final StereoBiquad windFilter = new StereoBiquad(FilterMode.BANDPASS, 210.0, 1.8);
+
+        private long nextArpSample;
+        private int arpStep;
+        private boolean arpActive;
+
+        private final List<NoiseBurstVoice> bursts = new ArrayList<>();
+
+        private void ensureNoiseBuffer() {
+            if (pinkL != null) return;
+            pinkL = new float[NOISE_FRAMES];
+            pinkR = new float[NOISE_FRAMES];
+            long seedL = 20261126L, seedR = 20261127L;
+            double b0L = 0, b1L = 0, b2L = 0, b0R = 0, b1R = 0, b2R = 0;
+            for (int i = 0; i < NOISE_FRAMES; i++) {
+                seedL = (seedL * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
+                double wL = ((seedL >>> 24) / (double) 0x800000) - 1.0;
+                b0L = 0.997 * b0L + wL * 0.029;
+                b1L = 0.985 * b1L + wL * 0.032;
+                b2L = 0.950 * b2L + wL * 0.048;
+                pinkL[i] = (float) ((b0L + b1L + b2L + wL * 0.015) * 1.4);
+
+                seedR = (seedR * 0x5DEECE66DL + 0xBL) & 0xFFFFFFFFFFFFL;
+                double wR = ((seedR >>> 24) / (double) 0x800000) - 1.0;
+                b0R = 0.997 * b0R + wR * 0.029;
+                b1R = 0.985 * b1R + wR * 0.032;
+                b2R = 0.950 * b2R + wR * 0.048;
+                pinkR[i] = (float) ((b0R + b1R + b2R + wR * 0.015) * 1.4);
+            }
+        }
+
+        void start(long nowSample, boolean fromStationStart) {
+            ensureNoiseBuffer();
+            this.active = true;
+            this.fromStart = fromStationStart;
+            this.startSample = nowSample;
+            this.breakoutSample = -1L;
+            this.progress = 0.0;
+            this.subPhase = 0.0;
+            this.noiseCursor = 0;
+            this.windCutoff = fromStationStart ? 210.0 : 520.0;
+            this.windGain = 0.0001;
+            this.windFilter.reset();
+            this.windFilter.setCutoff(this.windCutoff);
+            this.arpStep = 0;
+            this.arpActive = true;
+            this.nextArpSample = nowSample + Math.round((fromStationStart ? 2.22 : 0.12) * SAMPLE_RATE);
+            this.bursts.clear();
+        }
+
+        void setProgress(double p) {
+            this.progress = clamp01(p);
+        }
+
+        void triggerBreakout(long nowSample) {
+            if (!active) return;
+            this.breakoutSample = nowSample;
+            this.arpActive = false;
+        }
+
+        void addNoiseBurst(long nowSample, NoiseBurstSpec spec) {
+            if (bursts.size() >= 6) bursts.remove(0);
+            bursts.add(new NoiseBurstVoice(nowSample, spec));
+        }
+
+        void stop() {
+            this.active = false;
+            this.arpActive = false;
+            this.breakoutSample = -1L;
+            this.bursts.clear();
+        }
+
+        boolean mixInto(long blockStart, float[] bgmL, float[] bgmR, float[] sfxL, float[] sfxR,
+                        List<SfxVoice> sfxVoices) {
+            if (!active) return false;
+            long mid = blockStart + MIX_BLOCK_FRAMES / 2;
+            double t = Math.max(0.0, (mid - startSample) / (double) SAMPLE_RATE);
+            double blockDt = MIX_BLOCK_FRAMES / (double) SAMPLE_RATE;
+
+            // 1) Breakout envelope completion (1.55s after triggerTunnelBreakout)
+            if (breakoutSample >= 0L) {
+                double bt = Math.max(0.0, (mid - breakoutSample) / (double) SAMPLE_RATE);
+                if (bt >= 1.55) {
+                    active = false;
+                    bursts.clear();
+                    return false;
+                }
+                double targetFc = bt < 0.85
+                        ? windCutoff * Math.pow(3800.0 / Math.max(120.0, windCutoff), clamp01(blockDt / Math.max(0.04, 0.85 - bt)))
+                        : 3800.0;
+                windCutoff = clamp(targetFc, 120.0, 4200.0);
+                if (bt < 0.82) {
+                    windGain += (0.28 - windGain) * clamp01(blockDt / Math.max(0.05, 0.82 - bt));
+                } else {
+                    double fu = clamp01((bt - 0.82) / 0.63);
+                    windGain = 0.28 * Math.pow(0.0004, fu);
+                }
+            } else if (fromStart) {
+                if (t < 1.90) {
+                    windCutoff = 210.0 * Math.pow(1280.0 / 210.0, clamp01(t / 1.90));
+                    windGain = 0.20 * clamp01(t / 1.88);
+                } else if (t < 2.18) {
+                    double u = clamp01((t - 1.90) / 0.28);
+                    windCutoff = 1280.0 * Math.pow(280.0 / 1280.0, u);
+                    windGain = 0.20 + (0.04 - 0.20) * u;
+                } else if (t < 2.55) {
+                    double u = clamp01((t - 2.18) / 0.37);
+                    windCutoff = 280.0 * Math.pow(720.0 / 280.0, u);
+                    windGain = 0.04 + (0.15 - 0.04) * u;
+                } else {
+                    double targetFc = 520.0 + Math.pow(progress, 1.35) * 1850.0;
+                    double alphaF = 1.0 - Math.exp(-blockDt / 0.15);
+                    windCutoff += (targetFc - windCutoff) * alphaF;
+                    windGain += (0.15 - windGain) * alphaF;
+                }
+            } else {
+                double targetFc = 520.0 + Math.pow(progress, 1.35) * 1850.0;
+                double alphaF = 1.0 - Math.exp(-blockDt / 0.15);
+                windCutoff += (targetFc - windCutoff) * alphaF;
+                windGain = 0.15 * clamp01(t / 0.35);
+            }
+
+            // 2) Render stereo bandpass pink-noise wind bed into BGM bus
+            windFilter.setCutoff(windCutoff);
+            float wg = (float) windGain;
+            for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
+                double[] f = windFilter.process(pinkL[noiseCursor], pinkR[noiseCursor]);
+                bgmL[i] += (float) f[0] * wg;
+                bgmR[i] += (float) f[1] * wg;
+                noiseCursor++;
+                if (noiseCursor >= NOISE_FRAMES) noiseCursor = 0;
+            }
+
+            // 3) Act 1 sub-bass engine charge sweep (0.10s -> 2.50s)
+            if (fromStart && breakoutSample < 0L && t >= 0.08 && t <= 2.52) {
+                for (int i = 0; i < MIX_BLOCK_FRAMES; i++) {
+                    double st = ((blockStart + i) - startSample) / (double) SAMPLE_RATE;
+                    if (st < 0.10 || st > 2.50) continue;
+                    double freq;
+                    if (st < 1.92) {
+                        freq = 55.0 * Math.pow(146.83 / 55.0, (st - 0.10) / 1.82);
+                    } else if (st < 2.20) {
+                        freq = 146.83 * Math.pow(38.89 / 146.83, (st - 1.92) / 0.28);
+                    } else {
+                        freq = 38.89;
+                    }
+                    double sg;
+                    if (st < 1.88) {
+                        sg = 0.24 * (st / 1.88);
+                    } else if (st < 2.18) {
+                        sg = 0.24 * Math.pow(0.05 / 0.24, (st - 1.88) / 0.30);
+                    } else {
+                        sg = 0.05 * Math.pow(0.0001 / 0.05, clamp01((st - 2.18) / 0.27));
+                    }
+                    subPhase += (2.0 * Math.PI * freq) / SAMPLE_RATE;
+                    if (subPhase > 2.0 * Math.PI) subPhase -= 2.0 * Math.PI;
+                    float sv = (float) (Math.sin(subPhase) * sg);
+                    sfxL[i] += sv;
+                    sfxR[i] += sv;
+                }
+            }
+
+            // 4) 100 BPM eighth-note (0.30s) crystalline clock arpeggio inside Time Tunnel
+            if (arpActive && breakoutSample < 0L) {
+                while (nextArpSample < blockStart + MIX_BLOCK_FRAMES) {
+                    int s = arpStep++;
+                    double p = progress;
+                    long when = Math.max(blockStart, nextArpSample);
+                    if (s % 4 == 0) {
+                        spawnArpVoice(sfxVoices, when, 146.83, 55.0, 0.24, 0.11 + 0.05 * p, Wave.SINE, 0.0);
+                    }
+                    double f = ARP_NOTES[s % ARP_NOTES.length];
+                    spawnArpVoice(sfxVoices, when, f, f * 1.003, 0.26, 0.036 + 0.03 * p, Wave.TRIANGLE, ((s % 5) - 2) * 0.26);
+                    if (s % 2 == 1) {
+                        spawnArpVoice(sfxVoices, when, 1950.0 + (s % 3) * 320.0, 1280.0, 0.035, 0.024,
+                                Wave.SINE, (s % 4 == 1) ? -0.45 : 0.45);
+                    }
+                    nextArpSample += ARP_INTERVAL_SAMPLES;
+                }
+            }
+
+            // 5) Render any fallback noise bursts (used when OpenAL one-shot path isn't active)
+            if (!bursts.isEmpty()) {
+                Iterator<NoiseBurstVoice> it = bursts.iterator();
+                while (it.hasNext()) {
+                    if (!it.next().renderBlock(blockStart, sfxL, sfxR)) {
+                        it.remove();
+                    }
+                }
+            }
+            return true;
+        }
+
+        private static void spawnArpVoice(List<SfxVoice> sfxVoices, long startSample,
+                                          double f0, double f1, double durSec, double amp, Wave wave, double pan) {
+            if (sfxVoices.size() >= 36) sfxVoices.remove(0);
+            long durSamples = Math.max(64L, Math.round(durSec * SAMPLE_RATE));
+            sfxVoices.add(new SfxVoice(startSample, durSamples, f0, f1, amp, wave, pan));
         }
     }
 

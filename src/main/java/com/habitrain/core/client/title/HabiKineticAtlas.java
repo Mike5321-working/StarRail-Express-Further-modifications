@@ -1,18 +1,18 @@
 package com.habitrain.core.client.title;
 
 import com.habitrain.core.HabiTrainCore;
-import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.platform.TextureUtil;
 import com.mojang.blaze3d.vertex.BufferBuilder;
-import com.mojang.blaze3d.vertex.BufferUploader;
-import com.mojang.blaze3d.vertex.DefaultVertexFormat;
-import com.mojang.blaze3d.vertex.Tesselator;
-import com.mojang.blaze3d.vertex.VertexFormat;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.server.packs.resources.ResourceManager;
-import org.joml.Matrix4f;
+import org.jetbrains.annotations.Nullable;
+import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL12;
+import org.lwjgl.opengl.GL13;
+import org.lwjgl.system.MemoryUtil;
 
 import java.awt.BasicStroke;
 import java.awt.Color;
@@ -29,23 +29,26 @@ import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 /**
  * High-DPI vector sprite, font, and dynamic-text texture baker for HabiTrain Kinetic UI v3.
  *
- * <p>Loads {@code bebas.ttf}, {@code noto_sans_sc_bold.ttf}, and {@code DejaVuSansMono-Bold.ttf}
- * directly from the mod classpath so crisp typography and all 2.5D extruded slabs render from
- * frame 0 during early Minecraft boot (before {@code ResourceManager}/{@code FontManager} finish).</p>
- *
- * <p>Fast-changing ASCII readouts (timecodes, percentages, typed strings, giant "00"/"01"/
- * "DEPARTURE") draw from pre-baked ASCII glyph atlases with zero per-frame allocations; CJK
- * strings are rasterized once into a bounded LRU {@link DynamicTexture} cache.</p>
+ * <p>Decouples Java2D CPU rasterization (fonts, Station 00 sprites, Station 01 sprites, post
+ * textures, and ASCII glyph atlases) onto a dedicated background thread started during client
+ * initialization so Boot Frame 0 never stalls waiting for font decoding or software rendering.
+ * OpenGL uploads run on the render thread via bulk off-heap buffer transfer (eliminating millions
+ * of per-pixel JNI calls), with Station 01 textures uploaded incrementally across idle frames.</p>
  */
 @Environment(EnvType.CLIENT)
 public final class HabiKineticAtlas {
@@ -56,13 +59,158 @@ public final class HabiKineticAtlas {
     private static final float BAKE_SCALE = 2.0f;
     private static final int MAX_TEXT_CACHE = 256;
     private static final String FONT_BASE = "assets/habitrain_core/font/replay/";
+    private static final boolean IS_LITTLE_ENDIAN = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN;
 
-    /** Static GPU-only texture: uploads with autoClose=true so NativeImage off-heap RAM is freed immediately. */
+    // Reusable render-thread direct upload scratch buffer (avoids per-texture malloc/free)
+    private static @Nullable ByteBuffer sharedUploadScratch;
+
+    /** Off-thread CPU-rasterized RGBA image ready for bulk OpenGL upload. */
+    static final class CpuImage {
+        final int width;
+        final int height;
+        final int[] packedRgba; // packed for native byte order so bytes in memory are [R, G, B, A]
+        final boolean repeat;
+
+        CpuImage(int width, int height, int[] packedRgba, boolean repeat) {
+            this.width = width;
+            this.height = height;
+            this.packedRgba = packedRgba;
+            this.repeat = repeat;
+        }
+
+        static CpuImage fromBufferedImage(BufferedImage img, boolean repeat) {
+            int w = img.getWidth();
+            int h = img.getHeight();
+            int[] src = ((DataBufferInt) img.getRaster().getDataBuffer()).getData();
+            int[] dst = new int[src.length];
+            if (IS_LITTLE_ENDIAN) {
+                for (int i = 0; i < src.length; i++) {
+                    int argb = src[i];
+                    dst[i] = (argb & 0xFF00FF00) | ((argb & 0x00FF0000) >>> 16) | ((argb & 0x000000FF) << 16);
+                }
+            } else {
+                for (int i = 0; i < src.length; i++) {
+                    int argb = src[i];
+                    dst[i] = ((argb & 0x00FFFFFF) << 8) | ((argb >>> 24) & 0xFF);
+                }
+            }
+            return new CpuImage(w, h, dst, repeat);
+        }
+
+        static CpuImage silhouetteFrom(CpuImage src, int rgb) {
+            int[] srcPx = src.packedRgba;
+            int[] dst = new int[srcPx.length];
+            if (IS_LITTLE_ENDIAN) {
+                int bgr = ((rgb & 0x00FF0000) >>> 16) | (rgb & 0x0000FF00) | ((rgb & 0x000000FF) << 16);
+                for (int i = 0; i < srcPx.length; i++) {
+                    dst[i] = (srcPx[i] & 0xFF000000) | bgr;
+                }
+            } else {
+                int rgbShifted = (rgb & 0x00FFFFFF) << 8;
+                for (int i = 0; i < srcPx.length; i++) {
+                    dst[i] = rgbShifted | (srcPx[i] & 0xFF);
+                }
+            }
+            return new CpuImage(src.width, src.height, dst, false);
+        }
+    }
+
+    private static final class CpuSlab {
+        CpuImage face;
+        @Nullable CpuImage mask;
+        final double w, h, ax, ay, yc, y0, y1, adv, titleX;
+        final int sideRgb;
+        final boolean plate;
+
+        CpuSlab(CpuImage face, @Nullable CpuImage mask, double w, double h, double ax, double ay,
+                int sideRgb, double yc, double y0, double y1, double adv, double titleX, boolean plate) {
+            this.face = face;
+            this.mask = mask;
+            this.w = w;
+            this.h = h;
+            this.ax = ax;
+            this.ay = ay;
+            this.sideRgb = sideRgb;
+            this.yc = yc;
+            this.y0 = y0;
+            this.y1 = y1;
+            this.adv = adv;
+            this.titleX = titleX;
+            this.plate = plate;
+        }
+    }
+
+    private static final class CpuAsciiAtlas {
+        CpuImage image;
+        final float fontPx, ascent, descent;
+        final GlyphCell[] cells;
+
+        CpuAsciiAtlas(CpuImage image, float fontPx, float ascent, float descent, GlyphCell[] cells) {
+            this.image = image;
+            this.fontPx = fontPx;
+            this.ascent = ascent;
+            this.descent = descent;
+            this.cells = cells;
+        }
+    }
+
+    private static final class CpuPrebakedText {
+        final String key;
+        CpuImage image;
+        final double w, h;
+
+        CpuPrebakedText(String key, CpuImage image, double w, double h) {
+            this.key = key;
+            this.image = image;
+            this.w = w;
+            this.h = h;
+        }
+    }
+
+    private static final class CpuZeroPack {
+        final CpuSlab[] zeroBands = new CpuSlab[BANDS.length];
+        CpuSlab zeroStem, zeroLeaf;
+        CpuImage zeroOutlineDark, zeroOutlinePaper;
+        final List<CpuSlab> titleGlyphs = new ArrayList<>();
+        double titleWidth, titleCapH;
+        CpuSlab tagLead, tagCore, tagPrompt, tagAutoBoard, tagSyncBoard, tagDepart;
+        CpuSlab loadBadge, cursor, zeroCarLead, zeroCar;
+        CpuSlab cardA, cardB, cardC, cardD;
+        CpuImage noiseTex, vigPaperTex, vigDarkTex;
+        CpuAsciiAtlas monoAtlas, displayAtlas;
+        final List<CpuPrebakedText> prebakedTexts = new ArrayList<>();
+    }
+
+    private static final class CpuStation01Pack {
+        final CpuSlab[] stBands = new CpuSlab[BANDS.length];
+        CpuSlab stStem, stLeaf, stCarLead, stCar, plateStation, plateRoute;
+        CpuImage stationBgTex, stationAuraTex;
+        final List<CpuPrebakedText> prebakedTexts = new ArrayList<>();
+    }
+
+    /** Static GPU-only texture uploaded via bulk off-heap memory transfer on the render thread. */
     public static final class StaticGlTexture extends AbstractTexture {
-        StaticGlTexture(NativeImage image, boolean repeat) {
+        StaticGlTexture(CpuImage cpu) {
             int texId = this.getId();
-            TextureUtil.prepareImage(texId, image.getWidth(), image.getHeight());
-            image.upload(0, 0, 0, 0, 0, image.getWidth(), image.getHeight(), true, !repeat, false, true);
+            GlStateManager._activeTexture(GL13.GL_TEXTURE0);
+            TextureUtil.prepareImage(texId, cpu.width, cpu.height);
+            GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR);
+            GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR);
+            int wrap = cpu.repeat ? GL11.GL_REPEAT : GL12.GL_CLAMP_TO_EDGE;
+            GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_S, wrap);
+            GlStateManager._texParameter(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_WRAP_T, wrap);
+            GlStateManager._pixelStore(GL11.GL_UNPACK_ROW_LENGTH, 0);
+            GlStateManager._pixelStore(GL11.GL_UNPACK_SKIP_ROWS, 0);
+            GlStateManager._pixelStore(GL11.GL_UNPACK_SKIP_PIXELS, 0);
+            GlStateManager._pixelStore(GL11.GL_UNPACK_ALIGNMENT, 4);
+
+            int byteLen = cpu.packedRgba.length * 4;
+            ByteBuffer scratch = acquireUploadScratch(byteLen);
+            scratch.asIntBuffer().put(cpu.packedRgba);
+            GlStateManager._texSubImage2D(
+                    GL11.GL_TEXTURE_2D, 0, 0, 0, cpu.width, cpu.height,
+                    GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, MemoryUtil.memAddress(scratch)
+            );
         }
 
         @Override
@@ -71,6 +219,25 @@ public final class HabiKineticAtlas {
         @Override
         public void close() {
             this.releaseId();
+        }
+    }
+
+    private static ByteBuffer acquireUploadScratch(int byteSize) {
+        if (sharedUploadScratch == null || sharedUploadScratch.capacity() < byteSize) {
+            if (sharedUploadScratch != null) {
+                MemoryUtil.memFree(sharedUploadScratch);
+            }
+            int alloc = Math.max(byteSize, 512 * 512 * 4);
+            sharedUploadScratch = MemoryUtil.memAlloc(alloc);
+        }
+        sharedUploadScratch.clear();
+        return sharedUploadScratch;
+    }
+
+    static void releaseUploadScratch() {
+        if (sharedUploadScratch != null) {
+            MemoryUtil.memFree(sharedUploadScratch);
+            sharedUploadScratch = null;
         }
     }
 
@@ -124,10 +291,22 @@ public final class HabiKineticAtlas {
         return INSTANCE;
     }
 
-    private boolean ready;
-    private Font fontDisplay;
-    private Font fontSansCn;
-    private Font fontMono;
+    private final Object fontLock = new Object();
+    private final Object preloadLock = new Object();
+    private final AtomicInteger generation = new AtomicInteger(0);
+
+    private volatile Font fontDisplay;
+    private volatile Font fontSansCn;
+    private volatile Font fontMono;
+
+    private volatile boolean zeroReady;
+    private volatile boolean station01Ready;
+    private volatile boolean shuttingDown;
+    private int preloadStartedGen = -1;
+    private @Nullable CompletableFuture<CpuZeroPack> zeroCpuFuture;
+    private @Nullable CompletableFuture<CpuStation01Pack> st01CpuFuture;
+    private @Nullable CpuStation01Pack uploadingSt01Pack;
+    private int uploadingSt01Cursor;
 
     // ── Station 00 sprites ───────────────────────────────────────────────────
     public final Slab[] zeroBands = new Slab[BANDS.length];
@@ -168,6 +347,7 @@ public final class HabiKineticAtlas {
     public StaticGlTexture vigPaperTex;
     public StaticGlTexture vigDarkTex;
     public StaticGlTexture stationBgTex;
+    public StaticGlTexture stationAuraTex;
 
     // ── Zero-allocation ASCII glyph atlases ──────────────────────────────────
     private AsciiAtlas monoAtlas;
@@ -175,31 +355,211 @@ public final class HabiKineticAtlas {
 
     // ── Bounded LRU CJK/mixed text texture cache ─────────────────────────────
     private final Map<String, TextTex> textCache = new LinkedHashMap<>(128, 0.75f, true);
+    private final Map<Long, FontMetrics> metricsCache = new LinkedHashMap<>(16, 0.75f, false);
     private final List<StaticGlTexture> ownedTextures = new ArrayList<>();
-    private final Matrix4f identity = new Matrix4f();
 
     private HabiKineticAtlas() {}
 
     public boolean isReady() {
-        return ready;
+        return zeroReady;
     }
 
-    /** Lazily bakes all vector sprites &amp; glyph atlases on the OpenGL render thread. */
+    public boolean isStation01Ready() {
+        return zeroReady && station01Ready;
+    }
+
+    /**
+     * Kicks off background-thread font loading and CPU rasterization for Station 00 followed by
+     * Station 01. Safe to call from any thread (including {@code ClientModInitializer}).
+     */
+    public void preloadAsync() {
+        if (shuttingDown || (zeroReady && station01Ready)) return;
+        final int gen;
+        final CompletableFuture<CpuZeroPack> zFuture;
+        final CompletableFuture<CpuStation01Pack> sFuture;
+        synchronized (preloadLock) {
+            gen = generation.get();
+            if (preloadStartedGen == gen) {
+                return;
+            }
+            preloadStartedGen = gen;
+            zFuture = new CompletableFuture<>();
+            sFuture = new CompletableFuture<>();
+            zeroCpuFuture = zFuture;
+            st01CpuFuture = sFuture;
+        }
+
+        Thread baker = new Thread(() -> {
+            try {
+                long t0 = System.nanoTime();
+                ensureFontsLoaded();
+                if (generation.get() != gen) {
+                    zFuture.cancel(false);
+                    sFuture.cancel(false);
+                    return;
+                }
+                CpuZeroPack zeroPack = bakeZeroStationCpu();
+                double zeroMs = (System.nanoTime() - t0) / 1_000_000.0;
+                HabiLoadingPerfMonitor.getInstance().recordAtlasCpuBake("KineticAtlas", "zero", zeroMs, true);
+                zFuture.complete(zeroPack);
+
+                if (generation.get() != gen) {
+                    sFuture.cancel(false);
+                    return;
+                }
+                long t1 = System.nanoTime();
+                CpuStation01Pack st01Pack = bakeStation01Cpu();
+                double st01Ms = (System.nanoTime() - t1) / 1_000_000.0;
+                HabiLoadingPerfMonitor.getInstance().recordAtlasCpuBake("KineticAtlas", "station01", st01Ms, true);
+                sFuture.complete(st01Pack);
+            } catch (Throwable t) {
+                HabiTrainCore.LOGGER.warn("[HabiKineticAtlas] Background CPU rasterization failed", t);
+                zFuture.completeExceptionally(t);
+                sFuture.completeExceptionally(t);
+            }
+        }, "habitrain-kinetic-atlas-baker");
+        baker.setDaemon(true);
+        baker.setPriority(Thread.NORM_PRIORITY + 1);
+        baker.start();
+    }
+
+    /** Ensures Station 00 sprites, post textures, and ASCII glyph atlases are uploaded on the render thread. */
+    public double ensureZeroPrepared() {
+        if (shuttingDown || zeroReady) return 0.0;
+        preloadAsync();
+
+        CompletableFuture<CpuZeroPack> future;
+        synchronized (preloadLock) {
+            future = zeroCpuFuture;
+        }
+        CpuZeroPack pack = null;
+        double syncWaitMs = 0.0;
+        if (future != null) {
+            boolean doneAlready = future.isDone();
+            long waitStart = doneAlready ? 0L : System.nanoTime();
+            try {
+                pack = future.join();
+            } catch (Throwable t) {
+                HabiTrainCore.LOGGER.warn("[HabiKineticAtlas] Falling back to synchronous Station 00 bake", t);
+            }
+            if (!doneAlready) {
+                syncWaitMs = (System.nanoTime() - waitStart) / 1_000_000.0;
+            }
+        }
+        if (pack == null) {
+            long cpuStart = System.nanoTime();
+            ensureFontsLoaded();
+            pack = bakeZeroStationCpu();
+            HabiLoadingPerfMonitor.getInstance().recordAtlasCpuBake(
+                    "KineticAtlas", "zero", (System.nanoTime() - cpuStart) / 1_000_000.0, false);
+        }
+
+        long upStart = System.nanoTime();
+        int uploaded = uploadZeroPack(pack);
+        double upMs = (System.nanoTime() - upStart) / 1_000_000.0;
+        synchronized (preloadLock) {
+            zeroCpuFuture = null;
+        }
+        zeroReady = true;
+        HabiLoadingPerfMonitor.getInstance().recordAtlasUpload("KineticAtlas", "zero", uploaded, upMs, syncWaitMs);
+        return upMs + syncWaitMs;
+    }
+
+    /**
+     * Incrementally uploads Station 01 textures on the render thread within {@code budgetMs} once
+     * background CPU baking has finished (zero blocking on the render thread).
+     */
+    public double pumpStation01Uploads(double budgetMs) {
+        if (shuttingDown || station01Ready) return 0.0;
+        if (uploadingSt01Pack == null) {
+            CompletableFuture<CpuStation01Pack> future;
+            synchronized (preloadLock) {
+                future = st01CpuFuture;
+            }
+            if (future == null || !future.isDone() || future.isCancelled() || future.isCompletedExceptionally()) {
+                return 0.0;
+            }
+            uploadingSt01Pack = future.join();
+            uploadingSt01Cursor = 0;
+            synchronized (preloadLock) {
+                st01CpuFuture = null;
+            }
+        }
+        return uploadStation01Steps(budgetMs, false);
+    }
+
+    /** Ensures both Station 00 and Station 01 atlases are completely uploaded on the render thread. */
+    public double ensureStation01Prepared() {
+        if (shuttingDown) return 0.0;
+        double totalMs = ensureZeroPrepared();
+        if (station01Ready) return totalMs;
+
+        if (uploadingSt01Pack == null) {
+            preloadAsync();
+            CompletableFuture<CpuStation01Pack> future;
+            synchronized (preloadLock) {
+                future = st01CpuFuture;
+            }
+            double syncWaitMs = 0.0;
+            CpuStation01Pack pack = null;
+            if (future != null) {
+                boolean doneAlready = future.isDone();
+                long waitStart = doneAlready ? 0L : System.nanoTime();
+                try {
+                    pack = future.join();
+                } catch (Throwable t) {
+                    HabiTrainCore.LOGGER.warn("[HabiKineticAtlas] Falling back to synchronous Station 01 bake", t);
+                }
+                if (!doneAlready) {
+                    syncWaitMs = (System.nanoTime() - waitStart) / 1_000_000.0;
+                }
+            }
+            if (pack == null) {
+                long cpuStart = System.nanoTime();
+                ensureFontsLoaded();
+                pack = bakeStation01Cpu();
+                HabiLoadingPerfMonitor.getInstance().recordAtlasCpuBake(
+                        "KineticAtlas", "station01", (System.nanoTime() - cpuStart) / 1_000_000.0, false);
+            }
+            uploadingSt01Pack = pack;
+            uploadingSt01Cursor = 0;
+            synchronized (preloadLock) {
+                st01CpuFuture = null;
+            }
+            if (syncWaitMs > 0.0) {
+                HabiLoadingPerfMonitor.getInstance().recordAtlasUpload("KineticAtlas", "station01", 0, 0.0, syncWaitMs);
+                totalMs += syncWaitMs;
+            }
+        }
+        totalMs += uploadStation01Steps(Double.POSITIVE_INFINITY, true);
+        return totalMs;
+    }
+
+    /** Backward-compatible full preparation entry point (Station 00 + Station 01). */
     public void ensurePrepared() {
-        if (ready) return;
-        loadFonts();
-        bakeZeroStationSprites();
-        bakeStation01Sprites();
-        bakePostTextures();
-        monoAtlas = bakeAsciiAtlas(fontMono, 40f);
-        displayAtlas = bakeAsciiAtlas(fontDisplay, 96f);
-        ready = true;
+        ensureStation01Prepared();
     }
 
-    private void loadFonts() {
-        fontDisplay = loadClasspathFont(FONT_BASE + "bebas.ttf", Font.PLAIN, "SansSerif");
-        fontSansCn = loadClasspathFont(FONT_BASE + "noto_sans_sc_bold.ttf", Font.BOLD, "SansSerif");
-        fontMono = loadClasspathFont(FONT_BASE + "DejaVuSansMono-Bold.ttf", Font.BOLD, "Monospaced");
+    /** Package-private headless CPU baking entry point for unit testing & benchmarking. */
+    void prebakeCpuOnlyForTest() {
+        ensureFontsLoaded();
+        bakeZeroStationCpu();
+        bakeStation01Cpu();
+    }
+
+    void ensureFontsLoaded() {
+        if (fontDisplay != null && fontSansCn != null && fontMono != null) return;
+        synchronized (fontLock) {
+            if (fontDisplay == null) {
+                fontDisplay = loadClasspathFont(FONT_BASE + "bebas.ttf", Font.PLAIN, "SansSerif");
+            }
+            if (fontSansCn == null) {
+                fontSansCn = loadClasspathFont(FONT_BASE + "noto_sans_sc_bold.ttf", Font.BOLD, "SansSerif");
+            }
+            if (fontMono == null) {
+                fontMono = loadClasspathFont(FONT_BASE + "DejaVuSansMono-Bold.ttf", Font.BOLD, "Monospaced");
+            }
+        }
     }
 
     private static Font loadClasspathFont(String path, int fallbackStyle, String fallbackName) {
@@ -217,6 +577,146 @@ public final class HabiKineticAtlas {
         return new Font(fallbackName, fallbackStyle, 24);
     }
 
+    // ── GPU Upload Routines (Render Thread Only) ─────────────────────────────
+
+    private int uploadZeroPack(CpuZeroPack p) {
+        int count = 0;
+        for (int i = 0; i < BANDS.length; i++) {
+            zeroBands[i] = uploadCpuSlab(p.zeroBands[i]);
+            count += zeroBands[i].maskTex() != null ? 2 : 1;
+            p.zeroBands[i] = null;
+        }
+        zeroStem = uploadCpuSlab(p.zeroStem); count += 2; p.zeroStem = null;
+        zeroLeaf = uploadCpuSlab(p.zeroLeaf); count += 2; p.zeroLeaf = null;
+        zeroOutlinePaper = uploadOwnedCpu(p.zeroOutlinePaper); count++; p.zeroOutlinePaper = null;
+        zeroOutlineDark = uploadOwnedCpu(p.zeroOutlineDark); count++; p.zeroOutlineDark = null;
+
+        titleGlyphs.clear();
+        for (CpuSlab g : p.titleGlyphs) {
+            Slab uploaded = uploadCpuSlab(g);
+            titleGlyphs.add(uploaded);
+            count += uploaded.maskTex() != null ? 2 : 1;
+        }
+        p.titleGlyphs.clear();
+        this.titleWidth = p.titleWidth;
+        this.titleCapH = p.titleCapH;
+
+        tagLead = uploadCpuSlab(p.tagLead); count += 2; p.tagLead = null;
+        tagCore = uploadCpuSlab(p.tagCore); count += 2; p.tagCore = null;
+        tagPrompt = uploadCpuSlab(p.tagPrompt); count += 2; p.tagPrompt = null;
+        tagAutoBoard = uploadCpuSlab(p.tagAutoBoard); count += 2; p.tagAutoBoard = null;
+        tagSyncBoard = uploadCpuSlab(p.tagSyncBoard); count += 2; p.tagSyncBoard = null;
+        tagDepart = uploadCpuSlab(p.tagDepart); count += 2; p.tagDepart = null;
+
+        loadBadge = uploadCpuSlab(p.loadBadge); count += 2; p.loadBadge = null;
+        cursor = uploadCpuSlab(p.cursor); count += 2; p.cursor = null;
+        zeroCarLead = uploadCpuSlab(p.zeroCarLead); count += 2; p.zeroCarLead = null;
+        zeroCar = uploadCpuSlab(p.zeroCar); count += 2; p.zeroCar = null;
+
+        cardA = uploadCpuSlab(p.cardA); count += 2; p.cardA = null;
+        cardB = uploadCpuSlab(p.cardB); count += 2; p.cardB = null;
+        cardC = uploadCpuSlab(p.cardC); count++; p.cardC = null;
+        cardD = uploadCpuSlab(p.cardD); count++; p.cardD = null;
+
+        noiseTex = uploadOwnedCpu(p.noiseTex); count++; p.noiseTex = null;
+        vigPaperTex = uploadOwnedCpu(p.vigPaperTex); count++; p.vigPaperTex = null;
+        vigDarkTex = uploadOwnedCpu(p.vigDarkTex); count++; p.vigDarkTex = null;
+
+        monoAtlas = uploadCpuAsciiAtlas(p.monoAtlas); count++; p.monoAtlas = null;
+        displayAtlas = uploadCpuAsciiAtlas(p.displayAtlas); count++; p.displayAtlas = null;
+        count += uploadPrebakedTexts(p.prebakedTexts);
+        return count;
+    }
+
+    private int uploadPrebakedTexts(List<CpuPrebakedText> texts) {
+        int count = 0;
+        for (CpuPrebakedText pt : texts) {
+            if (pt == null || pt.image == null) continue;
+            if (!textCache.containsKey(pt.key)) {
+                StaticGlTexture dt = uploadCpuImage(pt.image);
+                textCache.put(pt.key, new TextTex(dt, pt.w, pt.h));
+                count++;
+            }
+            pt.image = null;
+        }
+        texts.clear();
+        return count;
+    }
+
+    private double uploadStation01Steps(double budgetMs, boolean finishAll) {
+        CpuStation01Pack p = uploadingSt01Pack;
+        if (p == null) return 0.0;
+        long startNanos = System.nanoTime();
+        long deadlineNanos = Double.isInfinite(budgetMs)
+                ? Long.MAX_VALUE
+                : startNanos + Math.round(Math.max(0.2, budgetMs) * 1_000_000.0);
+        int texCount = 0;
+        int stepsThisCall = 0;
+        final int totalSteps = BANDS.length + 9;
+
+        while (uploadingSt01Cursor < totalSteps) {
+            if (!finishAll && stepsThisCall > 0 && System.nanoTime() >= deadlineNanos) {
+                break;
+            }
+            int step = uploadingSt01Cursor++;
+            if (step < BANDS.length) {
+                stBands[step] = uploadCpuSlab(p.stBands[step]);
+                texCount += 2;
+                p.stBands[step] = null;
+            } else {
+                switch (step - BANDS.length) {
+                    case 0 -> { stStem = uploadCpuSlab(p.stStem); texCount += 2; p.stStem = null; }
+                    case 1 -> { stLeaf = uploadCpuSlab(p.stLeaf); texCount += 2; p.stLeaf = null; }
+                    case 2 -> { stCarLead = uploadCpuSlab(p.stCarLead); texCount += 2; p.stCarLead = null; }
+                    case 3 -> { stCar = uploadCpuSlab(p.stCar); texCount += 2; p.stCar = null; }
+                    case 4 -> { plateStation = uploadCpuSlab(p.plateStation); texCount += 2; p.plateStation = null; }
+                    case 5 -> { plateRoute = uploadCpuSlab(p.plateRoute); texCount += 2; p.plateRoute = null; }
+                    case 6 -> { stationBgTex = uploadOwnedCpu(p.stationBgTex); texCount++; p.stationBgTex = null; }
+                    case 7 -> { stationAuraTex = uploadOwnedCpu(p.stationAuraTex); texCount++; p.stationAuraTex = null; }
+                    case 8 -> { texCount += uploadPrebakedTexts(p.prebakedTexts); }
+                    default -> {}
+                }
+            }
+            stepsThisCall++;
+        }
+
+        if (uploadingSt01Cursor >= totalSteps) {
+            uploadingSt01Pack = null;
+            station01Ready = true;
+        }
+        double upMs = (System.nanoTime() - startNanos) / 1_000_000.0;
+        if (texCount > 0) {
+            HabiLoadingPerfMonitor.getInstance().recordAtlasUpload("KineticAtlas", "station01", texCount, upMs, 0.0);
+        }
+        return upMs;
+    }
+
+    private Slab uploadCpuSlab(CpuSlab c) {
+        StaticGlTexture faceTex = uploadOwnedCpu(c.face);
+        c.face = null;
+        StaticGlTexture maskTex = c.mask != null ? uploadOwnedCpu(c.mask) : null;
+        c.mask = null;
+        return new Slab(faceTex, maskTex, c.w, c.h, c.ax, c.ay, c.sideRgb, c.yc, c.y0, c.y1, c.adv, c.titleX, c.plate);
+    }
+
+    private AsciiAtlas uploadCpuAsciiAtlas(CpuAsciiAtlas c) {
+        StaticGlTexture dt = uploadOwnedCpu(c.image);
+        c.image = null;
+        AsciiAtlas finished = new AsciiAtlas(dt, c.fontPx, c.ascent, c.descent);
+        System.arraycopy(c.cells, 0, finished.cells, 0, 128);
+        return finished;
+    }
+
+    private StaticGlTexture uploadOwnedCpu(CpuImage cpu) {
+        StaticGlTexture dt = uploadCpuImage(cpu);
+        ownedTextures.add(dt);
+        return dt;
+    }
+
+    static StaticGlTexture uploadCpuImage(CpuImage cpu) {
+        return new StaticGlTexture(cpu);
+    }
+
     // ── Shared Apple Path (exact Bezier control points from scene.js) ────────
 
     private static Path2D.Double createApplePath() {
@@ -232,7 +732,10 @@ public final class HabiKineticAtlas {
         return p;
     }
 
-    private void bakeZeroStationSprites() {
+    // ── Off-Thread CPU Rasterization (Station 00) ────────────────────────────
+
+    private CpuZeroPack bakeZeroStationCpu() {
+        CpuZeroPack out = new CpuZeroPack();
         final Color cInk = new Color(0x16171D);
         final Color cRed = new Color(0xE1243B);
         final Color cRedShade = new Color(0xC41A30);
@@ -243,12 +746,11 @@ public final class HabiKineticAtlas {
         // 1) Sliced apple bands (6 bands)
         Path2D.Double apple = createApplePath();
         for (int i = 0; i < BANDS.length; i++) {
-            final int idx = i;
             final int y0 = BANDS[i][0], y1 = BANDS[i][1];
             final double yc = (y0 + y1) * 0.5;
             final int w = 344, h = (y1 - y0) + 4;
             final boolean isWin = (i == WIN_BAND);
-            zeroBands[i] = bakeSlab(w, h, w * 0.5, h * 0.5, isWin ? 0x050508 : 0x8E1323,
+            out.zeroBands[i] = bakeCpuSlab(w, h, w * 0.5, h * 0.5, isWin ? 0x050508 : 0x8E1323,
                     yc, y0, y1, w, 0, false, true, g -> {
                         g.translate(w * 0.5, -y0 + 2.0);
                         g.clipRect(-w / 2, y0, w, y1 - y0);
@@ -256,14 +758,12 @@ public final class HabiKineticAtlas {
                         g.fill(apple);
                         g.clip(apple);
                         if (!isWin) {
-                            // Flat right crescent shade
                             g.setColor(cRedShade);
                             var prev = g.getTransform();
                             g.translate(176, 26);
                             g.rotate(-0.18);
                             g.fill(new Ellipse2D.Double(-112, -230, 224, 460));
                             g.setTransform(prev);
-                            // Two paper-white highlights
                             g.setColor(cWhiteHi);
                             g.translate(-96, -96);
                             g.rotate(-0.72);
@@ -271,7 +771,6 @@ public final class HabiKineticAtlas {
                             g.setTransform(prev);
                             g.fill(new Ellipse2D.Double(-56 - 6.5, -125 - 6.5, 13.0, 13.0));
                         } else {
-                            // Carriage window strip
                             g.setColor(cPaperTxt);
                             int[] xs = {-112, -40, 32, 104};
                             for (int wx : xs) {
@@ -284,11 +783,11 @@ public final class HabiKineticAtlas {
         }
 
         // 2) Stem & Leaf
-        zeroStem = bakeSlab(18, 66, 9, 33, 0x000000, 0, 0, 0, 18, 0, false, true, g -> {
+        out.zeroStem = bakeCpuSlab(18, 66, 9, 33, 0x000000, 0, 0, 0, 18, 0, false, true, g -> {
             g.setColor(cInk);
             g.fill(new RoundRectangle2D.Double(2, 0, 14, 66, 14, 14));
         });
-        zeroLeaf = bakeSlab(120, 64, 4, 54, 0x000000, 0, 0, 0, 120, 0, false, true, g -> {
+        out.zeroLeaf = bakeCpuSlab(120, 64, 4, 54, 0x000000, 0, 0, 0, 120, 0, false, true, g -> {
             g.translate(4, 54);
             Path2D.Double lf = new Path2D.Double();
             lf.moveTo(0, 0);
@@ -306,11 +805,10 @@ public final class HabiKineticAtlas {
         });
 
         // 3) Dashed blueprint apple outline
-        zeroOutlinePaper = bakeTexture(360, 360, BAKE_SCALE, g -> drawBlueprintOutline(g, cInk));
-        zeroOutlineDark = bakeTexture(360, 360, BAKE_SCALE, g -> drawBlueprintOutline(g, new Color(0xECE9E2)));
+        out.zeroOutlinePaper = bakeCpuTexture(360, 360, BAKE_SCALE, g -> drawBlueprintOutline(g, cInk));
+        out.zeroOutlineDark = bakeCpuTexture(360, 360, BAKE_SCALE, g -> drawBlueprintOutline(g, new Color(0xECE9E2)));
 
         // 4) Extruded Title Glyphs: H A B I [T] R A I N
-        titleGlyphs.clear();
         String codeName = "HABITRAIN";
         int plateIndex = 4;
         Font titleFont = fontDisplay.deriveFont(Font.PLAIN, 214f);
@@ -320,16 +818,16 @@ public final class HabiKineticAtlas {
         pg.setFont(titleFont);
         FontMetrics fm = pg.getFontMetrics();
         double capH = Math.ceil(fm.getAscent() * 0.80);
-        this.titleCapH = capH;
+        out.titleCapH = capH;
 
-        List<Slab> rawGlyphs = new ArrayList<>();
+        List<CpuSlab> rawGlyphs = new ArrayList<>();
         for (int i = 0; i < codeName.length(); i++) {
             final String ch = codeName.substring(i, i + 1);
             final double adv = fm.stringWidth(ch);
             if (i == plateIndex) {
                 final int pw = (int) Math.ceil(adv + 46);
                 final int ph = (int) Math.ceil(capH + 44);
-                rawGlyphs.add(bakeSlab(pw, ph, pw * 0.5, ph - 22.0, 0x16171D,
+                rawGlyphs.add(bakeCpuSlab(pw, ph, pw * 0.5, ph - 22.0, 0x16171D,
                         0, 0, 0, pw, 0, true, true, g -> {
                             Path2D.Double poly = new Path2D.Double();
                             poly.moveTo(16, 0); poly.lineTo(pw, 0); poly.lineTo(pw, ph);
@@ -343,7 +841,7 @@ public final class HabiKineticAtlas {
             } else {
                 final int gw = (int) Math.ceil(adv + 10);
                 final int gh = (int) Math.ceil(capH + 14);
-                rawGlyphs.add(bakeSlab(gw, gh, gw * 0.5, gh - 5.0, 0xE1243B,
+                rawGlyphs.add(bakeCpuSlab(gw, gh, gw * 0.5, gh - 5.0, 0xE1243B,
                         0, 0, 0, adv, 0, false, true, g -> {
                             g.setFont(titleFont);
                             g.setColor(cInk);
@@ -355,27 +853,27 @@ public final class HabiKineticAtlas {
 
         double gap = 12.0;
         double total = 0.0;
-        for (Slab s : rawGlyphs) total += s.adv();
+        for (CpuSlab s : rawGlyphs) total += s.adv;
         total += gap * (rawGlyphs.size() - 1);
         double curX = -total * 0.5;
-        for (Slab s : rawGlyphs) {
-            titleGlyphs.add(new Slab(
-                    s.faceTex(), s.maskTex(), s.w(), s.h(), s.ax(), s.ay(),
-                    s.sideRgb(), s.yc(), s.y0(), s.y1(), s.adv(), curX + s.adv() * 0.5, s.plate()
+        for (CpuSlab s : rawGlyphs) {
+            out.titleGlyphs.add(new CpuSlab(
+                    s.face, s.mask, s.w, s.h, s.ax, s.ay,
+                    s.sideRgb, s.yc, s.y0, s.y1, s.adv, curX + s.adv * 0.5, s.plate
             ));
-            curX += s.adv() + gap;
+            curX += s.adv + gap;
         }
-        this.titleWidth = total;
+        out.titleWidth = total;
 
         // 5) Chinese chamfered tags
-        tagLead = bakeTag("直到列车变成", fontSansCn.deriveFont(Font.BOLD, 40f), 7f, 26, 66, cInk, cPaperTxt, 0xE1243B, "bl");
-        tagCore = bakeTag("一颗苹果", fontSansCn.deriveFont(Font.BOLD, 40f), 7f, 26, 66, cRed, cPaperTxt, 0x16171D, "tr");
-        tagPrompt = bakeTag("按任意键登车", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cInk, cPaperTxt, 0xE1243B, "bl");
-        tagAutoBoard = bakeTag("自动进站中", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cRed, cPaperTxt, 0x16171D, "bl");
-        tagSyncBoard = bakeTag("节拍校准中", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cRed, cPaperTxt, 0x16171D, "bl");
-        tagDepart = bakeTag("列车出发", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cRed, cPaperTxt, 0x16171D, "bl");
+        out.tagLead = bakeCpuTag("直到列车变成", fontSansCn.deriveFont(Font.BOLD, 40f), 7f, 26, 66, cInk, cPaperTxt, 0xE1243B, "bl");
+        out.tagCore = bakeCpuTag("一颗苹果", fontSansCn.deriveFont(Font.BOLD, 40f), 7f, 26, 66, cRed, cPaperTxt, 0x16171D, "tr");
+        out.tagPrompt = bakeCpuTag("按任意键登车", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cInk, cPaperTxt, 0xE1243B, "bl");
+        out.tagAutoBoard = bakeCpuTag("自动进站中", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cRed, cPaperTxt, 0x16171D, "bl");
+        out.tagSyncBoard = bakeCpuTag("节拍校准中", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cRed, cPaperTxt, 0x16171D, "bl");
+        out.tagDepart = bakeCpuTag("列车出发", fontSansCn.deriveFont(Font.BOLD, 26f), 10f, 22, 50, cRed, cPaperTxt, 0x16171D, "bl");
 
-        loadBadge = bakeSlab(210, 50, 105, 25, 0xE1243B, 0, 0, 0, 210, 0, false, true, g -> {
+        out.loadBadge = bakeCpuSlab(210, 50, 105, 25, 0xE1243B, 0, 0, 0, 210, 0, false, true, g -> {
             Path2D.Double p = new Path2D.Double();
             p.moveTo(0, 0); p.lineTo(210, 0); p.lineTo(210, 50); p.lineTo(14, 50); p.lineTo(0, 36); p.closePath();
             g.setColor(cInk);
@@ -383,21 +881,21 @@ public final class HabiKineticAtlas {
             g.setColor(cRed);
             g.fillRect(0, 0, 6, 36);
         });
-        cursor = bakeSlab(16, 30, 8, 15, 0x8E1323, 0, 0, 0, 16, 0, false, true, g -> {
+        out.cursor = bakeCpuSlab(16, 30, 8, 15, 0x8E1323, 0, 0, 0, 16, 0, false, true, g -> {
             g.setColor(cRed);
             g.fillRect(0, 0, 16, 30);
         });
 
         // 6) 3-car red HABITRAIN locomotive & carriages
-        zeroCarLead = bakeTrainCar(58, 22, true, cRed, cInk, cPaperTxt, 0x8E1323);
-        zeroCar = bakeTrainCar(58, 22, false, cRed, cInk, cPaperTxt, 0x8E1323);
+        out.zeroCarLead = bakeCpuTrainCar(58, 22, true, cRed, cInk, cPaperTxt, 0x8E1323);
+        out.zeroCar = bakeCpuTrainCar(58, 22, false, cRed, cInk, cPaperTxt, 0x8E1323);
 
         // 7) 4 Floating parallax cards
         Font fDisp58 = fontDisplay.deriveFont(Font.PLAIN, 58f);
         Font fDisp62 = fontDisplay.deriveFont(Font.PLAIN, 62f);
         Font fMono10 = fontMono.deriveFont(Font.BOLD, 10f);
 
-        cardA = bakeSlab(224, 140, 112, 70, 0x16171D, 0, 0, 0, 224, 0, false, true, g -> {
+        out.cardA = bakeCpuSlab(224, 140, 112, 70, 0x16171D, 0, 0, 0, 224, 0, false, true, g -> {
             g.setColor(new Color(0xF6F4EF));
             g.fillRect(0, 0, 224, 140);
             g.setColor(cInk);
@@ -421,7 +919,7 @@ public final class HabiKineticAtlas {
             drawSpaced(g, "FIG.A", 14, 16, 2f);
         });
 
-        cardB = bakeSlab(152, 200, 76, 100, 0x8E1323, 0, 0, 0, 152, 0, false, true, g -> {
+        out.cardB = bakeCpuSlab(152, 200, 76, 100, 0x8E1323, 0, 0, 0, 152, 0, false, true, g -> {
             g.setColor(cRed);
             g.fillRect(0, 0, 152, 200);
             Shape oldClip = g.getClip();
@@ -438,7 +936,7 @@ public final class HabiKineticAtlas {
             drawSpaced(g, "CARGO // 02", 14, 88, 2f);
         });
 
-        cardC = bakeSlab(128, 128, 64, 64, 0x16171D, 0, 0, 0, 128, 0, false, false, g -> {
+        out.cardC = bakeCpuSlab(128, 128, 64, 64, 0x16171D, 0, 0, 0, 128, 0, false, false, g -> {
             g.setColor(cInk);
             g.setStroke(new BasicStroke(2f));
             g.drawRect(2, 2, 124, 124);
@@ -448,7 +946,7 @@ public final class HabiKineticAtlas {
             g.fillRect(100, 100, 8, 8);
         });
 
-        cardD = bakeSlab(184, 50, 92, 25, 0x16171D, 0, 0, 0, 184, 0, false, false, g -> {
+        out.cardD = bakeCpuSlab(184, 50, 92, 25, 0x16171D, 0, 0, 0, 184, 0, false, false, g -> {
             int seed = 1435;
             int x = 0;
             g.setColor(cInk);
@@ -463,9 +961,51 @@ public final class HabiKineticAtlas {
             g.setFont(fMono10);
             drawSpaced(g, "HT-00 // 2026", 0, 46, 2f);
         });
+
+        // 8) Film grain + Station 00 radial vignettes
+        int[] nPixels = new int[256 * 256];
+        int seed = 77;
+        for (int i = 0; i < nPixels.length; i++) {
+            seed = nextMulberry(seed);
+            int v = (int) (toUnit(seed) * 255.0);
+            nPixels[i] = IS_LITTLE_ENDIAN
+                    ? ((0xFF << 24) | (v << 16) | (v << 8) | v)
+                    : ((v << 24) | (v << 16) | (v << 8) | 0xFF);
+        }
+        out.noiseTex = new CpuImage(256, 256, nPixels, true);
+
+        out.vigPaperTex = bakeCpuTexture(512, 288, 1f, g -> {
+            RadialGradientPaint p = new RadialGradientPaint(
+                    256f, 144f, 315f,
+                    new float[]{0.0f, 0.34f, 1.0f},
+                    new Color[]{new Color(70, 55, 40, 0), new Color(70, 55, 40, 0), new Color(70, 55, 40, 42)}
+            );
+            g.setPaint(p);
+            g.fillRect(0, 0, 512, 288);
+        });
+        out.vigDarkTex = bakeCpuTexture(512, 288, 1f, g -> {
+            RadialGradientPaint p = new RadialGradientPaint(
+                    256f, 144f, 315f,
+                    new float[]{0.0f, 0.34f, 1.0f},
+                    new Color[]{new Color(0, 0, 0, 0), new Color(0, 0, 0, 0), new Color(0, 0, 0, 118)}
+            );
+            g.setPaint(p);
+            g.fillRect(0, 0, 512, 288);
+        });
+
+        // 9) Zero-allocation ASCII glyph atlases
+        out.monoAtlas = bakeCpuAsciiAtlas(fontMono, 40f);
+        out.displayAtlas = bakeCpuAsciiAtlas(fontDisplay, 96f);
+
+        // 10) Pre-bake static Chinese HUD labels off-thread so Boot frame 0 has 0 dynamic text misses
+        prebakeZeroTexts(out.prebakedTexts);
+        return out;
     }
 
-    private void bakeStation01Sprites() {
+    // ── Off-Thread CPU Rasterization (Station 01) ────────────────────────────
+
+    private CpuStation01Pack bakeStation01Cpu() {
+        CpuStation01Pack out = new CpuStation01Pack();
         final Color cPaper = new Color(0xECE9E2);
         final Color cPaperTxt = new Color(0xF4F1EA);
         final Color cInk = new Color(0x16171D);
@@ -480,7 +1020,7 @@ public final class HabiKineticAtlas {
             final double yc = (y0 + y1) * 0.5;
             final int w = 344, h = (y1 - y0) + 4;
             final boolean isWin = (i == 1);
-            stBands[i] = bakeSlab(w, h, w * 0.5, h * 0.5, isWin ? 0x7E101E : 0x33394D,
+            out.stBands[i] = bakeCpuSlab(w, h, w * 0.5, h * 0.5, isWin ? 0x7E101E : 0x33394D,
                     yc, y0, y1, w, 0, false, true, g -> {
                         g.translate(w * 0.5, -y0 + 2.0);
                         g.clipRect(-w / 2, y0, w, y1 - y0);
@@ -526,11 +1066,11 @@ public final class HabiKineticAtlas {
                     });
         }
 
-        stStem = bakeSlab(18, 66, 9, 33, 0x252936, 0, 0, 0, 18, 0, false, true, g -> {
+        out.stStem = bakeCpuSlab(18, 66, 9, 33, 0x252936, 0, 0, 0, 18, 0, false, true, g -> {
             g.setColor(cPaper);
             g.fill(new RoundRectangle2D.Double(2, 0, 14, 66, 14, 14));
         });
-        stLeaf = bakeSlab(120, 64, 4, 54, 0x7E101E, 0, 0, 0, 120, 0, false, true, g -> {
+        out.stLeaf = bakeCpuSlab(120, 64, 4, 54, 0x7E101E, 0, 0, 0, 120, 0, false, true, g -> {
             g.translate(4, 54);
             Path2D.Double lf = new Path2D.Double();
             lf.moveTo(0, 0);
@@ -547,17 +1087,16 @@ public final class HabiKineticAtlas {
             g.draw(vein);
         });
 
-        stCarLead = bakeTrainCar(60, 23, true, cRedBright, cInk, new Color(0xFFF7E8), 0x7E101E);
-        stCar = bakeTrainCar(60, 23, false, cRedBright, cInk, new Color(0xFFF7E8), 0x7E101E);
+        out.stCarLead = bakeCpuTrainCar(60, 23, true, cRedBright, cInk, new Color(0xFFF7E8), 0x7E101E);
+        out.stCar = bakeCpuTrainCar(60, 23, false, cRedBright, cInk, new Color(0xFFF7E8), 0x7E101E);
 
-        // Floating station plates (exact original copy: STN.01 习惯中枢 & 苹果园环线)
         Font fMono10 = fontMono.deriveFont(Font.BOLD, 10f);
         Font fDisp54 = fontDisplay.deriveFont(Font.PLAIN, 54f);
         Font fDisp40 = fontDisplay.deriveFont(Font.PLAIN, 40f);
         Font fCn14 = fontSansCn.deriveFont(Font.BOLD, 14f);
         Font fCn20 = fontSansCn.deriveFont(Font.BOLD, 20f);
 
-        plateStation = bakeSlab(236, 126, 118, 63, 0x7E101E, 0, 0, 0, 236, 0, false, true, g -> {
+        out.plateStation = bakeCpuSlab(236, 126, 118, 63, 0x7E101E, 0, 0, 0, 236, 0, false, true, g -> {
             Path2D.Double poly = new Path2D.Double();
             poly.moveTo(0, 0); poly.lineTo(236, 0); poly.lineTo(236, 110);
             poly.lineTo(220, 126); poly.lineTo(0, 126); poly.closePath();
@@ -580,7 +1119,7 @@ public final class HabiKineticAtlas {
             g.drawString("01", 170, 90);
         });
 
-        plateRoute = bakeSlab(210, 112, 105, 56, 0x06070B, 0, 0, 0, 210, 0, false, true, g -> {
+        out.plateRoute = bakeCpuSlab(210, 112, 105, 56, 0x06070B, 0, 0, 0, 210, 0, false, true, g -> {
             g.setColor(new Color(0x161924));
             g.fillRect(0, 0, 210, 112);
             g.setColor(new Color(236, 233, 226, 166));
@@ -597,42 +1136,8 @@ public final class HabiKineticAtlas {
             g.setFont(fMono10);
             drawSpaced(g, "NEXT: ORCHARD // 100 BPM", 14, 92, 1.5f);
         });
-    }
 
-    private void bakePostTextures() {
-        // 256x256 tileable film grain (GL_REPEAT configured once at upload)
-        BufferedImage nImg = new BufferedImage(256, 256, BufferedImage.TYPE_INT_ARGB);
-        int[] nPixels = ((DataBufferInt) nImg.getRaster().getDataBuffer()).getData();
-        int seed = 77;
-        for (int i = 0; i < nPixels.length; i++) {
-            seed = nextMulberry(seed);
-            int v = (int) (toUnit(seed) * 255.0);
-            nPixels[i] = (0xFF << 24) | (v << 16) | (v << 8) | v;
-        }
-        noiseTex = uploadImage(nImg, true);
-
-        // Radial vignettes
-        vigPaperTex = bakeTexture(512, 288, 1f, g -> {
-            RadialGradientPaint p = new RadialGradientPaint(
-                    256f, 144f, 315f,
-                    new float[]{0.0f, 0.34f, 1.0f},
-                    new Color[]{new Color(70, 55, 40, 0), new Color(70, 55, 40, 0), new Color(70, 55, 40, 42)}
-            );
-            g.setPaint(p);
-            g.fillRect(0, 0, 512, 288);
-        });
-        vigDarkTex = bakeTexture(512, 288, 1f, g -> {
-            RadialGradientPaint p = new RadialGradientPaint(
-                    256f, 144f, 315f,
-                    new float[]{0.0f, 0.34f, 1.0f},
-                    new Color[]{new Color(0, 0, 0, 0), new Color(0, 0, 0, 0), new Color(0, 0, 0, 118)}
-            );
-            g.setPaint(p);
-            g.fillRect(0, 0, 512, 288);
-        });
-
-        // Station 01 ambient radial deep-space gradient
-        stationBgTex = bakeTexture(512, 288, 1f, g -> {
+        out.stationBgTex = bakeCpuTexture(512, 288, 1f, g -> {
             RadialGradientPaint p = new RadialGradientPaint(
                     256f + 85f, 144f - 10f, 340f,
                     new float[]{0.0f, 0.45f, 1.0f},
@@ -641,6 +1146,124 @@ public final class HabiKineticAtlas {
             g.setPaint(p);
             g.fillRect(0, 0, 512, 288);
         });
+
+        out.stationAuraTex = bakeCpuTexture(128, 128, 1f, g -> {
+            RadialGradientPaint p = new RadialGradientPaint(
+                    64f, 64f, 62f,
+                    new float[]{0.0f, 0.45f, 1.0f},
+                    new Color[]{new Color(225, 36, 59, 180), new Color(214, 178, 110, 72), new Color(0, 0, 0, 0)}
+            );
+            g.setPaint(p);
+            g.fillRect(0, 0, 128, 128);
+        });
+
+        // Pre-bake static Chinese World-Entry HUD/Act labels off-thread
+        prebakeWorldEntryTexts(out.prebakedTexts);
+        return out;
+    }
+
+    private void prebakeZeroTexts(List<CpuPrebakedText> dst) {
+        BufferedImage probe = new BufferedImage(8, 8, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D pg = probe.createGraphics();
+        setupHints(pg);
+        try {
+            addPrebakedText(dst, pg, FontFace.SANS_CN, "装载中", 20, 4f, 0);
+            addPrebakedText(dst, pg, FontFace.SANS_CN, HabiZeroStationRenderer.BRAND_CN, 14, 2f, 0);
+            addPrebakedText(dst, pg, FontFace.SANS_CN, "欢迎登车", 46, 16f, 0);
+            for (String ch : new String[]{"苹", "果", "列", "车", "第", "零", "站"}) {
+                addPrebakedText(dst, pg, FontFace.SANS_CN, ch, 18, 0f, 0);
+            }
+            for (HabiRealProgressTracker.StageDef stg : HabiRealProgressTracker.BOOT_STAGES) {
+                addPrebakedText(dst, pg, FontFace.SANS_CN, "//  " + stg.zh(), 11, 1.5f, 0);
+            }
+            for (HabiRealProgressTracker.TipItem tip : HabiRealProgressTracker.DEFAULT_TIPS) {
+                addPrebakedText(dst, pg, FontFace.SANS_CN, tip.code() + "  //  " + tip.zh(), 12, 2f, 0);
+            }
+        } finally {
+            pg.dispose();
+        }
+    }
+
+    private void prebakeWorldEntryTexts(List<CpuPrebakedText> dst) {
+        BufferedImage probe = new BufferedImage(8, 8, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D pg = probe.createGraphics();
+        setupHints(pg);
+        try {
+            addPrebakedText(dst, pg, FontFace.SANS_CN, "检票通过 · 即将抵达", 30, 14.0f, 0);
+            addPrebakedText(dst, pg, FontFace.SANS_CN, "世界维度同步就绪", 13, 3.5f, 0);
+            for (HabiWorldEntrySession.StageDef stg : HabiWorldEntrySession.WORLD_STAGES) {
+                addPrebakedText(dst, pg, FontFace.SANS_CN, stg.zh(), 13, 3.5f, 0);
+            }
+            for (String phaseCap : new String[]{
+                    "苹果沿切缝自上而下分离",
+                    "车窗带展开   ·   装配一号车厢",
+                    "车门开启   ·   请上车",
+                    "列车发车   ·   驶入星夜轨网"
+            }) {
+                addPrebakedText(dst, pg, FontFace.SANS_CN, phaseCap, 12, 4.5f, 0);
+            }
+            for (String tip : new String[]{
+                    "一号车厢已检票发车，正沿星夜轨网穿越维度隧道。",
+                    "深空中自由浮掠的齿孔邮票记录着列车各站台的乘车凭证与职能印记。",
+                    "正在同步出生点区块与世界光照，即将按 100 BPM 拍点丝滑着陆。",
+                    "已检票的登车凭证将随苹果视窗光幕展开，无缝驶入真实世界。"
+            }) {
+                addPrebakedText(dst, pg, FontFace.SANS_CN, tip, 11, 2.6f, 0);
+            }
+            for (String ch : new String[]{"星", "夜", "轨", "网", "开", "门", "登", "驶", "入"}) {
+                addPrebakedText(dst, pg, FontFace.SANS_CN, ch, 18, 0f, 0);
+            }
+        } finally {
+            pg.dispose();
+        }
+    }
+
+    private void addPrebakedText(List<CpuPrebakedText> dst, Graphics2D probeG,
+                                 FontFace face, String text, int sizePx, float letterSpacing, int maxWrapW) {
+        if (text == null || text.isEmpty()) return;
+        Font base = switch (face) {
+            case DISPLAY -> fontDisplay;
+            case SANS_CN -> fontSansCn;
+            case MONO -> fontMono;
+        };
+        Font f = base.deriveFont(face == FontFace.DISPLAY ? Font.PLAIN : Font.BOLD, (float) sizePx);
+        FontMetrics fm = probeG.getFontMetrics(f);
+        CpuPrebakedText entry = bakeCpuText(makeTextCacheKey(face, text, sizePx, letterSpacing, maxWrapW),
+                f, fm, text, sizePx, letterSpacing, maxWrapW);
+        dst.add(entry);
+    }
+
+    private static CpuPrebakedText bakeCpuText(String key, Font f, FontMetrics fm,
+                                               String text, int sizePx, float letterSpacing, int maxWrapW) {
+        List<String> lines = maxWrapW > 0 ? wrapText(fm, text, letterSpacing, maxWrapW) : List.of(text);
+        double maxW = 1.0;
+        for (String line : lines) {
+            maxW = Math.max(maxW, measureSpaced(fm, line, letterSpacing));
+        }
+        int lineH = Math.max(sizePx + 4, (int) Math.ceil((fm.getAscent() + fm.getDescent()) * 1.28));
+        int logW = Math.max(2, (int) Math.ceil(maxW + 8));
+        int logH = Math.max(2, lines.size() == 1 ? (fm.getAscent() + fm.getDescent() + 8) : (lines.size() * lineH + 6));
+        int ascent = fm.getAscent();
+
+        float scale = 2.0f;
+        int pw = Math.max(2, Math.round(logW * scale));
+        int ph = Math.max(2, Math.round(logH * scale));
+        BufferedImage img = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = img.createGraphics();
+        setupHints(g);
+        g.scale(scale, scale);
+        g.setFont(f);
+        g.setColor(Color.WHITE);
+        for (int i = 0; i < lines.size(); i++) {
+            float by = (lines.size() == 1) ? (ascent + 4f) : (ascent + 3f + i * lineH);
+            drawSpaced(g, lines.get(i), 4f, by, letterSpacing);
+        }
+        g.dispose();
+        return new CpuPrebakedText(key, CpuImage.fromBufferedImage(img, false), logW, logH);
+    }
+
+    private static String makeTextCacheKey(FontFace face, String text, int sizePx, float letterSpacing, int maxWrapW) {
+        return face.ordinal() + "|" + sizePx + "|" + Math.round(letterSpacing * 10f) + "|" + maxWrapW + "|" + text;
     }
 
     private void drawBlueprintOutline(Graphics2D g, Color color) {
@@ -650,8 +1273,8 @@ public final class HabiKineticAtlas {
         g.draw(createApplePath());
     }
 
-    private Slab bakeTrainCar(int w, int h, boolean lead, Color body, Color roof, Color win, int sideRgb) {
-        return bakeSlab(w, h, w * 0.5, h * 0.5, sideRgb, 0, 0, 0, w, 0, false, true, g -> {
+    private CpuSlab bakeCpuTrainCar(int w, int h, boolean lead, Color body, Color roof, Color win, int sideRgb) {
+        return bakeCpuSlab(w, h, w * 0.5, h * 0.5, sideRgb, 0, 0, 0, w, 0, false, true, g -> {
             g.setColor(body);
             g.fill(new RoundRectangle2D.Double(0, 0, w, h, 12, 12));
             g.setColor(roof);
@@ -671,8 +1294,8 @@ public final class HabiKineticAtlas {
         });
     }
 
-    private Slab bakeTag(String text, Font font, float ls, int padX, int h,
-                         Color bg, Color fg, int sideRgb, String cut) {
+    private CpuSlab bakeCpuTag(String text, Font font, float ls, int padX, int h,
+                               Color bg, Color fg, int sideRgb, String cut) {
         BufferedImage probe = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
         Graphics2D pg = probe.createGraphics();
         setupHints(pg);
@@ -681,7 +1304,7 @@ public final class HabiKineticAtlas {
         pg.dispose();
 
         final int w = (int) Math.ceil(tw + padX * 2);
-        return bakeSlab(w, h, w * 0.5, h * 0.5, sideRgb, 0, 0, 0, w, 0, false, true, g -> {
+        return bakeCpuSlab(w, h, w * 0.5, h * 0.5, sideRgb, 0, 0, 0, w, 0, false, true, g -> {
             Path2D.Double poly = new Path2D.Double();
             if ("bl".equals(cut)) {
                 poly.moveTo(0, 0); poly.lineTo(w, 0); poly.lineTo(w, h); poly.lineTo(14, h); poly.lineTo(0, h - 14);
@@ -701,9 +1324,9 @@ public final class HabiKineticAtlas {
         });
     }
 
-    private Slab bakeSlab(int w, int h, double ax, double ay, int sideRgb,
-                          double yc, double y0, double y1, double adv, double titleX,
-                          boolean plate, boolean makeMask, Consumer<Graphics2D> painter) {
+    private CpuSlab bakeCpuSlab(int w, int h, double ax, double ay, int sideRgb,
+                                double yc, double y0, double y1, double adv, double titleX,
+                                boolean plate, boolean makeMask, Consumer<Graphics2D> painter) {
         int pw = Math.max(1, Math.round(w * BAKE_SCALE));
         int ph = Math.max(1, Math.round(h * BAKE_SCALE));
         BufferedImage faceImg = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_ARGB);
@@ -713,21 +1336,12 @@ public final class HabiKineticAtlas {
         painter.accept(g);
         g.dispose();
 
-        StaticGlTexture faceTex = uploadImage(faceImg, false);
-        StaticGlTexture maskTex = null;
-        if (makeMask) {
-            BufferedImage maskImg = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_ARGB);
-            int[] src = ((DataBufferInt) faceImg.getRaster().getDataBuffer()).getData();
-            int[] dst = ((DataBufferInt) maskImg.getRaster().getDataBuffer()).getData();
-            for (int i = 0; i < src.length; i++) {
-                dst[i] = (src[i] & 0xFF000000) | 0x00FFFFFF;
-            }
-            maskTex = uploadImage(maskImg, false);
-        }
-        return new Slab(faceTex, maskTex, w, h, ax, ay, sideRgb, yc, y0, y1, adv, titleX, plate);
+        CpuImage faceCpu = CpuImage.fromBufferedImage(faceImg, false);
+        CpuImage maskCpu = makeMask ? CpuImage.silhouetteFrom(faceCpu, 0xFFFFFF) : null;
+        return new CpuSlab(faceCpu, maskCpu, w, h, ax, ay, sideRgb, yc, y0, y1, adv, titleX, plate);
     }
 
-    private StaticGlTexture bakeTexture(int w, int h, float scale, Consumer<Graphics2D> painter) {
+    private CpuImage bakeCpuTexture(int w, int h, float scale, Consumer<Graphics2D> painter) {
         int pw = Math.max(1, Math.round(w * scale));
         int ph = Math.max(1, Math.round(h * scale));
         BufferedImage img = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_ARGB);
@@ -736,12 +1350,12 @@ public final class HabiKineticAtlas {
         g.scale(scale, scale);
         painter.accept(g);
         g.dispose();
-        return uploadImage(img, false);
+        return CpuImage.fromBufferedImage(img, false);
     }
 
     // ── Zero-Allocation ASCII Glyph Atlas Rendering ──────────────────────────
 
-    private AsciiAtlas bakeAsciiAtlas(Font baseFont, float fontPx) {
+    private CpuAsciiAtlas bakeCpuAsciiAtlas(Font baseFont, float fontPx) {
         Font derived = baseFont.deriveFont(baseFont == fontDisplay ? Font.PLAIN : Font.BOLD, fontPx);
         BufferedImage probe = new BufferedImage(8, 8, BufferedImage.TYPE_INT_ARGB);
         Graphics2D pg = probe.createGraphics();
@@ -782,7 +1396,7 @@ public final class HabiKineticAtlas {
         g.setFont(derived);
         g.setColor(Color.WHITE);
 
-        AsciiAtlas atlas = new AsciiAtlas(null, fontPx, asc, desc);
+        GlyphCell[] cells = new GlyphCell[128];
         float gh = asc + desc + 8f;
         for (int ch = 32; ch <= 126; ch++) {
             int cx = gx[ch];
@@ -790,7 +1404,7 @@ public final class HabiKineticAtlas {
             float adv = advs[ch];
             float gw = Math.max(adv + padX * 2f, 8f);
             g.drawString(String.valueOf((char) ch), cx + padX, cy + asc + 4f);
-            atlas.cells[ch] = new GlyphCell(
+            cells[ch] = new GlyphCell(
                     cx / (float) texW,
                     cy / (float) texH,
                     (cx + gw) / (float) texW,
@@ -799,16 +1413,80 @@ public final class HabiKineticAtlas {
             );
         }
         g.dispose();
-        StaticGlTexture dt = uploadImage(img, false);
-        AsciiAtlas finished = new AsciiAtlas(dt, fontPx, asc, desc);
-        System.arraycopy(atlas.cells, 0, finished.cells, 0, 128);
-        return finished;
+        return new CpuAsciiAtlas(CpuImage.fromBufferedImage(img, false), fontPx, asc, desc, cells);
+    }
+
+    /** Truncates an ASCII string cleanly with "..." using the pre-baked glyph atlas (zero GPU uploads). */
+    public String truncateAscii(FontFace face, String text, double sizePx, double letterSpacing, double maxWidth) {
+        if (text == null || text.isEmpty() || maxWidth <= 0.0) return "";
+        if (measureAscii(face, text, sizePx, letterSpacing) <= maxWidth) return text;
+        String ellipsis = "...";
+        double ellW = measureAscii(face, ellipsis, sizePx, letterSpacing);
+        if (ellW >= maxWidth) return ellipsis;
+        int end = text.length();
+        while (end > 0 && measureAscii(face, text.substring(0, end), sizePx, letterSpacing) + ellW > maxWidth) {
+            end--;
+        }
+        return end <= 0 ? ellipsis : text.substring(0, end).stripTrailing() + ellipsis;
+    }
+
+    /** Truncates any CJK/mixed string cleanly with "..." using cached Java2D FontMetrics (zero GPU uploads). */
+    public String truncateText(FontFace face, String text, int sizePx, float letterSpacing, double maxWidth) {
+        if (text == null || text.isEmpty() || maxWidth <= 0.0) return "";
+        FontMetrics fm = getCachedFontMetrics(face, sizePx);
+        if (fm == null) return text;
+        if (measureSpaced(fm, text, letterSpacing) <= maxWidth) return text;
+        String ellipsis = "...";
+        double ellW = measureSpaced(fm, ellipsis, letterSpacing);
+        if (ellW >= maxWidth) return ellipsis;
+        double acc = 0.0;
+        int cut = 0;
+        for (int i = 0; i < text.length(); i++) {
+            double cw = fm.charWidth(text.charAt(i)) + (i > 0 ? letterSpacing : 0.0);
+            if (acc + cw + ellW > maxWidth) break;
+            acc += cw;
+            cut = i + 1;
+        }
+        return cut <= 0 ? ellipsis : text.substring(0, cut).stripTrailing() + ellipsis;
+    }
+
+    private FontMetrics getCachedFontMetrics(FontFace face, int sizePx) {
+        long key = (((long) face.ordinal()) << 32) | (sizePx & 0xFFFFFFFFL);
+        FontMetrics cached = metricsCache.get(key);
+        if (cached != null) return cached;
+        ensureFontsLoaded();
+        Font base = switch (face) {
+            case DISPLAY -> fontDisplay;
+            case SANS_CN -> fontSansCn;
+            case MONO -> fontMono;
+        };
+        if (base == null) return null;
+        Font f = base.deriveFont(face == FontFace.DISPLAY ? Font.PLAIN : Font.BOLD, (float) sizePx);
+        BufferedImage probe = new BufferedImage(4, 4, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D pg = probe.createGraphics();
+        setupHints(pg);
+        pg.setFont(f);
+        FontMetrics fm = pg.getFontMetrics();
+        pg.dispose();
+        metricsCache.put(key, fm);
+        return fm;
+    }
+
+    private static double measureSpaced(FontMetrics fm, String text, float ls) {
+        if (Math.abs(ls) < 0.01f) return fm.stringWidth(text);
+        double w = 0.0;
+        for (int i = 0; i < text.length(); i++) {
+            w += fm.charWidth(text.charAt(i));
+            if (i + 1 < text.length()) w += ls;
+        }
+        return w;
     }
 
     /** Measures ASCII string width in virtual pixels using the pre-baked glyph atlas. */
     public double measureAscii(FontFace face, String text, double sizePx, double letterSpacing) {
         if (text == null || text.isEmpty()) return 0.0;
         AsciiAtlas atlas = (face == FontFace.DISPLAY) ? displayAtlas : monoAtlas;
+        if (atlas == null) return 0.0;
         double scale = sizePx / atlas.fontPx;
         double total = 0.0;
         for (int i = 0; i < text.length(); i++) {
@@ -824,7 +1502,8 @@ public final class HabiKineticAtlas {
     }
 
     /**
-     * Draws an ASCII string directly from the pre-baked atlas (0 allocations, 1 GPU draw call).
+     * Draws an ASCII string directly from the pre-baked atlas (0 allocations, coalesced into
+     * {@link HabiKineticGfx}'s active textured-quad batch).
      * {@code align}: -1 left, 0 center, 1 right. {@code y} is vertical center.
      */
     public void drawAscii(HabiKineticGfx gfx, FontFace face, String text,
@@ -840,11 +1519,11 @@ public final class HabiKineticAtlas {
         double topOff = -(atlas.ascent + atlas.descent + 8.0) * 0.5 * scale;
         double cos = angleRad == 0.0 ? 1.0 : Math.cos(angleRad);
         double sin = angleRad == 0.0 ? 0.0 : Math.sin(angleRad);
+        float z = gfx.currentDrawZ();
 
-        gfx.bindTexture(atlas.tex.getId(), false, HabiKineticGfx.BlendMode.NORMAL);
-        BufferBuilder b = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX_COLOR);
+        BufferBuilder b = gfx.acquireTexturedQuads(atlas.tex.getId(), HabiKineticGfx.BlendMode.NORMAL);
         double penX = startX;
-        boolean added = false;
+        int added = 0;
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             int code = (c >= 32 && c <= 126) ? c : ' ';
@@ -861,21 +1540,18 @@ public final class HabiKineticAtlas {
                 double sx2 = x + lx1 * cos - ly1 * sin, sy2 = y + lx1 * sin + ly1 * cos;
                 double sx3 = x + lx1 * cos - ly0 * sin, sy3 = y + lx1 * sin + ly0 * cos;
 
-                b.addVertex(identity, (float) sx0, (float) sy0, 0f).setUv(cell.u0(), cell.v0()).setColor(argb);
-                b.addVertex(identity, (float) sx1, (float) sy1, 0f).setUv(cell.u0(), cell.v1()).setColor(argb);
-                b.addVertex(identity, (float) sx2, (float) sy2, 0f).setUv(cell.u1(), cell.v1()).setColor(argb);
-                b.addVertex(identity, (float) sx3, (float) sy3, 0f).setUv(cell.u1(), cell.v0()).setColor(argb);
-                added = true;
+                b.addVertex((float) sx0, (float) sy0, z).setUv(cell.u0(), cell.v0()).setColor(argb);
+                b.addVertex((float) sx1, (float) sy1, z).setUv(cell.u0(), cell.v1()).setColor(argb);
+                b.addVertex((float) sx2, (float) sy2, z).setUv(cell.u1(), cell.v1()).setColor(argb);
+                b.addVertex((float) sx3, (float) sy3, z).setUv(cell.u1(), cell.v0()).setColor(argb);
+                added++;
             }
             penX += cell.adv() * scale + letterSpacing;
         }
-        if (added) {
-            var mesh = b.build();
-            if (mesh != null) BufferUploader.drawWithShader(mesh);
-        }
+        gfx.noteQuadsAdded(added);
     }
 
-    /** Draws an ASCII string projected onto a 3D plane (O, M). */
+    /** Draws an ASCII string projected onto a 3D plane (O, M), coalesced into the active batch. */
     public void drawAsciiOnPlane(HabiKineticGfx gfx, HabiKineticGfx.Cam cam, double[] O, double[] M,
                                  FontFace face, String text, double localX, double localY,
                                  double sizePx, double letterSpacing, int argb, int align) {
@@ -889,11 +1565,11 @@ public final class HabiKineticAtlas {
         double topOff = localY - (atlas.ascent + atlas.descent + 8.0) * 0.5 * scale;
         double ux0 = M[0], ux1 = M[3], ux2 = M[6];
         double uy0 = M[1], uy1 = M[4], uy2 = M[7];
+        float z = gfx.currentDrawZ();
 
-        gfx.bindTexture(atlas.tex.getId(), false, HabiKineticGfx.BlendMode.NORMAL);
-        BufferBuilder b = Tesselator.getInstance().begin(VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX_COLOR);
+        BufferBuilder b = gfx.acquireTexturedQuads(atlas.tex.getId(), HabiKineticGfx.BlendMode.NORMAL);
         double penX = startX;
-        boolean added = false;
+        int added = 0;
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             int code = (c >= 32 && c <= 126) ? c : ' ';
@@ -910,70 +1586,40 @@ public final class HabiKineticAtlas {
                 double[] p2 = cam.project(O[0] + ux0 * lx1 + uy0 * ly1, O[1] + ux1 * lx1 + uy1 * ly1, O[2] + ux2 * lx1 + uy2 * ly1);
                 double[] p3 = cam.project(O[0] + ux0 * lx1 + uy0 * ly0, O[1] + ux1 * lx1 + uy1 * ly0, O[2] + ux2 * lx1 + uy2 * ly0);
                 if (p0 != null && p1 != null && p2 != null && p3 != null) {
-                    b.addVertex(identity, (float) p0[0], (float) p0[1], 0f).setUv(cell.u0(), cell.v0()).setColor(argb);
-                    b.addVertex(identity, (float) p1[0], (float) p1[1], 0f).setUv(cell.u0(), cell.v1()).setColor(argb);
-                    b.addVertex(identity, (float) p2[0], (float) p2[1], 0f).setUv(cell.u1(), cell.v1()).setColor(argb);
-                    b.addVertex(identity, (float) p3[0], (float) p3[1], 0f).setUv(cell.u1(), cell.v0()).setColor(argb);
-                    added = true;
+                    b.addVertex((float) p0[0], (float) p0[1], z).setUv(cell.u0(), cell.v0()).setColor(argb);
+                    b.addVertex((float) p1[0], (float) p1[1], z).setUv(cell.u0(), cell.v1()).setColor(argb);
+                    b.addVertex((float) p2[0], (float) p2[1], z).setUv(cell.u1(), cell.v1()).setColor(argb);
+                    b.addVertex((float) p3[0], (float) p3[1], z).setUv(cell.u1(), cell.v0()).setColor(argb);
+                    added++;
                 }
             }
             penX += cell.adv() * scale + letterSpacing;
         }
-        if (added) {
-            var mesh = b.build();
-            if (mesh != null) BufferUploader.drawWithShader(mesh);
-        }
+        gfx.noteQuadsAdded(added);
     }
 
     // ── LRU Dynamic Text Rendering (CJK & Mixed Typography) ──────────────────
 
     /** Gets or rasterizes a white-tinted crisp text texture (color applied via OpenGL tint!). */
     public TextTex getCachedText(FontFace face, String text, int sizePx, float letterSpacing, int maxWrapW) {
-        if (text == null || text.isEmpty()) return new TextTex(null, 0, 0);
-        String key = face.ordinal() + "|" + sizePx + "|" + Math.round(letterSpacing * 10f) + "|" + maxWrapW + "|" + text;
+        if (shuttingDown || text == null || text.isEmpty()) return new TextTex(null, 0, 0);
+        String key = makeTextCacheKey(face, text, sizePx, letterSpacing, maxWrapW);
         TextTex cached = textCache.get(key);
         if (cached != null) return cached;
 
+        long startNanos = System.nanoTime();
+        ensureFontsLoaded();
         Font base = switch (face) {
             case DISPLAY -> fontDisplay;
             case SANS_CN -> fontSansCn;
             case MONO -> fontMono;
         };
         Font f = base.deriveFont(face == FontFace.DISPLAY ? Font.PLAIN : Font.BOLD, (float) sizePx);
+        FontMetrics fm = getCachedFontMetrics(face, sizePx);
 
-        BufferedImage probe = new BufferedImage(8, 8, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D pg = probe.createGraphics();
-        setupHints(pg);
-        pg.setFont(f);
-        FontMetrics fm = pg.getFontMetrics();
-        List<String> lines = maxWrapW > 0 ? wrapText(pg, text, letterSpacing, maxWrapW) : List.of(text);
-        double maxW = 1.0;
-        for (String line : lines) {
-            maxW = Math.max(maxW, measureSpaced(pg, line, letterSpacing));
-        }
-        int lineH = Math.max(sizePx + 4, (int) Math.ceil((fm.getAscent() + fm.getDescent()) * 1.28));
-        int logW = Math.max(2, (int) Math.ceil(maxW + 8));
-        int logH = Math.max(2, lines.size() == 1 ? (fm.getAscent() + fm.getDescent() + 8) : (lines.size() * lineH + 6));
-        int ascent = fm.getAscent();
-        pg.dispose();
-
-        float scale = 2.0f;
-        int pw = Math.max(2, Math.round(logW * scale));
-        int ph = Math.max(2, Math.round(logH * scale));
-        BufferedImage img = new BufferedImage(pw, ph, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D g = img.createGraphics();
-        setupHints(g);
-        g.scale(scale, scale);
-        g.setFont(f);
-        g.setColor(Color.WHITE);
-        for (int i = 0; i < lines.size(); i++) {
-            float by = (lines.size() == 1) ? (ascent + 4f) : (ascent + 3f + i * lineH);
-            drawSpaced(g, lines.get(i), 4f, by, letterSpacing);
-        }
-        g.dispose();
-
-        StaticGlTexture dt = uploadUnmanaged(img, false);
-        TextTex tt = new TextTex(dt, logW, logH);
+        CpuPrebakedText baked = bakeCpuText(key, f, fm, text, sizePx, letterSpacing, maxWrapW);
+        StaticGlTexture dt = uploadCpuImage(baked.image);
+        TextTex tt = new TextTex(dt, baked.w, baked.h);
         textCache.put(key, tt);
         if (textCache.size() > MAX_TEXT_CACHE) {
             Iterator<Map.Entry<String, TextTex>> it = textCache.entrySet().iterator();
@@ -983,6 +1629,7 @@ public final class HabiKineticAtlas {
                 if (evicted.tex() != null) evicted.tex().close();
             }
         }
+        HabiLoadingPerfMonitor.getInstance().recordDynamicTextBake((System.nanoTime() - startNanos) / 1_000_000.0);
         return tt;
     }
 
@@ -993,20 +1640,31 @@ public final class HabiKineticAtlas {
     public TextTex drawText(HabiKineticGfx gfx, FontFace face, String text,
                             double x, double y, int sizePx, float letterSpacing,
                             int argb, int align, double angleRad, int maxWrapW) {
-        TextTex tt = getCachedText(face, text, sizePx, letterSpacing, maxWrapW);
-        if (tt.texId() <= 0 || (argb >>> 24) < 2) return tt;
-        double dx = align < 0 ? x : (align == 0 ? x - tt.w() * 0.5 : x - tt.w());
-        double dy = maxWrapW > 0 ? y : (y - tt.h() * 0.5);
+        return drawTextScaled(gfx, face, text, x, y, sizePx, letterSpacing, 1.0, argb, align, angleRad, maxWrapW);
+    }
+
+    /**
+     * Draws a cached CJK/mixed string rasterized once at a fixed {@code baseSizePx}/{@code baseLetterSpacing}
+     * and scaled smoothly on the GPU by {@code scale} — prevents per-frame cache misses on animated text.
+     */
+    public TextTex drawTextScaled(HabiKineticGfx gfx, FontFace face, String text,
+                                  double x, double y, int baseSizePx, float baseLetterSpacing, double scale,
+                                  int argb, int align, double angleRad, int maxWrapW) {
+        TextTex tt = getCachedText(face, text, baseSizePx, baseLetterSpacing, maxWrapW);
+        if (tt.texId() <= 0 || (argb >>> 24) < 2 || scale <= 1e-4) return tt;
+        double drawW = tt.w() * scale;
+        double drawH = tt.h() * scale;
+        double dx = align < 0 ? x : (align == 0 ? x - drawW * 0.5 : x - drawW);
+        double dy = maxWrapW > 0 ? y : (y - drawH * 0.5);
         if (Math.abs(angleRad) < 1e-4) {
-            gfx.drawTexturedRect(tt.texId(), dx, dy, tt.w(), tt.h(), argb, HabiKineticGfx.BlendMode.NORMAL);
+            gfx.drawTexturedRect(tt.texId(), dx, dy, drawW, drawH, argb, HabiKineticGfx.BlendMode.NORMAL);
         } else {
-            double cx = dx + tt.w() * 0.5;
-            double cy = dy + tt.h() * 0.5;
-            // Rotate around (x, y) anchor
+            double cx = dx + drawW * 0.5;
+            double cy = dy + drawH * 0.5;
             double rx = cx - x, ry = cy - y;
             double c = Math.cos(angleRad), s = Math.sin(angleRad);
             gfx.drawTexturedRectRotated(tt.texId(), x + rx * c - ry * s, y + rx * s + ry * c,
-                    tt.w(), tt.h(), angleRad, argb, HabiKineticGfx.BlendMode.NORMAL);
+                    drawW, drawH, angleRad, argb, HabiKineticGfx.BlendMode.NORMAL);
         }
         return tt;
     }
@@ -1023,37 +1681,20 @@ public final class HabiKineticAtlas {
 
     // ── Utilities ────────────────────────────────────────────────────────────
 
-    private StaticGlTexture uploadImage(BufferedImage img, boolean repeat) {
-        StaticGlTexture dt = uploadUnmanaged(img, repeat);
-        ownedTextures.add(dt);
-        return dt;
+    Font getFont(FontFace face) {
+        ensureFontsLoaded();
+        return switch (face) {
+            case DISPLAY -> fontDisplay;
+            case SANS_CN -> fontSansCn;
+            case MONO -> fontMono;
+        };
     }
 
-    private static StaticGlTexture uploadUnmanaged(BufferedImage img, boolean repeat) {
-        int w = img.getWidth();
-        int h = img.getHeight();
-        int[] src = ((DataBufferInt) img.getRaster().getDataBuffer()).getData();
-        NativeImage nativeImg = new NativeImage(NativeImage.Format.RGBA, w, h, false);
-        try {
-            for (int y = 0; y < h; y++) {
-                int row = y * w;
-                for (int x = 0; x < w; x++) {
-                    int argb = src[row + x];
-                    int a = (argb >>> 24) & 0xFF;
-                    int r = (argb >>> 16) & 0xFF;
-                    int g = (argb >>> 8) & 0xFF;
-                    int b = argb & 0xFF;
-                    nativeImg.setPixelRGBA(x, y, (a << 24) | (b << 16) | (g << 8) | r);
-                }
-            }
-            return new StaticGlTexture(nativeImg, repeat);
-        } catch (Throwable t) {
-            nativeImg.close();
-            throw t;
-        }
+    static StaticGlTexture uploadUnmanaged(BufferedImage img, boolean repeat) {
+        return uploadCpuImage(CpuImage.fromBufferedImage(img, repeat));
     }
 
-    private static void setupHints(Graphics2D g) {
+    static void setupHints(Graphics2D g) {
         g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         g.setRenderingHint(RenderingHints.KEY_FRACTIONALMETRICS, RenderingHints.VALUE_FRACTIONALMETRICS_ON);
@@ -1061,18 +1702,11 @@ public final class HabiKineticAtlas {
         g.setRenderingHint(RenderingHints.KEY_STROKE_CONTROL, RenderingHints.VALUE_STROKE_PURE);
     }
 
-    private static double measureSpaced(Graphics2D g, String text, float ls) {
-        FontMetrics fm = g.getFontMetrics();
-        if (Math.abs(ls) < 0.01f) return fm.stringWidth(text);
-        double w = 0.0;
-        for (int i = 0; i < text.length(); i++) {
-            w += fm.charWidth(text.charAt(i));
-            if (i + 1 < text.length()) w += ls;
-        }
-        return w;
+    static double measureSpaced(Graphics2D g, String text, float ls) {
+        return measureSpaced(g.getFontMetrics(), text, ls);
     }
 
-    private static void drawSpaced(Graphics2D g, String text, float x, float baselineY, float ls) {
+    static void drawSpaced(Graphics2D g, String text, float x, float baselineY, float ls) {
         if (Math.abs(ls) < 0.01f) {
             g.drawString(text, x, baselineY);
             return;
@@ -1086,11 +1720,10 @@ public final class HabiKineticAtlas {
         }
     }
 
-    private static List<String> wrapText(Graphics2D g, String text, float ls, int maxWidth) {
+    private static List<String> wrapText(FontMetrics fm, String text, float ls, int maxWidth) {
         List<String> lines = new ArrayList<>();
         StringBuilder cur = new StringBuilder();
         double curW = 0.0;
-        FontMetrics fm = g.getFontMetrics();
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
             if (c == '\n') {
@@ -1122,7 +1755,27 @@ public final class HabiKineticAtlas {
         return ((x ^ (x >>> 14)) & 0xFFFFFFFFL) / 4294967296.0;
     }
 
+    public void shutdown() {
+        shuttingDown = true;
+        dispose();
+    }
+
     public void dispose() {
+        generation.incrementAndGet();
+        synchronized (preloadLock) {
+            preloadStartedGen = -1;
+            if (zeroCpuFuture != null) {
+                zeroCpuFuture.cancel(false);
+                zeroCpuFuture = null;
+            }
+            if (st01CpuFuture != null) {
+                st01CpuFuture.cancel(false);
+                st01CpuFuture = null;
+            }
+        }
+        uploadingSt01Pack = null;
+        uploadingSt01Cursor = 0;
+
         for (StaticGlTexture dt : ownedTextures) {
             if (dt != null) dt.close();
         }
@@ -1131,15 +1784,18 @@ public final class HabiKineticAtlas {
             if (tt.tex() != null) tt.tex().close();
         }
         textCache.clear();
-        java.util.Arrays.fill(zeroBands, null);
-        java.util.Arrays.fill(stBands, null);
+        metricsCache.clear();
+        Arrays.fill(zeroBands, null);
+        Arrays.fill(stBands, null);
         titleGlyphs.clear();
         zeroStem = zeroLeaf = tagLead = tagCore = tagPrompt = tagAutoBoard = tagSyncBoard = tagDepart = null;
         loadBadge = cursor = zeroCarLead = zeroCar = cardA = cardB = cardC = cardD = null;
         stStem = stLeaf = stCarLead = stCar = plateStation = plateRoute = null;
-        zeroOutlineDark = zeroOutlinePaper = noiseTex = vigPaperTex = vigDarkTex = stationBgTex = null;
+        zeroOutlineDark = zeroOutlinePaper = noiseTex = vigPaperTex = vigDarkTex = stationBgTex = stationAuraTex = null;
         monoAtlas = null;
         displayAtlas = null;
-        ready = false;
+        zeroReady = false;
+        station01Ready = false;
+        releaseUploadScratch();
     }
 }

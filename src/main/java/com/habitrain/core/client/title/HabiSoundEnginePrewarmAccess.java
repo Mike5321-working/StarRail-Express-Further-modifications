@@ -19,4 +19,11 @@ public interface HabiSoundEnginePrewarmAccess {
 
     /** Returns whether {@code SoundEngine} currently has OpenAL initialized. */
     boolean habitrain$isSoundEngineLoaded();
+
+    /**
+     * Thread-safely schedules {@code ChannelAccess#scheduleTick()} on Minecraft's background
+     * {@code SoundEngineExecutor} so OpenAL stream buffers keep refilling smoothly even while the
+     * render thread stalls during heavy mod resource reloads.
+     */
+    void habitrain$pumpOpenAlStreamTick();
 }

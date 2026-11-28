@@ -53,6 +53,22 @@ public final class HabiTitleTelemetry {
 
     private HabiTitleTelemetry() {}
 
+    /** Pushes a freshly loaded saved-server count so main-menu telemetry updates immediately. */
+    public static void updateCachedServerCount(int count) {
+        if (count >= 0) {
+            savedServerCount = count;
+            lastDiskRefreshMs = System.currentTimeMillis();
+        }
+    }
+
+    /** Pushes a freshly loaded local-world count so main-menu telemetry updates immediately. */
+    public static void updateCachedWorldCount(int count) {
+        if (count >= 0) {
+            localWorldCount = count;
+            lastDiskRefreshMs = System.currentTimeMillis();
+        }
+    }
+
     /** Triggers a non-blocking refresh of disk-backed counts (saved servers + local worlds). */
     public static void refreshAsync(Minecraft mc) {
         if (mc == null) return;
@@ -161,7 +177,6 @@ public final class HabiTitleTelemetry {
         String label = entryText == null ? "" : entryText.getString();
         String player = (mc != null && mc.getUser() != null) ? mc.getUser().getName() : "PASSENGER";
         int mods = getLoadedModCount();
-        int roles = getRegisteredRoleCount();
         int servers = Math.max(0, savedServerCount);
         int worlds = Math.max(0, localWorldCount);
         int heapPct = getHeapUsagePercent();
@@ -219,6 +234,7 @@ public final class HabiTitleTelemetry {
             );
         }
         if ("menu.sre.role_introduction".equals(key) || label.contains("职业")) {
+            int roles = getRegisteredRoleCount();
             return new MenuVisualMeta(
                     "ROLES CODEX", roles + " ROLES",
                     "PASSENGER ROSTER // CODEX", roles + " LOADED",

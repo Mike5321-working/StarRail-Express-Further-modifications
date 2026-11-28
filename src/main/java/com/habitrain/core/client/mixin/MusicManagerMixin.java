@@ -1,6 +1,7 @@
 package com.habitrain.core.client.mixin;
 
 import com.habitrain.core.client.title.HabiBootAudioEngine;
+import com.habitrain.core.client.title.HabiWorldEntrySession;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Minecraft;
@@ -27,7 +28,10 @@ public abstract class MusicManagerMixin {
 
     @Inject(method = "tick", at = @At("HEAD"), cancellable = true)
     private void habitrain$suppressVanillaTitleMusic(CallbackInfo ci) {
-        if (!HabiBootAudioEngine.getInstance().isBlockingVanillaMusic()) return;
+        if (!HabiBootAudioEngine.getInstance().isBlockingVanillaMusic()
+                && !HabiWorldEntrySession.getInstance().isActive()) {
+            return;
+        }
         if (this.currentMusic != null && this.minecraft != null && this.minecraft.getSoundManager() != null) {
             this.minecraft.getSoundManager().stop(this.currentMusic);
             this.currentMusic = null;

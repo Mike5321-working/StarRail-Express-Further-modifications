@@ -10,6 +10,7 @@ import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
 import net.minecraft.client.Options;
 import net.minecraft.client.resources.sounds.Sound;
+import net.minecraft.client.sounds.ChannelAccess;
 import net.minecraft.client.sounds.SoundBufferLibrary;
 import net.minecraft.client.sounds.SoundEngine;
 import net.minecraft.sounds.SoundSource;
@@ -19,6 +20,8 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.gen.Invoker;
 import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import java.util.List;
 
@@ -36,15 +39,68 @@ public abstract class SoundEnginePrewarmMixin implements HabiSoundEnginePrewarmA
     @Shadow @Final private Listener listener;
     @Shadow @Final private SoundBufferLibrary soundBuffers;
     @Shadow @Final private List<Sound> preloadQueue;
+    @Shadow @Final private ChannelAccess channelAccess;
     @Shadow private boolean loaded;
 
     @Invoker("loadLibrary")
     protected abstract void habitrain$invokeLoadLibrary();
 
+    @Unique private final Object habitrain$pumpLock = new Object();
+    @Unique private volatile boolean habitrain$pumpingAllowed;
+    @Unique private boolean habitrain$destroying;
     @Unique private boolean habitrain$earlyPrewarmed;
     @Unique private String habitrain$prewarmedDevice = "";
     @Unique private boolean habitrain$prewarmedDirectional;
     @Unique private boolean habitrain$skipCurrentReloadReinit;
+
+    @Inject(method = "loadLibrary", at = @At("TAIL"))
+    private void habitrain$enableKeepaliveAfterLoad(CallbackInfo ci) {
+        synchronized (this.habitrain$pumpLock) {
+            this.habitrain$pumpingAllowed = this.loaded;
+        }
+    }
+
+    @Inject(method = "destroy", at = @At("HEAD"))
+    private void habitrain$disableKeepaliveBeforeDestroy(CallbackInfo ci) {
+        synchronized (this.habitrain$pumpLock) {
+            this.habitrain$destroying = true;
+            this.habitrain$pumpingAllowed = false;
+        }
+    }
+
+    @Inject(method = "destroy", at = @At("TAIL"))
+    private void habitrain$finishDestroyKeepaliveGuard(CallbackInfo ci) {
+        synchronized (this.habitrain$pumpLock) {
+            this.habitrain$destroying = false;
+            this.habitrain$pumpingAllowed = this.loaded;
+        }
+    }
+
+    @Inject(method = "stopAll", at = @At("HEAD"))
+    private void habitrain$pauseKeepaliveBeforeStopAll(CallbackInfo ci) {
+        synchronized (this.habitrain$pumpLock) {
+            this.habitrain$pumpingAllowed = false;
+        }
+    }
+
+    @Inject(method = "stopAll", at = @At("TAIL"))
+    private void habitrain$resumeKeepaliveAfterStopAll(CallbackInfo ci) {
+        synchronized (this.habitrain$pumpLock) {
+            if (!this.habitrain$destroying) {
+                this.habitrain$pumpingAllowed = this.loaded;
+            }
+        }
+    }
+
+    @Override
+    public void habitrain$pumpOpenAlStreamTick() {
+        synchronized (this.habitrain$pumpLock) {
+            if (!this.loaded || !this.habitrain$pumpingAllowed || this.habitrain$destroying || this.channelAccess == null) {
+                return;
+            }
+            this.channelAccess.scheduleTick();
+        }
+    }
 
     @Override
     public boolean habitrain$prewarmForKineticBoot() {

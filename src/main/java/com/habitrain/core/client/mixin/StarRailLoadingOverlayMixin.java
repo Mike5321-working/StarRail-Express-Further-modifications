@@ -5,6 +5,7 @@ import com.habitrain.core.client.title.HabiBootSession;
 import com.habitrain.core.client.title.HabiKineticAtlas;
 import com.habitrain.core.client.title.HabiKineticGfx;
 import com.habitrain.core.client.title.HabiKineticUiController;
+import com.habitrain.core.client.title.HabiLoadingPerfMonitor;
 import com.habitrain.core.client.title.HabiRealProgressTracker;
 import net.exmo.sre.loading.FrameAnimationRenderer;
 import net.exmo.sre.loading.StarRailExpressTitleScreen;
@@ -76,8 +77,8 @@ public class StarRailLoadingOverlayMixin {
         if (!this.habitrain$initialized) {
             this.habitrain$initialized = true;
             this.habitrain$initialBoot = HabiKineticUiController.isInitialBootOverlay(this.minecraft, this.fadeIn);
-            // Prepare fonts & sprites BEFORE starting the boot clock and intro.wav so frame 0 renders at t = 0.0s
-            HabiKineticAtlas.getInstance().ensurePrepared();
+            // Prepare Station 00 fonts & sprites BEFORE starting the boot clock and intro.wav so frame 0 renders at t = 0.0s
+            HabiKineticAtlas.getInstance().ensureZeroPrepared();
             nowNanos = System.nanoTime();
             this.habitrain$startNanos = nowNanos;
             this.habitrain$lastFrameNanos = nowNanos;
@@ -85,6 +86,8 @@ public class StarRailLoadingOverlayMixin {
                 HabiBootSession.getInstance().beginInitialBoot(this.minecraft, this.reload);
             } else {
                 this.habitrain$standaloneTracker = new HabiRealProgressTracker(HabiRealProgressTracker.BOOT_STAGES);
+                HabiLoadingPerfMonitor.getInstance().beginSession(
+                        HabiLoadingPerfMonitor.SessionKind.RESOURCE_RELOAD, "StandaloneReload");
             }
         }
 
@@ -111,9 +114,13 @@ public class StarRailLoadingOverlayMixin {
                         && HabiKineticUiController.isKineticTitleEnabled()) {
                     // Seamless zero-frame handoff into TitleScreen READY_STANDBY (native input enabled!)
                     HabiBootSession.getInstance().markOverlayHandedOff();
+                    HabiLoadingPerfMonitor.getInstance().finishSession(
+                            HabiLoadingPerfMonitor.SessionKind.GAME_BOOT, "overlay_handoff");
                     this.minecraft.setOverlay(null);
                 } else if (this.completeMillis >= 0L && (now - this.completeMillis) >= 950L) {
                     HabiBootSession.getInstance().onLeaveTitleFlow();
+                    HabiLoadingPerfMonitor.getInstance().finishSession(
+                            HabiLoadingPerfMonitor.SessionKind.GAME_BOOT, "completed_fallback");
                     this.minecraft.setOverlay(null);
                 }
             }
@@ -132,6 +139,8 @@ public class StarRailLoadingOverlayMixin {
             if (exitElapsed >= 0L) {
                 fadeAlpha = 1.0 - HabiKineticGfx.sstep(0.0, 1.0, exitElapsed / 450.0);
                 if (exitElapsed >= 450L) {
+                    HabiLoadingPerfMonitor.getInstance().finishSession(
+                            HabiLoadingPerfMonitor.SessionKind.RESOURCE_RELOAD, "completed");
                     this.minecraft.setOverlay(null);
                     ci.cancel();
                     return;

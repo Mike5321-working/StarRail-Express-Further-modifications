@@ -2,15 +2,13 @@ package com.habitrain.core.client.mixin;
 
 import com.habitrain.core.client.loading.HabiLoadingScreenTextures;
 import com.habitrain.core.client.title.HabiBootSession;
-import com.habitrain.core.client.title.HabiKineticGfx;
 import com.habitrain.core.client.title.HabiKineticUiController;
-import com.habitrain.core.client.title.HabiRealProgressTracker;
+import com.habitrain.core.client.title.HabiWorldEntrySession;
 import com.mojang.blaze3d.systems.RenderSystem;
 import net.exmo.sre.loading.FrameAnimationRenderer;
 import net.exmo.sre.loading.SREReceivingLevelScreen;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
-import net.minecraft.Util;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
@@ -27,20 +25,16 @@ import java.util.Locale;
 import java.util.function.BooleanSupplier;
 
 /**
- * Unifies {@link SREReceivingLevelScreen} (entering world / receiving chunks) with the
- * HabiTrain Kinetic Flat 3D visual system driven by real level-received state &amp; connection info.
+ * Bridges {@link SREReceivingLevelScreen} seamlessly into {@link HabiWorldEntrySession}:
+ * keeps the Time Tunnel continuous until real terrain arrival, displays the Act 3 gold-foil
+ * postmark seal ({@code 0.00..0.48s}), then closes the screen right at {@code END_PORTAL_START}
+ * so the expanding Apple Portal Iris reveals the real live 3D Minecraft world underneath.
  */
 @Environment(EnvType.CLIENT)
 @Mixin(SREReceivingLevelScreen.class)
 public abstract class SREReceivingLevelScreenMixin extends Screen {
 
     @Shadow @Final private BooleanSupplier levelReceived;
-    @Shadow @Final private long createdAt;
-    @Shadow private long receivedAt;
-
-    @Unique private HabiRealProgressTracker habitrain$recvTracker;
-    @Unique private long habitrain$startNanos;
-    @Unique private long habitrain$lastFrameNanos;
 
     protected SREReceivingLevelScreenMixin(Component title) {
         super(title);
@@ -48,11 +42,12 @@ public abstract class SREReceivingLevelScreenMixin extends Screen {
 
     @Inject(method = "init", at = @At("HEAD"))
     private void habitrain$onInit(CallbackInfo ci) {
-        HabiBootSession.getInstance().onLeaveTitleFlow();
-        if (this.habitrain$recvTracker == null) {
-            this.habitrain$recvTracker = new HabiRealProgressTracker(HabiRealProgressTracker.WORLD_STAGES);
-            this.habitrain$startNanos = System.nanoTime();
-            this.habitrain$lastFrameNanos = this.habitrain$startNanos;
+        if (HabiKineticUiController.isKineticLoadingEnabled()) {
+            String tag = habitrain$resolveRouteTag();
+            HabiWorldEntrySession.getInstance().ensureActiveForWorldScreen(
+                    this.minecraft, habitrain$resolveRouteName(), tag + " // EXPRESS 01");
+        } else {
+            HabiBootSession.getInstance().onLeaveTitleFlow();
         }
     }
 
@@ -60,57 +55,48 @@ public abstract class SREReceivingLevelScreenMixin extends Screen {
     private void habitrain$renderKineticReceiving(GuiGraphics g, int mouseX, int mouseY, float delta, CallbackInfo ci) {
         if (!HabiKineticUiController.isKineticLoadingEnabled()) return;
 
-        long now = Util.getMillis();
-        long nowNanos = System.nanoTime();
-        if (this.habitrain$recvTracker == null) {
-            this.habitrain$recvTracker = new HabiRealProgressTracker(HabiRealProgressTracker.WORLD_STAGES);
-            this.habitrain$startNanos = nowNanos;
-            this.habitrain$lastFrameNanos = nowNanos;
-        }
-        double dt = Math.min(0.1, Math.max(0.001, (nowNanos - this.habitrain$lastFrameNanos) / 1_000_000_000.0));
-        this.habitrain$lastFrameNanos = nowNanos;
-        double elapsedSec = Math.max(0.0, (nowNanos - this.habitrain$startNanos) / 1_000_000_000.0);
+        String tag = habitrain$resolveRouteTag();
+        HabiWorldEntrySession session = HabiWorldEntrySession.getInstance();
+        session.ensureActiveForWorldScreen(this.minecraft, habitrain$resolveRouteName(), tag + " // EXPRESS 01");
+        session.reportReceivingLevel(this.levelReceived != null && this.levelReceived.getAsBoolean(), tag);
 
-        double enterAlpha = HabiKineticGfx.sstep(0.0, 1.0, (now - this.createdAt) / 480.0);
-        if (this.receivedAt < 0L && this.levelReceived.getAsBoolean() && (now - this.createdAt) >= 650L) {
-            this.receivedAt = now;
-        }
+        HabiKineticUiController.getInstance().renderWorldEntryScreen(this.minecraft, mouseX, mouseY);
 
-        double exitAlpha = 1.0;
-        double arriveT = 0.0;
-        boolean arriving = this.receivedAt >= 0L;
-        if (arriving) {
-            long since = now - this.receivedAt;
-            arriveT = HabiKineticGfx.sstep(0.0, 1.0, since / 800.0);
-            if (since >= 800L) {
-                long ex = since - 800L;
-                exitAlpha = 1.0 - HabiKineticGfx.sstep(0.0, 1.0, ex / 500.0);
-                if (ex >= 500L) {
-                    this.onClose();
-                    ci.cancel();
-                    return;
-                }
+        if (session.shouldCloseReceivingScreen() || !session.isActive()) {
+            this.onClose();
+        }
+        ci.cancel();
+    }
+
+    @Unique
+    private String habitrain$resolveRouteName() {
+        if (this.minecraft != null) {
+            if (this.minecraft.getCurrentServer() != null && this.minecraft.getCurrentServer().name != null
+                    && !this.minecraft.getCurrentServer().name.isBlank()) {
+                return this.minecraft.getCurrentServer().name.trim();
+            }
+            if (this.minecraft.getSingleplayerServer() != null) {
+                return this.minecraft.getSingleplayerServer().getWorldData().getLevelName();
             }
         }
+        return "星夜轨网";
+    }
 
-        String tag = "WORLD TRANSFER";
+    @Unique
+    private String habitrain$resolveRouteTag() {
         if (this.minecraft != null) {
             if (this.minecraft.getCurrentServer() != null && this.minecraft.getCurrentServer().name != null) {
                 String srv = this.minecraft.getCurrentServer().name.trim();
                 if (!srv.isEmpty() && srv.length() <= 22 && srv.chars().allMatch(c -> c >= 32 && c < 127)) {
-                    tag = srv.toUpperCase(Locale.ROOT);
-                } else {
-                    tag = "REMOTE SERVER";
+                    return srv.toUpperCase(Locale.ROOT);
                 }
-            } else if (this.minecraft.getSingleplayerServer() != null) {
-                tag = "LOCAL WORLD";
+                return "REMOTE SERVER";
+            }
+            if (this.minecraft.getSingleplayerServer() != null) {
+                return "LOCAL WORLD";
             }
         }
-
-        HabiKineticUiController.getInstance().renderReceivingLevelScreen(
-                this.minecraft, this.habitrain$recvTracker, arriving, arriveT,
-                tag, elapsedSec, dt, enterAlpha * exitAlpha);
-        ci.cancel();
+        return "WORLD TRANSFER";
     }
 
     @Redirect(

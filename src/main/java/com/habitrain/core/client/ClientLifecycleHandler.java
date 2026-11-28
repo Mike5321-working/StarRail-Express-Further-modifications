@@ -36,8 +36,11 @@ public class ClientLifecycleHandler {
 
         net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
             com.habitrain.core.client.config.ClientVisualPreferences.flushAndShutdown();
+            com.habitrain.core.client.title.HabiWorldEntrySession.getInstance().abort(client, false);
             com.habitrain.core.client.title.HabiBootAudioEngine.getInstance().shutdown();
-            com.habitrain.core.client.title.HabiKineticAtlas.getInstance().dispose();
+            com.habitrain.core.client.title.HabiKineticUiController.getInstance().onWorldJoinedOrShutdown(true);
+            com.habitrain.core.client.title.HabiTunnelAtlas.getInstance().shutdown();
+            com.habitrain.core.client.title.HabiKineticAtlas.getInstance().shutdown();
             com.habitrain.core.client.gui.GuiGeo.closeSharedBuffer();
             MapVotePreviewCache.shutdown();
             com.habitrain.core.client.gui.menu.MapVotePreviewFilePicker.shutdown();
@@ -66,8 +69,12 @@ public class ClientLifecycleHandler {
             client.execute(() -> {
                 if (!ClientConnectionSession.isCurrent(handler)
                         || client.getConnection() != handler || !handler.getConnection().isConnected()) return;
-                com.habitrain.core.client.title.HabiBootSession.getInstance().onWorldJoined();
-                com.habitrain.core.client.title.HabiKineticAtlas.getInstance().dispose();
+                if (!com.habitrain.core.client.title.HabiWorldEntrySession.getInstance().shouldDeferJoinCleanup()) {
+                    com.habitrain.core.client.title.HabiBootSession.getInstance().onWorldJoined();
+                    com.habitrain.core.client.title.HabiKineticUiController.getInstance().onWorldJoinedOrShutdown(false);
+                    com.habitrain.core.client.title.HabiTunnelAtlas.getInstance().dispose();
+                    com.habitrain.core.client.title.HabiKineticAtlas.getInstance().dispose();
+                }
                 com.habitrain.core.client.loading.HabiLoadingScreenTextures.releaseTextures(client);
                 com.habitrain.core.client.render.CustomTitlePanoramaRenderer.release();
                 // INIT 已清理上一连接；JOIN 保留刚到达的服务端 snapshot、握手与场景状态。

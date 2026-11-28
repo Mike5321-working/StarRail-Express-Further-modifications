@@ -37,6 +37,9 @@ public final class HabiKineticUiController {
     private final HabiKineticGfx gfx = new HabiKineticGfx();
     private final HabiZeroStationRenderer zeroRenderer = new HabiZeroStationRenderer();
     private final HabiStationSceneRenderer stationRenderer = new HabiStationSceneRenderer();
+    private final HabiWorldEntryRenderer worldEntryRenderer = new HabiWorldEntryRenderer();
+    private List<HabiStationSceneRenderer.MenuItemData> cachedTitleEntries = List.of();
+    private boolean worldEntryRenderedThisFrame;
 
     private HabiKineticUiController() {}
 
@@ -98,8 +101,10 @@ public final class HabiKineticUiController {
      * @return {@code true} once the overlay is 100% ready and can seamlessly hand off to TitleScreen
      */
     public boolean renderInitialBootOverlay(Minecraft mc, ReloadInstance reload, int mouseX, int mouseY) {
+        long frameStartNanos = System.nanoTime();
         HabiKineticAtlas atlas = HabiKineticAtlas.getInstance();
-        atlas.ensurePrepared();
+        double uploadMs = atlas.ensureZeroPrepared();
+        uploadMs += atlas.pumpStation01Uploads(1.2);
         HabiBootSession session = HabiBootSession.getInstance();
 
         updateSessionPointer(mc, mouseX, mouseY);
@@ -118,6 +123,17 @@ public final class HabiKineticUiController {
         } finally {
             gfx.endFrame();
         }
+        double selfRenderMs = (System.nanoTime() - frameStartNanos) / 1_000_000.0;
+        HabiLoadingPerfMonitor.getInstance().recordFrame(
+                HabiLoadingPerfMonitor.SessionKind.GAME_BOOT,
+                session.getPhase().name(),
+                t,
+                snap.progress(),
+                selfRenderMs,
+                uploadMs,
+                gfx.getLastFrameDrawCalls(),
+                snap.statusCounter()
+        );
         return session.isReadyStandby();
     }
 
@@ -125,8 +141,9 @@ public final class HabiKineticUiController {
     public void renderStandaloneReloadOverlay(Minecraft mc, HabiRealProgressTracker tracker,
                                               ReloadInstance reload, boolean forceComplete,
                                               double elapsedSec, double dt, double fadeAlpha) {
+        long frameStartNanos = System.nanoTime();
         HabiKineticAtlas atlas = HabiKineticAtlas.getInstance();
-        atlas.ensurePrepared();
+        double uploadMs = atlas.ensureZeroPrepared();
 
         // Advance visual timeline starting past initial boot fade so F3+T feels snappy
         double visualT = elapsedSec + 1.20;
@@ -148,19 +165,52 @@ public final class HabiKineticUiController {
         } finally {
             gfx.endFrame();
         }
+        double selfRenderMs = (System.nanoTime() - frameStartNanos) / 1_000_000.0;
+        HabiLoadingPerfMonitor.getInstance().recordFrame(
+                HabiLoadingPerfMonitor.SessionKind.RESOURCE_RELOAD,
+                forceComplete ? "FADE_OUT" : "RELOADING",
+                elapsedSec,
+                snap.progress(),
+                selfRenderMs,
+                uploadMs,
+                gfx.getLastFrameDrawCalls(),
+                snap.statusCounter()
+        );
     }
 
     // ── Title Screen (Station 00 READY -> 1.20s Split -> Station 01 Menu) ────
 
-    public void onTitleScreenInit(Minecraft mc) {
+    public void onTitleScreenInit(Minecraft mc, @Nullable Screen titleScreen) {
         HabiTitleTelemetry.refreshAsync(mc);
         HabiBootSession.getInstance().ensureTitleScreenEntered(mc);
+        stationRenderer.onTitleScreenInit(mc, titleScreen);
+        if (isKineticLoadingEnabled()) {
+            // Quietly CPU-bake Act 1..3 tunnel sprites while idle on Station 01 so world entry never blocks frame 0
+            HabiTunnelAtlas.getInstance().preloadAsync(HabiKineticAtlas.getInstance());
+        }
+    }
+
+    public void onTitleScreenTick(Minecraft mc) {
+        stationRenderer.onTitleScreenTick(mc);
+    }
+
+    public void onTitleScreenRemoved() {
+        stationRenderer.onTitleScreenRemoved();
+    }
+
+    public void onWorldJoinedOrShutdown(boolean shutdownExecutor) {
+        stationRenderer.onWorldJoinedOrShutdown(shutdownExecutor);
     }
 
     public void renderTitleScreen(Minecraft mc, List<HabiStationSceneRenderer.MenuItemData> entries,
                                   int mouseX, int mouseY) {
+        this.cachedTitleEntries = entries != null ? entries : List.of();
+        if (HabiWorldEntrySession.getInstance().isActive()) {
+            renderWorldEntryFrame(mc, mouseX, mouseY, this.cachedTitleEntries, true);
+            return;
+        }
         HabiKineticAtlas atlas = HabiKineticAtlas.getInstance();
-        atlas.ensurePrepared();
+        atlas.ensureStation01Prepared();
         HabiBootSession session = HabiBootSession.getInstance();
 
         updateSessionPointer(mc, mouseX, mouseY);
@@ -208,7 +258,7 @@ public final class HabiKineticUiController {
     /** Renders the live Station 01 2.5D background behind title child screens (Multiplayer/Singleplayer/Options). */
     public void renderChildScreenBackdrop(Minecraft mc) {
         HabiKineticAtlas atlas = HabiKineticAtlas.getInstance();
-        atlas.ensurePrepared();
+        atlas.ensureStation01Prepared();
         HabiBootSession session = HabiBootSession.getInstance();
         HabiBootAudioEngine.getInstance().syncMinecraftVolumes(mc);
         double u = Math.max(2.0, session.getStationElapsed());
@@ -223,6 +273,96 @@ public final class HabiKineticUiController {
         }
     }
 
+    // ── Unified 3-Act World-Entry Cutscene (START -> LOADING -> END) ─────────
+
+    /** Renders the active world-entry cutscene on a loading/connect screen (marks screen pass done for this frame). */
+    public void renderWorldEntryScreen(Minecraft mc, int mouseX, int mouseY) {
+        renderWorldEntryFrame(mc, mouseX, mouseY, cachedTitleEntries, true);
+    }
+
+    /**
+     * Renders the Act 3 Apple Portal Iris cutout &amp; arrival bloom directly over the live 3D Minecraft world
+     * at the end of {@code GameRenderer.render}. Safe against double-rendering on the exact frame a loading
+     * screen calls {@code onClose()}.
+     */
+    public void renderWorldEntryInWorldOverlay(Minecraft mc) {
+        if (worldEntryRenderedThisFrame) {
+            worldEntryRenderedThisFrame = false;
+            return;
+        }
+        if (!HabiWorldEntrySession.getInstance().shouldRenderInWorldOverlay(mc)) return;
+        int mouseX = 0;
+        int mouseY = 0;
+        if (mc != null && mc.getWindow() != null && mc.mouseHandler != null) {
+            double sw = Math.max(1.0, mc.getWindow().getScreenWidth());
+            double sh = Math.max(1.0, mc.getWindow().getScreenHeight());
+            mouseX = (int) Math.round(mc.mouseHandler.xpos() * mc.getWindow().getGuiScaledWidth() / sw);
+            mouseY = (int) Math.round(mc.mouseHandler.ypos() * mc.getWindow().getGuiScaledHeight() / sh);
+        }
+        renderWorldEntryFrame(mc, mouseX, mouseY, List.of(), false);
+    }
+
+    /** Clears the per-frame screen-render guard at the tail of {@code GameRenderer.render}. */
+    public void endGameFrame() {
+        worldEntryRenderedThisFrame = false;
+    }
+
+    private void renderWorldEntryFrame(Minecraft mc, int mouseX, int mouseY,
+                                       List<HabiStationSceneRenderer.MenuItemData> menuEntries,
+                                       boolean fromScreenPass) {
+        HabiWorldEntrySession session = HabiWorldEntrySession.getInstance();
+        if (!session.isActive() || mc == null) return;
+
+        long frameStartNanos = System.nanoTime();
+        updateWorldEntryPointer(mc, mouseX, mouseY);
+        session.stepFrame(mc);
+        if (!session.isActive()) {
+            // Act 3 just completed & disposed atlases cleanly; exit immediately without re-creating atlases.
+            if (fromScreenPass) worldEntryRenderedThisFrame = true;
+            return;
+        }
+
+        HabiKineticAtlas atlas = HabiKineticAtlas.getInstance();
+        double uploadMs = atlas.ensureStation01Prepared();
+        HabiTunnelAtlas tunnelAtlas = HabiTunnelAtlas.getInstance();
+        uploadMs += tunnelAtlas.ensureTierAAndPumpTierB(atlas, 1.5, 2);
+
+        HabiBootSession boot = HabiBootSession.getInstance();
+        HabiBootAudioEngine.Telemetry tel = HabiBootAudioEngine.getInstance()
+                .getTelemetry(boot.getTimelineSeconds(), boot.getExitAt());
+
+        gfx.beginFrame(mc);
+        try {
+            worldEntryRenderer.render(gfx, atlas, tunnelAtlas, session, tel);
+            // Smoothly slide Station 01 left menu out across 0.00..0.38s of Act 1
+            if (session.getPhase() == HabiWorldEntrySession.Phase.START && !menuEntries.isEmpty()) {
+                double menuFade = session.getMenuFade();
+                if (menuFade < 0.995) {
+                    double mouseVx = gfx.guiToVirtualX(mc, mouseX);
+                    double mouseVy = gfx.guiToVirtualY(mc, mouseY);
+                    stationRenderer.renderMainMenuOverlay(gfx, atlas, mc, menuEntries, 1.0, mouseVx, mouseVy, false, menuFade);
+                }
+            }
+        } finally {
+            gfx.endFrame();
+        }
+        double selfRenderMs = (System.nanoTime() - frameStartNanos) / 1_000_000.0;
+        String ctx = mc.screen != null ? mc.screen.getClass().getSimpleName() : "InWorld";
+        HabiLoadingPerfMonitor.getInstance().recordFrame(
+                HabiLoadingPerfMonitor.SessionKind.WORLD_ENTRY,
+                session.getPhase().name(),
+                session.getPhaseT(),
+                session.getProgress(),
+                selfRenderMs,
+                uploadMs,
+                gfx.getLastFrameDrawCalls(),
+                ctx
+        );
+        if (fromScreenPass) {
+            worldEntryRenderedThisFrame = true;
+        }
+    }
+
     // ── World Generation & Receiving Level Unified Kinetic Screens ───────────
 
     public void renderWorldGenerationScreen(Minecraft mc, HabiRealProgressTracker tracker,
@@ -230,7 +370,7 @@ public final class HabiKineticUiController {
                                             boolean resolving, double resolveT,
                                             double elapsedSec, double dt, double alpha) {
         HabiKineticAtlas atlas = HabiKineticAtlas.getInstance();
-        atlas.ensurePrepared();
+        atlas.ensureZeroPrepared();
 
         double visualT = elapsedSec + 1.25;
         HabiRealProgressTracker.LoadSnapshot snap = tracker.updateWorldGeneration(
@@ -257,7 +397,7 @@ public final class HabiKineticUiController {
                                            boolean levelReceived, double arriveT, String reasonTag,
                                            double elapsedSec, double dt, double alpha) {
         HabiKineticAtlas atlas = HabiKineticAtlas.getInstance();
-        atlas.ensurePrepared();
+        atlas.ensureZeroPrepared();
 
         double visualT = elapsedSec + 1.25;
         HabiRealProgressTracker.LoadSnapshot snap = tracker.updateReceivingLevel(
@@ -282,13 +422,17 @@ public final class HabiKineticUiController {
 
     // ── Title Screen Input Handling ──────────────────────────────────────────
 
-    public boolean onTitleKeyPressed(int keyCode, List<HabiStationSceneRenderer.MenuItemData> entries) {
+    public boolean onTitleKeyPressed(Minecraft mc, int keyCode, List<HabiStationSceneRenderer.MenuItemData> entries) {
         HabiBootSession session = HabiBootSession.getInstance();
         if (keyCode == GLFW.GLFW_KEY_M) {
             session.toggleSoundMute();
             return true;
         }
+        if (HabiWorldEntrySession.getInstance().isActive()) {
+            return true;
+        }
         if (keyCode == GLFW.GLFW_KEY_R) {
+            stationRenderer.resetToMainForReplay();
             session.beginReplay();
             return true;
         }
@@ -301,18 +445,26 @@ public final class HabiKineticUiController {
         }
         if (session.isStationInteractive()) {
             if (keyCode == GLFW.GLFW_KEY_UP || keyCode == GLFW.GLFW_KEY_W) {
-                stationRenderer.setSelectedIndex(stationRenderer.getSelectedIndex() - 1, entries.size(), true);
+                stationRenderer.moveSelection(-1, entries, true);
                 return true;
             }
             if (keyCode == GLFW.GLFW_KEY_DOWN || keyCode == GLFW.GLFW_KEY_S) {
-                stationRenderer.setSelectedIndex(stationRenderer.getSelectedIndex() + 1, entries.size(), true);
+                stationRenderer.moveSelection(1, entries, true);
                 return true;
             }
             if (keyCode == GLFW.GLFW_KEY_ENTER || keyCode == GLFW.GLFW_KEY_KP_ENTER || keyCode == GLFW.GLFW_KEY_SPACE) {
-                stationRenderer.triggerSelected(entries);
+                stationRenderer.triggerSelected(mc, entries);
                 return true;
             }
-            if (keyCode == GLFW.GLFW_KEY_ESCAPE) {
+            if (keyCode == GLFW.GLFW_KEY_F5 && stationRenderer.isInSubPanel()) {
+                stationRenderer.refreshActiveSubPanel(mc);
+                return true;
+            }
+            if (keyCode == GLFW.GLFW_KEY_ESCAPE
+                    || ((keyCode == GLFW.GLFW_KEY_BACKSPACE || keyCode == GLFW.GLFW_KEY_LEFT) && stationRenderer.isInSubPanel())) {
+                if (stationRenderer.isInSubPanel()) {
+                    stationRenderer.returnToMain();
+                }
                 return true;
             }
         }
@@ -321,6 +473,9 @@ public final class HabiKineticUiController {
 
     public boolean onTitleCharTyped(char codePoint) {
         if (codePoint == 'm' || codePoint == 'M' || codePoint == 'r' || codePoint == 'R') {
+            return true;
+        }
+        if (HabiWorldEntrySession.getInstance().isActive()) {
             return true;
         }
         HabiBootSession session = HabiBootSession.getInstance();
@@ -333,6 +488,9 @@ public final class HabiKineticUiController {
 
     public boolean onTitleMouseClicked(Minecraft mc, double mouseX, double mouseY, int button,
                                        List<HabiStationSceneRenderer.MenuItemData> entries) {
+        if (HabiWorldEntrySession.getInstance().isActive()) {
+            return true;
+        }
         HabiBootSession session = HabiBootSession.getInstance();
         if (session.isReadyStandby()) {
             session.triggerBoarding();
@@ -341,15 +499,15 @@ public final class HabiKineticUiController {
         if (!session.isStationInteractive()) {
             return true;
         }
-        if (button != 0) return false;
+        if (button != 0 && button != 3) return false;
         gfx.updateViewport(mc.getWindow());
         double vx = gfx.guiToVirtualX(mc, mouseX);
         double vy = gfx.guiToVirtualY(mc, mouseY);
-        return stationRenderer.handleMouseClick(vx, vy, entries);
+        return stationRenderer.handleMouseClick(mc, vx, vy, button, entries);
     }
 
     public boolean onTitleMouseScrolled(Minecraft mc, double mouseX, double mouseY, double verticalAmount) {
-        if (!HabiBootSession.getInstance().isStationInteractive()) return true;
+        if (HabiWorldEntrySession.getInstance().isActive() || !HabiBootSession.getInstance().isStationInteractive()) return true;
         gfx.updateViewport(mc.getWindow());
         double vx = gfx.guiToVirtualX(mc, mouseX);
         double vy = gfx.guiToVirtualY(mc, mouseY);
@@ -357,7 +515,8 @@ public final class HabiKineticUiController {
     }
 
     public boolean onTitleMouseDragged(Minecraft mc, int button, double dragY) {
-        if (button != 0 || !HabiBootSession.getInstance().isStationInteractive()) return false;
+        if (button != 0 || HabiWorldEntrySession.getInstance().isActive()
+                || !HabiBootSession.getInstance().isStationInteractive()) return false;
         gfx.updateViewport(mc.getWindow());
         double guiH = Math.max(1.0, mc.getWindow().getGuiScaledHeight());
         double dragVirtualY = (dragY / guiH) * gfx.viewHeight();
@@ -377,5 +536,14 @@ public final class HabiKineticUiController {
         double nx = (mouseX / guiW) * 2.0 - 1.0;
         double ny = -((mouseY / guiH) * 2.0 - 1.0);
         HabiBootSession.getInstance().updatePointer(nx, ny);
+    }
+
+    private void updateWorldEntryPointer(Minecraft mc, int mouseX, int mouseY) {
+        if (mc == null || mc.getWindow() == null) return;
+        double guiW = Math.max(1.0, mc.getWindow().getGuiScaledWidth());
+        double guiH = Math.max(1.0, mc.getWindow().getGuiScaledHeight());
+        double nx = (mouseX / guiW) * 2.0 - 1.0;
+        double ny = -((mouseY / guiH) * 2.0 - 1.0);
+        HabiWorldEntrySession.getInstance().updatePointer(nx, ny);
     }
 }

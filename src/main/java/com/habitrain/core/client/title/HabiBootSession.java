@@ -85,6 +85,8 @@ public final class HabiBootSession {
         this.overlayHandedOff = false;
         this.tracker.reset();
         this.lastSnapshot = null;
+        HabiLoadingPerfMonitor.getInstance().beginSession(
+                HabiLoadingPerfMonitor.SessionKind.GAME_BOOT, "InitialBoot");
 
         HabiBootAudioEngine audio = HabiBootAudioEngine.getInstance();
         audio.preloadAsync();
@@ -401,6 +403,8 @@ public final class HabiBootSession {
 
     /** Called when leaving the title screen flow entirely (entering a world or switching to vanilla TitleScreen). */
     public void onLeaveTitleFlow() {
+        HabiLoadingPerfMonitor.getInstance().finishSession(
+                HabiLoadingPerfMonitor.SessionKind.GAME_BOOT, "left_title_flow");
         HabiBootAudioEngine.getInstance().fadeOutAndReleaseStems();
     }
 
@@ -411,6 +415,8 @@ public final class HabiBootSession {
         if (phase != Phase.STATION_01) {
             phase = Phase.IDLE;
         }
+        HabiLoadingPerfMonitor.getInstance().finishSession(
+                HabiLoadingPerfMonitor.SessionKind.GAME_BOOT, "world_joined");
         HabiBootAudioEngine.getInstance().fadeOutAndReleaseStems();
     }
 

@@ -8,6 +8,7 @@ import com.habitrain.core.client.title.HabiBootSession;
 import com.habitrain.core.client.title.HabiKineticUiController;
 import com.habitrain.core.client.title.HabiStationSceneRenderer;
 import com.habitrain.core.client.title.HabiTitleTelemetry;
+import com.habitrain.core.client.title.HabiWorldEntrySession;
 import net.exmo.sre.loading.StarRailExpressTitleScreen;
 import net.fabricmc.api.EnvType;
 import net.fabricmc.api.Environment;
@@ -119,7 +120,8 @@ public class StarRailExpressTitleScreenMixin {
         if (HabiKineticUiController.isKineticTitleEnabled()) {
             waitingForContinue.set(false);
             StarRailExpressTitleScreen.voiceFadeInDuration = 0;
-            HabiKineticUiController.getInstance().onTitleScreenInit(Minecraft.getInstance());
+            StarRailExpressTitleScreen self = (StarRailExpressTitleScreen) (Object) this;
+            HabiKineticUiController.getInstance().onTitleScreenInit(Minecraft.getInstance(), self);
         }
     }
 
@@ -133,6 +135,7 @@ public class StarRailExpressTitleScreenMixin {
                 mc.getSoundManager().stop(ambient_sound);
             }
         }
+        HabiKineticUiController.getInstance().onTitleScreenTick(mc);
         ci.cancel();
     }
 
@@ -154,7 +157,8 @@ public class StarRailExpressTitleScreenMixin {
     @Inject(method = "keyPressed", at = @At("HEAD"), cancellable = true)
     private void habitrain$onKeyPressed(int keyCode, int scanCode, int modifiers, CallbackInfoReturnable<Boolean> cir) {
         if (!HabiKineticUiController.isKineticTitleEnabled()) return;
-        if (HabiKineticUiController.getInstance().onTitleKeyPressed(keyCode, habitrain$extractMenuItems())) {
+        if (HabiKineticUiController.getInstance().onTitleKeyPressed(
+                Minecraft.getInstance(), keyCode, habitrain$extractMenuItems())) {
             cir.setReturnValue(true);
         }
     }
@@ -207,7 +211,10 @@ public class StarRailExpressTitleScreenMixin {
         if (mc != null && mc.getSoundManager() != null && ambient_sound != null) {
             mc.getSoundManager().stop(ambient_sound);
         }
-        HabiBootSession.getInstance().onEnterSubScreen();
+        HabiKineticUiController.getInstance().onTitleScreenRemoved();
+        if (!HabiWorldEntrySession.getInstance().isActive()) {
+            HabiBootSession.getInstance().onEnterSubScreen();
+        }
     }
 
     // ==================== 社群与扩展入口定制（菜单列表） ====================

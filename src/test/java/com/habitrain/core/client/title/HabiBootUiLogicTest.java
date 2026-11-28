@@ -457,6 +457,116 @@ class HabiBootUiLogicTest {
                 "Feedback telemetry description must not reference upstream repo");
     }
 
+    @Test
+    void subPanelForwardTransitionSlidesOutgoingLeftAndIncomingRightToLeftTopToBottom() {
+        HabiStationListTransition tr = new HabiStationListTransition();
+        assertEquals(HabiStationListTransition.PanelMode.MAIN, tr.getActivePanel());
+        assertFalse(tr.isTransitioning());
+
+        double slideDist = 544.0;
+        tr.transitionTo(HabiStationListTransition.PanelMode.MULTIPLAYER, 8, 5);
+        assertTrue(tr.isTransitioning());
+        assertEquals(HabiStationListTransition.PanelMode.MULTIPLAYER, tr.getActivePanel());
+        assertEquals(HabiStationListTransition.PanelMode.MAIN, tr.getOutgoingPanel());
+        assertEquals(1, tr.getSlideDirection());
+        assertFalse(tr.canAcceptItemClick(), "Click guard must block accidental double-click right after panel switch");
+
+        // Early phase: outgoing rank 0 has already moved left further than rank 1 and rank 2 (top-to-bottom stagger)
+        tr.step(0.10);
+        var out0 = tr.outgoingMotion(0, slideDist);
+        var out1 = tr.outgoingMotion(1, slideDist);
+        var out2 = tr.outgoingMotion(2, slideDist);
+        assertTrue(out0.visible() && out1.visible() && out2.visible());
+        assertTrue(out0.offsetX() < out1.offsetX() && out1.offsetX() < out2.offsetX() && out2.offsetX() <= 0.0,
+                "Outgoing buttons must slide LEFT sequentially from top to bottom: "
+                        + out0.offsetX() + ", " + out1.offsetX() + ", " + out2.offsetX());
+
+        // Mid phase: at elapsed = 0.20s, rank 0 & 1 are entering while rank 2 hasn't started yet
+        tr.step(0.10); // elapsed = 0.20s
+        assertTrue(tr.incomingMotion(0, slideDist).visible());
+        assertFalse(tr.incomingMotion(2, slideDist).visible(),
+                "Rank 2 must wait its top-to-bottom stagger turn before entering");
+
+        // At elapsed = 0.26s, ranks 0, 1, 2 are all sliding right-to-left sequentially top-to-bottom
+        tr.step(0.06); // elapsed = 0.26s
+        var in0 = tr.incomingMotion(0, slideDist);
+        var in1 = tr.incomingMotion(1, slideDist);
+        var in2 = tr.incomingMotion(2, slideDist);
+        assertTrue(in0.visible() && in1.visible() && in2.visible());
+        assertTrue(in0.offsetX() > 0.0 && in0.offsetX() < in1.offsetX() && in1.offsetX() < in2.offsetX(),
+                "Incoming list must slide RIGHT-TO-LEFT sequentially from top to bottom: "
+                        + in0.offsetX() + ", " + in1.offsetX() + ", " + in2.offsetX());
+
+        // Past click guard (0.28s)
+        tr.step(0.05); // elapsed = 0.31s
+        assertTrue(tr.canAcceptItemClick(), "Click guard must lift once incoming items are clearly visible");
+
+        // Advance until settled
+        for (int i = 0; i < 12; i++) tr.step(0.08);
+        assertFalse(tr.isTransitioning());
+        assertNull(tr.getOutgoingPanel());
+        assertEquals(0.0, tr.incomingMotion(0, slideDist).offsetX(), 1e-9);
+        assertEquals(1.0, tr.incomingMotion(0, slideDist).alpha(), 1e-9);
+    }
+
+    @Test
+    void subPanelBackwardTransitionReversesDirectionCleanlyForSingleplayerAndMultiplayer() {
+        HabiStationListTransition tr = new HabiStationListTransition();
+        tr.snapTo(HabiStationListTransition.PanelMode.SINGLEPLAYER);
+        assertEquals(HabiStationListTransition.PanelMode.SINGLEPLAYER, tr.getActivePanel());
+        assertTrue(tr.isInSubPanel());
+
+        double slideDist = 544.0;
+        tr.transitionTo(HabiStationListTransition.PanelMode.MAIN, 4, 8);
+        assertEquals(-1, tr.getSlideDirection());
+        assertEquals(HabiStationListTransition.PanelMode.SINGLEPLAYER, tr.getOutgoingPanel());
+
+        tr.step(0.10);
+        var out0 = tr.outgoingMotion(0, slideDist);
+        var out1 = tr.outgoingMotion(1, slideDist);
+        assertTrue(out0.offsetX() > out1.offsetX() && out1.offsetX() >= 0.0,
+                "Returning to main menu must slide sub-panel items RIGHT top-to-bottom");
+
+        tr.step(0.08);
+        tr.step(0.08); // elapsed = 0.26s
+        var in0 = tr.incomingMotion(0, slideDist);
+        var in1 = tr.incomingMotion(1, slideDist);
+        assertTrue(in0.visible() && in1.visible());
+        assertTrue(in0.offsetX() < 0.0 && in0.offsetX() > in1.offsetX(),
+                "Returning to main menu must slide main buttons LEFT-TO-RIGHT top-to-bottom");
+    }
+
+    @Test
+    void subPanelEntryDetectionFormattingAndEditFallbackMetadataStayCohesive() {
+        assertTrue(HabiStationSceneRenderer.isMultiplayerEntry(Component.translatable("menu.sre.multiplayer")));
+        assertTrue(HabiStationSceneRenderer.isMultiplayerEntry(Component.literal("多人游戏")));
+        assertFalse(HabiStationSceneRenderer.isMultiplayerEntry(Component.translatable("menu.sre.singleplayer")));
+
+        assertTrue(HabiStationSceneRenderer.isSingleplayerEntry(Component.translatable("menu.sre.singleplayer")));
+        assertTrue(HabiStationSceneRenderer.isSingleplayerEntry(Component.literal("单人游戏")));
+        assertFalse(HabiStationSceneRenderer.isSingleplayerEntry(Component.translatable("menu.sre.options")));
+
+        assertEquals("HabiTrain 联机服 1", HabiTitleSubPanelData.sanitizeSingleLine("  §a§lHabiTrain\n  联机服\t1  "));
+        assertTrue(HabiTitleSubPanelData.isPureAscii("PLAY.HABITRAIN.CN // 24MS"));
+        assertFalse(HabiTitleSubPanelData.isPureAscii("哈比列车 // 24MS"));
+
+        assertEquals(4, HabiTitleSubPanelData.pingBarsForLatency(24));
+        assertEquals(3, HabiTitleSubPanelData.pingBarsForLatency(120));
+        assertEquals(2, HabiTitleSubPanelData.pingBarsForLatency(240));
+        assertEquals(1, HabiTitleSubPanelData.pingBarsForLatency(450));
+        assertEquals(0, HabiTitleSubPanelData.pingBarsForLatency(-1));
+
+        var mpEdit = HabiTitleSubPanelData.describeEditFallbackForCard(HabiStationListTransition.PanelMode.MULTIPLAYER);
+        assertEquals("EDIT SERVERS", mpEdit.enSub());
+        assertEquals("NATIVE", mpEdit.tag());
+        assertTrue(mpEdit.cardTitle().contains("编辑"));
+
+        var spEdit = HabiTitleSubPanelData.describeEditFallbackForCard(HabiStationListTransition.PanelMode.SINGLEPLAYER);
+        assertEquals("EDIT WORLDS", spEdit.enSub());
+        assertEquals("NATIVE", spEdit.tag());
+        assertTrue(spEdit.cardTitle().contains("编辑"));
+    }
+
     private static double rms(float[] pcm) {
         double sum = 0.0;
         for (float v : pcm) sum += v * v;
